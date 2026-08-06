@@ -1,0 +1,436 @@
+// Package config loads the typed, non-secret service configuration.
+package config
+
+import (
+	"bytes"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"net/url"
+	"os"
+	"strings"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+const (
+	defaultIngressFrames       = 25
+	defaultEgressFrames        = 75
+	defaultControlEvents       = 256
+	defaultWriterControlEvents = 64
+	defaultSampleRate          = 24_000
+)
+
+type Config struct {
+	Mode      string          `yaml:"mode"`
+	Gateway   GatewayConfig   `yaml:"gateway"`
+	Worker    WorkerConfig    `yaml:"worker"`
+	Store     StoreConfig     `yaml:"store"`
+	Auth      AuthConfig      `yaml:"auth"`
+	Admission AdmissionConfig `yaml:"admission"`
+	Safety    SafetyConfig    `yaml:"safety"`
+	Telemetry TelemetryConfig `yaml:"telemetry"`
+	Shutdown  ShutdownConfig  `yaml:"shutdown"`
+	Admin     AdminConfig     `yaml:"admin"`
+	Features  FeatureConfig   `yaml:"features"`
+}
+
+type GatewayConfig struct {
+	AdvertisedModel string          `yaml:"advertised_model"`
+	ListenAddr      string          `yaml:"listen_addr"`
+	TLS             TLSConfig       `yaml:"tls"`
+	BehindIngress   bool            `yaml:"behind_ingress"`
+	TrustedProxies  []string        `yaml:"trusted_proxies"`
+	Voice           VoiceConfig     `yaml:"voice"`
+	Audio           AudioConfig     `yaml:"audio"`
+	Session         SessionConfig   `yaml:"session"`
+	WebSocket       WebSocketConfig `yaml:"websocket"`
+	ProviderRetry   RetryConfig     `yaml:"provider_retry"`
+	StorageGrace    time.Duration   `yaml:"storage_grace"`
+	Reconnect       ReconnectConfig `yaml:"reconnect"`
+}
+
+type TLSConfig struct {
+	CertFile string `yaml:"cert_file"`
+	KeyFile  string `yaml:"key_file"`
+}
+
+type VoiceConfig struct {
+	Role      string `yaml:"role"`
+	Provider  string `yaml:"provider"`
+	URL       string `yaml:"url"`
+	Model     string `yaml:"model"`
+	APIKeyEnv string `yaml:"api_key_env"`
+}
+
+type AudioConfig struct {
+	SampleRate     int `yaml:"sample_rate"`
+	Channels       int `yaml:"channels"`
+	BytesPerSample int `yaml:"bytes_per_sample"`
+}
+
+type SessionConfig struct {
+	IngressFrames       int           `yaml:"ingress_frames"`
+	EgressFrames        int           `yaml:"egress_frames"`
+	ControlEvents       int           `yaml:"control_events"`
+	WriterControlEvents int           `yaml:"writer_control_events"`
+	IngressAudioBytes   int           `yaml:"ingress_audio_bytes"`
+	EgressAudioBytes    int           `yaml:"egress_audio_bytes"`
+	IngressBlockTimeout time.Duration `yaml:"ingress_block_timeout"`
+	EgressBlockTimeout  time.Duration `yaml:"egress_block_timeout"`
+}
+
+type WebSocketConfig struct {
+	MaxFrameBytes int           `yaml:"max_frame_bytes"`
+	ReadTimeout   time.Duration `yaml:"read_timeout"`
+	WriteTimeout  time.Duration `yaml:"write_timeout"`
+}
+
+type RetryConfig struct {
+	Base       time.Duration `yaml:"base"`
+	Max        time.Duration `yaml:"max"`
+	MaxRetries int           `yaml:"max_retries"`
+}
+
+type ReconnectConfig struct {
+	MaxRetries int           `yaml:"max_retries"`
+	RetryBase  time.Duration `yaml:"retry_base"`
+	RetryMax   time.Duration `yaml:"retry_max"`
+}
+
+type WorkerConfig struct {
+	Concurrency       int            `yaml:"concurrency"`
+	LeaseDuration     time.Duration  `yaml:"lease_duration"`
+	HeartbeatInterval time.Duration  `yaml:"heartbeat_interval"`
+	PollInterval      time.Duration  `yaml:"poll_interval"`
+	RequestTimeout    time.Duration  `yaml:"request_timeout"`
+	RetryBase         time.Duration  `yaml:"retry_base"`
+	RetryMax          time.Duration  `yaml:"retry_max"`
+	MaxRetries        int            `yaml:"max_retries"`
+	MaxOutputBytes    int            `yaml:"max_output_bytes"`
+	MaxOutputTokens   int            `yaml:"max_output_tokens"`
+	MaxToolRounds     int            `yaml:"max_tool_rounds"`
+	Reasoner          ReasonerConfig `yaml:"reasoner"`
+}
+
+type ReasonerConfig struct {
+	Role      string `yaml:"role"`
+	Provider  string `yaml:"provider"`
+	BaseURL   string `yaml:"base_url"`
+	Model     string `yaml:"model"`
+	APIKeyEnv string `yaml:"api_key_env"`
+}
+
+type StoreConfig struct {
+	DatabaseURLEnv string          `yaml:"database_url_env"`
+	URL            string          `yaml:"url"`
+	Retention      RetentionConfig `yaml:"retention"`
+}
+
+type RetentionConfig struct {
+	ConversationTTL time.Duration `yaml:"conversation_ttl"`
+	SweepInterval   time.Duration `yaml:"sweep_interval"`
+}
+
+type AuthConfig struct {
+	OIDCIssuer      string   `yaml:"oidc_issuer"`
+	OIDCAudience    string   `yaml:"oidc_audience"`
+	StaticBearerEnv string   `yaml:"static_bearer_env"`
+	AllowedOrigins  []string `yaml:"allowed_origins"`
+}
+
+type AdmissionConfig struct {
+	MaxSessions          int           `yaml:"max_sessions"`
+	MaxSessionsPerTenant int           `yaml:"max_sessions_per_tenant"`
+	MaxSessionsPerUser   int           `yaml:"max_sessions_per_user"`
+	LeaseDuration        time.Duration `yaml:"lease_duration"`
+}
+
+type SafetyConfig struct {
+	PrivacyHMACKeyEnv string `yaml:"privacy_hmac_key_env"`
+	MaxInputBytes     int    `yaml:"max_input_bytes"`
+}
+
+type TelemetryConfig struct {
+	OTLPEndpoint string `yaml:"otlp_endpoint"`
+	ServiceName  string `yaml:"service_name"`
+}
+
+type ShutdownConfig struct {
+	DrainTimeout time.Duration `yaml:"drain_timeout"`
+}
+
+type AdminConfig struct {
+	ListenAddr string `yaml:"listen_addr"`
+}
+
+type FeatureConfig struct {
+	SideEffectingTools   bool   `yaml:"side_effecting_tools"`
+	ToolEncryptionKeyEnv string `yaml:"tool_encryption_key_env"`
+	Handoffs             bool   `yaml:"handoffs"`
+}
+
+// Load reads a YAML file, resolves only secret environment names, supplies
+// operational defaults, and rejects insecure or incomplete settings.
+func Load(path string, lookup func(string) (string, bool)) (Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Config{}, fmt.Errorf("read config: %w", err)
+	}
+	if err := rejectPlaintextSecrets(data); err != nil {
+		return Config{}, err
+	}
+	var cfg Config
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&cfg); err != nil {
+		return Config{}, fmt.Errorf("parse config: %w", err)
+	}
+	cfg.applyDefaults()
+	if err := cfg.validateSecrets(lookup); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.Validate(); err != nil {
+		return Config{}, err
+	}
+	return cfg, nil
+}
+
+func (c *Config) applyDefaults() {
+	if c.Mode == "" {
+		c.Mode = "local"
+	}
+	if c.Gateway.ListenAddr == "" {
+		c.Gateway.ListenAddr = ":8080"
+	}
+	if c.Gateway.Audio.SampleRate == 0 {
+		c.Gateway.Audio.SampleRate = defaultSampleRate
+	}
+	if c.Gateway.Audio.Channels == 0 {
+		c.Gateway.Audio.Channels = 1
+	}
+	if c.Gateway.Audio.BytesPerSample == 0 {
+		c.Gateway.Audio.BytesPerSample = 2
+	}
+	if c.Gateway.Session.IngressFrames == 0 {
+		c.Gateway.Session.IngressFrames = defaultIngressFrames
+	}
+	if c.Gateway.Session.EgressFrames == 0 {
+		c.Gateway.Session.EgressFrames = defaultEgressFrames
+	}
+	if c.Gateway.Session.ControlEvents == 0 {
+		c.Gateway.Session.ControlEvents = defaultControlEvents
+	}
+	if c.Gateway.Session.WriterControlEvents == 0 {
+		c.Gateway.Session.WriterControlEvents = defaultWriterControlEvents
+	}
+	if c.Gateway.Session.IngressAudioBytes == 0 {
+		c.Gateway.Session.IngressAudioBytes = 24_000
+	}
+	if c.Gateway.Session.EgressAudioBytes == 0 {
+		c.Gateway.Session.EgressAudioBytes = 72_000
+	}
+	if c.Gateway.WebSocket.MaxFrameBytes == 0 {
+		c.Gateway.WebSocket.MaxFrameBytes = 1 << 20
+	}
+	if c.Gateway.StorageGrace == 0 {
+		c.Gateway.StorageGrace = 30 * time.Second
+	}
+	if c.Worker.Concurrency == 0 {
+		c.Worker.Concurrency = 1
+	}
+	if c.Worker.LeaseDuration == 0 {
+		c.Worker.LeaseDuration = 30 * time.Second
+	}
+	if c.Worker.HeartbeatInterval == 0 {
+		c.Worker.HeartbeatInterval = 10 * time.Second
+	}
+	if c.Worker.PollInterval == 0 {
+		c.Worker.PollInterval = time.Second
+	}
+	if c.Worker.RequestTimeout == 0 {
+		c.Worker.RequestTimeout = 30 * time.Second
+	}
+	if c.Worker.RetryBase == 0 {
+		c.Worker.RetryBase = time.Second
+	}
+	if c.Worker.RetryMax == 0 {
+		c.Worker.RetryMax = 30 * time.Second
+	}
+	if c.Worker.MaxRetries == 0 {
+		c.Worker.MaxRetries = 3
+	}
+	if c.Worker.MaxOutputBytes == 0 {
+		c.Worker.MaxOutputBytes = 1 << 20
+	}
+	if c.Worker.MaxOutputTokens == 0 {
+		c.Worker.MaxOutputTokens = 8_192
+	}
+	if c.Worker.MaxToolRounds == 0 {
+		c.Worker.MaxToolRounds = 8
+	}
+}
+
+func (c Config) Validate() error {
+	if c.Mode != "local" && c.Mode != "production" {
+		return fmt.Errorf("mode must be local or production")
+	}
+	if c.Gateway.Voice.URL != "" {
+		u, err := url.Parse(c.Gateway.Voice.URL)
+		if err != nil || (u.Scheme != "ws" && u.Scheme != "wss") || u.Host == "" {
+			return fmt.Errorf("gateway.voice.url must be an absolute ws or wss URL")
+		}
+		if c.Mode == "production" && u.Scheme != "wss" {
+			return fmt.Errorf("production gateway.voice.url must use wss")
+		}
+	}
+	if err := validateHTTPURL(c.Worker.Reasoner.BaseURL, "worker.reasoner.base_url", c.Mode == "production"); err != nil {
+		return err
+	}
+	if err := validateHTTPURL(c.Auth.OIDCIssuer, "auth.oidc_issuer", c.Mode == "production"); err != nil {
+		return err
+	}
+	if err := validateHTTPURL(c.Telemetry.OTLPEndpoint, "telemetry.otlp_endpoint", c.Mode == "production"); err != nil {
+		return err
+	}
+	if c.Gateway.Audio.SampleRate <= 0 || c.Gateway.Audio.Channels <= 0 || c.Gateway.Audio.BytesPerSample <= 0 {
+		return errors.New("gateway.audio format must be positive")
+	}
+	frameBytes := c.Gateway.Audio.Channels * c.Gateway.Audio.BytesPerSample
+	if c.Gateway.Session.IngressAudioBytes <= 0 || c.Gateway.Session.EgressAudioBytes <= 0 || c.Gateway.Session.IngressAudioBytes%frameBytes != 0 || c.Gateway.Session.EgressAudioBytes%frameBytes != 0 {
+		return fmt.Errorf("gateway.session audio byte limits must be frame aligned (ingress_audio_bytes, egress_audio_bytes)")
+	}
+	if c.Gateway.Session.IngressFrames <= 0 || c.Gateway.Session.EgressFrames <= 0 || c.Gateway.Session.ControlEvents <= 0 || c.Gateway.Session.WriterControlEvents <= 0 || c.Gateway.Session.IngressFrames > 10_000 || c.Gateway.Session.EgressFrames > 10_000 || c.Gateway.Session.ControlEvents > 10_000 || c.Gateway.Session.WriterControlEvents > 10_000 {
+		return errors.New("gateway session queue sizes must be positive and bounded")
+	}
+	if c.Worker.Concurrency <= 0 {
+		return errors.New("worker.concurrency must be positive")
+	}
+	if c.Worker.LeaseDuration <= 0 || c.Worker.HeartbeatInterval <= 0 || c.Worker.HeartbeatInterval*2 >= c.Worker.LeaseDuration {
+		return errors.New("worker.heartbeat_interval must be below half worker.lease_duration")
+	}
+	if c.Worker.RetryBase <= 0 || c.Worker.RetryMax <= 0 || c.Worker.RetryMax < c.Worker.RetryBase || c.Worker.MaxRetries <= 0 {
+		return errors.New("worker retry limits must be positive")
+	}
+	if c.Worker.MaxOutputBytes <= 0 || c.Worker.MaxOutputTokens <= 0 || c.Worker.MaxToolRounds <= 0 {
+		return errors.New("worker output limits must be positive")
+	}
+	if c.Mode == "production" {
+		if strings.Contains(c.Store.URL, "sslmode=disable") {
+			return errors.New("production store.url must not disable SSL")
+		}
+		if c.Auth.StaticBearerEnv != "" {
+			return errors.New("production static authentication is not allowed")
+		}
+		for _, origin := range c.Auth.AllowedOrigins {
+			if origin == "*" {
+				return errors.New("production wildcard origins are not allowed")
+			}
+		}
+		if c.Gateway.BehindIngress && len(c.Gateway.TrustedProxies) == 0 {
+			return errors.New("production ingress requires trusted proxies")
+		}
+	}
+	return nil
+}
+
+func validateHTTPURL(raw, name string, requireHTTPS bool) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("%s must be an absolute http or https URL", name)
+	}
+	if requireHTTPS && u.Scheme != "https" {
+		return fmt.Errorf("production %s must use https", name)
+	}
+	return nil
+}
+
+func (c Config) validateSecrets(lookup func(string) (string, bool)) error {
+	if lookup == nil {
+		lookup = os.LookupEnv
+	}
+	for _, name := range []string{c.Gateway.Voice.APIKeyEnv, c.Worker.Reasoner.APIKeyEnv, c.Store.DatabaseURLEnv, c.Auth.StaticBearerEnv, c.Safety.PrivacyHMACKeyEnv} {
+		if name == "" {
+			continue
+		}
+		if !environmentName(name) {
+			return fmt.Errorf("secret environment variable name %q is invalid", name)
+		}
+		value, ok := lookup(name)
+		if !ok {
+			return fmt.Errorf("required secret environment variable %q is not set", name)
+		}
+		if name == c.Store.DatabaseURLEnv && c.Mode == "production" && strings.Contains(value, "sslmode=disable") {
+			return errors.New("production database URL must not disable SSL")
+		}
+	}
+	if c.Features.SideEffectingTools {
+		name := c.Features.ToolEncryptionKeyEnv
+		if name == "" {
+			name = "LIVE_TOOL_ENCRYPTION_KEY"
+		}
+		if !environmentName(name) {
+			return fmt.Errorf("secret environment variable name %q is invalid", name)
+		}
+		value, ok := lookup(name)
+		if !ok {
+			return fmt.Errorf("required secret environment variable %q is not set", name)
+		}
+		key, err := base64.StdEncoding.DecodeString(value)
+		if err != nil || len(key) != 32 {
+			return fmt.Errorf("%s must contain a base64-encoded 32-byte key", name)
+		}
+	}
+	return nil
+}
+
+func environmentName(value string) bool {
+	if value == "" || value[0] < 'A' || value[0] > 'Z' {
+		return false
+	}
+	for _, r := range value[1:] {
+		if (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+func rejectPlaintextSecrets(data []byte) error {
+	var node yaml.Node
+	if err := yaml.Unmarshal(data, &node); err != nil {
+		return fmt.Errorf("parse config: %w", err)
+	}
+	var walk func(*yaml.Node) error
+	walk = func(n *yaml.Node) error {
+		if n.Kind == yaml.MappingNode {
+			for i := 0; i+1 < len(n.Content); i += 2 {
+				key, value := n.Content[i], n.Content[i+1]
+				lower := strings.ToLower(key.Value)
+				if (strings.Contains(lower, "secret") || strings.Contains(lower, "password") || strings.Contains(lower, "api_key") || strings.Contains(lower, "token") || strings.Contains(lower, "hmac_key") || strings.Contains(lower, "encryption_key")) && !strings.HasSuffix(lower, "_env") && value.Kind == yaml.ScalarNode && value.Value != "" {
+					return fmt.Errorf("plaintext secret %q is not allowed in YAML; use an environment variable name", key.Value)
+				}
+				if lower == "url" && value.Kind == yaml.ScalarNode {
+					if parsed, err := url.Parse(value.Value); err == nil && parsed.User != nil {
+						return fmt.Errorf("plaintext secret in %q is not allowed in YAML; use an environment variable name", key.Value)
+					}
+				}
+				if err := walk(value); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		for _, child := range n.Content {
+			if err := walk(child); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return walk(&node)
+}

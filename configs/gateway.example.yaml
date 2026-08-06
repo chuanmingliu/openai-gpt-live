@@ -1,0 +1,22 @@
+# Local simulator configuration. Values ending in _env name process environment
+# variables; this file deliberately contains no credential values.
+mode: local
+gateway:
+  advertised_model: gpt-live-simulator
+  listen_addr: :8080
+  voice:
+    role: realtime_voice
+    provider: speech_to_speech
+    url: ws://127.0.0.1:8000/v1/realtime
+    model: s2s-realtime
+    api_key_env: S2S_API_KEY
+  audio:
+    sample_rate: 24000
+    channels: 1
+    bytes_per_sample: 2
+store:
+  database_url_env: DATABASE_URL
+auth:
+  static_bearer_env: LIVE_STATIC_BEARER_TOKEN
+safety:
+  privacy_hmac_key_env: LIVE_PRIVACY_HMAC_KEY

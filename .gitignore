@@ -1,2 +1,14 @@
 .superpowers/
 .worktrees/
+
+# Go build and test outputs.
+bin/
+*.test
+*.out
+coverage.txt
+
+# Local configuration and credentials.
+.env
+.env.*
+!*.example.env
+configs/*.local.yaml

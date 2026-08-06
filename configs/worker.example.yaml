@@ -1,0 +1,15 @@
+# Local DeepSeek-simulator worker configuration. Credentials are environment
+# variable names, never checked-in secret values.
+mode: local
+worker:
+  concurrency: 1
+  reasoner:
+    role: async_gpt_5_5
+    provider: deepseek
+    base_url: https://api.deepseek.com
+    model: deepseek-chat
+    api_key_env: DEEPSEEK_API_KEY
+store:
+  database_url_env: DATABASE_URL
+safety:
+  privacy_hmac_key_env: LIVE_PRIVACY_HMAC_KEY
