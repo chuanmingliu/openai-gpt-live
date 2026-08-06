@@ -46,7 +46,7 @@ func DecodeClient(raw []byte, limits Limits) (ClientEvent, error) {
 		return nil, fmt.Errorf("decode client event: %w", err)
 	}
 	event := reflect.ValueOf(target).Elem().Interface().(ClientEvent)
-	if err := validateClient(event, limits); err != nil {
+	if err := validateClient(event, raw, limits); err != nil {
 		return nil, err
 	}
 	return event, nil
@@ -112,10 +112,8 @@ func DecodeServer(raw []byte, limits Limits) (ServerEvent, error) {
 		return nil, fmt.Errorf("decode server event: %w", err)
 	}
 	event := reflect.ValueOf(target).Elem().Interface().(ServerEvent)
-	if audio, ok := event.(ResponseOutputAudioDeltaEvent); ok {
-		if _, err := decodeBase64(audio.Delta, limits.MaxAudioBytes); err != nil {
-			return nil, fmt.Errorf("decode output audio: %w", err)
-		}
+	if err := validateServer(event, raw, limits); err != nil {
+		return nil, err
 	}
 	return event, nil
 }
@@ -211,9 +209,16 @@ func (f *PCMFramer) Reset() {
 	}
 }
 
-func validateClient(event ClientEvent, limits Limits) error {
+func validateClient(event ClientEvent, raw []byte, limits Limits) error {
+	fields, err := rawObject(raw)
+	if err != nil {
+		return err
+	}
 	switch typed := event.(type) {
 	case SessionUpdateEvent:
+		if _, err := requiredObject(fields, "session"); err != nil {
+			return err
+		}
 		if typed.Session.Type != "realtime" {
 			return fmt.Errorf("session type must be realtime, got %q", typed.Session.Type)
 		}
@@ -225,12 +230,19 @@ func validateClient(event ClientEvent, limits Limits) error {
 			return err
 		}
 	case ConversationItemCreateEvent:
+		if _, err := requiredObject(fields, "item"); err != nil {
+			return err
+		}
 		if typed.Item.Type == "" {
 			return errors.New("conversation item type is required")
 		}
 		if err := validateConversationItem(typed.Item); err != nil {
 			return err
 		}
+	case InputAudioBufferCommitEvent, ResponseCreateEvent, ResponseCancelEvent:
+		return nil
+	default:
+		return fmt.Errorf("unsupported client event %T", event)
 	}
 	return nil
 }
@@ -257,8 +269,12 @@ func validateSessionAudio(audio *SessionAudio) error {
 func validateConversationItem(item ConversationItem) error {
 	switch item.Type {
 	case "message":
-		if item.Role == "" || len(item.Content) == 0 {
+		if item.Role == "" {
 			return errors.New("message item requires role and content")
+		}
+		var content []json.RawMessage
+		if err := json.Unmarshal(item.Content, &content); err != nil || len(content) == 0 {
+			return errors.New("message item requires a non-empty content array")
 		}
 	case "function_call":
 		if item.CallID == "" || item.Name == "" || item.Arguments == "" {
@@ -268,6 +284,188 @@ func validateConversationItem(item ConversationItem) error {
 		if item.CallID == "" || item.Output == "" {
 			return errors.New("function call output requires call_id and output")
 		}
+	default:
+		return fmt.Errorf("unsupported conversation item type %q", item.Type)
+	}
+	return nil
+}
+
+func validateServer(event ServerEvent, raw []byte, limits Limits) error {
+	fields, err := rawObject(raw)
+	if err != nil {
+		return err
+	}
+	requireResponse := func() error {
+		response, err := requiredObject(fields, "response")
+		if err != nil {
+			return err
+		}
+		if err := requireString(response, "id", true); err != nil {
+			return err
+		}
+		return requireString(response, "status", true)
+	}
+	requireOutputCoordinates := func() error {
+		if err := requireString(fields, "response_id", true); err != nil {
+			return err
+		}
+		if err := requireString(fields, "item_id", true); err != nil {
+			return err
+		}
+		if err := requireNonNegativeInt(fields, "output_index"); err != nil {
+			return err
+		}
+		return requireNonNegativeInt(fields, "content_index")
+	}
+	requireHandoff := func() error {
+		if err := requireNonNegativeInt(fields, "sequence_id"); err != nil {
+			return err
+		}
+		if err := requireString(fields, "handoff_id", true); err != nil {
+			return err
+		}
+		return requireString(fields, "status", true)
+	}
+
+	switch typed := event.(type) {
+	case SessionCreatedEvent, SessionUpdatedEvent:
+		_, err = requiredObject(fields, "session")
+		return err
+	case ErrorEvent:
+		errorFields, err := requiredObject(fields, "error")
+		if err != nil {
+			return err
+		}
+		if err := requireString(errorFields, "type", true); err != nil {
+			return err
+		}
+		return requireString(errorFields, "message", true)
+	case InputAudioBufferSpeechStartedEvent:
+		if err := requireString(fields, "item_id", true); err != nil {
+			return err
+		}
+		return requireNonNegativeInt(fields, "audio_start_ms")
+	case InputAudioBufferSpeechStoppedEvent:
+		if err := requireString(fields, "item_id", true); err != nil {
+			return err
+		}
+		return requireNonNegativeInt(fields, "audio_end_ms")
+	case ConversationItemInputAudioTranscriptionDeltaEvent:
+		if err := requireString(fields, "item_id", true); err != nil {
+			return err
+		}
+		if err := requireNonNegativeInt(fields, "content_index"); err != nil {
+			return err
+		}
+		return requireString(fields, "delta", false)
+	case ConversationItemInputAudioTranscriptionCompletedEvent:
+		if err := requireString(fields, "item_id", true); err != nil {
+			return err
+		}
+		if err := requireNonNegativeInt(fields, "content_index"); err != nil {
+			return err
+		}
+		return requireString(fields, "transcript", false)
+	case ResponseCreatedEvent, ResponseDoneEvent:
+		return requireResponse()
+	case ResponseOutputAudioDeltaEvent:
+		if err := requireOutputCoordinates(); err != nil {
+			return err
+		}
+		if _, err := decodeBase64(typed.Delta, limits.MaxAudioBytes); err != nil {
+			return fmt.Errorf("decode output audio: %w", err)
+		}
+		return nil
+	case ResponseOutputAudioDoneEvent:
+		return requireOutputCoordinates()
+	case ResponseOutputAudioTranscriptDeltaEvent:
+		if err := requireOutputCoordinates(); err != nil {
+			return err
+		}
+		return requireString(fields, "delta", false)
+	case ResponseOutputAudioTranscriptDoneEvent:
+		if err := requireOutputCoordinates(); err != nil {
+			return err
+		}
+		return requireString(fields, "transcript", false)
+	case ResponseFunctionCallArgumentsDoneEvent:
+		if err := requireString(fields, "response_id", true); err != nil {
+			return err
+		}
+		if err := requireString(fields, "item_id", true); err != nil {
+			return err
+		}
+		if err := requireNonNegativeInt(fields, "output_index"); err != nil {
+			return err
+		}
+		for _, name := range []string{"call_id", "name", "arguments"} {
+			if err := requireString(fields, name, true); err != nil {
+				return err
+			}
+		}
+		return nil
+	case LiveHandoffCreatedEvent, LiveHandoffProgressEvent, LiveHandoffNeedsInputEvent,
+		LiveHandoffCompletedEvent, LiveHandoffFailedEvent, LiveHandoffCancelledEvent:
+		return requireHandoff()
+	case LiveSessionDegradedEvent, LiveSessionResumedEvent:
+		if err := requireNonNegativeInt(fields, "sequence_id"); err != nil {
+			return err
+		}
+		return requireString(fields, "status", true)
+	default:
+		return fmt.Errorf("unsupported server event %T", event)
+	}
+}
+
+func rawObject(raw []byte) (map[string]json.RawMessage, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, fmt.Errorf("decode object: %w", err)
+	}
+	if fields == nil {
+		return nil, errors.New("object is required")
+	}
+	return fields, nil
+}
+
+func requiredObject(fields map[string]json.RawMessage, name string) (map[string]json.RawMessage, error) {
+	raw, ok := fields[name]
+	if !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil, fmt.Errorf("%s object is required", name)
+	}
+	object, err := rawObject(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%s must be an object: %w", name, err)
+	}
+	return object, nil
+}
+
+func requireString(fields map[string]json.RawMessage, name string, nonEmpty bool) error {
+	raw, ok := fields[name]
+	if !ok {
+		return fmt.Errorf("%s is required", name)
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return fmt.Errorf("%s must be a string: %w", name, err)
+	}
+	if nonEmpty && value == "" {
+		return fmt.Errorf("%s must not be empty", name)
+	}
+	return nil
+}
+
+func requireNonNegativeInt(fields map[string]json.RawMessage, name string) error {
+	raw, ok := fields[name]
+	if !ok {
+		return fmt.Errorf("%s is required", name)
+	}
+	var value int64
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return fmt.Errorf("%s must be an integer: %w", name, err)
+	}
+	if value < 0 {
+		return fmt.Errorf("%s must not be negative", name)
 	}
 	return nil
 }

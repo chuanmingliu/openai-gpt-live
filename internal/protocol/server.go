@@ -87,7 +87,7 @@ func (ConversationItemInputAudioTranscriptionCompletedEvent) isServerEvent()    
 type ResponseCreatedEvent struct {
 	Type     string          `json:"type"`
 	EventID  string          `json:"event_id,omitempty"`
-	Response json.RawMessage `json:"response"`
+	Response ResponsePayload `json:"response"`
 }
 
 func (e ResponseCreatedEvent) EventType() string { return e.Type }
@@ -161,11 +161,58 @@ func (ResponseFunctionCallArgumentsDoneEvent) isServerEvent()      {}
 type ResponseDoneEvent struct {
 	Type     string          `json:"type"`
 	EventID  string          `json:"event_id,omitempty"`
-	Response json.RawMessage `json:"response"`
+	Response ResponsePayload `json:"response"`
 }
 
 func (e ResponseDoneEvent) EventType() string { return e.Type }
 func (ResponseDoneEvent) isServerEvent()      {}
+
+// ResponsePayload exposes the provider-neutral response correlation fields and
+// retains the bounded provider payload for lossless forwarding.
+type ResponsePayload struct {
+	ID     string          `json:"id"`
+	Status string          `json:"status"`
+	Raw    json.RawMessage `json:"-"`
+}
+
+func (p *ResponsePayload) UnmarshalJSON(data []byte) error {
+	type core struct {
+		ID     string `json:"id"`
+		Status string `json:"status"`
+	}
+	var decoded core
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	p.ID = decoded.ID
+	p.Status = decoded.Status
+	p.Raw = append(p.Raw[:0], data...)
+	return nil
+}
+
+func (p ResponsePayload) MarshalJSON() ([]byte, error) {
+	type core struct {
+		ID     string `json:"id"`
+		Status string `json:"status"`
+	}
+	if len(p.Raw) == 0 {
+		return json.Marshal(core{ID: p.ID, Status: p.Status})
+	}
+	var original core
+	if err := json.Unmarshal(p.Raw, &original); err != nil {
+		return nil, err
+	}
+	if original.ID == p.ID && original.Status == p.Status {
+		return p.Raw, nil
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(p.Raw, &fields); err != nil {
+		return nil, err
+	}
+	fields["id"], _ = json.Marshal(p.ID)
+	fields["status"], _ = json.Marshal(p.Status)
+	return json.Marshal(fields)
+}
 
 type LiveHandoffCreatedEvent struct {
 	Type       string          `json:"type"`

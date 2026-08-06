@@ -97,6 +97,36 @@ func TestDecodeClientRejectsNonPCM24kSessionFormats(t *testing.T) {
 	}
 }
 
+func TestDecodeClientRejectsInvalidPayloadForEverySupportedType(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{"session update missing session", `{"type":"session.update"}`},
+		{"audio append missing audio", `{"type":"input_audio_buffer.append"}`},
+		{"audio commit event id is not a string", `{"type":"input_audio_buffer.commit","event_id":7}`},
+		{"conversation item kind is unsupported", `{"type":"conversation.item.create","item":{"type":"provider_future_item"}}`},
+		{"response create response is not an object", `{"type":"response.create","response":"invalid"}`},
+		{"response cancel response id is not a string", `{"type":"response.cancel","response_id":7}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := DecodeClient([]byte(tt.raw), testLimits)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestDecodeClientRejectsMessageWithoutContentEntries(t *testing.T) {
+	for _, raw := range []string{
+		`{"type":"conversation.item.create","item":{"type":"message","role":"user","content":null}}`,
+		`{"type":"conversation.item.create","item":{"type":"message","role":"user","content":[]}}`,
+	} {
+		_, err := DecodeClient([]byte(raw), testLimits)
+		require.Error(t, err)
+	}
+}
+
 func TestDecodePCM24kRejectsInvalidBase64BeforeAllocation(t *testing.T) {
 	_, err := DecodePCM24k(InputAudioBufferAppendEvent{Type: "input_audio_buffer.append", Audio: "AAAA"}, 2)
 	require.Error(t, err)
@@ -199,7 +229,11 @@ func TestPCMFramerReturnsIndependentFrames(t *testing.T) {
 
 func TestServerEventsRoundTripEverySupportedType(t *testing.T) {
 	session := json.RawMessage(`{"id":"sess-1","provider_extra":{"kept":true}}`)
-	response := json.RawMessage(`{"id":"resp-1","status":"completed","provider_extra":7}`)
+	response := ResponsePayload{
+		ID:     "resp-1",
+		Status: "completed",
+		Raw:    json.RawMessage(`{"id":"resp-1","status":"completed","provider_extra":7}`),
+	}
 	details := json.RawMessage(`{"step":"search","percent":50}`)
 	events := []ServerEvent{
 		SessionCreatedEvent{Type: "session.created", EventID: "e1", Session: session},
@@ -236,6 +270,23 @@ func TestServerEventsRoundTripEverySupportedType(t *testing.T) {
 	}
 }
 
+func TestDecodeServerExposesResponseCoreAndPreservesProviderPayload(t *testing.T) {
+	raw := []byte(`{"type":"response.done","event_id":"evt-response","response":{"id":"resp-typed","status":"failed","provider_status_details":{"reason":"content_filter"}}}`)
+
+	event, err := DecodeServer(raw, testLimits)
+
+	require.NoError(t, err)
+	got, ok := event.(ResponseDoneEvent)
+	require.True(t, ok)
+	assert.Equal(t, "resp-typed", got.Response.ID)
+	assert.Equal(t, "failed", got.Response.Status)
+	assert.JSONEq(t, `{"id":"resp-typed","status":"failed","provider_status_details":{"reason":"content_filter"}}`, string(got.Response.Raw))
+
+	reencoded, err := Encode(got)
+	require.NoError(t, err)
+	assert.JSONEq(t, string(raw), string(reencoded))
+}
+
 func TestDecodeServerRejectsUnknownAndOversizedEvents(t *testing.T) {
 	_, err := DecodeServer([]byte(`{"type":"server.future"}`), testLimits)
 	require.Error(t, err)
@@ -247,6 +298,42 @@ func TestDecodeServerRejectsOversizedAudioDelta(t *testing.T) {
 	raw := `{"type":"response.output_audio.delta","delta":"` + strings.Repeat("A", 8) + `"}`
 	_, err := DecodeServer([]byte(raw), Limits{MaxFrameBytes: 1_000, MaxJSONDepth: 8, MaxAudioBytes: 3})
 	require.Error(t, err)
+}
+
+func TestDecodeServerRejectsMissingLifecycleFieldsForEverySupportedType(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{"session created missing session", `{"type":"session.created"}`},
+		{"session updated session is null", `{"type":"session.updated","session":null}`},
+		{"error missing message", `{"type":"error","error":{"type":"invalid_request_error"}}`},
+		{"speech started missing zero audio start", `{"type":"input_audio_buffer.speech_started","item_id":"item-1"}`},
+		{"speech stopped missing zero audio end", `{"type":"input_audio_buffer.speech_stopped","item_id":"item-1"}`},
+		{"transcription delta missing zero content index", `{"type":"conversation.item.input_audio_transcription.delta","item_id":"item-1","delta":""}`},
+		{"transcription completed missing transcript", `{"type":"conversation.item.input_audio_transcription.completed","item_id":"item-1","content_index":0}`},
+		{"response created missing response status", `{"type":"response.created","response":{"id":"resp-1"}}`},
+		{"audio delta missing zero output index", `{"type":"response.output_audio.delta","response_id":"resp-1","item_id":"item-1","content_index":0,"delta":"AA=="}`},
+		{"audio done missing zero content index", `{"type":"response.output_audio.done","response_id":"resp-1","item_id":"item-1","output_index":0}`},
+		{"audio transcript delta missing delta", `{"type":"response.output_audio_transcript.delta","response_id":"resp-1","item_id":"item-1","output_index":0,"content_index":0}`},
+		{"audio transcript done missing transcript", `{"type":"response.output_audio_transcript.done","response_id":"resp-1","item_id":"item-1","output_index":0,"content_index":0}`},
+		{"function arguments done missing call id", `{"type":"response.function_call_arguments.done","response_id":"resp-1","item_id":"item-1","output_index":0,"name":"lookup","arguments":"{}"}`},
+		{"response done missing response", `{"type":"response.done"}`},
+		{"handoff created missing zero sequence", `{"type":"live.handoff.created","handoff_id":"h-1","status":"queued"}`},
+		{"handoff progress missing handoff id", `{"type":"live.handoff.progress","sequence_id":0,"status":"running"}`},
+		{"handoff needs input missing status", `{"type":"live.handoff.needs_input","sequence_id":0,"handoff_id":"h-1"}`},
+		{"handoff completed missing zero sequence", `{"type":"live.handoff.completed","handoff_id":"h-1","status":"completed"}`},
+		{"handoff failed missing handoff id", `{"type":"live.handoff.failed","sequence_id":0,"status":"failed"}`},
+		{"handoff cancelled missing status", `{"type":"live.handoff.cancelled","sequence_id":0,"handoff_id":"h-1"}`},
+		{"session degraded missing zero sequence", `{"type":"live.session.degraded","status":"degraded"}`},
+		{"session resumed missing status", `{"type":"live.session.resumed","sequence_id":0}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := DecodeServer([]byte(tt.raw), testLimits)
+			require.Error(t, err)
+		})
+	}
 }
 
 func TestEncodeRejectsNilAndUnsupportedValues(t *testing.T) {
