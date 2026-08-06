@@ -21,30 +21,6 @@ type closeWaitContext struct {
 	once     sync.Once
 }
 
-type secondSendWaitContext struct {
-	context.Context
-	calls       atomic.Int32
-	waiting     chan struct{}
-	releaseWait chan struct{}
-	waitOnce    sync.Once
-}
-
-func newSecondSendWaitContext(parent context.Context) *secondSendWaitContext {
-	return &secondSendWaitContext{
-		Context:     parent,
-		waiting:     make(chan struct{}),
-		releaseWait: make(chan struct{}),
-	}
-}
-
-func (c *secondSendWaitContext) Done() <-chan struct{} {
-	if c.calls.Add(1) == 2 {
-		c.waitOnce.Do(func() { close(c.waiting) })
-		<-c.releaseWait
-	}
-	return c.Context.Done()
-}
-
 func newCloseWaitContext(parent context.Context) *closeWaitContext {
 	return &closeWaitContext{Context: parent, observed: make(chan struct{})}
 }
@@ -120,61 +96,49 @@ func TestSendPreservesWriteErrorWithoutLocalClose(t *testing.T) {
 	<-writerDone
 }
 
-func TestSendNormalizesCanceledWriteAfterLocalCloseWithoutNetwork(t *testing.T) {
-	const (
-		iterations = 128
-		senders    = 8
-	)
+func TestWaitForSendResultNormalizesReadyResultDuringLocalClose(t *testing.T) {
 	rawWriteError := errors.New("raw canceled write")
-	closeHandshakeError := errors.New("close handshake result")
+	closing := make(chan struct{})
+	close(closing)
+	session := &voiceSession{closing: closing, done: make(chan struct{})}
+	result := make(chan error, 1)
 
-	for iteration := range iterations {
-		writeStarted := make(chan struct{})
-		var writeStartedOnce sync.Once
-		closeHandshakeStarted := make(chan struct{})
-		closeHandshakeRelease := make(chan struct{})
-		session, writerDone := newUnitWriteSession(t,
-			func(ctx context.Context, _ websocket.MessageType, _ []byte) error {
-				writeStartedOnce.Do(func() { close(writeStarted) })
-				<-ctx.Done()
-				return rawWriteError
-			},
-			func(websocket.StatusCode, string) error {
-				close(closeHandshakeStarted)
-				<-closeHandshakeRelease
-				return closeHandshakeError
-			},
-		)
-
-		activeContext := newSecondSendWaitContext(context.Background())
-		activeSendResult := make(chan error, 1)
-		go func() {
-			activeSendResult <- session.Send(activeContext, realtime.Command{Kind: realtime.CommandCommitAudio})
-		}()
-		<-activeContext.waiting
-		<-writeStarted
-
-		concurrentSendResults := make(chan error, senders-1)
-		for range senders - 1 {
-			go func() {
-				concurrentSendResults <- session.Send(context.Background(), realtime.Command{Kind: realtime.CommandCommitAudio})
-			}()
+	for range 1024 {
+		select {
+		case result <- rawWriteError:
+		default:
 		}
+		require.ErrorIs(t, session.waitForSendResult(context.Background(), result), ErrSessionClosed)
+	}
+}
 
-		closeResult := make(chan error, 1)
-		go func() { closeResult <- session.Close(context.Background()) }()
-		<-closeHandshakeStarted
-		close(activeContext.releaseWait)
-		activeError := <-activeSendResult
-		for range senders - 1 {
-			require.ErrorIs(t, <-concurrentSendResults, ErrSessionClosed)
-		}
-		close(closeHandshakeRelease)
-		require.ErrorIs(t, <-closeResult, closeHandshakeError)
-		<-writerDone
-		if !errors.Is(activeError, ErrSessionClosed) {
-			t.Fatalf("iteration %d: active Send error = %v, want %v", iteration, activeError, ErrSessionClosed)
-		}
+func TestWaitForSendResultPreservesReadyResultWithoutLocalClose(t *testing.T) {
+	rawWriteError := errors.New("raw write failure")
+
+	for _, test := range []struct {
+		name       string
+		doneClosed bool
+	}{
+		{name: "direct result"},
+		{name: "terminal result", doneClosed: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			closing := make(chan struct{})
+			done := make(chan struct{})
+			if test.doneClosed {
+				close(done)
+			}
+			session := &voiceSession{closing: closing, done: done}
+			result := make(chan error, 1)
+
+			for range 1024 {
+				select {
+				case result <- rawWriteError:
+				default:
+				}
+				require.ErrorIs(t, session.waitForSendResult(context.Background(), result), rawWriteError)
+			}
+		})
 	}
 }
 

@@ -216,8 +216,12 @@ func (s *voiceSession) Send(ctx context.Context, command realtime.Command) error
 	case <-s.done:
 		return s.sessionError()
 	}
+	return s.waitForSendResult(ctx, request.result)
+}
+
+func (s *voiceSession) waitForSendResult(ctx context.Context, result <-chan error) error {
 	select {
-	case err := <-request.result:
+	case err := <-result:
 		return s.normalizeSendResult(err)
 	case <-ctx.Done():
 		return ctx.Err()
@@ -225,7 +229,7 @@ func (s *voiceSession) Send(ctx context.Context, command realtime.Command) error
 		return ErrSessionClosed
 	case <-s.done:
 		select {
-		case err := <-request.result:
+		case err := <-result:
 			return s.normalizeSendResult(err)
 		default:
 			return s.sessionError()
