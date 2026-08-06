@@ -83,7 +83,7 @@ func (s *FakeVoiceSession) Send(ctx context.Context, command realtime.Command) e
 	case <-ctx.Done():
 		return ctx.Err()
 	case s.commands <- command:
-		return nil
+		return s.terminalError()
 	}
 }
 
@@ -100,6 +100,9 @@ func (s *FakeVoiceSession) Receive(ctx context.Context) (realtime.Event, error) 
 	case <-ctx.Done():
 		return realtime.Event{}, ctx.Err()
 	case event := <-s.events:
+		if err := s.terminalError(); err != nil {
+			return realtime.Event{}, err
+		}
 		return cloneEvent(event), nil
 	}
 }
@@ -123,7 +126,7 @@ func (s *FakeVoiceSession) Emit(ctx context.Context, event realtime.Event) error
 	case <-ctx.Done():
 		return ctx.Err()
 	case s.events <- event:
-		return nil
+		return s.terminalError()
 	}
 }
 
@@ -140,6 +143,9 @@ func (s *FakeVoiceSession) NextCommand(ctx context.Context) (realtime.Command, e
 	case <-ctx.Done():
 		return realtime.Command{}, ctx.Err()
 	case command := <-s.commands:
+		if err := s.terminalError(); err != nil {
+			return realtime.Command{}, err
+		}
 		return cloneCommand(command), nil
 	}
 }
