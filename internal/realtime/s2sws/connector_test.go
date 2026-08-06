@@ -1225,10 +1225,12 @@ func TestPeerCloseUnblocksOperations(t *testing.T) {
 	err := <-receiveResult
 	require.Error(t, err)
 	assert.Equal(t, websocket.StatusGoingAway, websocket.CloseStatus(err))
-	_, repeated := session.Receive(t.Context())
-	require.EqualError(t, repeated, err.Error())
-	sendErr := session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio})
-	require.EqualError(t, sendErr, err.Error())
+	for range 16 {
+		_, repeated := session.Receive(t.Context())
+		require.EqualError(t, repeated, err.Error())
+		sendErr := session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio})
+		require.EqualError(t, sendErr, err.Error())
+	}
 }
 
 // TestCloseIsConcurrentAndIdempotent catches multiple normal close writes and
@@ -1333,9 +1335,11 @@ func TestCloseCallersShareOneHandshake(t *testing.T) {
 		require.NoError(t, <-laterResults)
 	}
 	require.NoError(t, session.Close(t.Context()))
-	require.ErrorIs(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio}), s2sws.ErrSessionClosed)
-	_, receiveErr := session.Receive(t.Context())
-	require.ErrorIs(t, receiveErr, s2sws.ErrSessionClosed)
+	for range 16 {
+		require.ErrorIs(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio}), s2sws.ErrSessionClosed)
+		_, receiveErr := session.Receive(t.Context())
+		require.ErrorIs(t, receiveErr, s2sws.ErrSessionClosed)
+	}
 
 	select {
 	case err := <-server.peerClose:
@@ -1378,7 +1382,7 @@ func TestCloseUnblocksBlockedSends(t *testing.T) {
 	closeResult := make(chan error, 1)
 	go func() { closeResult <- session.Close(t.Context()) }()
 	for range senders {
-		require.Error(t, <-results)
+		require.ErrorIs(t, <-results, s2sws.ErrSessionClosed)
 	}
 	require.ErrorIs(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio}), s2sws.ErrSessionClosed)
 	releaseGate.Do(func() { close(readGate) })

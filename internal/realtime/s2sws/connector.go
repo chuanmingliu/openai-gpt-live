@@ -692,6 +692,9 @@ func (s *voiceSession) terminate(err error) {
 }
 
 func (s *voiceSession) sessionError() error {
+	if s.isClosing() {
+		return ErrSessionClosed
+	}
 	s.terminalMu.RLock()
 	err := s.terminalErr
 	s.terminalMu.RUnlock()
