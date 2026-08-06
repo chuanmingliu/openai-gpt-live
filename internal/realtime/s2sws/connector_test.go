@@ -48,6 +48,59 @@ type testVoiceServer struct {
 	server    *httptest.Server
 }
 
+type observedContext struct {
+	context.Context
+	observed chan struct{}
+	once     sync.Once
+}
+
+func newObservedContext(parent context.Context) *observedContext {
+	return &observedContext{Context: parent, observed: make(chan struct{})}
+}
+
+func (c *observedContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.observed) })
+	return c.Context.Done()
+}
+
+type controlledDeadlineContext struct {
+	parent       context.Context
+	done         chan struct{}
+	observed     chan struct{}
+	observeOnce  sync.Once
+	deadlineOnce sync.Once
+}
+
+func newControlledDeadlineContext(parent context.Context) *controlledDeadlineContext {
+	return &controlledDeadlineContext{
+		parent:   parent,
+		done:     make(chan struct{}),
+		observed: make(chan struct{}),
+	}
+}
+
+func (c *controlledDeadlineContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+
+func (c *controlledDeadlineContext) Done() <-chan struct{} {
+	c.observeOnce.Do(func() { close(c.observed) })
+	return c.done
+}
+
+func (c *controlledDeadlineContext) Err() error {
+	select {
+	case <-c.done:
+		return context.DeadlineExceeded
+	default:
+		return c.parent.Err()
+	}
+}
+
+func (c *controlledDeadlineContext) Value(key any) any { return c.parent.Value(key) }
+
+func (c *controlledDeadlineContext) expire() {
+	c.deadlineOnce.Do(func() { close(c.done) })
+}
+
 func newTestVoiceServer(t *testing.T) *testVoiceServer {
 	return newTestVoiceServerWithReadGate(t, nil)
 }
@@ -857,6 +910,78 @@ func TestExplicitResponseRequiresMatchingStringEpoch(t *testing.T) {
 	}
 }
 
+// TestExplicitPendingResponseLimit catches a withholding provider growing the
+// pending response.create correlation set without bound.
+func TestExplicitPendingResponseLimit(t *testing.T) {
+	const limit = 64
+
+	fill := func(t *testing.T, session realtime.Session, server *testVoiceServer) {
+		t.Helper()
+		for value := 1; value <= limit; value++ {
+			require.NoError(t, session.Send(t.Context(), realtime.Command{
+				Kind:  realtime.CommandCreateResponse,
+				Epoch: identity.ResponseEpoch(value),
+			}))
+		}
+		for value := 1; value <= limit; value++ {
+			var frame struct {
+				Type     string `json:"type"`
+				Response struct {
+					Metadata map[string]string `json:"metadata"`
+				} `json:"response"`
+			}
+			require.NoError(t, json.Unmarshal(server.nextClientFrame(t), &frame))
+			assert.Equal(t, "response.create", frame.Type)
+			assert.Equal(t, fmt.Sprintf("%d", value), frame.Response.Metadata["live_epoch"])
+		}
+	}
+
+	t.Run("accepts exact limit", func(t *testing.T) {
+		server := newTestVoiceServer(t)
+		session := connectTestSession(t, server.URL, nil, realtime.OpenRequest{Model: "model"})
+		fill(t, session, server)
+	})
+
+	t.Run("rejects first over limit without a frame", func(t *testing.T) {
+		server := newTestVoiceServer(t)
+		session := connectTestSession(t, server.URL, nil, realtime.OpenRequest{Model: "model"})
+		fill(t, session, server)
+
+		err := session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCreateResponse, Epoch: limit + 1})
+		require.ErrorIs(t, err, s2sws.ErrPendingResponseLimit)
+		require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio}))
+		assert.JSONEq(t, `{"type":"input_audio_buffer.commit"}`, string(server.nextClientFrame(t)))
+	})
+
+	t.Run("matching response created restores capacity", func(t *testing.T) {
+		server := newTestVoiceServer(t)
+		session := connectTestSession(t, server.URL, nil, realtime.OpenRequest{Model: "model"})
+		fill(t, session, server)
+
+		err := session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCreateResponse, Epoch: limit + 1})
+		require.ErrorIs(t, err, s2sws.ErrPendingResponseLimit)
+		server.sendEvent(t, map[string]any{
+			"type": "response.created",
+			"response": map[string]any{
+				"id":       "response-1",
+				"status":   "in_progress",
+				"metadata": map[string]any{"live_epoch": "1"},
+			},
+		})
+		created := receiveEvent(t, session)
+		assert.Equal(t, identity.ResponseEpoch(1), created.Epoch)
+
+		require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCreateResponse, Epoch: limit + 1}))
+		var retried struct {
+			Response struct {
+				Metadata map[string]string `json:"metadata"`
+			} `json:"response"`
+		}
+		require.NoError(t, json.Unmarshal(server.nextClientFrame(t), &retried))
+		assert.Equal(t, "65", retried.Response.Metadata["live_epoch"])
+	})
+}
+
 // TestExplicitCreateRegistersBeforeProviderEcho catches the write/register
 // race by having the provider echo response.created as soon as each create
 // frame is read.
@@ -1154,17 +1279,87 @@ func TestCloseIsConcurrentAndIdempotent(t *testing.T) {
 	}
 }
 
+// TestCloseCallersShareOneHandshake catches Close returning after merely
+// enqueueing a close frame, binding the shared handshake to the first caller's
+// context, or starting another handshake for later callers.
+func TestCloseCallersShareOneHandshake(t *testing.T) {
+	readGate := make(chan struct{})
+	var releaseGate sync.Once
+	server := newTestVoiceServerWithReadGate(t, readGate)
+	session := connectTestSession(t, server.URL, nil, realtime.OpenRequest{Model: "model"})
+	t.Cleanup(func() { releaseGate.Do(func() { close(readGate) }) })
+
+	receiveResult := make(chan error, 1)
+	go func() {
+		_, err := session.Receive(t.Context())
+		receiveResult <- err
+	}()
+
+	firstContext := newControlledDeadlineContext(t.Context())
+	firstResult := make(chan error, 1)
+	go func() { firstResult <- session.Close(firstContext) }()
+	require.ErrorIs(t, <-receiveResult, s2sws.ErrSessionClosed)
+	select {
+	case err := <-firstResult:
+		t.Fatalf("Close returned before the peer acknowledged the handshake: %v", err)
+	case <-firstContext.observed:
+	}
+	firstContext.expire()
+	require.ErrorIs(t, <-firstResult, context.DeadlineExceeded)
+
+	const laterCallers = 16
+	laterResults := make(chan error, laterCallers)
+	laterContexts := make([]*observedContext, 0, laterCallers)
+	for range laterCallers {
+		closeContext := newObservedContext(t.Context())
+		laterContexts = append(laterContexts, closeContext)
+		go func() { laterResults <- session.Close(closeContext) }()
+	}
+	for _, closeContext := range laterContexts {
+		select {
+		case err := <-laterResults:
+			t.Fatalf("later Close returned before the shared handshake completed: %v", err)
+		case <-closeContext.observed:
+		}
+	}
+	select {
+	case err := <-laterResults:
+		t.Fatalf("Close returned while the peer read gate was closed: %v", err)
+	default:
+	}
+
+	releaseGate.Do(func() { close(readGate) })
+	for range laterCallers {
+		require.NoError(t, <-laterResults)
+	}
+	require.NoError(t, session.Close(t.Context()))
+	require.ErrorIs(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio}), s2sws.ErrSessionClosed)
+	_, receiveErr := session.Receive(t.Context())
+	require.ErrorIs(t, receiveErr, s2sws.ErrSessionClosed)
+
+	select {
+	case err := <-server.peerClose:
+		assert.Equal(t, websocket.StatusNormalClosure, websocket.CloseStatus(err))
+	case <-t.Context().Done():
+		t.Fatal(t.Context().Err())
+	}
+	select {
+	case err := <-server.peerClose:
+		t.Fatalf("observed a second close: %v", err)
+	default:
+	}
+}
+
 // TestCloseUnblocksBlockedSends catches a normal close request queued behind a
-// data write whose peer has stopped reading. The timeout is only a deadlock
-// guard; the gate, not elapsed time, controls the transport state.
+// data write whose peer has stopped reading.
 func TestCloseUnblocksBlockedSends(t *testing.T) {
 	readGate := make(chan struct{})
 	var releaseGate sync.Once
-	t.Cleanup(func() { releaseGate.Do(func() { close(readGate) }) })
 	server := newTestVoiceServerWithReadGate(t, readGate)
 	session := connectTestSession(t, server.URL, func(cfg *s2sws.Config) {
 		cfg.MaxFrameBytes = 4 << 20
 	}, realtime.OpenRequest{Model: "model"})
+	t.Cleanup(func() { releaseGate.Do(func() { close(readGate) }) })
 
 	largeItem := json.RawMessage(`{"type":"message","content":"` + strings.Repeat("x", 3<<20) + `"}`)
 	const senders = 8
@@ -1180,12 +1375,12 @@ func TestCloseUnblocksBlockedSends(t *testing.T) {
 		<-started
 	}
 
-	closeContext, cancel := context.WithTimeout(t.Context(), 2*time.Second)
-	defer cancel()
-	require.NoError(t, session.Close(closeContext))
+	closeResult := make(chan error, 1)
+	go func() { closeResult <- session.Close(t.Context()) }()
 	for range senders {
-		<-results
+		require.Error(t, <-results)
 	}
-	require.Error(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio}))
+	require.ErrorIs(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio}), s2sws.ErrSessionClosed)
 	releaseGate.Do(func() { close(readGate) })
+	require.NoError(t, <-closeResult)
 }

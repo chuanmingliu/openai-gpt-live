@@ -22,6 +22,7 @@ const (
 	receiveQueueCapacity     = 256
 	writeQueueCapacity       = 64
 	correlationQueueCapacity = 64
+	explicitPendingLimit     = 64
 	responseHistoryLimit     = 1024
 	implicitEventLimit       = 16
 	implicitByteLimit        = 2 << 20
@@ -30,6 +31,7 @@ const (
 var (
 	ErrUnknownResponseEpoch = errors.New("unknown response epoch")
 	ErrImplicitBufferFull   = errors.New("implicit response buffer limit exceeded")
+	ErrPendingResponseLimit = errors.New("pending explicit response limit exceeded")
 	ErrSessionClosed        = errors.New("realtime WebSocket session closed")
 )
 
@@ -94,19 +96,22 @@ func (c *Connector) Connect(ctx context.Context, request realtime.OpenRequest) (
 
 	sessionContext, cancelSession := context.WithCancel(context.Background())
 	session := &voiceSession{
-		conn:          conn,
-		ctx:           sessionContext,
-		cancel:        cancelSession,
-		maxFrameBytes: c.cfg.MaxFrameBytes,
-		writes:        make(chan writeRequest, writeQueueCapacity),
-		closeWrites:   make(chan writeRequest, 1),
-		reads:         make(chan socketRead, 1),
-		correlations:  make(chan correlationRequest, correlationQueueCapacity),
-		events:        make(chan realtime.Event, receiveQueueCapacity),
-		closing:       make(chan struct{}),
-		done:          make(chan struct{}),
-		responses:     make(map[string]*responseCorrelation),
-		pending:       make(map[identity.ResponseEpoch]struct{}),
+		conn:           conn,
+		ctx:            sessionContext,
+		cancel:         cancelSession,
+		closeHandshake: conn.Close,
+		closeNow:       conn.CloseNow,
+		maxFrameBytes:  c.cfg.MaxFrameBytes,
+		writes:         make(chan writeRequest, writeQueueCapacity),
+		closeWrites:    make(chan struct{}, 1),
+		reads:          make(chan socketRead, 1),
+		correlations:   make(chan correlationRequest, correlationQueueCapacity),
+		events:         make(chan realtime.Event, receiveQueueCapacity),
+		closing:        make(chan struct{}),
+		closeDone:      make(chan struct{}),
+		done:           make(chan struct{}),
+		responses:      make(map[string]*responseCorrelation),
+		pending:        make(map[identity.ResponseEpoch]struct{}),
 	}
 	go session.readLoop()
 	go session.mappingLoop()
@@ -155,17 +160,20 @@ type responseCorrelation struct {
 }
 
 type voiceSession struct {
-	conn          *websocket.Conn
-	ctx           context.Context
-	cancel        context.CancelFunc
-	maxFrameBytes int64
+	conn           *websocket.Conn
+	ctx            context.Context
+	cancel         context.CancelFunc
+	closeHandshake func(websocket.StatusCode, string) error
+	closeNow       func() error
+	maxFrameBytes  int64
 
 	writes       chan writeRequest
-	closeWrites  chan writeRequest
+	closeWrites  chan struct{}
 	reads        chan socketRead
 	correlations chan correlationRequest
 	events       chan realtime.Event
 	closing      chan struct{}
+	closeDone    chan struct{}
 	done         chan struct{}
 
 	responses     map[string]*responseCorrelation
@@ -176,6 +184,10 @@ type voiceSession struct {
 	terminalMu        sync.RWMutex
 	terminalErr       error
 	closeOnce         sync.Once
+	closeCompleteOnce sync.Once
+	closeStateMu      sync.Mutex
+	closeResultMu     sync.RWMutex
+	closeResult       error
 	activeWriteMu     sync.Mutex
 	activeWriteCancel context.CancelFunc
 }
@@ -255,25 +267,39 @@ func (s *voiceSession) Close(ctx context.Context) error {
 		return err
 	}
 	select {
-	case <-s.done:
-		return nil
+	case <-s.closeDone:
+		return s.sharedCloseResult()
 	default:
 	}
+	if !s.startClose() {
+		return nil
+	}
+	select {
+	case <-s.closeDone:
+		return s.sharedCloseResult()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
-	var closeErr error
+func (s *voiceSession) startClose() bool {
+	s.closeStateMu.Lock()
+	defer s.closeStateMu.Unlock()
+
+	if s.isClosing() {
+		return true
+	}
+	select {
+	case <-s.done:
+		return false
+	default:
+	}
 	s.closeOnce.Do(func() {
 		close(s.closing)
-		request := writeRequest{ctx: ctx, result: make(chan error, 1)}
-		select {
-		case s.closeWrites <- request:
-			s.cancelActiveWrite()
-		case <-ctx.Done():
-			closeErr = ctx.Err()
-			s.terminate(ctx.Err())
-		case <-s.done:
-		}
+		s.closeWrites <- struct{}{}
+		s.cancelActiveWrite()
 	})
-	return closeErr
+	return true
 }
 
 func (s *voiceSession) readLoop() {
@@ -294,14 +320,14 @@ func (s *voiceSession) readLoop() {
 func (s *voiceSession) writeLoop() {
 	for {
 		select {
-		case request := <-s.closeWrites:
-			s.finishClose(request)
+		case <-s.closeWrites:
+			s.finishClose()
 			return
 		default:
 		}
 		select {
-		case request := <-s.closeWrites:
-			s.finishClose(request)
+		case <-s.closeWrites:
+			s.finishClose()
 			return
 		case request := <-s.writes:
 			select {
@@ -341,15 +367,35 @@ func (s *voiceSession) writeLoop() {
 			request.result <- err
 			if attemptedWrite && err != nil && !s.isClosing() {
 				s.terminate(err)
+				if s.takeCloseAfterTermination() {
+					s.finishClose()
+				}
 				return
 			}
 		case <-s.done:
+			if s.takeCloseAfterTermination() {
+				s.finishClose()
+			}
 			return
 		}
 	}
 }
 
-func (s *voiceSession) finishClose(request writeRequest) {
+// takeCloseAfterTermination synchronizes a terminal writer exit with close
+// initiation. If it finds no request while holding closeStateMu, future Close
+// calls will observe done and cannot enqueue one after the writer exits.
+func (s *voiceSession) takeCloseAfterTermination() bool {
+	s.closeStateMu.Lock()
+	defer s.closeStateMu.Unlock()
+	select {
+	case <-s.closeWrites:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *voiceSession) finishClose() {
 drain:
 	for {
 		select {
@@ -359,12 +405,28 @@ drain:
 			break drain
 		}
 	}
-	err := s.conn.Close(websocket.StatusNormalClosure, "")
+	err := s.closeHandshake(websocket.StatusNormalClosure, "")
 	if errors.Is(err, net.ErrClosed) {
 		err = nil
 	}
-	request.result <- err
 	s.terminate(ErrSessionClosed)
+	s.completeClose(err)
+}
+
+func (s *voiceSession) completeClose(err error) {
+	s.closeCompleteOnce.Do(func() {
+		s.closeResultMu.Lock()
+		s.closeResult = err
+		s.closeResultMu.Unlock()
+		close(s.closeDone)
+	})
+}
+
+func (s *voiceSession) sharedCloseResult() error {
+	s.closeResultMu.RLock()
+	err := s.closeResult
+	s.closeResultMu.RUnlock()
+	return err
 }
 
 func (s *voiceSession) beginWrite(parent context.Context) (context.Context, func(), bool) {
@@ -479,8 +541,28 @@ func (s *voiceSession) registerExplicit(epoch identity.ResponseEpoch) error {
 	if _, exists := s.pending[epoch]; exists {
 		return fmt.Errorf("response epoch %d is already pending", epoch)
 	}
+	if len(s.pending) >= explicitPendingLimit {
+		return fmt.Errorf("%w: maximum %d", ErrPendingResponseLimit, explicitPendingLimit)
+	}
 	s.pending[epoch] = struct{}{}
 	return nil
+}
+
+func (s *voiceSession) resolvePendingExplicit(epoch identity.ResponseEpoch, hasEpoch bool) (bool, error) {
+	if len(s.pending) == 0 {
+		if hasEpoch {
+			return false, fmt.Errorf("response.created echoed unregistered live_epoch %d", epoch)
+		}
+		return false, nil
+	}
+	if !hasEpoch {
+		return false, errors.New("explicit response.created is missing live_epoch metadata")
+	}
+	if _, exists := s.pending[epoch]; !exists {
+		return false, fmt.Errorf("explicit response.created has unmatched live_epoch %d", epoch)
+	}
+	delete(s.pending, epoch)
+	return true, nil
 }
 
 func (s *voiceSession) handleMapped(mapped mappedServerEvent) error {
@@ -518,22 +600,16 @@ func (s *voiceSession) handleResponseCreated(mapped mappedServerEvent) error {
 		return fmt.Errorf("duplicate response.created for %q", created.responseID)
 	}
 
+	explicit, err := s.resolvePendingExplicit(created.epoch, created.hasEpoch)
+	if err != nil {
+		return err
+	}
 	correlation := &responseCorrelation{}
-	if len(s.pending) > 0 {
-		if !created.hasEpoch {
-			return errors.New("explicit response.created is missing live_epoch metadata")
-		}
-		if _, exists := s.pending[created.epoch]; !exists {
-			return fmt.Errorf("explicit response.created has unmatched live_epoch %d", created.epoch)
-		}
-		delete(s.pending, created.epoch)
+	if explicit {
 		correlation.bound = true
 		correlation.epoch = created.epoch
 		mapped.event.Epoch = created.epoch
 	} else {
-		if created.hasEpoch {
-			return fmt.Errorf("response.created echoed unregistered live_epoch %d", created.epoch)
-		}
 		mapped.event.NeedsEpochBinding = true
 	}
 	s.responses[created.responseID] = correlation
@@ -611,7 +687,7 @@ func (s *voiceSession) terminate(err error) {
 		s.terminalMu.Unlock()
 		close(s.done)
 		s.cancel()
-		_ = s.conn.CloseNow()
+		_ = s.closeNow()
 	})
 }
 
