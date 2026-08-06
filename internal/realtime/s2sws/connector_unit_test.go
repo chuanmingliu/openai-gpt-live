@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
+	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
 	"github.com/coder/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -18,6 +19,30 @@ type closeWaitContext struct {
 	context.Context
 	observed chan struct{}
 	once     sync.Once
+}
+
+type secondSendWaitContext struct {
+	context.Context
+	calls       atomic.Int32
+	waiting     chan struct{}
+	releaseWait chan struct{}
+	waitOnce    sync.Once
+}
+
+func newSecondSendWaitContext(parent context.Context) *secondSendWaitContext {
+	return &secondSendWaitContext{
+		Context:     parent,
+		waiting:     make(chan struct{}),
+		releaseWait: make(chan struct{}),
+	}
+}
+
+func (c *secondSendWaitContext) Done() <-chan struct{} {
+	if c.calls.Add(1) == 2 {
+		c.waitOnce.Do(func() { close(c.waiting) })
+		<-c.releaseWait
+	}
+	return c.Context.Done()
 }
 
 func newCloseWaitContext(parent context.Context) *closeWaitContext {
@@ -53,6 +78,104 @@ func newUnitCloseSession(
 		close(writerDone)
 	}()
 	return session, writerDone
+}
+
+func newUnitWriteSession(
+	t *testing.T,
+	writeMessage func(context.Context, websocket.MessageType, []byte) error,
+	closeHandshake func(websocket.StatusCode, string) error,
+) (*voiceSession, <-chan struct{}) {
+	t.Helper()
+	sessionContext, cancelSession := context.WithCancel(context.Background())
+	session := &voiceSession{
+		ctx:            sessionContext,
+		cancel:         cancelSession,
+		writeMessage:   writeMessage,
+		closeHandshake: closeHandshake,
+		closeNow:       func() error { return nil },
+		maxFrameBytes:  1 << 20,
+		writes:         make(chan writeRequest, writeQueueCapacity),
+		closeWrites:    make(chan struct{}, 1),
+		closing:        make(chan struct{}),
+		closeDone:      make(chan struct{}),
+		done:           make(chan struct{}),
+	}
+	writerDone := make(chan struct{})
+	go func() {
+		session.writeLoop()
+		close(writerDone)
+	}()
+	return session, writerDone
+}
+
+func TestSendPreservesWriteErrorWithoutLocalClose(t *testing.T) {
+	rawWriteError := errors.New("raw write failure")
+	session, writerDone := newUnitWriteSession(t,
+		func(context.Context, websocket.MessageType, []byte) error { return rawWriteError },
+		func(websocket.StatusCode, string) error { return nil },
+	)
+
+	err := session.Send(context.Background(), realtime.Command{Kind: realtime.CommandCommitAudio})
+	require.ErrorIs(t, err, rawWriteError)
+	<-writerDone
+}
+
+func TestSendNormalizesCanceledWriteAfterLocalCloseWithoutNetwork(t *testing.T) {
+	const (
+		iterations = 128
+		senders    = 8
+	)
+	rawWriteError := errors.New("raw canceled write")
+	closeHandshakeError := errors.New("close handshake result")
+
+	for iteration := range iterations {
+		writeStarted := make(chan struct{})
+		var writeStartedOnce sync.Once
+		closeHandshakeStarted := make(chan struct{})
+		closeHandshakeRelease := make(chan struct{})
+		session, writerDone := newUnitWriteSession(t,
+			func(ctx context.Context, _ websocket.MessageType, _ []byte) error {
+				writeStartedOnce.Do(func() { close(writeStarted) })
+				<-ctx.Done()
+				return rawWriteError
+			},
+			func(websocket.StatusCode, string) error {
+				close(closeHandshakeStarted)
+				<-closeHandshakeRelease
+				return closeHandshakeError
+			},
+		)
+
+		activeContext := newSecondSendWaitContext(context.Background())
+		activeSendResult := make(chan error, 1)
+		go func() {
+			activeSendResult <- session.Send(activeContext, realtime.Command{Kind: realtime.CommandCommitAudio})
+		}()
+		<-activeContext.waiting
+		<-writeStarted
+
+		concurrentSendResults := make(chan error, senders-1)
+		for range senders - 1 {
+			go func() {
+				concurrentSendResults <- session.Send(context.Background(), realtime.Command{Kind: realtime.CommandCommitAudio})
+			}()
+		}
+
+		closeResult := make(chan error, 1)
+		go func() { closeResult <- session.Close(context.Background()) }()
+		<-closeHandshakeStarted
+		close(activeContext.releaseWait)
+		activeError := <-activeSendResult
+		for range senders - 1 {
+			require.ErrorIs(t, <-concurrentSendResults, ErrSessionClosed)
+		}
+		close(closeHandshakeRelease)
+		require.ErrorIs(t, <-closeResult, closeHandshakeError)
+		<-writerDone
+		if !errors.Is(activeError, ErrSessionClosed) {
+			t.Fatalf("iteration %d: active Send error = %v, want %v", iteration, activeError, ErrSessionClosed)
+		}
+	}
 }
 
 func TestPendingExplicitBudgetWithoutSocket(t *testing.T) {

@@ -99,6 +99,7 @@ func (c *Connector) Connect(ctx context.Context, request realtime.OpenRequest) (
 		conn:           conn,
 		ctx:            sessionContext,
 		cancel:         cancelSession,
+		writeMessage:   conn.Write,
 		closeHandshake: conn.Close,
 		closeNow:       conn.CloseNow,
 		maxFrameBytes:  c.cfg.MaxFrameBytes,
@@ -163,6 +164,7 @@ type voiceSession struct {
 	conn           *websocket.Conn
 	ctx            context.Context
 	cancel         context.CancelFunc
+	writeMessage   func(context.Context, websocket.MessageType, []byte) error
 	closeHandshake func(websocket.StatusCode, string) error
 	closeNow       func() error
 	maxFrameBytes  int64
@@ -216,7 +218,7 @@ func (s *voiceSession) Send(ctx context.Context, command realtime.Command) error
 	}
 	select {
 	case err := <-request.result:
-		return err
+		return s.normalizeSendResult(err)
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-s.closing:
@@ -224,11 +226,18 @@ func (s *voiceSession) Send(ctx context.Context, command realtime.Command) error
 	case <-s.done:
 		select {
 		case err := <-request.result:
-			return err
+			return s.normalizeSendResult(err)
 		default:
 			return s.sessionError()
 		}
 	}
+}
+
+func (s *voiceSession) normalizeSendResult(err error) error {
+	if s.isClosing() {
+		return ErrSessionClosed
+	}
+	return err
 }
 
 func (s *voiceSession) Receive(ctx context.Context) (realtime.Event, error) {
@@ -360,7 +369,7 @@ func (s *voiceSession) writeLoop() {
 					err = ErrSessionClosed
 				} else {
 					attemptedWrite = true
-					err = s.conn.Write(writeContext, websocket.MessageText, raw)
+					err = s.writeMessage(writeContext, websocket.MessageText, raw)
 					finishWrite()
 				}
 			}
