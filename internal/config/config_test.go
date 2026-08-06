@@ -46,6 +46,38 @@ func TestMissingSecretEnvironmentVariable(t *testing.T) {
 	assert.Contains(t, err.Error(), "DEEPSEEK_API_KEY")
 }
 
+// TestRejectsDatabasePasswordInURLQuery catches a secret scanner regression that
+// accepts a PostgreSQL URL whose password is supplied as a query parameter.
+func TestRejectsDatabasePasswordInURLQuery(t *testing.T) {
+	_, err := loadFixture(t, "store:\n  url: postgres://db.example/live?password=secret&sslmode=require\n", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "plaintext secret")
+}
+
+// TestRejectsDatabasePasswordInLibPQDSN catches a secret scanner regression that
+// accepts a libpq-style PostgreSQL password assignment in checked-in YAML.
+func TestRejectsDatabasePasswordInLibPQDSN(t *testing.T) {
+	_, err := loadFixture(t, "store:\n  url: host=db.example dbname=live password=secret sslmode=require\n", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "plaintext secret")
+}
+
+// TestLoadDefaultsPCMFrameBytes catches a loader regression that omits the fixed
+// 20 ms frame size required by the 24 kHz mono PCM16LE transport contract.
+func TestLoadDefaultsPCMFrameBytes(t *testing.T) {
+	cfg, err := loadFixture(t, "gateway:\n  voice:\n    url: ws://127.0.0.1:8000/v1/realtime\n", nil)
+	require.NoError(t, err)
+	assert.Equal(t, 960, cfg.Gateway.Audio.FrameBytes)
+}
+
+// TestRejectsPCMFrameBytesOutsideTwentyMilliseconds catches a validator
+// regression that allows a frame size other than 20 ms of PCM16LE samples.
+func TestRejectsPCMFrameBytesOutsideTwentyMilliseconds(t *testing.T) {
+	_, err := loadFixture(t, "gateway:\n  audio:\n    sample_rate: 24000\n    channels: 1\n    bytes_per_sample: 2\n    frame_bytes: 480\n", nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must be 960")
+}
+
 func loadFixture(t *testing.T, yaml string, lookup func(string) (string, bool)) (Config, error) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.yaml")

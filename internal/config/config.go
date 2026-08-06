@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -20,6 +21,7 @@ const (
 	defaultControlEvents       = 256
 	defaultWriterControlEvents = 64
 	defaultSampleRate          = 24_000
+	defaultPCMFrameBytes       = 960
 )
 
 type Config struct {
@@ -68,6 +70,7 @@ type AudioConfig struct {
 	SampleRate     int `yaml:"sample_rate"`
 	Channels       int `yaml:"channels"`
 	BytesPerSample int `yaml:"bytes_per_sample"`
+	FrameBytes     int `yaml:"frame_bytes"`
 }
 
 type SessionConfig struct {
@@ -213,6 +216,9 @@ func (c *Config) applyDefaults() {
 	if c.Gateway.Audio.BytesPerSample == 0 {
 		c.Gateway.Audio.BytesPerSample = 2
 	}
+	if c.Gateway.Audio.FrameBytes == 0 {
+		c.Gateway.Audio.FrameBytes = defaultPCMFrameBytes
+	}
 	if c.Gateway.Session.IngressFrames == 0 {
 		c.Gateway.Session.IngressFrames = defaultIngressFrames
 	}
@@ -294,8 +300,11 @@ func (c Config) Validate() error {
 	if err := validateHTTPURL(c.Telemetry.OTLPEndpoint, "telemetry.otlp_endpoint", c.Mode == "production"); err != nil {
 		return err
 	}
-	if c.Gateway.Audio.SampleRate <= 0 || c.Gateway.Audio.Channels <= 0 || c.Gateway.Audio.BytesPerSample <= 0 {
-		return errors.New("gateway.audio format must be positive")
+	if c.Gateway.Audio.SampleRate != defaultSampleRate || c.Gateway.Audio.Channels != 1 || c.Gateway.Audio.BytesPerSample != 2 {
+		return errors.New("gateway.audio must be 24kHz mono PCM16LE")
+	}
+	if c.Gateway.Audio.FrameBytes != defaultPCMFrameBytes {
+		return errors.New("gateway.audio.frame_bytes must be 960 for 20ms 24kHz mono PCM16LE")
 	}
 	frameBytes := c.Gateway.Audio.Channels * c.Gateway.Audio.BytesPerSample
 	if c.Gateway.Session.IngressAudioBytes <= 0 || c.Gateway.Session.EgressAudioBytes <= 0 || c.Gateway.Session.IngressAudioBytes%frameBytes != 0 || c.Gateway.Session.EgressAudioBytes%frameBytes != 0 {
@@ -415,7 +424,7 @@ func rejectPlaintextSecrets(data []byte) error {
 					return fmt.Errorf("plaintext secret %q is not allowed in YAML; use an environment variable name", key.Value)
 				}
 				if lower == "url" && value.Kind == yaml.ScalarNode {
-					if parsed, err := url.Parse(value.Value); err == nil && parsed.User != nil {
+					if containsDatabasePassword(value.Value) {
 						return fmt.Errorf("plaintext secret in %q is not allowed in YAML; use an environment variable name", key.Value)
 					}
 				}
@@ -433,4 +442,21 @@ func rejectPlaintextSecrets(data []byte) error {
 		return nil
 	}
 	return walk(&node)
+}
+
+var libPQPassword = regexp.MustCompile(`(?i)(?:^|\s)(?:password|pass|passwd|pwd)\s*=`)
+
+func containsDatabasePassword(value string) bool {
+	if parsed, err := url.Parse(value); err == nil {
+		if parsed.User != nil {
+			return true
+		}
+		for key := range parsed.Query() {
+			switch strings.ToLower(key) {
+			case "password", "pass", "passwd", "pwd":
+				return true
+			}
+		}
+	}
+	return libPQPassword.MatchString(value)
 }
