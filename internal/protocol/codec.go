@@ -230,13 +230,14 @@ func validateClient(event ClientEvent, raw []byte, limits Limits) error {
 			return err
 		}
 	case ConversationItemCreateEvent:
-		if _, err := requiredObject(fields, "item"); err != nil {
+		itemFields, err := requiredObject(fields, "item")
+		if err != nil {
 			return err
 		}
 		if typed.Item.Type == "" {
 			return errors.New("conversation item type is required")
 		}
-		if err := validateConversationItem(typed.Item); err != nil {
+		if err := validateConversationItem(typed.Item, itemFields); err != nil {
 			return err
 		}
 	case InputAudioBufferCommitEvent, ResponseCreateEvent, ResponseCancelEvent:
@@ -266,7 +267,7 @@ func validateSessionAudio(audio *SessionAudio) error {
 	return nil
 }
 
-func validateConversationItem(item ConversationItem) error {
+func validateConversationItem(item ConversationItem, fields map[string]json.RawMessage) error {
 	switch item.Type {
 	case "message":
 		if item.Role == "" {
@@ -281,9 +282,10 @@ func validateConversationItem(item ConversationItem) error {
 			return errors.New("function call item requires call_id, name, and arguments")
 		}
 	case "function_call_output":
-		if item.CallID == "" || item.Output == "" {
-			return errors.New("function call output requires call_id and output")
+		if item.CallID == "" {
+			return errors.New("function call output requires call_id")
 		}
+		return requireString(fields, "output", false)
 	default:
 		return fmt.Errorf("unsupported conversation item type %q", item.Type)
 	}
@@ -293,6 +295,9 @@ func validateConversationItem(item ConversationItem) error {
 func validateServer(event ServerEvent, raw []byte, limits Limits) error {
 	fields, err := rawObject(raw)
 	if err != nil {
+		return err
+	}
+	if err := requireString(fields, "event_id", true); err != nil {
 		return err
 	}
 	requireResponse := func() error {

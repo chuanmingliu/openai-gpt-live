@@ -127,6 +127,21 @@ func TestDecodeClientRejectsMessageWithoutContentEntries(t *testing.T) {
 	}
 }
 
+func TestDecodeClientDistinguishesEmptyFromMissingFunctionCallOutput(t *testing.T) {
+	t.Run("present empty output remains valid", func(t *testing.T) {
+		event, err := DecodeClient([]byte(`{"type":"conversation.item.create","item":{"type":"function_call_output","call_id":"call-1","output":""}}`), testLimits)
+		require.NoError(t, err)
+		got, ok := event.(ConversationItemCreateEvent)
+		require.True(t, ok)
+		assert.Equal(t, "", got.Item.Output)
+	})
+
+	t.Run("missing output is rejected", func(t *testing.T) {
+		_, err := DecodeClient([]byte(`{"type":"conversation.item.create","item":{"type":"function_call_output","call_id":"call-1"}}`), testLimits)
+		require.Error(t, err)
+	})
+}
+
 func TestDecodePCM24kRejectsInvalidBase64BeforeAllocation(t *testing.T) {
 	_, err := DecodePCM24k(InputAudioBufferAppendEvent{Type: "input_audio_buffer.append", Audio: "AAAA"}, 2)
 	require.Error(t, err)
@@ -295,9 +310,51 @@ func TestDecodeServerRejectsUnknownAndOversizedEvents(t *testing.T) {
 }
 
 func TestDecodeServerRejectsOversizedAudioDelta(t *testing.T) {
-	raw := `{"type":"response.output_audio.delta","delta":"` + strings.Repeat("A", 8) + `"}`
+	raw := `{"type":"response.output_audio.delta","event_id":"evt","response_id":"resp-1","item_id":"item-1","output_index":0,"content_index":0,"delta":"` + strings.Repeat("A", 8) + `"}`
 	_, err := DecodeServer([]byte(raw), Limits{MaxFrameBytes: 1_000, MaxJSONDepth: 8, MaxAudioBytes: 3})
 	require.Error(t, err)
+}
+
+func TestDecodeServerRejectsMissingOrEmptyEventIDForEverySupportedType(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{"session created", `{"type":"session.created","event_id":"evt","session":{}}`},
+		{"session updated", `{"type":"session.updated","event_id":"evt","session":{}}`},
+		{"error", `{"type":"error","event_id":"evt","error":{"type":"invalid_request_error","message":"bad"}}`},
+		{"speech started", `{"type":"input_audio_buffer.speech_started","event_id":"evt","item_id":"item-1","audio_start_ms":0}`},
+		{"speech stopped", `{"type":"input_audio_buffer.speech_stopped","event_id":"evt","item_id":"item-1","audio_end_ms":0}`},
+		{"transcription delta", `{"type":"conversation.item.input_audio_transcription.delta","event_id":"evt","item_id":"item-1","content_index":0,"delta":""}`},
+		{"transcription completed", `{"type":"conversation.item.input_audio_transcription.completed","event_id":"evt","item_id":"item-1","content_index":0,"transcript":""}`},
+		{"response created", `{"type":"response.created","event_id":"evt","response":{"id":"resp-1","status":"in_progress"}}`},
+		{"audio delta", `{"type":"response.output_audio.delta","event_id":"evt","response_id":"resp-1","item_id":"item-1","output_index":0,"content_index":0,"delta":"AA=="}`},
+		{"audio done", `{"type":"response.output_audio.done","event_id":"evt","response_id":"resp-1","item_id":"item-1","output_index":0,"content_index":0}`},
+		{"audio transcript delta", `{"type":"response.output_audio_transcript.delta","event_id":"evt","response_id":"resp-1","item_id":"item-1","output_index":0,"content_index":0,"delta":""}`},
+		{"audio transcript done", `{"type":"response.output_audio_transcript.done","event_id":"evt","response_id":"resp-1","item_id":"item-1","output_index":0,"content_index":0,"transcript":""}`},
+		{"function arguments done", `{"type":"response.function_call_arguments.done","event_id":"evt","response_id":"resp-1","item_id":"item-1","output_index":0,"call_id":"call-1","name":"lookup","arguments":"{}"}`},
+		{"response done", `{"type":"response.done","event_id":"evt","response":{"id":"resp-1","status":"completed"}}`},
+		{"handoff created", `{"type":"live.handoff.created","event_id":"evt","sequence_id":0,"handoff_id":"h-1","status":"queued"}`},
+		{"handoff progress", `{"type":"live.handoff.progress","event_id":"evt","sequence_id":0,"handoff_id":"h-1","status":"running"}`},
+		{"handoff needs input", `{"type":"live.handoff.needs_input","event_id":"evt","sequence_id":0,"handoff_id":"h-1","status":"needs_input"}`},
+		{"handoff completed", `{"type":"live.handoff.completed","event_id":"evt","sequence_id":0,"handoff_id":"h-1","status":"completed"}`},
+		{"handoff failed", `{"type":"live.handoff.failed","event_id":"evt","sequence_id":0,"handoff_id":"h-1","status":"failed"}`},
+		{"handoff cancelled", `{"type":"live.handoff.cancelled","event_id":"evt","sequence_id":0,"handoff_id":"h-1","status":"cancelled"}`},
+		{"session degraded", `{"type":"live.session.degraded","event_id":"evt","sequence_id":0,"status":"degraded"}`},
+		{"session resumed", `{"type":"live.session.resumed","event_id":"evt","sequence_id":0,"status":"resumed"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name+" missing event id", func(t *testing.T) {
+			raw := strings.Replace(tt.raw, `"event_id":"evt",`, "", 1)
+			_, err := DecodeServer([]byte(raw), testLimits)
+			require.Error(t, err)
+		})
+		t.Run(tt.name+" empty event id", func(t *testing.T) {
+			raw := strings.Replace(tt.raw, `"event_id":"evt"`, `"event_id":""`, 1)
+			_, err := DecodeServer([]byte(raw), testLimits)
+			require.Error(t, err)
+		})
+	}
 }
 
 func TestDecodeServerRejectsMissingLifecycleFieldsForEverySupportedType(t *testing.T) {
@@ -305,28 +362,28 @@ func TestDecodeServerRejectsMissingLifecycleFieldsForEverySupportedType(t *testi
 		name string
 		raw  string
 	}{
-		{"session created missing session", `{"type":"session.created"}`},
-		{"session updated session is null", `{"type":"session.updated","session":null}`},
-		{"error missing message", `{"type":"error","error":{"type":"invalid_request_error"}}`},
-		{"speech started missing zero audio start", `{"type":"input_audio_buffer.speech_started","item_id":"item-1"}`},
-		{"speech stopped missing zero audio end", `{"type":"input_audio_buffer.speech_stopped","item_id":"item-1"}`},
-		{"transcription delta missing zero content index", `{"type":"conversation.item.input_audio_transcription.delta","item_id":"item-1","delta":""}`},
-		{"transcription completed missing transcript", `{"type":"conversation.item.input_audio_transcription.completed","item_id":"item-1","content_index":0}`},
-		{"response created missing response status", `{"type":"response.created","response":{"id":"resp-1"}}`},
-		{"audio delta missing zero output index", `{"type":"response.output_audio.delta","response_id":"resp-1","item_id":"item-1","content_index":0,"delta":"AA=="}`},
-		{"audio done missing zero content index", `{"type":"response.output_audio.done","response_id":"resp-1","item_id":"item-1","output_index":0}`},
-		{"audio transcript delta missing delta", `{"type":"response.output_audio_transcript.delta","response_id":"resp-1","item_id":"item-1","output_index":0,"content_index":0}`},
-		{"audio transcript done missing transcript", `{"type":"response.output_audio_transcript.done","response_id":"resp-1","item_id":"item-1","output_index":0,"content_index":0}`},
-		{"function arguments done missing call id", `{"type":"response.function_call_arguments.done","response_id":"resp-1","item_id":"item-1","output_index":0,"name":"lookup","arguments":"{}"}`},
-		{"response done missing response", `{"type":"response.done"}`},
-		{"handoff created missing zero sequence", `{"type":"live.handoff.created","handoff_id":"h-1","status":"queued"}`},
-		{"handoff progress missing handoff id", `{"type":"live.handoff.progress","sequence_id":0,"status":"running"}`},
-		{"handoff needs input missing status", `{"type":"live.handoff.needs_input","sequence_id":0,"handoff_id":"h-1"}`},
-		{"handoff completed missing zero sequence", `{"type":"live.handoff.completed","handoff_id":"h-1","status":"completed"}`},
-		{"handoff failed missing handoff id", `{"type":"live.handoff.failed","sequence_id":0,"status":"failed"}`},
-		{"handoff cancelled missing status", `{"type":"live.handoff.cancelled","sequence_id":0,"handoff_id":"h-1"}`},
-		{"session degraded missing zero sequence", `{"type":"live.session.degraded","status":"degraded"}`},
-		{"session resumed missing status", `{"type":"live.session.resumed","sequence_id":0}`},
+		{"session created missing session", `{"type":"session.created","event_id":"evt"}`},
+		{"session updated session is null", `{"type":"session.updated","event_id":"evt","session":null}`},
+		{"error missing message", `{"type":"error","event_id":"evt","error":{"type":"invalid_request_error"}}`},
+		{"speech started missing zero audio start", `{"type":"input_audio_buffer.speech_started","event_id":"evt","item_id":"item-1"}`},
+		{"speech stopped missing zero audio end", `{"type":"input_audio_buffer.speech_stopped","event_id":"evt","item_id":"item-1"}`},
+		{"transcription delta missing zero content index", `{"type":"conversation.item.input_audio_transcription.delta","event_id":"evt","item_id":"item-1","delta":""}`},
+		{"transcription completed missing transcript", `{"type":"conversation.item.input_audio_transcription.completed","event_id":"evt","item_id":"item-1","content_index":0}`},
+		{"response created missing response status", `{"type":"response.created","event_id":"evt","response":{"id":"resp-1"}}`},
+		{"audio delta missing zero output index", `{"type":"response.output_audio.delta","event_id":"evt","response_id":"resp-1","item_id":"item-1","content_index":0,"delta":"AA=="}`},
+		{"audio done missing zero content index", `{"type":"response.output_audio.done","event_id":"evt","response_id":"resp-1","item_id":"item-1","output_index":0}`},
+		{"audio transcript delta missing delta", `{"type":"response.output_audio_transcript.delta","event_id":"evt","response_id":"resp-1","item_id":"item-1","output_index":0,"content_index":0}`},
+		{"audio transcript done missing transcript", `{"type":"response.output_audio_transcript.done","event_id":"evt","response_id":"resp-1","item_id":"item-1","output_index":0,"content_index":0}`},
+		{"function arguments done missing call id", `{"type":"response.function_call_arguments.done","event_id":"evt","response_id":"resp-1","item_id":"item-1","output_index":0,"name":"lookup","arguments":"{}"}`},
+		{"response done missing response", `{"type":"response.done","event_id":"evt"}`},
+		{"handoff created missing zero sequence", `{"type":"live.handoff.created","event_id":"evt","handoff_id":"h-1","status":"queued"}`},
+		{"handoff progress missing handoff id", `{"type":"live.handoff.progress","event_id":"evt","sequence_id":0,"status":"running"}`},
+		{"handoff needs input missing status", `{"type":"live.handoff.needs_input","event_id":"evt","sequence_id":0,"handoff_id":"h-1"}`},
+		{"handoff completed missing zero sequence", `{"type":"live.handoff.completed","event_id":"evt","handoff_id":"h-1","status":"completed"}`},
+		{"handoff failed missing handoff id", `{"type":"live.handoff.failed","event_id":"evt","sequence_id":0,"status":"failed"}`},
+		{"handoff cancelled missing status", `{"type":"live.handoff.cancelled","event_id":"evt","sequence_id":0,"handoff_id":"h-1"}`},
+		{"session degraded missing zero sequence", `{"type":"live.session.degraded","event_id":"evt","status":"degraded"}`},
+		{"session resumed missing status", `{"type":"live.session.resumed","event_id":"evt","sequence_id":0}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
