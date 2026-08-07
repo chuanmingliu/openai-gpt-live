@@ -202,6 +202,13 @@ func TestNewHandoffsFeatureFailsClosedAndFeatureOffStaysCompatible(t *testing.T)
 	}
 	_, err = New(cfg, testkit.NewFakeConnector(4), WithIDGenerator(deterministicIDs{}), WithDurableHandoffs(dependencies))
 	require.ErrorContains(t, err, "handoff presentation")
+	store := gatewayEventStoreFake{}
+	missingSafety := WithHandoffPresentation(HandoffPresentationDependencies{
+		Reader: store, Cursors: store, Listener: gatewayEventListenerFake{}, Clock: clock.Real{},
+		PollInterval: 10 * time.Millisecond, ConsumerID: "gateway-test", Policy: presentation.NewPolicy(presentation.Config{}),
+	})
+	_, err = New(cfg, testkit.NewFakeConnector(4), WithIDGenerator(deterministicIDs{}), WithDurableHandoffs(dependencies), missingSafety)
+	require.ErrorContains(t, err, "explicit handoff presentation safety")
 	app, err := New(cfg, testkit.NewFakeConnector(4), WithIDGenerator(deterministicIDs{}), WithDurableHandoffs(dependencies), testHandoffPresentationOption())
 	require.NoError(t, err)
 	require.NotNil(t, app.handoffs)

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -25,6 +26,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/reasoner/deepseek"
 	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
 	"github.com/chuanmingliu/openai-gpt-live/internal/store/postgres"
+	"github.com/chuanmingliu/openai-gpt-live/internal/telemetry"
 	"github.com/chuanmingliu/openai-gpt-live/internal/worker"
 	"github.com/chuanmingliu/openai-gpt-live/migrations"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -55,6 +57,7 @@ type serviceRuntime interface {
 type runtimeBuilder func(context.Context, config.Config, resolvedSecrets) (serviceRuntime, error)
 
 func main() {
+	slog.SetDefault(slog.New(telemetry.NewRedactingHandler(slog.Default().Handler(), nil)))
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	if err := runWithBuilder(ctx, os.Args[1:], os.LookupEnv, buildRuntime); err != nil {
@@ -86,6 +89,7 @@ func runWithBuilder(ctx context.Context, args []string, lookup func(string) (str
 	if err != nil {
 		return fmt.Errorf("load worker configuration: %w", err)
 	}
+	slog.SetDefault(slog.New(telemetry.NewRedactingHandler(slog.Default().Handler(), cfg.Safety.RedactionDeniedKeys)))
 	secrets, err := resolveSecrets(cfg, lookup)
 	if err != nil {
 		return err
@@ -240,7 +244,12 @@ func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecret
 		return nil, fmt.Errorf("configure DeepSeek client: %w", err)
 	}
 	privacyKey := append([]byte(nil), secrets.PrivacyHMACKey...)
-	runnerConfig := worker.Runner{Store: repo, Reasoner: client, Safety: safety.DenyAll{}, Tools: registry, Clock: realClock, Jitter: jitter,
+	staticPolicy, err := safety.NewStaticPolicy(safety.StaticConfig{Mode: safety.StaticMode(cfg.Safety.Mode), MaxSummaryBytes: cfg.Safety.MaxSummaryBytes, MaxStructuredBytes: cfg.Safety.MaxStructuredBytes, RedactedSummary: cfg.Safety.RedactedSummary, ClarificationPrompt: cfg.Safety.ClarificationPrompt})
+	if err != nil {
+		clear(privacyKey)
+		return nil, fmt.Errorf("configure static safety policy: %w", err)
+	}
+	runnerConfig := worker.Runner{Store: repo, Reasoner: client, Safety: staticPolicy, Tools: registry, Clock: realClock, Jitter: jitter,
 		Retry: worker.RetryPolicy{Base: cfg.Worker.RetryBase, Maximum: cfg.Worker.RetryMax, MaxRetries: uint32(cfg.Worker.MaxRetries)}, WorkerID: workerIdentity(), LeaseDuration: cfg.Worker.LeaseDuration, Concurrency: cfg.Worker.Concurrency,
 		PollInterval: cfg.Worker.PollInterval, MaxOutputBytes: cfg.Worker.MaxOutputBytes, MaxOutputTokens: cfg.Worker.MaxOutputTokens, MaxToolRounds: cfg.Worker.MaxToolRounds, MaxToolCalls: 64,
 		MaxToolArgumentBytes: minInt(cfg.Worker.MaxOutputBytes, 256<<10), MaxToolOutputBytes: minInt(cfg.Worker.MaxOutputBytes, 256<<10),

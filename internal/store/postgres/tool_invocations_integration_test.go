@@ -40,6 +40,14 @@ func TestToolInvocationStableIDVector(t *testing.T) {
 	assert.Equal(t, "988e17850f0f5237994ab8a1b972af8a8ed8c22020656cc1c839c06eaba18099", got)
 }
 
+func assertCanonicalApproval(t *testing.T, invocation worker.ToolInvocation, required bool, state worker.ApprovalState) {
+	t.Helper()
+	assert.Equal(t, required, invocation.RequiresApproval)
+	assert.Equal(t, state, invocation.ApprovalState)
+	assert.Len(t, invocation.ApprovalProof, 64)
+	require.NoError(t, worker.ValidateCanonicalToolApproval(invocation))
+}
+
 // Removing allowlist, process-registry, or durable approval checks permits a
 // side effect that the immutable handoff did not authorize.
 func TestToolInvocationRequiresRegistryAllowlistAndDurableApproval(t *testing.T) {
@@ -64,6 +72,7 @@ func TestToolInvocationRequiresRegistryAllowlistAndDurableApproval(t *testing.T)
 	assert.ErrorIs(t, err, worker.ErrApprovalRequired)
 	assert.True(t, created)
 	assert.Equal(t, "pending", invocation.Status)
+	assertCanonicalApproval(t, invocation, true, worker.ApprovalPending)
 	var plaintextColumns int
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM information_schema.columns WHERE table_name='tool_invocations' AND column_name IN ('arguments','plaintext')`).Scan(&plaintextColumns))
 	assert.Zero(t, plaintextColumns)
@@ -74,6 +83,7 @@ func TestToolInvocationRequiresRegistryAllowlistAndDurableApproval(t *testing.T)
 	require.NoError(t, err)
 	assert.False(t, created)
 	assert.Equal(t, "running", invocation.Status)
+	assertCanonicalApproval(t, invocation, true, worker.ApprovalApproved)
 
 	bad := invocationRecord
 	bad.ArgumentsHash = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
@@ -142,8 +152,14 @@ func TestToolInvocationRegistryAllowlistApprovalDenialAndExpiry(t *testing.T) {
 				_, err = pool.Exec(t.Context(), `UPDATE tool_invocations SET approval_state=$1,approval_expires_at=$2 WHERE invocation_id=$3`, tc.approval, repositoryTestNow.Add(-time.Second), id)
 				require.NoError(t, err)
 			}
-			_, _, err = repo.BeginToolInvocation(t.Context(), lease.Token, rec)
+			invocation, _, err := repo.BeginToolInvocation(t.Context(), lease.Token, rec)
 			assert.ErrorIs(t, err, tc.want)
+			if tc.name == "denied" {
+				assertCanonicalApproval(t, invocation, true, worker.ApprovalDenied)
+			}
+			if tc.name == "expired" {
+				assertCanonicalApproval(t, invocation, true, worker.ApprovalExpired)
+			}
 		})
 	}
 }
@@ -293,9 +309,12 @@ func TestToolApprovalPendingRebindsToReacquiredAttempt(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, created)
 	assert.Equal(t, "running", invocation.Status)
+	assertCanonicalApproval(t, invocation, true, worker.ApprovalApproved)
 	var attempt int64
-	require.NoError(t, pool.QueryRow(t.Context(), `SELECT attempt FROM tool_invocations WHERE invocation_id=$1`, id).Scan(&attempt))
+	var approvalState string
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT attempt,approval_state FROM tool_invocations WHERE invocation_id=$1`, id).Scan(&attempt, &approvalState))
 	assert.Equal(t, int64(second.Token.Attempt), attempt)
+	assert.Equal(t, "approved", approvalState)
 	require.NoError(t, repo.CompleteToolInvocation(t.Context(), second.Token, worker.ToolCompletionRecord{InvocationID: id, MutationID: "done", Result: json.RawMessage(`{"ok":true}`)}))
 }
 
@@ -340,6 +359,7 @@ func TestToolRunningInvocationRebindsToReacquiredAttemptAndCompletes(t *testing.
 	require.NoError(t, err)
 	assert.False(t, created)
 	assert.Equal(t, "succeeded", succeeded.Status)
+	assertCanonicalApproval(t, succeeded, false, worker.ApprovalNotRequired)
 	assert.JSONEq(t, `{"ok":true}`, string(succeeded.Result))
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT attempt,status,result::text FROM tool_invocations WHERE invocation_id=$1`, id).Scan(&attempt, &status, &result))
 	assert.Equal(t, int64(second.Token.Attempt), attempt)
@@ -413,6 +433,11 @@ func TestToolInvocationAttemptRebindFailpointsRollbackAndRetry(t *testing.T) {
 			require.NoError(t, err)
 			assert.False(t, replayCreated)
 			assert.Equal(t, "running", invocation.Status)
+			if tc.approvalRequired {
+				assertCanonicalApproval(t, invocation, true, worker.ApprovalApproved)
+			} else {
+				assertCanonicalApproval(t, invocation, false, worker.ApprovalNotRequired)
+			}
 			require.NoError(t, pool.QueryRow(t.Context(), `SELECT attempt FROM tool_invocations WHERE invocation_id=$1`, id).Scan(&attempt))
 			assert.Equal(t, int64(second.Token.Attempt), attempt)
 			require.NoError(t, repo.CompleteToolInvocation(t.Context(), second.Token, worker.ToolCompletionRecord{InvocationID: id, MutationID: "done", Result: json.RawMessage(`{"ok":true}`)}))

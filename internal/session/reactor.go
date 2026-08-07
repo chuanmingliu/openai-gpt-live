@@ -218,7 +218,16 @@ func (r *Reactor) ApplyContext(ctx context.Context, input Input) ([]Effect, erro
 	case ClientInput:
 		return r.applyClient(typed.Event)
 	case VoiceInput:
-		return r.applyVoice(typed)
+		effects, err := r.applyVoice(typed)
+		if err == nil && typed.Event.Epoch != 0 {
+			for index := range effects {
+				if effects[index].ClientEvent != nil {
+					effects[index].ResponseEpoch = typed.Event.Epoch
+					effects[index].Incarnation = typed.Incarnation
+				}
+			}
+		}
+		return effects, err
 	case VoiceCommandCompletedInput:
 		return r.applyVoiceCommandCompleted(typed)
 	case DurableInput:
@@ -277,7 +286,7 @@ func (r *Reactor) applyHandoffEvent(ctx context.Context, input HandoffEventInput
 	}
 	baseCandidate := safety.WorkerResultCandidate{
 		SessionID: r.ids.SessionID, ConversationID: r.ids.ConversationID, HandoffID: event.HandoffID,
-		Summary: summary, Structured: append(json.RawMessage(nil), event.Payload...),
+		Summary: summary, Structured: append(json.RawMessage(nil), event.Payload...), RequestedAction: durableSafetyAction(event, public.Details),
 	}
 	visualCandidate := baseCandidate.Clone()
 	visualCandidate.Channel = safety.ChannelVisual
@@ -289,13 +298,7 @@ func (r *Reactor) applyHandoffEvent(ctx context.Context, input HandoffEventInput
 	_ = visualSummary
 	visualUrgent := visualSafety.Action == safety.ActionCancelResponse
 	if visualTerminate {
-		return []Effect{
-			{ClientEvent: handoffDegradedEvent(event, "safety_termination"), RequireClientWrite: true},
-			{Close: &CloseEffect{Code: 1008, Reason: "session safety policy"}},
-		}, nil
-	}
-	if !visualAllowed {
-		return nil, nil
+		return r.terminateForSafety(), nil
 	}
 
 	var speechSafety safety.Decision
@@ -326,15 +329,33 @@ func (r *Reactor) applyHandoffEvent(ctx context.Context, input HandoffEventInput
 	if !known {
 		return []Effect{{ClientEvent: handoffDegradedEvent(event, "unsupported_handoff_event"), RequireClientWrite: true}}, nil
 	}
-	effects := []Effect{{ClientEvent: visual, RequireClientWrite: true}}
 	if speechTerminate {
-		return append(effects, Effect{Close: &CloseEffect{Code: 1008, Reason: "session safety policy"}}), nil
+		return r.terminateForSafety(), nil
+	}
+	effects := make([]Effect, 0, 4)
+	if urgent {
+		wasActive := r.responseActive()
+		effects = append(effects, r.cancelActiveResponseForSafety()...)
+		if speechEligible && speechAllowed && !r.state.UserSpeaking && (presentationDecision.SpeakNow || urgent) {
+			if wasActive {
+				r.stagedPresentation = &stagedPresentation{event: handoff.CloneEvent(event), summary: speechSummary, structured: append(json.RawMessage(nil), speechDetails...)}
+			} else {
+				presentationEffects, err := r.startPresentation(event, speechSummary, speechDetails)
+				if err != nil {
+					return nil, err
+				}
+				effects = append(effects, presentationEffects...)
+			}
+		}
+	}
+	if visualAllowed {
+		effects = append(effects, Effect{ClientEvent: visual, RequireClientWrite: true})
 	}
 	if !speechEligible || !speechAllowed || r.state.UserSpeaking || (!presentationDecision.SpeakNow && !urgent) {
-		if visualUrgent {
-			return append(effects, r.cancelActiveResponseForSafety()...), nil
-		}
-		return effects, nil
+		return markPolicySuppression(effects, visualAllowed), nil
+	}
+	if urgent {
+		return markPolicySuppression(effects, visualAllowed), nil
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -343,15 +364,44 @@ func (r *Reactor) applyHandoffEvent(ctx context.Context, input HandoffEventInput
 	if err != nil {
 		return nil, err
 	}
-	return append(effects, presentationEffects...), nil
+	return markPolicySuppression(append(effects, presentationEffects...), visualAllowed), nil
+}
+
+func markPolicySuppression(effects []Effect, visualAllowed bool) []Effect {
+	if !visualAllowed {
+		return append(effects, Effect{PolicySuppressed: true})
+	}
+	return effects
+}
+
+func durableSafetyAction(event handoff.Event, details json.RawMessage) safety.Action {
+	if event.Kind != "handoff.fail" || event.State != handoff.StateFailed {
+		return ""
+	}
+	var payload struct {
+		Code string `json:"code"`
+	}
+	if json.Unmarshal(details, &payload) != nil {
+		return ""
+	}
+	switch payload.Code {
+	case "safety_cancelled":
+		return safety.ActionCancelResponse
+	case "safety_terminated":
+		return safety.ActionTerminateSession
+	default:
+		return ""
+	}
 }
 
 func (r *Reactor) cancelActiveResponseForSafety() []Effect {
-	if r.state.Response != ResponsePending && r.state.Response != ResponseStreaming && r.state.Response != ResponseCancelRequested {
-		return nil
-	}
+	active := r.responseActive()
 	r.clearPresentationResponse()
 	epoch := r.fence.Advance()
+	effects := []Effect{{FlushBefore: epoch}}
+	if !active {
+		return effects
+	}
 	command := realtime.Command{
 		Kind: realtime.CommandCancelResponse, Sequence: r.allocateSequence(), Epoch: epoch, ResponseID: r.activeResponseID,
 	}
@@ -362,7 +412,23 @@ func (r *Reactor) cancelActiveResponseForSafety() []Effect {
 	} else {
 		r.state.Response = ResponseCancelRequested
 	}
-	return []Effect{{FlushBefore: epoch}, {VoiceCommand: &command}}
+	return append(effects, Effect{VoiceCommand: &command})
+}
+
+func (r *Reactor) responseActive() bool {
+	return r.state.Response == ResponsePending || r.state.Response == ResponseStreaming || r.state.Response == ResponseCancelRequested
+}
+
+func (r *Reactor) terminateForSafety() []Effect {
+	r.stagedPresentation = nil
+	r.clearPresentationResponse()
+	epoch := r.fence.Advance()
+	r.activeResponseEpoch = epoch
+	r.activeResponseID = ""
+	r.pendingCancelSequence = 0
+	r.terminal = nil
+	r.state.Response = ResponseTerminal
+	return []Effect{{FlushBefore: epoch}, {Close: &CloseEffect{Code: 1008, Reason: "session safety policy"}}}
 }
 
 func validateHandoffPresentationInput(ids IDs, scope handoff.Scope, event handoff.Event) error {

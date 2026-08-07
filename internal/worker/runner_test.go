@@ -200,9 +200,15 @@ func (s *memoryStore) BeginToolInvocation(_ context.Context, _ LeaseToken, recor
 	if existing, ok := s.invocations[record.InvocationID]; ok {
 		return CloneToolInvocation(existing), false, nil
 	}
-	invocation := ToolInvocation{Record: record, Status: "running"}
+	invocation := canonicalInvocation(record, "running", nil, false, ApprovalNotRequired)
 	s.invocations[record.InvocationID] = invocation
 	return CloneToolInvocation(invocation), true, nil
+}
+
+func canonicalInvocation(record ToolInvocationRecord, status string, result json.RawMessage, required bool, state ApprovalState) ToolInvocation {
+	invocation := ToolInvocation{Record: record, Status: status, Result: append(json.RawMessage(nil), result...)}
+	SetCanonicalToolApproval(&invocation, required, state)
+	return invocation
 }
 func (s *memoryStore) CompleteToolInvocation(_ context.Context, _ LeaseToken, record ToolCompletionRecord) error {
 	s.mu.Lock()
@@ -374,6 +380,47 @@ func TestRunnerSafetyErrorMalformedAndRedactionPaths(t *testing.T) {
 	}
 }
 
+func TestRunnerSafetyClarificationUsesConstantDurableMutationWithoutCandidate(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	store := &memoryStore{leases: []Lease{workerLease()}, onComplete: cancel}
+	registry, _ := NewToolRegistry(map[string][]RegisteredTool{"tools-v1": {}})
+	stream := streamerFunc(func(context.Context, reasoner.Request, func(reasoner.Chunk) error) (reasoner.Result, error) {
+		return reasoner.Result{Text: "unsafe-candidate-sentinel", FinishReason: "stop"}, nil
+	})
+	policy := safetyPolicyFunc(func(context.Context, safety.WorkerResultCandidate) (safety.Decision, error) {
+		return safety.Decision{Action: safety.ActionRequestClarification, SafeSummary: "Approval is required before this task can continue.", ReasonCode: "approval_required"}, nil
+	})
+	runner := testRunner(store, stream, policy, clock.Real{}, fixedJitter(0), registry)
+	require.NoError(t, runner.Run(ctx))
+	assert.Empty(t, store.completed)
+	assert.Empty(t, store.failed)
+	require.Len(t, store.needsInput, 1)
+	encoded, err := json.Marshal(store.needsInput[0])
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), "unsafe-candidate-sentinel")
+	assert.Equal(t, "Approval is required before this task can continue.", store.needsInput[0].Prompt)
+}
+
+func TestRunnerProviderBlockedResultReachesPolicyWithoutProviderBytes(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	store := &memoryStore{leases: []Lease{workerLease()}, onComplete: cancel}
+	registry, _ := NewToolRegistry(map[string][]RegisteredTool{"tools-v1": {}})
+	stream := streamerFunc(func(context.Context, reasoner.Request, func(reasoner.Chunk) error) (reasoner.Result, error) {
+		return reasoner.Result{FinishReason: "content_filter", ProviderBlocked: true}, nil
+	})
+	var seen safety.WorkerResultCandidate
+	policy := safetyPolicyFunc(func(_ context.Context, candidate safety.WorkerResultCandidate) (safety.Decision, error) {
+		seen = candidate.Clone()
+		return safety.Decision{Action: safety.ActionTerminateSession, ReasonCode: "provider_blocked"}, nil
+	})
+	runner := testRunner(store, stream, policy, clock.Real{}, fixedJitter(0), registry)
+	require.NoError(t, runner.Run(ctx))
+	assert.True(t, seen.ProviderBlocked)
+	assert.Empty(t, store.completed)
+	require.Len(t, store.failed, 1)
+	assert.Equal(t, "safety_terminated", store.failed[0].Code)
+}
+
 func TestRunnerLostLeaseCancelsReasonerAndNeverMutatesTerminal(t *testing.T) {
 	manual := clock.NewManual(workerLease().Job.CreatedAt)
 	started, cancelled := make(chan struct{}), make(chan struct{})
@@ -489,7 +536,7 @@ func TestRunnerRevisionFenceDuringToolBeginAndCompletionRestartsImmediately(t *t
 					if begins.Add(1) == 1 {
 						return ToolInvocation{}, false, ErrLeaseLost
 					}
-					return ToolInvocation{Record: record, Status: "running"}, true, nil
+					return canonicalInvocation(record, "running", nil, true, ApprovalApproved), true, nil
 				}
 			} else {
 				store.completeToolResult = func(ToolCompletionRecord) error {
@@ -523,6 +570,134 @@ func TestRunnerRevisionFenceDuringToolBeginAndCompletionRestartsImmediately(t *t
 			require.Len(t, store.completed, 1)
 		})
 	}
+}
+
+func TestRunnerApprovalProvenanceResetsWhenSteeringStartsNewRevision(t *testing.T) {
+	manual := clock.NewManual(workerLease().Job.CreatedAt)
+	lease := workerLease()
+	lease.Job.CreatedAt = manual.Now()
+	lease.Job.Request.Deadline = manual.Now().Add(time.Hour)
+	lease.Job.Request.ToolAllowlist = []string{"charge"}
+	approved := make(chan struct{})
+	waitingForSteer := make(chan struct{})
+	var beginOnce, waitOnce sync.Once
+	store := &memoryStore{heartbeat: func(context.Context, LeaseToken, time.Time) (Control, error) {
+		return Control{ObjectiveRevision: 1, Objective: "revised objective"}, nil
+	}}
+	store.beginTool = func(record ToolInvocationRecord) (ToolInvocation, bool, error) {
+		beginOnce.Do(func() { close(approved) })
+		return canonicalInvocation(record, "running", nil, true, ApprovalApproved), true, nil
+	}
+	tool := RegisteredTool{Definition: reasoner.ToolDefinition{Name: "charge", Parameters: json.RawMessage(`{"type":"object"}`)}, SideEffecting: true, StableIdempotency: true, Executor: toolExecutorFunc(func(context.Context, ToolExecutionRequest) (json.RawMessage, error) {
+		return json.RawMessage(`{"ok":true}`), nil
+	})}
+	registry, err := NewToolRegistry(map[string][]RegisteredTool{"tools-v1": {tool}})
+	require.NoError(t, err)
+	var streams atomic.Int32
+	stream := streamerFunc(func(ctx context.Context, request reasoner.Request, _ func(reasoner.Chunk) error) (reasoner.Result, error) {
+		switch streams.Add(1) {
+		case 1:
+			return reasoner.Result{FinishReason: "tool_calls", ToolCalls: []reasoner.ToolCall{{ID: "call", Name: "charge", Arguments: json.RawMessage(`{"amount":1}`)}}}, nil
+		case 2:
+			waitOnce.Do(func() { close(waitingForSteer) })
+			<-ctx.Done()
+			return reasoner.Result{}, ctx.Err()
+		default:
+			assert.Contains(t, request.Messages[1].Content, "revised objective")
+			return reasoner.Result{Text: "revision one result", FinishReason: "stop"}, nil
+		}
+	})
+	var seen safety.WorkerResultCandidate
+	policy := safetyPolicyFunc(func(_ context.Context, candidate safety.WorkerResultCandidate) (safety.Decision, error) {
+		seen = candidate.Clone()
+		return safety.Decision{Action: safety.ActionAllow, ReasonCode: "allowed"}, nil
+	})
+	runner := testRunner(store, stream, policy, manual, fixedJitter(0), registry)
+	runner.ArgumentSealer, err = NewAESArgumentSealer("test-key", bytes.Repeat([]byte{5}, 32), bytes.NewReader(bytes.Repeat([]byte{1}, 24)))
+	require.NoError(t, err)
+	done := make(chan error, 1)
+	go func() { done <- runner.executeLease(t.Context(), lease) }()
+	<-approved
+	<-waitingForSteer
+	var runErr error
+	completed := false
+	deadline := time.After(2 * time.Second)
+	for !completed {
+		manual.Advance(3 * time.Second)
+		runtime.Gosched()
+		select {
+		case runErr = <-done:
+			completed = true
+		case <-deadline:
+			t.Fatal("steered generation did not complete")
+		default:
+		}
+	}
+	require.NoError(t, runErr)
+	assert.False(t, seen.RequiresApproval)
+	assert.False(t, seen.Approved)
+	require.Len(t, store.completed, 1)
+	assert.Equal(t, "revision one result", store.completed[0].Summary)
+}
+
+func TestRunnerApprovalProvenanceUsesCurrentCanonicalBeginRetryOrReplay(t *testing.T) {
+	for _, mode := range []string{"current", "ambiguous retry", "succeeded replay"} {
+		t.Run(mode, func(t *testing.T) {
+			var executions, beginAttempts atomic.Int32
+			tool := RegisteredTool{Definition: reasoner.ToolDefinition{Name: "charge", Parameters: json.RawMessage(`{"type":"object"}`)}, SideEffecting: true, StableIdempotency: true, Executor: toolExecutorFunc(func(context.Context, ToolExecutionRequest) (json.RawMessage, error) {
+				executions.Add(1)
+				return json.RawMessage(`{"ok":true}`), nil
+			})}
+			var streams atomic.Int32
+			stream := streamerFunc(func(context.Context, reasoner.Request, func(reasoner.Chunk) error) (reasoner.Result, error) {
+				if streams.Add(1) == 1 {
+					return reasoner.Result{FinishReason: "tool_calls", ToolCalls: []reasoner.ToolCall{{ID: "call", Name: "charge", Arguments: json.RawMessage(`{"amount":1}`)}}}, nil
+				}
+				return reasoner.Result{Text: "done", FinishReason: "stop"}, nil
+			})
+			ctx, _, store, runner := toolRunnerFixture(t, []RegisteredTool{tool}, stream)
+			store.beginTool = func(record ToolInvocationRecord) (ToolInvocation, bool, error) {
+				attempt := beginAttempts.Add(1)
+				if mode == "ambiguous retry" && attempt == 1 {
+					return ToolInvocation{}, false, errors.New("begin response unavailable")
+				}
+				if mode == "succeeded replay" {
+					return canonicalInvocation(record, "succeeded", json.RawMessage(`{"ok":true}`), true, ApprovalApproved), false, nil
+				}
+				return canonicalInvocation(record, "running", nil, true, ApprovalApproved), true, nil
+			}
+			var seen safety.WorkerResultCandidate
+			runner.Safety = safetyPolicyFunc(func(_ context.Context, candidate safety.WorkerResultCandidate) (safety.Decision, error) {
+				seen = candidate.Clone()
+				return safety.Decision{Action: safety.ActionAllow, ReasonCode: "allowed"}, nil
+			})
+			require.NoError(t, runner.Run(ctx))
+			assert.True(t, seen.RequiresApproval)
+			assert.True(t, seen.Approved)
+			if mode == "ambiguous retry" {
+				assert.Equal(t, int32(2), beginAttempts.Load())
+			}
+			if mode == "succeeded replay" {
+				assert.Zero(t, executions.Load())
+			} else {
+				assert.Equal(t, int32(1), executions.Load())
+			}
+		})
+	}
+}
+
+func TestJobExecutionApprovalFenceRejectsStaleSameRevisionGeneration(t *testing.T) {
+	execution := &jobExecution{}
+	stale := execution.beginGeneration(4)
+	current := execution.beginGeneration(4)
+	execution.markApproved(4, stale)
+	required, approved := execution.approval(4, current)
+	assert.False(t, required)
+	assert.False(t, approved)
+	execution.markApproved(4, current)
+	required, approved = execution.approval(4, current)
+	assert.True(t, required)
+	assert.True(t, approved)
 }
 
 func TestRunnerProgressCoalescesThousandsOfChunksAndObservesFirstToken(t *testing.T) {
@@ -681,7 +856,7 @@ func TestRunnerToolReplayReusesSucceededResultAndStableIdempotency(t *testing.T)
 		seenID = record.IdempotencyKey
 		assert.Equal(t, record.InvocationID, record.IdempotencyKey)
 		assert.NotContains(t, string(record.Ciphertext), `"n":1`)
-		return ToolInvocation{Record: record, Status: "succeeded", Result: json.RawMessage(`{"cached":true}`)}, false, nil
+		return canonicalInvocation(record, "succeeded", json.RawMessage(`{"cached":true}`), false, ApprovalNotRequired), false, nil
 	}
 	require.NoError(t, runner.Run(ctx))
 	assert.Zero(t, executions.Load())
@@ -706,7 +881,7 @@ func TestRunnerRunningToolRecoveryUsesStableIdempotencyKey(t *testing.T) {
 	})
 	ctx, _, store, runner := toolRunnerFixture(t, []RegisteredTool{tool}, stream)
 	store.beginTool = func(record ToolInvocationRecord) (ToolInvocation, bool, error) {
-		return ToolInvocation{Record: record, Status: "running"}, false, nil
+		return canonicalInvocation(record, "running", nil, true, ApprovalApproved), false, nil
 	}
 	require.NoError(t, runner.Run(ctx))
 	assert.Equal(t, int32(1), executions.Load())
@@ -789,7 +964,7 @@ func TestRunnerApprovalMovesDurablyToNeedsInput(t *testing.T) {
 	})
 	ctx, _, store, runner := toolRunnerFixture(t, []RegisteredTool{tool}, stream)
 	store.beginTool = func(record ToolInvocationRecord) (ToolInvocation, bool, error) {
-		return ToolInvocation{Record: record, Status: "pending"}, true, ErrApprovalRequired
+		return canonicalInvocation(record, "pending", nil, true, ApprovalPending), true, ErrApprovalRequired
 	}
 	require.NoError(t, runner.Run(ctx))
 	require.Len(t, store.needsInput, 1)
@@ -811,7 +986,7 @@ func TestRunnerNeedsInputCommitResponseLossReplaysExactAndUncertaintyNeverFailsB
 			})}
 			registry, _ := NewToolRegistry(map[string][]RegisteredTool{"tools-v1": {tool}})
 			store := &memoryStore{beginTool: func(record ToolInvocationRecord) (ToolInvocation, bool, error) {
-				return ToolInvocation{Record: record, Status: "pending"}, true, ErrApprovalRequired
+				return canonicalInvocation(record, "pending", nil, true, ApprovalPending), true, ErrApprovalRequired
 			}}
 			var attempts atomic.Int32
 			store.needsInputResult = func(NeedsInputRecord) error {

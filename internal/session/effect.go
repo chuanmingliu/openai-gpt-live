@@ -11,6 +11,9 @@ import (
 type Effect struct {
 	ClientEvent        protocol.ServerEvent
 	RequireClientWrite bool
+	PolicySuppressed   bool
+	ResponseEpoch      identity.ResponseEpoch
+	Incarnation        identity.Incarnation
 	VoiceCommand       *realtime.Command
 	Async              *AsyncEffect
 	Transcript         *TranscriptRequestedEffect

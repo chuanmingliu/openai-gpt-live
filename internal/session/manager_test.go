@@ -1002,6 +1002,38 @@ type blockingWriteClient struct {
 	closeOnce sync.Once
 }
 
+type gatedResponseControlClient struct {
+	started   chan struct{}
+	writes    chan string
+	closed    chan struct{}
+	startOnce sync.Once
+	closeOnce sync.Once
+}
+
+func (c *gatedResponseControlClient) Read(ctx context.Context) (protocol.ClientEvent, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (c *gatedResponseControlClient) Write(ctx context.Context, event protocol.ServerEvent) error {
+	if event.EventType() == "response.output_audio_transcript.delta" {
+		c.startOnce.Do(func() { close(c.started) })
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	select {
+	case c.writes <- event.EventType():
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *gatedResponseControlClient) Close(context.Context, int, string) error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return nil
+}
+
 type failureConnector struct {
 	voice     *failureVoice
 	connected chan struct{}
@@ -1369,6 +1401,98 @@ func TestManagerZeroExpiryInheritsParentAndFiniteExpiryCancelsExactly(t *testing
 		require.ErrorIs(t, err, context.DeadlineExceeded)
 		require.GreaterOrEqual(t, time.Since(started), time.Until(expires)-20*time.Millisecond)
 	})
+}
+
+func TestDispatchFlushFencesActiveAndQueuedResponseControlsBeforeCancelOrTerminate(t *testing.T) {
+	for _, action := range []string{"cancel", "terminate"} {
+		t.Run(action, func(t *testing.T) {
+			cfg, err := normalizeManagerConfig(Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second})
+			require.NoError(t, err)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			client := &gatedResponseControlClient{started: make(chan struct{}), writes: make(chan string, 2), closed: make(chan struct{})}
+			voice := &recordingVoice{sent: make(chan realtime.Command, 2)}
+			ids := IDs{SessionID: "session", ConversationID: "conversation", Incarnation: 1}
+			state := newRunState(cfg, ids, voice, client, cancel)
+			epoch := state.fence.Advance()
+			writerDone := make(chan error, 1)
+			go func() { writerDone <- state.clientWriter(ctx) }()
+			voiceDone := make(chan error, 1)
+			go func() { voiceDone <- state.voiceWriter(ctx) }()
+
+			stale := protocol.ResponseOutputAudioTranscriptDeltaEvent{Type: "response.output_audio_transcript.delta", Delta: "private"}
+			require.NoError(t, state.enqueueClientControl(clientControl{event: stale, epoch: epoch, incarnation: ids.Incarnation, writeCtx: ctx}))
+			select {
+			case <-client.started:
+			case <-time.After(time.Second):
+				t.Fatal("response control write did not start")
+			}
+			require.NoError(t, state.enqueueClientControl(clientControl{event: stale, epoch: epoch, incarnation: ids.Incarnation, writeCtx: ctx}))
+			flushEpoch := state.fence.Advance()
+			effects := []Effect{{FlushBefore: flushEpoch}}
+			if action == "cancel" {
+				command := realtime.Command{Kind: realtime.CommandCancelResponse, Epoch: flushEpoch, Sequence: 1}
+				effects = append(effects, Effect{VoiceCommand: &command}, Effect{ClientEvent: protocol.ErrorEvent{Type: "error"}, RequireClientWrite: true})
+			} else {
+				effects = append(effects, Effect{Close: &CloseEffect{Code: 1008, Reason: "safety"}})
+			}
+			dispatchDone := make(chan error, 1)
+			go func() { dispatchDone <- state.dispatchEffects(ctx, effects, 0, 0) }()
+
+			if action == "cancel" {
+				select {
+				case command := <-voice.sent:
+					require.Equal(t, realtime.CommandCancelResponse, command.Kind)
+				case eventType := <-client.writes:
+					t.Fatalf("client event %q escaped before provider cancellation", eventType)
+				case <-time.After(time.Second):
+					t.Fatal("provider cancellation was not sent")
+				}
+				require.Equal(t, "error", <-client.writes)
+				require.NoError(t, <-dispatchDone)
+			} else {
+				require.NoError(t, <-dispatchDone)
+				select {
+				case <-client.closed:
+				case <-time.After(time.Second):
+					t.Fatal("safety close was not written")
+				}
+			}
+			select {
+			case eventType := <-client.writes:
+				t.Fatalf("unexpected stale client event %q", eventType)
+			default:
+			}
+			cancel()
+			select {
+			case <-writerDone:
+			case <-time.After(time.Second):
+				t.Fatal("client writer did not stop")
+			}
+			select {
+			case <-voiceDone:
+			case <-time.After(time.Second):
+				t.Fatal("voice writer did not stop")
+			}
+		})
+	}
+}
+
+func TestDispatchPolicySuppressionWaitsForAllowedSpeechSendSuccess(t *testing.T) {
+	cfg, err := normalizeManagerConfig(Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	providerErr := errors.New("provider rejected presentation")
+	voice := &failureVoice{sendErr: make(chan error, 1), receiveErr: make(chan error)}
+	voice.sendErr <- providerErr
+	state := newRunState(cfg, IDs{SessionID: "session", ConversationID: "conversation", Incarnation: 1}, voice, newChannelClient(1), cancel)
+	voiceDone := make(chan error, 1)
+	go func() { voiceDone <- state.voiceWriter(ctx) }()
+	command := realtime.Command{Kind: realtime.CommandCreateResponse, Sequence: 1}
+	err = state.dispatchEffects(ctx, []Effect{{VoiceCommand: &command}, {PolicySuppressed: true}}, 0, 0)
+	require.ErrorIs(t, err, providerErr)
+	require.ErrorIs(t, <-voiceDone, providerErr)
 }
 
 func TestManagerConfigDefaultsAndBounds(t *testing.T) {
@@ -2419,6 +2543,10 @@ func TestManagerReactorAggregateBoundRejectsFirstExcessWhileApplyIsActive(t *tes
 	require.NoError(t, state.enqueueReactorSync(context.Background(), reactorMessage{
 		input: ClientInput{Event: protocol.ResponseCreateEvent{Type: "response.create"}},
 	}))
+	createControl := <-state.voiceCtl
+	require.Equal(t, realtime.CommandCreateResponse, createControl.command.Kind)
+	state.releaseVoiceSlot()
+	state.pendingVoice.Add(-1)
 	cancelSeen := make(chan struct{})
 	releaseApply := make(chan struct{})
 	state.activeWrite.mu.Lock()
@@ -2436,6 +2564,12 @@ func TestManagerReactorAggregateBoundRejectsFirstExcessWhileApplyIsActive(t *tes
 	}
 	require.ErrorIs(t, state.enqueueReactor(reactorMessage{input: DurableInput{Sequence: 1}}), ErrControlOverflow)
 	close(releaseApply)
+	cancelControl := <-state.voiceCtl
+	require.Equal(t, realtime.CommandCancelResponse, cancelControl.command.Kind)
+	require.NotNil(t, cancelControl.sent)
+	state.releaseVoiceSlot()
+	cancelControl.sent <- nil
+	state.pendingVoice.Add(-1)
 	require.NoError(t, <-applyDone)
 	require.NoError(t, state.enqueueReactorSync(context.Background(), reactorMessage{
 		input: DurableInput{Sequence: 1, Kind: "benign-after-ack"},

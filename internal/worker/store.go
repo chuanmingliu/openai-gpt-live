@@ -107,10 +107,23 @@ type ToolInvocationRecord struct {
 }
 
 type ToolInvocation struct {
-	Record ToolInvocationRecord
-	Status string
-	Result json.RawMessage
+	Record           ToolInvocationRecord
+	Status           string
+	Result           json.RawMessage
+	RequiresApproval bool
+	ApprovalState    ApprovalState
+	ApprovalProof    string
 }
+
+type ApprovalState string
+
+const (
+	ApprovalNotRequired ApprovalState = "not_required"
+	ApprovalPending     ApprovalState = "pending"
+	ApprovalApproved    ApprovalState = "approved"
+	ApprovalDenied      ApprovalState = "denied"
+	ApprovalExpired     ApprovalState = "expired"
+)
 
 type ToolCompletionRecord struct {
 	InvocationID string
@@ -162,6 +175,35 @@ func writePart(h hash.Hash, value string) {
 	binary.BigEndian.PutUint64(size[:], uint64(len(value)))
 	_, _ = h.Write(size[:])
 	_, _ = h.Write([]byte(value))
+}
+
+// SetCanonicalToolApproval records approval metadata derived by the durable
+// invocation gate. The proof lets downstream execution reject caller-synthesized
+// booleans and stale or incomplete store implementations.
+func SetCanonicalToolApproval(invocation *ToolInvocation, required bool, state ApprovalState) {
+	if invocation == nil {
+		return
+	}
+	invocation.RequiresApproval = required
+	invocation.ApprovalState = state
+	h := sha256.New()
+	writePart(h, invocation.Record.InvocationID)
+	writePart(h, strconv.FormatBool(required))
+	writePart(h, string(state))
+	invocation.ApprovalProof = hex.EncodeToString(h.Sum(nil))
+}
+
+func ValidateCanonicalToolApproval(invocation ToolInvocation) error {
+	validState := invocation.ApprovalState == ApprovalNotRequired || invocation.ApprovalState == ApprovalPending || invocation.ApprovalState == ApprovalApproved || invocation.ApprovalState == ApprovalDenied || invocation.ApprovalState == ApprovalExpired
+	if !validState || (!invocation.RequiresApproval && invocation.ApprovalState != ApprovalNotRequired) || (invocation.RequiresApproval && invocation.ApprovalState == ApprovalNotRequired) {
+		return errors.New("worker tool approval metadata is invalid")
+	}
+	copy := invocation
+	SetCanonicalToolApproval(&copy, invocation.RequiresApproval, invocation.ApprovalState)
+	if invocation.ApprovalProof == "" || invocation.ApprovalProof != copy.ApprovalProof {
+		return errors.New("worker tool approval proof is invalid")
+	}
+	return nil
 }
 
 func CloneToolInvocation(in ToolInvocation) ToolInvocation {

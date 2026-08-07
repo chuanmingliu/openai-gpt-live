@@ -22,7 +22,10 @@ const (
 	maximumPumpIdentityBytes   = 256
 )
 
-var ErrNoLiveSession = errors.New("no live session")
+var (
+	ErrNoLiveSession          = errors.New("no live session")
+	ErrPresentationSuppressed = errors.New("presentation suppressed by safety policy")
+)
 
 type PresentationSink interface {
 	OfferHandoffEvent(context.Context, Scope, Event) error
@@ -242,7 +245,7 @@ func (p *EventPump) deliverSubscription(ctx context.Context, subscription EventS
 					end++
 				}
 			}
-			if err := p.Sink.OfferHandoffEvent(ctx, subscription.Scope, CloneEvent(events[end-1])); err != nil {
+			if err := p.Sink.OfferHandoffEvent(ctx, subscription.Scope, CloneEvent(events[end-1])); err != nil && err != ErrPresentationSuppressed {
 				return err
 			}
 			for acknowledged := index; acknowledged < end; acknowledged++ {

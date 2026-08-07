@@ -174,8 +174,15 @@ type AdmissionConfig struct {
 }
 
 type SafetyConfig struct {
-	PrivacyHMACKeyEnv string `yaml:"privacy_hmac_key_env"`
-	MaxInputBytes     int    `yaml:"max_input_bytes"`
+	PolicyVersion       string   `yaml:"policy_version"`
+	Mode                string   `yaml:"mode"`
+	PrivacyHMACKeyEnv   string   `yaml:"privacy_hmac_key_env"`
+	MaxInputBytes       int      `yaml:"max_input_bytes"`
+	MaxSummaryBytes     int      `yaml:"max_summary_bytes"`
+	MaxStructuredBytes  int      `yaml:"max_structured_bytes"`
+	RedactedSummary     string   `yaml:"redacted_summary"`
+	ClarificationPrompt string   `yaml:"clarification_prompt"`
+	RedactionDeniedKeys []string `yaml:"redaction_denied_keys"`
 }
 
 type TelemetryConfig struct {
@@ -376,6 +383,24 @@ func (c *Config) applyDefaults() {
 	if c.Worker.MaxToolRounds == 0 {
 		c.Worker.MaxToolRounds = 8
 	}
+	if c.Safety.PolicyVersion == "" {
+		c.Safety.PolicyVersion = "static-v1"
+	}
+	if c.Safety.Mode == "" {
+		c.Safety.Mode = "enforce"
+	}
+	if c.Safety.MaxSummaryBytes == 0 {
+		c.Safety.MaxSummaryBytes = 16 << 10
+	}
+	if c.Safety.MaxStructuredBytes == 0 {
+		c.Safety.MaxStructuredBytes = 64 << 10
+	}
+	if c.Safety.RedactedSummary == "" {
+		c.Safety.RedactedSummary = "A background task completed with protected details removed."
+	}
+	if c.Safety.ClarificationPrompt == "" {
+		c.Safety.ClarificationPrompt = "Approval is required before this task can continue."
+	}
 	if c.Shutdown.DrainTimeout == 0 {
 		c.Shutdown.DrainTimeout = 10 * time.Second
 	}
@@ -385,6 +410,30 @@ func (c *Config) applyDefaults() {
 }
 
 func (c Config) Validate() error {
+	safetyPolicyVersion := c.Safety.PolicyVersion
+	if safetyPolicyVersion == "" {
+		safetyPolicyVersion = "static-v1"
+	}
+	safetyMode := c.Safety.Mode
+	if safetyMode == "" {
+		safetyMode = "enforce"
+	}
+	safetyMaxSummary := c.Safety.MaxSummaryBytes
+	if safetyMaxSummary == 0 {
+		safetyMaxSummary = 16 << 10
+	}
+	safetyMaxStructured := c.Safety.MaxStructuredBytes
+	if safetyMaxStructured == 0 {
+		safetyMaxStructured = 64 << 10
+	}
+	safetyRedactedSummary := c.Safety.RedactedSummary
+	if safetyRedactedSummary == "" {
+		safetyRedactedSummary = "A background task completed with protected details removed."
+	}
+	safetyClarificationPrompt := c.Safety.ClarificationPrompt
+	if safetyClarificationPrompt == "" {
+		safetyClarificationPrompt = "Approval is required before this task can continue."
+	}
 	if c.Mode != "local" && c.Mode != "production" {
 		return fmt.Errorf("mode must be local or production")
 	}
@@ -439,6 +488,19 @@ func (c Config) Validate() error {
 	}
 	if c.Worker.MaxOutputBytes <= 0 || c.Worker.MaxOutputTokens <= 0 || c.Worker.MaxToolRounds <= 0 {
 		return errors.New("worker output limits must be positive")
+	}
+	if safetyPolicyVersion != "static-v1" || safetyMode != "enforce" && safetyMode != "redact" ||
+		c.Safety.MaxInputBytes < 0 || c.Safety.MaxInputBytes > 1<<20 || safetyMaxSummary <= 0 || safetyMaxSummary > 16<<10 ||
+		safetyMaxStructured <= 0 || safetyMaxStructured > 64<<10 ||
+		strings.TrimSpace(safetyRedactedSummary) == "" || len(safetyRedactedSummary) > safetyMaxSummary || !utf8.ValidString(safetyRedactedSummary) ||
+		strings.TrimSpace(safetyClarificationPrompt) == "" || len(safetyClarificationPrompt) > safetyMaxSummary || !utf8.ValidString(safetyClarificationPrompt) ||
+		len(c.Safety.RedactionDeniedKeys) > 128 {
+		return errors.New("safety policy configuration is invalid")
+	}
+	for _, key := range c.Safety.RedactionDeniedKeys {
+		if strings.TrimSpace(key) == "" || len(key) > 128 || !utf8.ValidString(key) {
+			return errors.New("safety redaction denied keys must be non-empty and bounded")
+		}
 	}
 	if c.Shutdown.DrainTimeout < 0 || c.Shutdown.DrainTimeout > 10*time.Minute {
 		return errors.New("shutdown.drain_timeout must be positive and bounded when set")

@@ -41,4 +41,11 @@ admission:
   ip_key_ttl: 10m
   max_ip_keys: 10000
 safety:
+  policy_version: static-v1
+  mode: enforce
   privacy_hmac_key_env: LIVE_PRIVACY_HMAC_KEY
+  max_summary_bytes: 16384
+  max_structured_bytes: 65536
+  redacted_summary: A background task completed with protected details removed.
+  clarification_prompt: Approval is required before this task can continue.
+  redaction_denied_keys: []

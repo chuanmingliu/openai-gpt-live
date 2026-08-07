@@ -67,6 +67,7 @@ type Result struct {
 	ToolCalls         []ToolCall
 	FinishReason      string
 	ProviderRequestID string
+	ProviderBlocked   bool
 	Usage             Usage
 }
 

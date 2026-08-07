@@ -127,20 +127,20 @@ func TestUrgentSafetyCancelsActiveResponseBeforeAnnouncement(t *testing.T) {
 
 	effects := applyOK(t, reactor, presentationEvent("handoff.needs-input", handoff.StateNeedsInput, `{"Prompt":"urgent safety update","Schema":{}}`))
 	require.Len(t, effects, 3)
-	_, ok := effects[0].ClientEvent.(protocol.LiveHandoffNeedsInputEvent)
+	assert.NotZero(t, effects[0].FlushBefore)
+	assert.Equal(t, realtime.CommandCancelResponse, effects[1].VoiceCommand.Kind)
+	assert.Equal(t, "active", effects[1].VoiceCommand.ResponseID)
+	_, ok := effects[2].ClientEvent.(protocol.LiveHandoffNeedsInputEvent)
 	require.True(t, ok)
-	assert.NotZero(t, effects[1].FlushBefore)
-	assert.Equal(t, realtime.CommandCancelResponse, effects[2].VoiceCommand.Kind)
-	assert.Equal(t, "active", effects[2].VoiceCommand.ResponseID)
 	assert.Equal(t, ResponseCancelRequested, reactor.Snapshot().Response)
-	completed := applyOK(t, reactor, VoiceCommandCompletedInput{Kind: realtime.CommandCancelResponse, Sequence: effects[2].VoiceCommand.Sequence})
+	completed := applyOK(t, reactor, VoiceCommandCompletedInput{Kind: realtime.CommandCancelResponse, Sequence: effects[1].VoiceCommand.Sequence})
 	require.Len(t, completed, 2)
 	_, terminal := completed[0].ClientEvent.(protocol.ResponseDoneEvent)
 	assert.True(t, terminal)
 	assert.Equal(t, realtime.CommandCreateResponse, completed[1].VoiceCommand.Kind)
-	assert.Greater(t, completed[1].VoiceCommand.Epoch, effects[2].VoiceCommand.Epoch)
+	assert.Greater(t, completed[1].VoiceCommand.Epoch, effects[1].VoiceCommand.Epoch)
 	lateOld := applyOK(t, reactor, VoiceInput{Incarnation: 1, Event: realtime.Event{
-		Kind: realtime.EventResponseDone, Epoch: effects[2].VoiceCommand.Epoch, ResponseID: "active", Status: "cancelled",
+		Kind: realtime.EventResponseDone, Epoch: effects[1].VoiceCommand.Epoch, ResponseID: "active", Status: "cancelled",
 	}})
 	assert.Empty(t, lateOld, "old response has exactly one terminal event")
 }
@@ -153,7 +153,7 @@ func TestUrgentPresentationBargeInBeforeCancelCompletionNeverSpeaks(t *testing.T
 	reactor := presentationReactor(safetyPolicy)
 	epoch := startStreaming(t, reactor, "active")
 	urgent := applyOK(t, reactor, presentationEvent("handoff.needs-input", handoff.StateNeedsInput, `{"Prompt":"urgent","Schema":{}}`))
-	cancel := urgent[2].VoiceCommand
+	cancel := urgent[1].VoiceCommand
 	require.Equal(t, realtime.CommandCancelResponse, cancel.Kind)
 
 	started := applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventSpeechStarted, ItemID: "user-turn"}))
@@ -181,11 +181,11 @@ func TestVisualCancelSafetyActionCancelsWithoutForcingSpeech(t *testing.T) {
 
 	effects := applyOK(t, reactor, presentationEvent("handoff.needs-input", handoff.StateNeedsInput, `{"Prompt":"unsafe","Schema":{}}`))
 	require.Len(t, effects, 3)
-	_, ok := effects[0].ClientEvent.(protocol.LiveHandoffNeedsInputEvent)
+	assert.NotZero(t, effects[0].FlushBefore)
+	assert.Equal(t, realtime.CommandCancelResponse, effects[1].VoiceCommand.Kind)
+	assert.Equal(t, "active", effects[1].VoiceCommand.ResponseID)
+	_, ok := effects[2].ClientEvent.(protocol.LiveHandoffNeedsInputEvent)
 	require.True(t, ok)
-	assert.NotZero(t, effects[1].FlushBefore)
-	assert.Equal(t, realtime.CommandCancelResponse, effects[2].VoiceCommand.Kind)
-	assert.Equal(t, "active", effects[2].VoiceCommand.ResponseID)
 	assert.Equal(t, ResponseCancelRequested, reactor.Snapshot().Response)
 }
 
@@ -434,10 +434,10 @@ func TestPresentationHandlesNonAllowSafetyActionsDeterministically(t *testing.T)
 		wantVoice   bool
 		wantClose   bool
 	}{
-		{"visual suppress", safety.ChannelVisual, safety.Decision{Action: safety.ActionSuppress, ReasonCode: "suppress"}, 0, false, false},
+		{"visual suppress", safety.ChannelVisual, safety.Decision{Action: safety.ActionSuppress, ReasonCode: "suppress"}, 2, true, false},
 		{"visual terminate", safety.ChannelVisual, safety.Decision{Action: safety.ActionTerminateSession, ReasonCode: "terminate"}, 2, false, true},
 		{"speech suppress", safety.ChannelSpeech, safety.Decision{Action: safety.ActionSuppress, ReasonCode: "suppress"}, 1, false, false},
-		{"speech clarification", safety.ChannelSpeech, safety.Decision{Action: safety.ActionRequestClarification, ReasonCode: "clarify"}, 2, true, false},
+		{"speech clarification", safety.ChannelSpeech, safety.Decision{Action: safety.ActionRequestClarification, SafeSummary: "clarification required", ReasonCode: "clarify"}, 2, true, false},
 		{"speech terminate", safety.ChannelSpeech, safety.Decision{Action: safety.ActionTerminateSession, ReasonCode: "terminate"}, 2, false, true},
 	}
 	for _, test := range tests {
@@ -459,6 +459,34 @@ func TestPresentationHandlesNonAllowSafetyActionsDeterministically(t *testing.T)
 			assert.Equal(t, test.wantClose, hasClose)
 		})
 	}
+}
+
+func TestDurableSafetyTerminationIsReauthorizedAndFencesBeforeClose(t *testing.T) {
+	policy, err := safety.NewStaticPolicy(safety.StaticConfig{})
+	require.NoError(t, err)
+	reactor := presentationReactor(policy)
+	effects := applyOK(t, reactor, presentationEvent("handoff.fail", handoff.StateFailed, `{"ExpectedObjectiveRevision":1,"Failure":{"MutationID":"m","Code":"safety_terminated","Retryable":false,"Message":"session termination was requested by safety policy"}}`))
+	require.Len(t, effects, 2)
+	assert.NotZero(t, effects[0].FlushBefore)
+	require.NotNil(t, effects[1].Close)
+	assert.Equal(t, 1008, effects[1].Close.Code)
+	for _, effect := range effects {
+		assert.Nil(t, effect.ClientEvent)
+		assert.Nil(t, effect.VoiceCommand)
+	}
+}
+
+func TestSafetySuppressionProducesExplicitNonWriteAcceptance(t *testing.T) {
+	policy := &presentationSafety{decisions: map[safety.Channel]safety.Decision{
+		safety.ChannelVisual: {Action: safety.ActionSuppress, ReasonCode: "suppress"},
+		safety.ChannelSpeech: {Action: safety.ActionSuppress, ReasonCode: "suppress"},
+	}}
+	reactor := presentationReactor(policy)
+	effects := applyOK(t, reactor, presentationEvent("handoff.needs-input", handoff.StateNeedsInput, `{"Prompt":"private","Schema":{}}`))
+	require.Len(t, effects, 1)
+	assert.True(t, effects[0].PolicySuppressed)
+	assert.Nil(t, effects[0].ClientEvent)
+	assert.Nil(t, effects[0].VoiceCommand)
 }
 
 var _ safety.Policy = (*presentationSafety)(nil)

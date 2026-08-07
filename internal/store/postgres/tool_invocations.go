@@ -91,6 +91,7 @@ func (r *Repository) BeginToolInvocation(ctx context.Context, token worker.Lease
 		if !sameToolIdentity(existing.Record, record) {
 			return worker.ToolInvocation{}, false, handoff.ErrIdempotencyConflict
 		}
+		setInvocationApproval(&existing, requiresApproval, approvalState, approvalExpires, now, existing.Status == "succeeded")
 		if existing.Status == "succeeded" {
 			if err := tx.Commit(ctx); err != nil {
 				return worker.ToolInvocation{}, false, err
@@ -193,6 +194,7 @@ func (r *Repository) BeginToolInvocation(ctx context.Context, token worker.Lease
 		return worker.ToolInvocation{}, false, err
 	}
 	invocation := worker.ToolInvocation{Record: cloneToolRecord(record), Status: status}
+	worker.SetCanonicalToolApproval(&invocation, requiresApproval, worker.ApprovalState(approvalState))
 	if err := tx.Commit(ctx); err != nil {
 		return worker.ToolInvocation{}, false, err
 	}
@@ -200,6 +202,14 @@ func (r *Repository) BeginToolInvocation(ctx context.Context, token worker.Lease
 		return invocation, true, worker.ErrApprovalRequired
 	}
 	return invocation, true, nil
+}
+
+func setInvocationApproval(invocation *worker.ToolInvocation, required bool, state string, expires *time.Time, now time.Time, completed bool) {
+	effective := worker.ApprovalState(state)
+	if required && state == string(worker.ApprovalApproved) && !completed && (expires == nil || !expires.After(now)) {
+		effective = worker.ApprovalExpired
+	}
+	worker.SetCanonicalToolApproval(invocation, required, effective)
 }
 
 func (r *Repository) CompleteToolInvocation(ctx context.Context, token worker.LeaseToken, completion worker.ToolCompletionRecord) error {

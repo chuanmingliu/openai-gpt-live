@@ -224,7 +224,7 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 			app.presentation.Policy = presentation.NewPolicy(presentation.Config{})
 		}
 		if isNil(app.presentation.Safety) {
-			app.presentation.Safety = safety.DenyAll{}
+			return nil, errors.New("explicit handoff presentation safety policy is required")
 		}
 		app.eventWakeups = make(chan handoff.EventWakeup, app.presentation.WakeupCapacity)
 		app.eventPump = &handoff.EventPump{

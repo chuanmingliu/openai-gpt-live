@@ -190,9 +190,10 @@ func (r *Runner) executeLease(parent context.Context, lease Lease) error {
 	control := initial
 	execution := &jobExecution{builder: &resultBuilder{limit: r.MaxOutputBytes, clock: r.Clock, store: r.Store, token: lease.Token, observer: r.FirstTokenObserver}}
 	for {
+		generation := execution.beginGeneration(control.ObjectiveRevision)
 		generationCtx, cancelGeneration := context.WithCancelCause(jobCtx)
 		canceller.install(cancelGeneration)
-		terminal, err := r.generate(generationCtx, lease, control, execution)
+		terminal, err := r.generate(generationCtx, lease, control, execution, generation)
 		cause := context.Cause(generationCtx)
 		canceller.clear(cancelGeneration)
 		cancelGeneration(context.Canceled)
@@ -291,16 +292,55 @@ func (r *Runner) recoverRevisionFence(ctx context.Context, lease Lease, expected
 }
 
 type generatedResult struct {
-	summary    string
-	structured json.RawMessage
-	usage      json.RawMessage
-	budget     *resultBuilder
+	summary          string
+	structured       json.RawMessage
+	usage            json.RawMessage
+	requiresApproval bool
+	approved         bool
+	providerBlocked  bool
+	budget           *resultBuilder
 }
 
 type jobExecution struct {
-	builder    *resultBuilder
-	toolCalls  int
-	toolRounds int
+	builder            *resultBuilder
+	toolCalls          int
+	toolRounds         int
+	approvalMu         sync.Mutex
+	approvalRevision   uint32
+	approvalGeneration uint64
+	requiresApproval   bool
+	approved           bool
+}
+
+func (e *jobExecution) beginGeneration(revision uint32) uint64 {
+	e.approvalMu.Lock()
+	e.approvalGeneration++
+	e.approvalRevision = revision
+	e.requiresApproval = false
+	e.approved = false
+	generation := e.approvalGeneration
+	e.approvalMu.Unlock()
+	return generation
+}
+
+func (e *jobExecution) markApproved(revision uint32, generation uint64) {
+	e.approvalMu.Lock()
+	if e.approvalRevision != revision || e.approvalGeneration != generation {
+		e.approvalMu.Unlock()
+		return
+	}
+	e.requiresApproval = true
+	e.approved = true
+	e.approvalMu.Unlock()
+}
+
+func (e *jobExecution) approval(revision uint32, generation uint64) (bool, bool) {
+	e.approvalMu.Lock()
+	defer e.approvalMu.Unlock()
+	if e.approvalRevision != revision || e.approvalGeneration != generation {
+		return false, false
+	}
+	return e.requiresApproval, e.approved
 }
 
 func (e *jobExecution) consumeTools(calls, maxCalls, maxRounds int) error {
@@ -315,7 +355,7 @@ func (e *jobExecution) consumeTools(calls, maxCalls, maxRounds int) error {
 	return nil
 }
 
-func (r *Runner) generate(ctx context.Context, lease Lease, control Control, execution *jobExecution) (generatedResult, error) {
+func (r *Runner) generate(ctx context.Context, lease Lease, control Control, execution *jobExecution, generation uint64) (generatedResult, error) {
 	definitions, err := r.Tools.Definitions(lease.Job.Request.Versions.ToolRegistry, lease.Job.Request.ToolAllowlist)
 	if err != nil {
 		return generatedResult{}, err
@@ -345,6 +385,15 @@ func (r *Runner) generate(ctx context.Context, lease Lease, control Control, exe
 		if err := builder.addResult(result); err != nil {
 			return generatedResult{}, err
 		}
+		if result.ProviderBlocked {
+			usage, _ := json.Marshal(result.Usage)
+			const summary = "The provider blocked this result."
+			structured := json.RawMessage(`{}`)
+			if err := builder.reserve(len(summary) + len(structured) + len(usage)); err != nil {
+				return generatedResult{}, err
+			}
+			return generatedResult{summary: summary, structured: structured, usage: usage, providerBlocked: true, budget: builder}, nil
+		}
 		if len(result.ToolCalls) == 0 {
 			if strings.TrimSpace(result.Text) == "" {
 				return generatedResult{}, errors.New("worker reasoner returned empty result")
@@ -357,7 +406,8 @@ func (r *Runner) generate(ctx context.Context, lease Lease, control Control, exe
 			if err := builder.reserve(len(summary) + len(structured) + len(usage)); err != nil {
 				return generatedResult{}, err
 			}
-			return generatedResult{summary: summary, structured: structured, usage: usage, budget: builder}, nil
+			requiresApproval, approved := execution.approval(control.ObjectiveRevision, generation)
+			return generatedResult{summary: summary, structured: structured, usage: usage, requiresApproval: requiresApproval, approved: approved, budget: builder}, nil
 		}
 		if err := execution.consumeTools(len(result.ToolCalls), r.MaxToolCalls, r.MaxToolRounds); err != nil {
 			return generatedResult{}, err
@@ -365,7 +415,7 @@ func (r *Runner) generate(ctx context.Context, lease Lease, control Control, exe
 		if int(toolOrdinal)+len(result.ToolCalls) > r.MaxToolCalls {
 			return generatedResult{}, errors.New("worker per-revision tool ordinal limit exceeded")
 		}
-		toolMessages, nextOrdinal, err := r.executeToolCalls(ctx, lease, control.ObjectiveRevision, toolOrdinal, result.ToolCalls, builder)
+		toolMessages, nextOrdinal, err := r.executeToolCalls(ctx, lease, control.ObjectiveRevision, toolOrdinal, result.ToolCalls, builder, execution, generation)
 		if err != nil {
 			return generatedResult{}, err
 		}
@@ -489,7 +539,7 @@ func (b *resultBuilder) addResult(result reasoner.Result) error {
 	return b.reserve(textMissing + argumentsMissing)
 }
 
-func (r *Runner) executeToolCalls(ctx context.Context, lease Lease, revision, startOrdinal uint32, calls []reasoner.ToolCall, builder *resultBuilder) ([]reasoner.Message, uint32, error) {
+func (r *Runner) executeToolCalls(ctx context.Context, lease Lease, revision, startOrdinal uint32, calls []reasoner.ToolCall, builder *resultBuilder, execution *jobExecution, generation uint64) ([]reasoner.Message, uint32, error) {
 	seenIDs := make(map[string]struct{}, len(calls))
 	resolved := make([]RegisteredTool, len(calls))
 	canonical := make([]json.RawMessage, len(calls))
@@ -524,7 +574,7 @@ func (r *Runner) executeToolCalls(ctx context.Context, lease Lease, revision, st
 				group.Add(1)
 				go func() {
 					defer group.Done()
-					output, executionErr := r.executeOneTool(groupCtx, lease, revision, startOrdinal+uint32(toolIndex)+1, calls[toolIndex], resolved[toolIndex], canonical[toolIndex], builder)
+					output, executionErr := r.executeOneTool(groupCtx, lease, revision, startOrdinal+uint32(toolIndex)+1, calls[toolIndex], resolved[toolIndex], canonical[toolIndex], builder, execution, generation)
 					if executionErr != nil {
 						errorMu.Lock()
 						if firstErr == nil {
@@ -545,7 +595,7 @@ func (r *Runner) executeToolCalls(ctx context.Context, lease Lease, revision, st
 			index = end
 			continue
 		}
-		output, err := r.executeOneTool(ctx, lease, revision, startOrdinal+uint32(index)+1, calls[index], resolved[index], canonical[index], builder)
+		output, err := r.executeOneTool(ctx, lease, revision, startOrdinal+uint32(index)+1, calls[index], resolved[index], canonical[index], builder, execution, generation)
 		if err != nil {
 			return nil, startOrdinal, err
 		}
@@ -559,7 +609,7 @@ func (r *Runner) executeToolCalls(ctx context.Context, lease Lease, revision, st
 	return messages, startOrdinal + uint32(len(calls)), nil
 }
 
-func (r *Runner) executeOneTool(ctx context.Context, lease Lease, revision, ordinal uint32, call reasoner.ToolCall, tool RegisteredTool, arguments json.RawMessage, builder *resultBuilder) (json.RawMessage, error) {
+func (r *Runner) executeOneTool(ctx context.Context, lease Lease, revision, ordinal uint32, call reasoner.ToolCall, tool RegisteredTool, arguments json.RawMessage, builder *resultBuilder, execution *jobExecution, generation uint64) (json.RawMessage, error) {
 	if r.ArgumentSealer == nil {
 		return nil, errors.New("worker argument sealer is required for tools")
 	}
@@ -590,6 +640,15 @@ func (r *Runner) executeOneTool(ctx context.Context, lease Lease, revision, ordi
 			return nil, errNeedsInput
 		}
 		return nil, err
+	}
+	if err := ValidateCanonicalToolApproval(invocation); err != nil {
+		return nil, err
+	}
+	if invocation.RequiresApproval {
+		if invocation.ApprovalState != ApprovalApproved {
+			return nil, errors.New("worker tool invocation was not approved")
+		}
+		execution.markApproved(revision, generation)
 	}
 	if invocation.Status == "succeeded" {
 		output, outputErr := boundedToolOutput(invocation.Result, r.MaxToolOutputBytes)
@@ -631,9 +690,20 @@ func boundedToolOutput(raw json.RawMessage, limit int) (json.RawMessage, error) 
 }
 
 func (r *Runner) persistTerminal(ctx context.Context, lease Lease, revision uint32, generated generatedResult) error {
-	candidate := safety.WorkerResultCandidate{SessionID: lease.Job.Request.SessionID, ConversationID: lease.Token.ConversationID, HandoffID: lease.Token.HandoffID, Channel: safety.ChannelWorker, Summary: generated.summary, Structured: append(json.RawMessage(nil), generated.structured...)}
+	candidate := safety.WorkerResultCandidate{SessionID: lease.Job.Request.SessionID, ConversationID: lease.Token.ConversationID, HandoffID: lease.Token.HandoffID, Channel: safety.ChannelWorker, Summary: generated.summary, Structured: append(json.RawMessage(nil), generated.structured...), RequiresApproval: generated.requiresApproval, Approved: generated.approved, ProviderBlocked: generated.providerBlocked}
 	decision := safety.EvaluateOrSuppress(ctx, r.Safety, candidate)
-	if decision.Action != safety.ActionAllow && decision.Action != safety.ActionRedact {
+	switch decision.Action {
+	case safety.ActionRequestClarification:
+		record := NeedsInputRecord{MutationID: stableMutationID(lease, revision, "safety-clarification"), ExpectedObjectiveRevision: revision, Prompt: decision.SafeSummary, Schema: json.RawMessage(`{"type":"object","properties":{"approved":{"type":"boolean"}},"required":["approved"],"additionalProperties":false}`)}
+		return retryExactMutation(ctx, func() error { return r.Store.MarkNeedsInput(ctx, lease.Token, record) })
+	case safety.ActionSuppress:
+		return r.fail(ctx, lease, revision, "safety_suppressed", "result was suppressed by safety policy")
+	case safety.ActionCancelResponse:
+		return r.fail(ctx, lease, revision, "safety_cancelled", "result was cancelled by safety policy")
+	case safety.ActionTerminateSession:
+		return r.fail(ctx, lease, revision, "safety_terminated", "session termination was requested by safety policy")
+	case safety.ActionAllow, safety.ActionRedact:
+	default:
 		return r.fail(ctx, lease, revision, "safety_suppressed", "result was suppressed by safety policy")
 	}
 	if decision.Action == safety.ActionRedact {

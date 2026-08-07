@@ -13,6 +13,9 @@ const (
 	defaultMaxToolCalls         = 64
 	defaultMaxToolArgumentBytes = 256 << 10
 	maxSSEEventBytes            = 1 << 20
+	maxBufferedCallbacks        = 16 << 10
+	maxStreamRecords            = (32 << 10) + 1024
+	maxStreamBytes              = 64 << 20
 	maxErrorBodyBytes           = 64 << 10
 )
 

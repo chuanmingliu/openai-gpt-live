@@ -9,16 +9,25 @@ import (
 
 var (
 	errEventTooLarge       = errors.New("deepseek: SSE event exceeds limit")
+	errStreamLimit         = errors.New("deepseek: SSE stream exceeds limit")
 	errUnsupportedSSEField = errors.New("deepseek: unsupported SSE field contains content")
 )
 
 type sseReader struct {
-	reader *bufio.Reader
-	limit  int
+	reader      *bufio.Reader
+	limit       int
+	byteLimit   int
+	recordLimit int
+	bytesRead   int
+	recordsRead int
 }
 
 func newSSEReader(reader *bufio.Reader, limit int) *sseReader {
-	return &sseReader{reader: reader, limit: limit}
+	return newSSEReaderWithBounds(reader, limit, maxStreamBytes, maxStreamRecords)
+}
+
+func newSSEReaderWithBounds(reader *bufio.Reader, limit, byteLimit, recordLimit int) *sseReader {
+	return &sseReader{reader: reader, limit: limit, byteLimit: byteLimit, recordLimit: recordLimit}
 }
 
 func (reader *sseReader) Next() ([]byte, error) {
@@ -72,8 +81,22 @@ func (reader *sseReader) Next() ([]byte, error) {
 
 func (reader *sseReader) readLine() ([]byte, bool, error) {
 	line := make([]byte, 0, min(reader.limit+16, 4096))
+	recordStarted := false
 	for {
 		fragment, err := reader.reader.ReadSlice('\n')
+		if len(fragment) != 0 {
+			if !recordStarted {
+				if reader.recordsRead >= reader.recordLimit {
+					return nil, false, errStreamLimit
+				}
+				reader.recordsRead++
+				recordStarted = true
+			}
+			if reader.bytesRead > reader.byteLimit || len(fragment) > reader.byteLimit-reader.bytesRead {
+				return nil, false, errStreamLimit
+			}
+			reader.bytesRead += len(fragment)
+		}
 		terminated := len(fragment) > 0 && fragment[len(fragment)-1] == '\n'
 		if terminated {
 			fragment = fragment[:len(fragment)-1]

@@ -372,15 +372,18 @@ type egressFrame struct {
 
 type voiceControl struct {
 	command realtime.Command
+	sent    chan error
 }
 
 type clientControl struct {
-	order    uint64
-	afterSeq uint64
-	event    protocol.ServerEvent
-	close    *CloseEffect
-	written  chan error
-	writeCtx context.Context
+	order       uint64
+	afterSeq    uint64
+	event       protocol.ServerEvent
+	close       *CloseEffect
+	written     chan error
+	writeCtx    context.Context
+	epoch       identity.ResponseEpoch
+	incarnation identity.Incarnation
 }
 
 type sequenceProgress struct {
@@ -468,27 +471,28 @@ func (a *activeAudioWrite) cancelAndWait() error {
 }
 
 type runState struct {
-	cfg          Config
-	ids          IDs
-	runtime      *sessionRuntime
-	voice        realtime.Session
-	client       ClientConn
-	fence        *EpochFence
-	inbox        chan reactorMessage
-	ingress      chan ingressFrame
-	ingressSlots chan struct{}
-	voiceCtl     chan voiceControl
-	egress       chan egressFrame
-	clientCtl    chan clientControl
-	inboxSlots   chan struct{}
-	voiceSlots   chan struct{}
-	clientSlots  chan struct{}
-	egressSlots  chan struct{}
-	progress     *sequenceProgress
-	activeWrite  *activeAudioWrite
-	metrics      MetricsHooks
-	subject      Subject
-	dispatcher   DurableEffectDispatcher
+	cfg                Config
+	ids                IDs
+	runtime            *sessionRuntime
+	voice              realtime.Session
+	client             ClientConn
+	fence              *EpochFence
+	inbox              chan reactorMessage
+	ingress            chan ingressFrame
+	ingressSlots       chan struct{}
+	voiceCtl           chan voiceControl
+	egress             chan egressFrame
+	clientCtl          chan clientControl
+	inboxSlots         chan struct{}
+	voiceSlots         chan struct{}
+	clientSlots        chan struct{}
+	egressSlots        chan struct{}
+	progress           *sequenceProgress
+	activeWrite        *activeAudioWrite
+	activeControlWrite *activeAudioWrite
+	metrics            MetricsHooks
+	subject            Subject
+	dispatcher         DurableEffectDispatcher
 
 	ingressSequence uint64
 	egressSequence  uint64
@@ -1140,28 +1144,29 @@ func (m *Manager) registerReplacement(runtime *sessionRuntime, logical *logicalS
 
 func newRunState(cfg Config, ids IDs, voice realtime.Session, client ClientConn, cancel context.CancelFunc) *runState {
 	state := &runState{
-		cfg:             cfg,
-		ids:             ids,
-		voice:           voice,
-		client:          client,
-		fence:           NewEpochFence(0),
-		inbox:           make(chan reactorMessage, cfg.ControlEvents),
-		ingress:         make(chan ingressFrame, cfg.IngressFrames),
-		ingressSlots:    make(chan struct{}, cfg.IngressFrames),
-		voiceCtl:        make(chan voiceControl, cfg.WriterControlEvents),
-		egress:          make(chan egressFrame, cfg.EgressFrames),
-		clientCtl:       make(chan clientControl, cfg.WriterControlEvents),
-		inboxSlots:      make(chan struct{}, cfg.ControlEvents),
-		voiceSlots:      make(chan struct{}, cfg.WriterControlEvents),
-		clientSlots:     make(chan struct{}, cfg.WriterControlEvents),
-		egressSlots:     make(chan struct{}, cfg.EgressFrames),
-		progress:        newSequenceProgress(),
-		activeWrite:     &activeAudioWrite{},
-		closeClientDone: make(chan struct{}),
-		metrics:         normalizeMetricsHooks(MetricsHooks{}),
-		dispatcher:      cfg.DurableDispatcher,
-		cancel:          cancel,
-		boundary:        Snapshot{IDs: ids, Response: ResponseIdle},
+		cfg:                cfg,
+		ids:                ids,
+		voice:              voice,
+		client:             client,
+		fence:              NewEpochFence(0),
+		inbox:              make(chan reactorMessage, cfg.ControlEvents),
+		ingress:            make(chan ingressFrame, cfg.IngressFrames),
+		ingressSlots:       make(chan struct{}, cfg.IngressFrames),
+		voiceCtl:           make(chan voiceControl, cfg.WriterControlEvents),
+		egress:             make(chan egressFrame, cfg.EgressFrames),
+		clientCtl:          make(chan clientControl, cfg.WriterControlEvents),
+		inboxSlots:         make(chan struct{}, cfg.ControlEvents),
+		voiceSlots:         make(chan struct{}, cfg.WriterControlEvents),
+		clientSlots:        make(chan struct{}, cfg.WriterControlEvents),
+		egressSlots:        make(chan struct{}, cfg.EgressFrames),
+		progress:           newSequenceProgress(),
+		activeWrite:        &activeAudioWrite{},
+		activeControlWrite: &activeAudioWrite{},
+		closeClientDone:    make(chan struct{}),
+		metrics:            normalizeMetricsHooks(MetricsHooks{}),
+		dispatcher:         cfg.DurableDispatcher,
+		cancel:             cancel,
+		boundary:           Snapshot{IDs: ids, Response: ResponseIdle},
 	}
 	for range cfg.ControlEvents {
 		state.inboxSlots <- struct{}{}
@@ -1626,6 +1631,9 @@ func (s *runState) voiceWriter(ctx context.Context) error {
 			pending = append(pending[:selected], pending[selected+1:]...)
 			err := s.voice.Send(ctx, control.command)
 			s.releaseVoiceSlot()
+			if control.sent != nil {
+				control.sent <- err
+			}
 			if err != nil {
 				return err
 			}
@@ -1791,6 +1799,10 @@ func (s *runState) reactorLoop(ctx context.Context) error {
 			}
 			dispatchCtx, finishDispatch := offerDispatchContext(ctx, message.offerCtx)
 			effects, err := reactor.ApplyContext(dispatchCtx, message.input)
+			policySuppressed := false
+			for index := range effects {
+				policySuppressed = policySuppressed || effects[index].PolicySuppressed
+			}
 			if err == nil {
 				if message.requireClientWrites {
 					for index := range effects {
@@ -1813,7 +1825,11 @@ func (s *runState) reactorLoop(ctx context.Context) error {
 			s.controlApplied.Store(message.controlSequence)
 			s.inboxSlots <- struct{}{}
 			if message.done != nil {
-				message.done <- err
+				resultErr := err
+				if resultErr == nil && policySuppressed {
+					resultErr = handoff.ErrPresentationSuppressed
+				}
+				message.done <- resultErr
 			}
 			if err != nil {
 				return err
@@ -1835,26 +1851,39 @@ func offerDispatchContext(sessionCtx, offerCtx context.Context) (context.Context
 }
 
 func (s *runState) dispatchEffects(ctx context.Context, effects []Effect, ingressAfter, egressAfter uint64) error {
-	for _, effect := range effects {
-		if effect.FlushBefore != 0 {
-			if err := s.activeWrite.cancelAndWait(); err != nil {
-				return err
-			}
-		}
+	requireVoiceAcks := false
+	for index := range effects {
+		requireVoiceAcks = requireVoiceAcks || effects[index].PolicySuppressed
 	}
-	writeAcks := make([]<-chan error, 0, len(effects))
 	for _, effect := range effects {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if effect.FlushBefore != 0 {
+			if err := s.activeWrite.cancelAndWait(); err != nil {
+				return err
+			}
+			if err := s.activeControlWrite.cancelAndWait(); err != nil {
+				return err
+			}
+		}
 		if effect.ClientEvent != nil {
-			control := clientControl{afterSeq: egressAfter, event: effect.ClientEvent, writeCtx: ctx}
+			control := clientControl{afterSeq: egressAfter, event: effect.ClientEvent, writeCtx: ctx, epoch: effect.ResponseEpoch, incarnation: effect.Incarnation}
 			if effect.RequireClientWrite {
 				control.written = make(chan error, 1)
-				writeAcks = append(writeAcks, control.written)
 			}
 			if err := s.enqueueClientControl(control); err != nil {
 				return err
+			}
+			if control.written != nil {
+				select {
+				case err := <-control.written:
+					if err != nil {
+						return err
+					}
+				case <-ctx.Done():
+					return ctx.Err()
+				}
 			}
 		}
 		if effect.Close != nil {
@@ -1863,38 +1892,34 @@ func (s *runState) dispatchEffects(ctx context.Context, effects []Effect, ingres
 				return err
 			}
 		}
-	}
-	for _, written := range writeAcks {
-		select {
-		case err := <-written:
-			if err != nil {
-				return err
+		if effect.VoiceCommand != nil {
+			command := *effect.VoiceCommand
+			if command.Kind != realtime.CommandCancelResponse && command.Kind != realtime.CommandBindResponseEpoch {
+				command.AfterSeq = ingressAfter
 			}
-		case <-ctx.Done():
-			return ctx.Err()
+			select {
+			case <-s.voiceSlots:
+			default:
+				s.metrics.queueOverflow("voice_control")
+				return ErrControlOverflow
+			}
+			control := voiceControl{command: command}
+			if requireVoiceAcks || command.Kind == realtime.CommandCancelResponse {
+				control.sent = make(chan error, 1)
+			}
+			s.pendingVoice.Add(1)
+			s.voiceCtl <- control
+			if control.sent != nil {
+				select {
+				case err := <-control.sent:
+					if err != nil {
+						return err
+					}
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
 		}
-	}
-	for _, effect := range effects {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if effect.VoiceCommand == nil {
-			continue
-		}
-		command := *effect.VoiceCommand
-		if command.Kind != realtime.CommandCancelResponse && command.Kind != realtime.CommandBindResponseEpoch {
-			command.AfterSeq = ingressAfter
-		}
-		select {
-		case <-s.voiceSlots:
-		default:
-			s.metrics.queueOverflow("voice_control")
-			return ErrControlOverflow
-		}
-		s.pendingVoice.Add(1)
-		s.voiceCtl <- voiceControl{command: command}
-	}
-	for _, effect := range effects {
 		if effect.Transcript != nil || effect.Handoff != nil {
 			if isNilInterface(s.dispatcher) {
 				return fmt.Errorf("%w: durable typed effect", ErrUnsupportedAsync)
@@ -1954,6 +1979,13 @@ func (s *runState) clientWriter(ctx context.Context) error {
 			pendingControl = nil
 			nextOrder++
 			if control.event != nil {
+				if control.epoch != 0 && (control.incarnation != s.ids.Incarnation || !s.fence.Accept(control.epoch)) {
+					if control.written != nil {
+						control.written <- nil
+					}
+					s.releaseClientSlot()
+					continue
+				}
 				writeCtx := ctx
 				if control.writeCtx != nil {
 					writeCtx = control.writeCtx
@@ -1965,11 +1997,28 @@ func (s *runState) clientWriter(ctx context.Context) error {
 					s.releaseClientSlot()
 					return err
 				}
+				finish := func() {}
+				if control.epoch != 0 {
+					writeCtx, finish = s.activeControlWrite.begin(writeCtx)
+				}
+				if control.epoch != 0 && (control.incarnation != s.ids.Incarnation || !s.fence.Accept(control.epoch)) {
+					finish()
+					if control.written != nil {
+						control.written <- nil
+					}
+					s.releaseClientSlot()
+					continue
+				}
 				err := s.client.Write(writeCtx, control.event)
+				finish()
 				if control.written != nil {
 					control.written <- err
 				}
 				if err != nil {
+					if errors.Is(err, context.Canceled) && control.epoch != 0 && !s.fence.Accept(control.epoch) {
+						s.releaseClientSlot()
+						continue
+					}
 					s.releaseClientSlot()
 					return err
 				}

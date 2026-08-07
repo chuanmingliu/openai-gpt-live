@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -16,12 +17,14 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/config"
 	"github.com/chuanmingliu/openai-gpt-live/internal/gateway"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime/s2sws"
+	"github.com/chuanmingliu/openai-gpt-live/internal/telemetry"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const providerConnectTimeout = 10 * time.Second
 
 func main() {
+	slog.SetDefault(slog.New(telemetry.NewRedactingHandler(slog.Default().Handler(), nil)))
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	if err := run(ctx, os.Args[1:], os.LookupEnv); err != nil {
@@ -43,6 +46,7 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 	if err != nil {
 		return fmt.Errorf("load gateway configuration: %w", err)
 	}
+	slog.SetDefault(slog.New(telemetry.NewRedactingHandler(slog.Default().Handler(), cfg.Safety.RedactionDeniedKeys)))
 	if err := validateComposition(cfg); err != nil {
 		return err
 	}
@@ -180,9 +184,10 @@ func composeAdmission(ctx context.Context, cfg config.Config, lookup func(string
 
 func validateComposition(cfg config.Config) error {
 	if cfg.Features.Handoffs {
-		// Task 18 supplies the configured safety policy. Authenticated admission is
-		// composed above, but durable delivery remains closed until result safety is.
-		return errors.New("handoff delivery is unavailable until configured presentation safety is installed")
+		// The reviewed safety policy now exists, but this CLI still has no durable
+		// repository/event-listener composition. Starting without those components
+		// would acknowledge work that can never be delivered.
+		return errors.New("handoff delivery is unavailable: durable repository and event listener composition is required")
 	}
 	return nil
 }

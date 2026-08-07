@@ -42,6 +42,133 @@ func TestStreamParsesSplitSSEAndOmitsReasoning(t *testing.T) {
 	assert.NotContains(t, result.Text, "private")
 }
 
+func TestStreamReturnsOnlyTrustedProviderBlockMetadata(t *testing.T) {
+	raw := "data: {\"id\":\"blocked-request\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"unsafe-provider-sentinel\"},\"finish_reason\":\"content_filter\"}]}\n\ndata: [DONE]\n\n"
+	server := testkit.NewDeepSeekServer(t, testkit.DeepSeekResponse{Chunks: [][]byte{[]byte(raw)}})
+	client := newClient(t, server.URL, server.Client())
+	var chunks []reasoner.Chunk
+	result, err := client.Stream(t.Context(), validRequest(), func(chunk reasoner.Chunk) error { chunks = append(chunks, chunk); return nil })
+	require.NoError(t, err)
+	assert.True(t, result.ProviderBlocked)
+	assert.Equal(t, "content_filter", result.FinishReason)
+	assert.Empty(t, result.Text)
+	assert.Empty(t, result.ToolCalls)
+	assert.Empty(t, chunks)
+}
+
+func TestStreamBuffersAllDeltasUntilValidatedTerminalAndDiscardsOnLateBlock(t *testing.T) {
+	raw := "data: {\"id\":\"blocked-request\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"unsafe-text\"}}]}\n\n" +
+		"data: {\"id\":\"blocked-request\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"secret\\\":\"}}]}}]}\n\n" +
+		"data: {\"id\":\"blocked-request\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"true}\"}}]}}]}\n\n" +
+		"data: {\"id\":\"blocked-request\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	server := testkit.NewDeepSeekServer(t, testkit.DeepSeekResponse{Chunks: testkit.SplitBytes(raw, 11)})
+	client, err := deepseek.New(deepseek.Config{BaseURL: server.URL, MaxOutputBytes: len("unsafe-text") + len(`{"secret":true}`), MaxToolCalls: 4, MaxToolArgumentBytes: len(`{"secret":true}`)}, server.Client())
+	require.NoError(t, err)
+	var callbacks []reasoner.Chunk
+	result, err := client.Stream(t.Context(), validRequest(), func(chunk reasoner.Chunk) error { callbacks = append(callbacks, chunk.Clone()); return nil })
+	require.NoError(t, err)
+	assert.True(t, result.ProviderBlocked)
+	assert.Empty(t, result.Text)
+	assert.Empty(t, result.ToolCalls)
+	assert.Empty(t, callbacks)
+}
+
+func TestStreamLateBlockOutranksQuarantineByteAndCallbackOverflow(t *testing.T) {
+	t.Run("byte limit plus one", func(t *testing.T) {
+		raw := "data: {\"id\":\"blocked\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"123456789\"}}]}\n\n" +
+			"data: {\"id\":\"blocked\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\ndata: [DONE]\n\n"
+		result, callbacks, err := runQuarantineStream(t, raw, 8)
+		require.NoError(t, err)
+		assert.True(t, result.ProviderBlocked)
+		assert.Empty(t, result.Text)
+		assert.Empty(t, result.ToolCalls)
+		assert.Zero(t, callbacks)
+	})
+
+	t.Run("callback limit plus one", func(t *testing.T) {
+		const callbackLimit = 16 << 10
+		const delta = "data: {\"id\":\"blocked\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0}]}}]}\n\n"
+		var raw strings.Builder
+		raw.Grow((callbackLimit + 1) * len(delta))
+		for range callbackLimit + 1 {
+			raw.WriteString(delta)
+		}
+		raw.WriteString("data: {\"id\":\"blocked\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\ndata: [DONE]\n\n")
+		result, callbacks, err := runQuarantineStream(t, raw.String(), 1<<20)
+		require.NoError(t, err)
+		assert.True(t, result.ProviderBlocked)
+		assert.Empty(t, result.Text)
+		assert.Empty(t, result.ToolCalls)
+		assert.Zero(t, callbacks)
+	})
+}
+
+func TestStreamQuarantineOverflowDrainsToSafeTerminalOrDeterministicFailure(t *testing.T) {
+	t.Run("safe terminal", func(t *testing.T) {
+		raw := "data: {\"id\":\"safe\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"123456789\"}}]}\n\n" +
+			"data: {\"id\":\"safe\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+		_, callbacks, err := runQuarantineStream(t, raw, 8)
+		var providerErr *reasoner.ProviderError
+		require.ErrorAs(t, err, &providerErr)
+		assert.Equal(t, "output_limit", providerErr.Code)
+		assert.Zero(t, callbacks)
+	})
+
+	t.Run("malformed after overflow", func(t *testing.T) {
+		raw := "data: {\"id\":\"safe\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"123456789\"}}]}\n\ndata: {\n\n"
+		_, callbacks, err := runQuarantineStream(t, raw, 8)
+		var providerErr *reasoner.ProviderError
+		require.ErrorAs(t, err, &providerErr)
+		assert.Equal(t, "malformed_chunk", providerErr.Code)
+		assert.Zero(t, callbacks)
+	})
+
+	t.Run("provider error after overflow", func(t *testing.T) {
+		raw := "data: {\"id\":\"safe\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"123456789\"}}]}\n\n" +
+			"data: {\"id\":\"safe\",\"error\":{\"code\":\"overloaded\",\"message\":\"bounded\"}}\n\n"
+		_, callbacks, err := runQuarantineStream(t, raw, 8)
+		var providerErr *reasoner.ProviderError
+		require.ErrorAs(t, err, &providerErr)
+		assert.Equal(t, "overloaded", providerErr.Code)
+		assert.Zero(t, callbacks)
+	})
+
+	t.Run("cancellation after overflow", func(t *testing.T) {
+		raw := "data: {\"id\":\"safe\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"123456789\"}}]}\n\n"
+		server := testkit.NewDeepSeekServer(t, testkit.DeepSeekResponse{Chunks: [][]byte{[]byte(raw)}, Stall: true})
+		client, err := deepseek.New(deepseek.Config{BaseURL: server.URL, MaxOutputBytes: 8, MaxToolCalls: 4, MaxToolArgumentBytes: 64}, server.Client())
+		require.NoError(t, err)
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() {
+			_, streamErr := client.Stream(ctx, validRequest(), func(reasoner.Chunk) error { return nil })
+			done <- streamErr
+		}()
+		<-server.Started
+		select {
+		case err := <-done:
+			t.Fatalf("stream returned before terminal status: %v", err)
+		case <-time.After(50 * time.Millisecond):
+		}
+		cancel()
+		assert.ErrorIs(t, <-done, context.Canceled)
+	})
+}
+
+func TestStreamReplaysBufferedCallbacksInOriginalOrderOnlyAfterValidDone(t *testing.T) {
+	raw := "data: {\"id\":\"request\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"first\"}}]}\n\n" +
+		"data: {\"id\":\"request\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"second\"},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	server := testkit.NewDeepSeekServer(t, testkit.DeepSeekResponse{Chunks: [][]byte{[]byte(raw)}})
+	client := newClient(t, server.URL, server.Client())
+	var callbacks []reasoner.Chunk
+	result, err := client.Stream(t.Context(), validRequest(), func(chunk reasoner.Chunk) error { callbacks = append(callbacks, chunk.Clone()); return nil })
+	require.NoError(t, err)
+	assert.Equal(t, "firstsecond", result.Text)
+	assert.Equal(t, []reasoner.Chunk{{Text: "first"}, {Text: "second"}}, callbacks)
+}
+
 func TestStreamSerializesOnlyProviderContractAndSafetyID(t *testing.T) {
 	server := testkit.NewDeepSeekServer(t, testkit.DeepSeekResponse{Chunks: [][]byte{[]byte("data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")}})
 	client := newClientWithKey(t, server.URL, server.Client(), "secret-key")
@@ -293,7 +420,7 @@ func TestStreamCancellationCallbackAndTransportFailures(t *testing.T) {
 		}
 	})
 	t.Run("callback", func(t *testing.T) {
-		server := testkit.NewDeepSeekServer(t, testkit.DeepSeekResponse{Chunks: [][]byte{[]byte("data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}]}\n\n")}, Stall: true})
+		server := testkit.NewDeepSeekServer(t, testkit.DeepSeekResponse{Chunks: [][]byte{[]byte("data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")}})
 		client := newClient(t, server.URL, server.Client())
 		callbackErr := errors.New("stop callback")
 		_, err := client.Stream(t.Context(), validRequest(), func(reasoner.Chunk) error { return callbackErr })
@@ -392,7 +519,6 @@ func TestStreamEnforcesFinishReasonToolCallConsistencyBeforeCallback(t *testing.
 		"earlier calls with stop": {
 			stream: "data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]}}]}\n\n" +
 				"data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
-			wantCallbacks: 1,
 		},
 	}
 	for name, test := range tests {
@@ -430,12 +556,10 @@ func TestStreamResourceFinishTakesPrecedenceOverPartialOutput(t *testing.T) {
 	}{
 		"no fragments": {stream: resourceTerminal},
 		"prior text": {
-			stream:        "data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial-text\"}}]}\n\n" + resourceTerminal,
-			wantCallbacks: 1,
+			stream: "data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial-text\"}}]}\n\n" + resourceTerminal,
 		},
 		"prior tool fragment": {
-			stream:        "data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\"}}]}}]}\n\n" + resourceTerminal,
-			wantCallbacks: 1,
+			stream: "data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\"}}]}}]}\n\n" + resourceTerminal,
 		},
 		"same chunk tool fragment": {
 			stream: "data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"must-not-deliver\",\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\"}}]},\"finish_reason\":\"insufficient_system_resource\"}]}\n\ndata: [DONE]\n\n",
@@ -514,7 +638,7 @@ func TestStreamToolArgumentsHonorExactAggregateBoundaries(t *testing.T) {
 
 func TestStreamClosesBodyAfterCallbackFailure(t *testing.T) {
 	closed := make(chan struct{})
-	body := &trackingBody{Reader: strings.NewReader("data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}]}\n\n"), closed: closed}
+	body := &trackingBody{Reader: strings.NewReader("data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"), closed: closed}
 	httpClient := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: body}, nil
 	})}
@@ -731,6 +855,21 @@ func runBufferedToolStream(t *testing.T, stream string, limit int) (reasoner.Res
 	client, err := deepseek.New(deepseek.Config{BaseURL: "http://provider.example", MaxRequestBytes: 1 << 20, MaxOutputBytes: limit, MaxToolCalls: 2, MaxToolArgumentBytes: limit}, httpClient)
 	require.NoError(t, err)
 	return client.Stream(t.Context(), validRequest(), func(reasoner.Chunk) error { return nil })
+}
+
+func runQuarantineStream(t *testing.T, stream string, limit int) (reasoner.Result, int, error) {
+	t.Helper()
+	httpClient := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(stream))}, nil
+	})}
+	client, err := deepseek.New(deepseek.Config{BaseURL: "http://provider.example", MaxRequestBytes: 1 << 20, MaxOutputBytes: limit, MaxToolCalls: 4, MaxToolArgumentBytes: 64}, httpClient)
+	require.NoError(t, err)
+	callbacks := 0
+	result, streamErr := client.Stream(t.Context(), validRequest(), func(reasoner.Chunk) error {
+		callbacks++
+		return nil
+	})
+	return result, callbacks, streamErr
 }
 
 func (body *trackingBody) Close() error {

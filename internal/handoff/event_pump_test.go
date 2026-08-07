@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -142,6 +143,56 @@ func TestEventPumpOrdersOffersAndAdvancesEachExactCursor(t *testing.T) {
 		defer store.mu.Unlock()
 		return assert.Equal(t, []int64{7, 11}, store.advances)
 	}, time.Second, time.Millisecond)
+}
+
+func TestEventPumpExplicitSafetySuppressionAdvancesCursor(t *testing.T) {
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "conversation"}
+	store := newPumpStore()
+	store.events[scope] = []handoff.Event{pumpEvent(scope, 1, "handoff.progress", handoff.StateRunning)}
+	store.sinkErr = handoff.ErrPresentationSuppressed
+	pump := &handoff.EventPump{Reader: store, Cursors: store, Sink: store, Clock: clock.Real{}, PollInterval: time.Millisecond}
+	require.NoError(t, pump.Register(handoff.EventSubscription{ConsumerID: "consumer", Scope: scope}))
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- pump.Run(ctx) }()
+	require.Eventually(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return store.cursors[pumpKey("consumer", scope)] == 1
+	}, time.Second, time.Millisecond)
+	cancel()
+	assert.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestEventPumpRejectsWrappedJoinedAndForgedPresentationSuppression(t *testing.T) {
+	tests := map[string]error{
+		"wrapped": fmt.Errorf("context: %w", handoff.ErrPresentationSuppressed),
+		"joined":  errors.Join(errors.New("context"), handoff.ErrPresentationSuppressed),
+		"forged":  errors.New(handoff.ErrPresentationSuppressed.Error()),
+	}
+	for name, sinkErr := range tests {
+		t.Run(name, func(t *testing.T) {
+			scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "conversation"}
+			store := newPumpStore()
+			store.events[scope] = []handoff.Event{pumpEvent(scope, 1, "handoff.progress", handoff.StateRunning)}
+			store.sinkErr = sinkErr
+			pump := &handoff.EventPump{Reader: store, Cursors: store, Sink: store, Clock: clock.Real{}, PollInterval: time.Millisecond}
+			require.NoError(t, pump.Register(handoff.EventSubscription{ConsumerID: "consumer", Scope: scope}))
+			ctx, cancel := context.WithCancel(t.Context())
+			done := make(chan error, 1)
+			go func() { done <- pump.Run(ctx) }()
+			select {
+			case <-store.offerCalls:
+			case <-time.After(time.Second):
+				t.Fatal("event was not offered")
+			}
+			cancel()
+			assert.ErrorIs(t, <-done, context.Canceled)
+			store.mu.Lock()
+			defer store.mu.Unlock()
+			assert.Zero(t, store.cursors[pumpKey("consumer", scope)])
+		})
+	}
 }
 
 func TestEventPumpReconnectReplayUsesClientCursorWithoutRollingBackGlobalCursor(t *testing.T) {

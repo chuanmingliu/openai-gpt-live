@@ -18,9 +18,11 @@ import (
 )
 
 type Client struct {
-	config   Config
-	endpoint *url.URL
-	http     *http.Client
+	config            Config
+	endpoint          *url.URL
+	http              *http.Client
+	streamByteLimit   int
+	streamRecordLimit int
 }
 
 func New(config Config, httpClient *http.Client) (*Client, error) {
@@ -31,7 +33,13 @@ func New(config Config, httpClient *http.Client) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{config: validated, endpoint: endpoint, http: httpClient}, nil
+	return &Client{
+		config:            validated,
+		endpoint:          endpoint,
+		http:              httpClient,
+		streamByteLimit:   maxStreamBytes,
+		streamRecordLimit: maxStreamRecords,
+	}, nil
 }
 
 type providerRequest struct {
@@ -222,12 +230,22 @@ type toolDeltaPlan struct {
 }
 
 func (client *Client) readStream(ctx context.Context, body io.Reader, onChunk func(reasoner.Chunk) error) (reasoner.Result, error) {
-	reader := newSSEReader(bufio.NewReaderSize(body, 32<<10), maxSSEEventBytes)
+	streamByteLimit := client.streamByteLimit
+	if streamByteLimit <= 0 {
+		streamByteLimit = maxStreamBytes
+	}
+	streamRecordLimit := client.streamRecordLimit
+	if streamRecordLimit <= 0 {
+		streamRecordLimit = maxStreamRecords
+	}
+	reader := newSSEReaderWithBounds(bufio.NewReaderSize(body, 32<<10), maxSSEEventBytes, streamByteLimit, streamRecordLimit)
 	result := reasoner.Result{}
 	var answer strings.Builder
 	tools := make(map[int]*toolAccumulator)
 	toolArgumentBytes := 0
 	var terminalToolCalls []reasoner.ToolCall
+	bufferedCallbacks := make([]reasoner.Chunk, 0, 16)
+	quarantineOverflow := false
 	terminal := false
 	usageSeen := false
 	for {
@@ -238,6 +256,9 @@ func (client *Client) readStream(ctx context.Context, body io.Reader, onChunk fu
 		if err != nil {
 			if contextErr := ctx.Err(); contextErr != nil {
 				return reasoner.Result{}, contextErr
+			}
+			if errors.Is(err, errStreamLimit) {
+				return reasoner.Result{}, providerError("stream_limit", "", 0, false, 0)
 			}
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				return reasoner.Result{}, providerError("truncated_stream", "", 0, true, 0)
@@ -291,11 +312,29 @@ func (client *Client) readStream(ctx context.Context, body io.Reader, onChunk fu
 			result.FinishReason = *choice.FinishReason
 			continue
 		}
+		if choice.FinishReason != nil && *choice.FinishReason == "content_filter" {
+			terminal = true
+			result.FinishReason = *choice.FinishReason
+			result.ProviderBlocked = true
+			continue
+		}
+		if quarantineOverflow {
+			if choice.FinishReason != nil {
+				terminal = true
+				result.FinishReason = *choice.FinishReason
+			}
+			continue
+		}
 		callbackChunk := reasoner.Chunk{}
 		if choice.Delta.Content != nil {
 			callbackChunk.Text = *choice.Delta.Content
 			if exceedsLimit(answer.Len()+toolArgumentBytes, len(callbackChunk.Text), client.config.MaxOutputBytes) {
-				return reasoner.Result{}, providerError("output_limit", "", 0, false, 0)
+				quarantineOverflow = true
+				if choice.FinishReason != nil {
+					terminal = true
+					result.FinishReason = *choice.FinishReason
+				}
+				continue
 			}
 		}
 		plans, deltas, addedArgumentBytes, err := client.planToolDeltas(
@@ -304,9 +343,25 @@ func (client *Client) readStream(ctx context.Context, body io.Reader, onChunk fu
 			answer.Len()+toolArgumentBytes+len(callbackChunk.Text),
 		)
 		if err != nil {
+			if quarantineOutputLimit(err) {
+				quarantineOverflow = true
+				if choice.FinishReason != nil {
+					terminal = true
+					result.FinishReason = *choice.FinishReason
+				}
+				continue
+			}
 			return reasoner.Result{}, err
 		}
 		callbackChunk.ToolCalls = deltas
+		if (callbackChunk.Text != "" || len(callbackChunk.ToolCalls) != 0) && len(bufferedCallbacks) == maxBufferedCallbacks {
+			quarantineOverflow = true
+			if choice.FinishReason != nil {
+				terminal = true
+				result.FinishReason = *choice.FinishReason
+			}
+			continue
+		}
 		if choice.FinishReason != nil {
 			assembled, err := assembleProjectedTools(tools, plans, client.config.MaxToolCalls)
 			if err != nil {
@@ -326,15 +381,7 @@ func (client *Client) readStream(ctx context.Context, body io.Reader, onChunk fu
 			result.FinishReason = *choice.FinishReason
 		}
 		if callbackChunk.Text != "" || len(callbackChunk.ToolCalls) != 0 {
-			if err := ctx.Err(); err != nil {
-				return reasoner.Result{}, err
-			}
-			if err := onChunk(callbackChunk.Clone()); err != nil {
-				return reasoner.Result{}, err
-			}
-			if err := ctx.Err(); err != nil {
-				return reasoner.Result{}, err
-			}
+			bufferedCallbacks = append(bufferedCallbacks, callbackChunk.Clone())
 		}
 	}
 	if result.FinishReason == "insufficient_system_resource" {
@@ -343,9 +390,34 @@ func (client *Client) readStream(ctx context.Context, body io.Reader, onChunk fu
 	if err := ctx.Err(); err != nil {
 		return reasoner.Result{}, err
 	}
+	if result.FinishReason == "content_filter" {
+		result.Text = ""
+		result.ToolCalls = nil
+		result.ProviderBlocked = true
+		return result, nil
+	}
+	if quarantineOverflow {
+		return reasoner.Result{}, providerError("output_limit", "", 0, false, 0)
+	}
 	result.Text = answer.String()
 	result.ToolCalls = terminalToolCalls
+	for _, callback := range bufferedCallbacks {
+		if err := ctx.Err(); err != nil {
+			return reasoner.Result{}, err
+		}
+		if err := onChunk(callback.Clone()); err != nil {
+			return reasoner.Result{}, err
+		}
+		if err := ctx.Err(); err != nil {
+			return reasoner.Result{}, err
+		}
+	}
 	return result, nil
+}
+
+func quarantineOutputLimit(err error) bool {
+	var providerErr *reasoner.ProviderError
+	return errors.As(err, &providerErr) && providerErr != nil && providerErr.Code == "tool_output_limit"
 }
 
 func (client *Client) planToolDeltas(
