@@ -1,0 +1,13 @@
+DROP TABLE deletion_audits;
+DROP TABLE session_admission_leases;
+DROP TABLE delivery_cursors;
+DROP TABLE tool_invocations;
+DROP TABLE outbox;
+DROP TABLE handoff_events;
+DROP TABLE handoffs;
+DROP TABLE conversation_items;
+DROP TABLE conversations;
+DROP FUNCTION outbox_payload_keys_valid(JSON);
+DROP FUNCTION tool_allowlist_valid(JSON);
+DROP FUNCTION canonical_json_depth_valid(JSON);
+DROP FUNCTION canonical_tool_name_bytes(TEXT);
