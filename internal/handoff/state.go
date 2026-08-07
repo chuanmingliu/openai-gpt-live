@@ -76,6 +76,13 @@ func ValidateCreateRequest(request CreateRequest, now time.Time) (CreateRequest,
 	return normalizeCreateRequest(request, now, true)
 }
 
+// NormalizeCreateRequest validates and canonicalizes immutable request fields
+// without deciding whether its deadline is still in the future. Durable
+// repositories use this before an atomic replay-or-create decision.
+func NormalizeCreateRequest(request CreateRequest) (CreateRequest, error) {
+	return normalizeCreateRequest(request, time.Time{}, false)
+}
+
 func normalizeCreateRequest(request CreateRequest, now time.Time, checkFuture bool) (CreateRequest, error) {
 	request = cloneRequest(request)
 	if err := validateScope(request.Scope); err != nil {

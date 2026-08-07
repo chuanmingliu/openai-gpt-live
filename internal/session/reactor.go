@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"unicode/utf8"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
@@ -18,8 +20,15 @@ const (
 	PendingBackgroundToolBytes = 1 << 20
 	PendingSessionUpdateLimit  = 16
 	PendingSessionUpdateBytes  = 1 << 20
+	PendingHandoffResultLimit  = 16
+	PendingHandoffResultBytes  = 64 << 10
+	DurableIdentifierBytes     = 256
+	DurableTranscriptBytes     = 64 << 10
+	DurableArgumentsBytes      = 64 << 10
 
-	StartBackgroundTaskTool              = "start_background_task"
+	StartBackgroundTaskTool              = handoff.ToolStartBackgroundTask
+	SteerBackgroundTaskTool              = handoff.ToolSteerBackgroundTask
+	CancelBackgroundTaskTool             = handoff.ToolCancelBackgroundTask
 	DurableKindTurnProvisional           = "turn.provisional"
 	DurableKindTurnCommitted             = "turn.committed"
 	AsyncKindStartBackgroundTask         = StartBackgroundTaskTool
@@ -63,6 +72,30 @@ type activeInputTurn struct {
 	key                identity.TurnKey
 	committed          bool
 	transcriptComplete bool
+	transcript         string
+	durableSequence    uint64
+}
+
+type handoffCall struct {
+	originEpoch identity.ResponseEpoch
+	turn        identity.TurnKey
+	responseID  string
+	callID      string
+	completed   *HandoffAcceptedInput
+	emitted     bool
+	bytes       int
+}
+
+type handoffToken struct {
+	originEpoch identity.ResponseEpoch
+	turn        identity.TurnKey
+	responseID  string
+	callID      string
+}
+
+type finalizedTranscript struct {
+	turn identity.TurnKey
+	text string
 }
 
 type Reactor struct {
@@ -84,6 +117,17 @@ type Reactor struct {
 	inputTurnRevision         uint32
 	pendingCancelSequence     uint64
 	synthEventSequence        uint64
+	transcriptSequence        uint64
+	committedTranscript       string
+	handoffCalls              map[string]*handoffCall
+	handoffCallOrder          []string
+	handoffCallBytes          int
+	terminalResponses         map[string]struct{}
+	finalizedAssistantTexts   map[string]finalizedTranscript
+	finalizedAssistantOrder   []string
+	finalizedAssistantBytes   int
+	resolvedHandoffs          map[handoffToken]struct{}
+	resolvedHandoffOrder      []handoffToken
 }
 
 func NewReactor(ids IDs, fence *EpochFence) *Reactor {
@@ -91,11 +135,15 @@ func NewReactor(ids IDs, fence *EpochFence) *Reactor {
 		fence = NewEpochFence(0)
 	}
 	reactor := &Reactor{
-		ids:                   ids,
-		state:                 State{Response: ResponseIdle},
-		fence:                 fence,
-		nextSeq:               1,
-		pendingSessionUpdates: make(map[uint64]pendingSessionUpdate),
+		ids:                     ids,
+		state:                   State{Response: ResponseIdle},
+		fence:                   fence,
+		nextSeq:                 1,
+		pendingSessionUpdates:   make(map[uint64]pendingSessionUpdate),
+		handoffCalls:            make(map[string]*handoffCall),
+		terminalResponses:       make(map[string]struct{}),
+		finalizedAssistantTexts: make(map[string]finalizedTranscript),
+		resolvedHandoffs:        make(map[handoffToken]struct{}),
 	}
 	reactor.initErr = validateSessionIDs(ids)
 	return reactor
@@ -132,6 +180,12 @@ func (r *Reactor) Apply(input Input) ([]Effect, error) {
 		return r.applyVoiceCommandCompleted(typed)
 	case DurableInput:
 		return r.applyDurable(typed)
+	case TurnCommittedInput:
+		return r.applyTurnCommitted(typed)
+	case TranscriptPersistedInput:
+		return r.applyTranscriptPersisted(typed)
+	case HandoffAcceptedInput:
+		return r.applyHandoffAccepted(typed)
 	case FailedInput:
 		return r.applyFailed(typed)
 	default:
@@ -207,6 +261,220 @@ func (r *Reactor) applyDurable(input DurableInput) ([]Effect, error) {
 		r.state.LastDurableSeq = input.Sequence
 		return nil, nil
 	}
+}
+
+func (r *Reactor) applyTranscriptPersisted(input TranscriptPersistedInput) ([]Effect, error) {
+	if input.Sequence <= r.state.LastDurableSeq {
+		return nil, nil
+	}
+	want := r.state.LastDurableSeq + 1
+	if input.Sequence != want {
+		return nil, fmt.Errorf("%w: got %d, want %d", ErrDurableSequenceGap, input.Sequence, want)
+	}
+	r.state.LastDurableSeq = input.Sequence
+	return nil, nil
+}
+
+func (r *Reactor) applyTurnCommitted(input TurnCommittedInput) ([]Effect, error) {
+	if input.Sequence <= r.state.LastDurableSeq {
+		return nil, nil
+	}
+	want := r.state.LastDurableSeq + 1
+	if input.Sequence != want {
+		return nil, fmt.Errorf("%w: got %d, want %d", ErrDurableSequenceGap, input.Sequence, want)
+	}
+	if input.Turn.ID == "" || input.Turn.Revision == 0 || input.Transcript == "" {
+		return nil, errors.New("committed turn requires turn and transcript")
+	}
+	if err := validateDurableID("committed turn ID", input.Turn.ID); err != nil {
+		return nil, err
+	}
+	if err := validateDurableText("committed transcript", input.Transcript); err != nil {
+		return nil, err
+	}
+	if input.Turn.Revision < r.inputTurnRevision {
+		return r.applyTypedStaleTurnCommit(input)
+	}
+	if input.Turn.Revision == r.inputTurnRevision && r.activeTurn != nil && r.activeTurn.key != input.Turn {
+		return nil, fmt.Errorf("%w: revision %d belongs to active turn %q", ErrTurnRevisionRegression, input.Turn.Revision, r.activeTurn.key.ID)
+	}
+	if r.activeTurn != nil && r.activeTurn.key == input.Turn && r.activeTurn.transcriptComplete {
+		if r.activeTurn.transcript != input.Transcript ||
+			(r.activeTurn.durableSequence != 0 && r.activeTurn.durableSequence != input.Sequence) {
+			return nil, errors.New("committed turn does not match finalized transcript work")
+		}
+	}
+
+	prepared, err := r.preparePendingToolEffects(input.Turn)
+	if err != nil {
+		return nil, err
+	}
+	isCurrent := r.activeTurn != nil && r.activeTurn.key == input.Turn
+	isNew := input.Turn.Revision > r.inputTurnRevision
+	r.state.CommittedTurn = cloneTurn(&input.Turn)
+	r.committedTranscript = input.Transcript
+	if isNew {
+		r.activeTurn = &activeInputTurn{key: input.Turn, committed: true, transcriptComplete: true, transcript: input.Transcript}
+		r.inputTurnRevision = input.Turn.Revision
+	} else if isCurrent {
+		r.activeTurn.committed = true
+		r.activeTurn.transcript = input.Transcript
+	}
+	r.state.LastDurableSeq = input.Sequence
+	r.pendingTools = nil
+	r.pendingToolBytes = 0
+
+	effects := make([]Effect, 0, len(prepared))
+	for index := range prepared {
+		prepared[index].Sequence = r.allocateSequence()
+		legacy := prepared[index]
+		var payload toolAsyncPayload
+		if err := json.Unmarshal(legacy.Payload, &payload); err != nil {
+			return nil, fmt.Errorf("decode prepared handoff: %w", err)
+		}
+		handoffEffect := HandoffRequestedEffect{
+			ResponseID: payload.ResponseID, CallID: payload.CallID, ToolName: payload.Name,
+			Arguments: cloneRaw(payload.Arguments), Turn: payload.Turn,
+			Transcript: input.Transcript, RejectReason: payload.Reason,
+		}
+		if call := r.handoffCalls[payload.CallID]; call != nil {
+			call.turn = payload.Turn
+			handoffEffect.OriginEpoch = call.originEpoch
+		}
+		effects = append(effects, Effect{Async: &legacy, Handoff: &handoffEffect})
+	}
+	return effects, nil
+}
+
+func (r *Reactor) applyTypedStaleTurnCommit(input TurnCommittedInput) ([]Effect, error) {
+	legacy, err := r.applyStaleTurnCommit(input.Sequence, input.Turn)
+	if err != nil {
+		return nil, err
+	}
+	for index := range legacy {
+		if legacy[index].Async == nil {
+			continue
+		}
+		var payload toolAsyncPayload
+		if err := json.Unmarshal(legacy[index].Async.Payload, &payload); err != nil {
+			return nil, err
+		}
+		legacy[index].Handoff = &HandoffRequestedEffect{
+			ResponseID: payload.ResponseID, CallID: payload.CallID, ToolName: payload.Name,
+			Arguments: cloneRaw(payload.Arguments), Turn: payload.Turn,
+			Transcript: input.Transcript, RejectReason: payload.Reason,
+		}
+		if call := r.handoffCalls[payload.CallID]; call != nil {
+			legacy[index].Handoff.OriginEpoch = call.originEpoch
+		}
+	}
+	return legacy, nil
+}
+
+func (r *Reactor) applyHandoffAccepted(input HandoffAcceptedInput) ([]Effect, error) {
+	for name, value := range map[string]string{
+		"completion response ID": input.ResponseID,
+		"completion call ID":     input.CallID,
+		"completion turn ID":     input.Turn.ID,
+		"completion handoff ID":  string(input.HandoffID),
+	} {
+		if value != "" {
+			if err := validateDurableID(name, value); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if len(input.Reason) > 1024 || !utf8.ValidString(input.Reason) {
+		return nil, errors.New("completion reason exceeds durable-work bounds")
+	}
+	token := handoffToken{
+		originEpoch: input.OriginEpoch, turn: input.Turn, responseID: input.ResponseID, callID: input.CallID,
+	}
+	if _, resolved := r.resolvedHandoffs[token]; resolved {
+		return nil, nil
+	}
+	call := r.handoffCalls[input.CallID]
+	if call == nil || input.ResponseID == "" || call.responseID != input.ResponseID ||
+		call.originEpoch != input.OriginEpoch || call.turn != input.Turn || call.emitted || call.completed != nil {
+		return nil, nil
+	}
+	if input.Accepted == (input.HandoffID == "") {
+		return nil, errors.New("accepted handoff result has inconsistent durable ID")
+	}
+	owned := input
+	retained := len(owned.ResponseID) + len(owned.CallID) + len(owned.HandoffID) + len(owned.Reason)
+	if retained > PendingHandoffResultBytes-r.handoffCallBytes {
+		return nil, ErrPendingToolLimit
+	}
+	call.completed = &owned
+	call.bytes += retained
+	r.handoffCallBytes += retained
+	if _, terminal := r.terminalResponses[input.ResponseID]; !terminal {
+		return nil, nil
+	}
+	return r.emitHandoffAcceptance(call)
+}
+
+func (r *Reactor) emitHandoffAcceptance(call *handoffCall) ([]Effect, error) {
+	if call == nil || call.completed == nil || call.emitted {
+		return nil, nil
+	}
+	if r.state.Response != ResponseIdle && r.state.Response != ResponseTerminal {
+		return nil, nil
+	}
+	output := struct {
+		Accepted  bool               `json:"accepted"`
+		HandoffID identity.HandoffID `json:"handoff_id,omitempty"`
+		Reason    string             `json:"reason,omitempty"`
+	}{Accepted: call.completed.Accepted, HandoffID: call.completed.HandoffID, Reason: call.completed.Reason}
+	outputRaw, err := json.Marshal(output)
+	if err != nil {
+		return nil, err
+	}
+	itemRaw, err := json.Marshal(struct {
+		Type   string `json:"type"`
+		CallID string `json:"call_id"`
+		Output string `json:"output"`
+	}{Type: "function_call_output", CallID: call.callID, Output: string(outputRaw)})
+	if err != nil {
+		return nil, err
+	}
+	itemCommand := realtime.Command{Kind: realtime.CommandCreateItem, Sequence: r.allocateSequence(), Item: itemRaw}
+	epoch := r.fence.Advance()
+	responseCommand := realtime.Command{Kind: realtime.CommandCreateResponse, Sequence: r.allocateSequence(), Epoch: epoch}
+	r.state.Response = ResponsePending
+	r.activeResponseID = ""
+	r.activeResponseEpoch = epoch
+	r.terminal = nil
+	r.pendingCancelSequence = 0
+	call.emitted = true
+	r.handoffCallBytes -= call.bytes
+	token := handoffToken{originEpoch: call.originEpoch, turn: call.turn, responseID: call.responseID, callID: call.callID}
+	if len(r.resolvedHandoffOrder) >= PendingHandoffResultLimit*2 {
+		oldest := r.resolvedHandoffOrder[0]
+		r.resolvedHandoffOrder = r.resolvedHandoffOrder[1:]
+		delete(r.resolvedHandoffs, oldest)
+	}
+	r.resolvedHandoffs[token] = struct{}{}
+	r.resolvedHandoffOrder = append(r.resolvedHandoffOrder, token)
+	delete(r.handoffCalls, call.callID)
+	for index, callID := range r.handoffCallOrder {
+		if callID == call.callID {
+			r.handoffCallOrder = append(r.handoffCallOrder[:index], r.handoffCallOrder[index+1:]...)
+			break
+		}
+	}
+	responseStillReferenced := false
+	for _, pending := range r.handoffCalls {
+		if pending != nil && pending.responseID == call.responseID {
+			responseStillReferenced = true
+			break
+		}
+	}
+	if !responseStillReferenced {
+		delete(r.terminalResponses, call.responseID)
+	}
+	return []Effect{{VoiceCommand: &itemCommand}, {VoiceCommand: &responseCommand}}, nil
 }
 
 func (r *Reactor) applyStaleTurnCommit(sequence uint64, turn identity.TurnKey) ([]Effect, error) {
@@ -302,6 +570,7 @@ func (r *Reactor) applyConnected(input ConnectedInput) ([]Effect, error) {
 	}
 
 	effects := make([]Effect, 0, 3)
+	terminalizedPending := false
 	if r.connected {
 		r.clearPendingSessionUpdates()
 		epoch := r.fence.Advance()
@@ -309,6 +578,7 @@ func (r *Reactor) applyConnected(input ConnectedInput) ([]Effect, error) {
 		if r.state.Response == ResponsePending {
 			r.activeResponseEpoch = epoch
 			r.state.Response = ResponseTerminal
+			terminalizedPending = true
 		} else if r.state.Response == ResponseStreaming || r.state.Response == ResponseCancelRequested {
 			r.activeResponseEpoch = epoch
 			terminal, err := r.synthesizeResponseDone("cancelled")
@@ -327,6 +597,13 @@ func (r *Reactor) applyConnected(input ConnectedInput) ([]Effect, error) {
 		Session: cloneRaw(providerSession),
 	}
 	effects = append(effects, Effect{ClientEvent: created})
+	if terminalizedPending {
+		acceptance, err := r.emitNextReadyHandoffAcceptance()
+		if err != nil {
+			return nil, err
+		}
+		effects = append(effects, acceptance...)
+	}
 	return effects, nil
 }
 
@@ -451,10 +728,18 @@ func (r *Reactor) applyResponseCancel(event protocol.ResponseCancelEvent) ([]Eff
 	} else {
 		r.state.Response = ResponseCancelRequested
 	}
-	return []Effect{
+	effects := []Effect{
 		{FlushBefore: epoch},
 		{VoiceCommand: &command},
-	}, nil
+	}
+	if r.state.Response == ResponseTerminal {
+		acceptance, err := r.emitNextReadyHandoffAcceptance()
+		if err != nil {
+			return nil, err
+		}
+		effects = append(effects, acceptance...)
+	}
+	return effects, nil
 }
 
 func (r *Reactor) applyVoice(input VoiceInput) ([]Effect, error) {
@@ -569,8 +854,8 @@ func (r *Reactor) applyExplicitResponseCreated(event realtime.Event) ([]Effect, 
 	if r.state.Response != ResponsePending {
 		return nil, fmt.Errorf("%w: response.created from state %d", ErrInvalidTransition, r.state.Response)
 	}
-	if event.ResponseID == "" {
-		return nil, fmt.Errorf("%w: response.created has empty response ID", ErrInvalidTransition)
+	if err := validateDurableID("response ID", event.ResponseID); err != nil {
+		return nil, err
 	}
 
 	r.state.Response = ResponseStreaming
@@ -591,8 +876,8 @@ func (r *Reactor) applyImplicitResponseCreated(event realtime.Event) ([]Effect, 
 	if r.state.Response != ResponseIdle && r.state.Response != ResponseTerminal {
 		return nil, fmt.Errorf("%w: implicit response.created from state %d", ErrInvalidTransition, r.state.Response)
 	}
-	if event.ResponseID == "" {
-		return nil, fmt.Errorf("%w: implicit response.created has empty response ID", ErrInvalidTransition)
+	if err := validateDurableID("response ID", event.ResponseID); err != nil {
+		return nil, err
 	}
 
 	epoch := r.fence.Advance()
@@ -649,6 +934,19 @@ func (r *Reactor) applyInputTranscriptionDelta(event realtime.Event) ([]Effect, 
 }
 
 func (r *Reactor) applyInputTranscriptionCompleted(event realtime.Event) ([]Effect, error) {
+	if err := validateDurableText("user transcript", event.Text); err != nil {
+		return nil, err
+	}
+	if err := validateDurableID("transcript item ID", event.ItemID); err != nil {
+		return nil, err
+	}
+	if r.activeTurn != nil && r.activeTurn.key.ID == event.ItemID && r.activeTurn.transcriptComplete && r.activeTurn.transcript == event.Text {
+		mapped := protocol.ConversationItemInputAudioTranscriptionCompletedEvent{
+			Type: "conversation.item.input_audio_transcription.completed", EventID: r.providerOrSynthEventID(event.ProviderEventID),
+			ItemID: event.ItemID, Transcript: event.Text,
+		}
+		return []Effect{{ClientEvent: mapped}}, nil
+	}
 	if err := r.observeTranscription(event.ItemID, true); err != nil {
 		return nil, err
 	}
@@ -658,7 +956,16 @@ func (r *Reactor) applyInputTranscriptionCompleted(event realtime.Event) ([]Effe
 		ItemID:     event.ItemID,
 		Transcript: event.Text,
 	}
-	return []Effect{{ClientEvent: mapped}}, nil
+	if r.activeTurn == nil {
+		return []Effect{{ClientEvent: mapped}}, nil
+	}
+	r.activeTurn.transcript = event.Text
+	r.transcriptSequence++
+	r.activeTurn.durableSequence = r.transcriptSequence
+	transcript := TranscriptRequestedEffect{
+		Turn: r.activeTurn.key, Sequence: r.transcriptSequence, Role: "user", FinalText: event.Text,
+	}
+	return []Effect{{ClientEvent: mapped, Transcript: &transcript}}, nil
 }
 
 func (r *Reactor) applyAudioDone(event realtime.Event) ([]Effect, error) {
@@ -678,6 +985,15 @@ func (r *Reactor) applyTranscriptDone(event realtime.Event) ([]Effect, error) {
 	if !r.currentResponseEvent(event) || r.state.Response != ResponseStreaming {
 		return nil, nil
 	}
+	if err := validateDurableText("assistant transcript", event.Text); err != nil {
+		return nil, err
+	}
+	if err := validateDurableID("transcript item ID", event.ItemID); err != nil {
+		return nil, err
+	}
+	if err := validateDurableID("transcript response ID", event.ResponseID); err != nil {
+		return nil, err
+	}
 	mapped := protocol.ResponseOutputAudioTranscriptDoneEvent{
 		Type:       "response.output_audio_transcript.done",
 		EventID:    r.providerOrSynthEventID(event.ProviderEventID),
@@ -685,7 +1001,53 @@ func (r *Reactor) applyTranscriptDone(event realtime.Event) ([]Effect, error) {
 		ItemID:     event.ItemID,
 		Transcript: event.Text,
 	}
-	return []Effect{{ClientEvent: mapped}}, nil
+	turn := r.activeTurnKey()
+	if turn == nil {
+		turn = cloneTurn(r.state.CommittedTurn)
+	}
+	if turn == nil {
+		return []Effect{{ClientEvent: mapped}}, nil
+	}
+	key := event.ResponseID + "\x00" + event.ItemID
+	if finalized, exists := r.finalizedAssistantTexts[key]; exists {
+		if finalized.text == event.Text {
+			return []Effect{{ClientEvent: mapped}}, nil
+		}
+		turn = cloneTurn(&finalized.turn)
+	}
+	retained := len(key) + len(event.Text) + len(turn.ID)
+	if retained > PendingBackgroundToolBytes {
+		return nil, ErrPendingToolLimit
+	}
+	r.transcriptSequence++
+	transcript := TranscriptRequestedEffect{
+		Turn: *turn, Sequence: r.transcriptSequence, Role: "assistant", FinalText: event.Text,
+	}
+	if previous, exists := r.finalizedAssistantTexts[key]; exists {
+		r.finalizedAssistantBytes -= len(key) + len(previous.text) + len(previous.turn.ID)
+		delete(r.finalizedAssistantTexts, key)
+		for index, orderedKey := range r.finalizedAssistantOrder {
+			if orderedKey == key {
+				r.finalizedAssistantOrder = append(r.finalizedAssistantOrder[:index], r.finalizedAssistantOrder[index+1:]...)
+				break
+			}
+		}
+	}
+	for len(r.finalizedAssistantOrder) >= PendingBackgroundToolLimit || retained > PendingBackgroundToolBytes-r.finalizedAssistantBytes {
+		if len(r.finalizedAssistantOrder) == 0 {
+			return nil, ErrPendingToolLimit
+		}
+		oldKey := r.finalizedAssistantOrder[0]
+		r.finalizedAssistantOrder = r.finalizedAssistantOrder[1:]
+		if previous, exists := r.finalizedAssistantTexts[oldKey]; exists {
+			r.finalizedAssistantBytes -= len(oldKey) + len(previous.text) + len(previous.turn.ID)
+			delete(r.finalizedAssistantTexts, oldKey)
+		}
+	}
+	r.finalizedAssistantTexts[key] = finalizedTranscript{turn: *turn, text: event.Text}
+	r.finalizedAssistantOrder = append(r.finalizedAssistantOrder, key)
+	r.finalizedAssistantBytes += retained
+	return []Effect{{ClientEvent: mapped, Transcript: &transcript}}, nil
 }
 
 func (r *Reactor) applyFunctionCallDone(event realtime.Event) ([]Effect, error) {
@@ -695,7 +1057,25 @@ func (r *Reactor) applyFunctionCallDone(event realtime.Event) ([]Effect, error) 
 	if event.CallID == "" || event.Name == "" || len(event.Arguments) == 0 || !json.Valid(event.Arguments) {
 		return nil, errors.New("function call requires call ID, name, and valid arguments")
 	}
-	isPendingStart := event.Name == StartBackgroundTaskTool && r.committedTurnForCurrentRevision() == nil
+	isReserved := isReservedHandoffTool(event.Name)
+	if isReserved {
+		for name, value := range map[string]string{
+			"response ID":  event.ResponseID,
+			"call ID":      event.CallID,
+			"tool item ID": event.ItemID,
+			"tool name":    event.Name,
+		} {
+			if err := validateDurableID(name, value); err != nil {
+				return nil, err
+			}
+		}
+		if len(event.Arguments) > DurableArgumentsBytes {
+			return nil, ErrPendingToolLimit
+		}
+	}
+	existingCall := r.handoffCalls[event.CallID]
+	committed := r.committedTurnForCurrentRevision()
+	isPendingStart := event.Name == StartBackgroundTaskTool && committed == nil
 	if isPendingStart {
 		if len(r.pendingTools) >= PendingBackgroundToolLimit ||
 			len(event.Arguments) > PendingBackgroundToolBytes-r.pendingToolBytes {
@@ -713,10 +1093,44 @@ func (r *Reactor) applyFunctionCallDone(event realtime.Event) ([]Effect, error) 
 		Arguments:  string(event.Arguments),
 	}
 	effects := []Effect{{ClientEvent: mapped}}
-	if event.Name != StartBackgroundTaskTool {
+	if !isReserved {
 		return effects, nil
 	}
-	if committed := r.committedTurnForCurrentRevision(); committed != nil {
+	if existingCall != nil {
+		return effects, nil
+	}
+	if len(r.handoffCalls) >= PendingHandoffResultLimit {
+		return nil, ErrPendingToolLimit
+	}
+	correlationTurn := identity.TurnKey{}
+	if committed != nil {
+		correlationTurn = *committed
+	} else if active := r.activeTurnKey(); active != nil {
+		correlationTurn = *active
+	}
+	callRetained := len(event.ResponseID) + len(event.CallID) + len(correlationTurn.ID)
+	if callRetained > PendingHandoffResultBytes-r.handoffCallBytes {
+		return nil, ErrPendingToolLimit
+	}
+	r.handoffCalls[event.CallID] = &handoffCall{
+		originEpoch: event.Epoch, turn: correlationTurn, responseID: event.ResponseID, callID: event.CallID, bytes: callRetained,
+	}
+	r.handoffCallBytes += callRetained
+	r.handoffCallOrder = append(r.handoffCallOrder, event.CallID)
+	if event.Name != StartBackgroundTaskTool {
+		handoffEffect := HandoffRequestedEffect{
+			OriginEpoch: event.Epoch, ResponseID: event.ResponseID, CallID: event.CallID, ToolName: event.Name,
+			Arguments: cloneRaw(event.Arguments), Turn: correlationTurn,
+		}
+		if committed == nil {
+			handoffEffect.RejectReason = "missing_committed_turn"
+		} else {
+			handoffEffect.Transcript = r.committedTranscript
+		}
+		effects[0].Handoff = &handoffEffect
+		return effects, nil
+	}
+	if committed != nil {
 		async, err := makeToolAsyncEffect(pendingTool{
 			responseID: event.ResponseID,
 			callID:     event.CallID,
@@ -727,7 +1141,11 @@ func (r *Reactor) applyFunctionCallDone(event realtime.Event) ([]Effect, error) 
 			return nil, err
 		}
 		async.Sequence = r.allocateSequence()
-		effects = append(effects, Effect{Async: &async})
+		handoffEffect := HandoffRequestedEffect{
+			OriginEpoch: event.Epoch, ResponseID: event.ResponseID, CallID: event.CallID, ToolName: event.Name,
+			Arguments: cloneRaw(event.Arguments), Turn: *committed, Transcript: r.committedTranscript,
+		}
+		effects = append(effects, Effect{Async: &async, Handoff: &handoffEffect})
 		return effects, nil
 	}
 
@@ -740,6 +1158,15 @@ func (r *Reactor) applyFunctionCallDone(event realtime.Event) ([]Effect, error) 
 	})
 	r.pendingToolBytes += len(event.Arguments)
 	return effects, nil
+}
+
+func isReservedHandoffTool(name string) bool {
+	switch name {
+	case StartBackgroundTaskTool, SteerBackgroundTaskTool, CancelBackgroundTaskTool:
+		return true
+	default:
+		return false
+	}
 }
 
 func (r *Reactor) applyResponseDone(event realtime.Event) ([]Effect, error) {
@@ -755,6 +1182,7 @@ func (r *Reactor) applyResponseDone(event realtime.Event) ([]Effect, error) {
 
 	r.state.Response = ResponseTerminal
 	r.terminal = &terminalMarker{responseID: event.ResponseID, epoch: event.Epoch}
+	r.rememberTerminalResponse(event.ResponseID)
 	done := protocol.ResponseDoneEvent{
 		Type:    "response.done",
 		EventID: r.providerOrSynthEventID(event.ProviderEventID),
@@ -763,7 +1191,41 @@ func (r *Reactor) applyResponseDone(event realtime.Event) ([]Effect, error) {
 			Status: event.Status,
 		},
 	}
-	return []Effect{{ClientEvent: done}}, nil
+	effects := []Effect{{ClientEvent: done}}
+	acceptance, err := r.emitNextReadyHandoffAcceptance()
+	if err != nil {
+		return nil, err
+	}
+	return append(effects, acceptance...), nil
+}
+
+func (r *Reactor) emitNextReadyHandoffAcceptance() ([]Effect, error) {
+	for _, callID := range r.handoffCallOrder {
+		call := r.handoffCalls[callID]
+		if call == nil || call.completed == nil || call.emitted {
+			continue
+		}
+		if _, terminal := r.terminalResponses[call.responseID]; !terminal {
+			continue
+		}
+		acceptance, err := r.emitHandoffAcceptance(call)
+		if err != nil {
+			return nil, err
+		}
+		if len(acceptance) != 0 {
+			return acceptance, nil
+		}
+	}
+	return nil, nil
+}
+
+func (r *Reactor) rememberTerminalResponse(responseID string) {
+	for _, call := range r.handoffCalls {
+		if call != nil && call.responseID == responseID {
+			r.terminalResponses[responseID] = struct{}{}
+			return
+		}
+	}
 }
 
 func (r *Reactor) applyVoiceCommandCompleted(input VoiceCommandCompletedInput) ([]Effect, error) {
@@ -810,6 +1272,7 @@ func (r *Reactor) synthesizeResponseDone(status string) ([]Effect, error) {
 	}
 	r.state.Response = ResponseTerminal
 	r.terminal = &terminalMarker{responseID: r.activeResponseID, epoch: r.activeResponseEpoch}
+	r.rememberTerminalResponse(r.activeResponseID)
 	done := protocol.ResponseDoneEvent{
 		Type:    "response.done",
 		EventID: r.providerOrSynthEventID(""),
@@ -818,7 +1281,12 @@ func (r *Reactor) synthesizeResponseDone(status string) ([]Effect, error) {
 			Status: status,
 		},
 	}
-	return []Effect{{ClientEvent: done}}, nil
+	effects := []Effect{{ClientEvent: done}}
+	acceptance, err := r.emitNextReadyHandoffAcceptance()
+	if err != nil {
+		return nil, err
+	}
+	return append(effects, acceptance...), nil
 }
 
 func (r *Reactor) applyProviderError(event realtime.Event) ([]Effect, error) {
@@ -841,6 +1309,11 @@ func (r *Reactor) applyProviderError(event realtime.Event) ([]Effect, error) {
 	effects := []Effect{{ClientEvent: mapped}}
 	if r.state.Response == ResponsePending && r.activeResponseID == "" {
 		r.state.Response = ResponseTerminal
+		acceptance, err := r.emitNextReadyHandoffAcceptance()
+		if err != nil {
+			return nil, err
+		}
+		effects = append(effects, acceptance...)
 	}
 	if r.activeResponseID != "" &&
 		(r.state.Response == ResponseStreaming || r.state.Response == ResponseCancelRequested) {
@@ -912,6 +1385,20 @@ func defaultString(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func validateDurableID(name, value string) error {
+	if strings.TrimSpace(value) == "" || !utf8.ValidString(value) || len(value) > DurableIdentifierBytes {
+		return fmt.Errorf("%s exceeds durable-work bounds", name)
+	}
+	return nil
+}
+
+func validateDurableText(name, value string) error {
+	if !utf8.ValidString(value) || len(value) > DurableTranscriptBytes {
+		return fmt.Errorf("%s exceeds durable-work bounds", name)
+	}
+	return nil
 }
 
 func validateVoiceEvent(event realtime.Event) error {

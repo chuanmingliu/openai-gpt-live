@@ -54,6 +54,17 @@ type Config struct {
 	WriterControlEvents int
 	IngressBlockTimeout time.Duration
 	EgressBlockTimeout  time.Duration
+	DurableDispatcher   DurableEffectDispatcher
+}
+
+type TrustedSessionContext struct {
+	IDs     IDs
+	Subject Subject
+}
+
+type DurableEffectDispatcher interface {
+	DispatchTranscript(context.Context, TrustedSessionContext, TranscriptRequestedEffect) error
+	DispatchHandoff(context.Context, TrustedSessionContext, HandoffRequestedEffect) error
 }
 
 type MetricsHooks struct {
@@ -328,6 +339,8 @@ type runState struct {
 	progress     *sequenceProgress
 	activeWrite  *activeAudioWrite
 	metrics      MetricsHooks
+	subject      Subject
+	dispatcher   DurableEffectDispatcher
 
 	ingressSequence uint64
 	egressSequence  uint64
@@ -452,6 +465,7 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 
 	group, groupCtx := errgroup.WithContext(sessionCtx)
 	state := newRunState(m.cfg, ids, voice, client, cancel)
+	state.subject = cloneSubject(subject)
 	state.metrics = m.metricsSnapshot()
 	runtime := &sessionRuntime{
 		key:        runtimeKey{sessionID: sessionID, incarnation: ids.Incarnation},
@@ -540,6 +554,7 @@ func newRunState(cfg Config, ids IDs, voice realtime.Session, client ClientConn,
 		progress:     newSequenceProgress(),
 		activeWrite:  &activeAudioWrite{},
 		metrics:      normalizeMetricsHooks(MetricsHooks{}),
+		dispatcher:   cfg.DurableDispatcher,
 		cancel:       cancel,
 	}
 	for range cfg.ControlEvents {
@@ -983,7 +998,26 @@ func (s *runState) dispatchEffects(ctx context.Context, effects []Effect, ingres
 		s.voiceCtl <- voiceControl{command: command}
 	}
 	for _, effect := range effects {
-		if effect.Async != nil {
+		if effect.Transcript != nil || effect.Handoff != nil {
+			if isNilInterface(s.dispatcher) {
+				return fmt.Errorf("%w: durable typed effect", ErrUnsupportedAsync)
+			}
+			trusted := TrustedSessionContext{IDs: s.ids, Subject: cloneSubject(s.subject)}
+			if effect.Transcript != nil {
+				owned := *effect.Transcript
+				if err := s.dispatcher.DispatchTranscript(ctx, trusted, owned); err != nil {
+					return err
+				}
+			}
+			if effect.Handoff != nil {
+				owned := *effect.Handoff
+				owned.Arguments = append(json.RawMessage(nil), effect.Handoff.Arguments...)
+				if err := s.dispatcher.DispatchHandoff(ctx, trusted, owned); err != nil {
+					return err
+				}
+			}
+		}
+		if effect.Async != nil && effect.Handoff == nil {
 			return fmt.Errorf("%w: %s", ErrUnsupportedAsync, effect.Async.Kind)
 		}
 	}

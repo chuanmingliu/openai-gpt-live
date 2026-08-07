@@ -16,10 +16,11 @@ import (
 	pgx5migrate "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const latestVersion uint = 1
+const latestVersion uint = 2
 
 const (
 	migrationCancelTimeout     = 2 * time.Second
@@ -29,6 +30,8 @@ const (
 )
 
 var migrationRunnerSequence atomic.Uint64
+
+var ErrCoordinatorPendingWork = errors.New("coordinator journal contains undelivered replay work")
 
 //go:embed *.sql
 var files embed.FS
@@ -303,9 +306,45 @@ func (d *cancellablePGXDriver) Run(migration io.Reader) error {
 	}
 	if _, err := tx.Exec(d.ctx, string(statement)); err != nil {
 		_ = tx.Rollback(context.Background())
+		if isCoordinatorPendingRefusal(err) {
+			if recoveryErr := d.recoverCoordinatorPendingRefusal(); recoveryErr != nil {
+				return errors.Join(err, fmt.Errorf("recover coordinator downgrade refusal: %w", recoveryErr))
+			}
+			return errors.Join(ErrCoordinatorPendingWork, err)
+		}
 		return err
 	}
 	return tx.Commit(d.ctx)
+}
+
+func isCoordinatorPendingRefusal(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "55000" && pgErr.Message == ErrCoordinatorPendingWork.Error()
+}
+
+func (d *cancellablePGXDriver) recoverCoordinatorPendingRefusal() error {
+	if d.ctx == nil || d.ctx.Err() != nil {
+		return errors.New("migration context is not active")
+	}
+	version, dirty, err := d.Version()
+	if err != nil {
+		return err
+	}
+	if version != 1 || !dirty {
+		return fmt.Errorf("unexpected migration state version=%d dirty=%t", version, dirty)
+	}
+	var journalExists bool
+	if err := d.connection.QueryRow(d.ctx, `SELECT EXISTS (
+		SELECT 1 FROM pg_catalog.pg_class c
+		JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+		WHERE n.nspname=$1 AND c.relname='coordinator_work_journal' AND c.relkind='r'
+	)`, d.schema).Scan(&journalExists); err != nil {
+		return err
+	}
+	if !journalExists {
+		return errors.New("coordinator journal table is absent")
+	}
+	return d.SetVersion(2, false)
 }
 
 func (d *cancellablePGXDriver) SetVersion(version int, dirty bool) error {

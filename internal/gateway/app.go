@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/config"
+	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
 	"github.com/chuanmingliu/openai-gpt-live/internal/session"
@@ -45,6 +47,30 @@ type App struct {
 	listener        net.Listener
 	shutdownTimeout time.Duration
 	activeHandlers  handlerTracker
+	durable         *DurableDependencies
+	handoffs        *HandoffCoordinator
+	transcripts     *TranscriptCoordinator
+}
+
+type DurableDependencies struct {
+	Service                 handoff.Service
+	ConversationWriter      ConversationWriter
+	Journal                 CoordinatorJournal
+	DeliveryAffinity        string
+	JournalOwner            string
+	JournalClaimLease       time.Duration
+	HandoffQueueCapacity    int
+	TranscriptQueueCapacity int
+	Snapshot                SessionHandoffSnapshot
+}
+
+func WithDurableHandoffs(dependencies DurableDependencies) Option {
+	return func(app *App) error {
+		copy := dependencies
+		copy.Snapshot = cloneHandoffSnapshot(dependencies.Snapshot)
+		app.durable = &copy
+		return nil
+	}
 }
 
 func WithIDGenerator(ids session.IDGenerator) Option {
@@ -140,13 +166,88 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 		return nil, errors.New("session ID generator is required")
 	}
 
-	app.manager = session.NewManager(managerConfig, connector, app.ids)
+	if cfg.Features.Handoffs {
+		if app.durable == nil || isNil(app.durable.Service) || isNil(app.durable.ConversationWriter) ||
+			isNil(app.durable.Journal) || app.durable.DeliveryAffinity == "" || app.durable.JournalOwner == "" || app.durable.JournalClaimLease <= 0 ||
+			app.durable.HandoffQueueCapacity <= 0 || app.durable.TranscriptQueueCapacity <= 0 ||
+			validateHandoffSnapshot(app.durable.Snapshot) != nil {
+			return nil, errors.New("durable handoff dependencies and valid server snapshot are required")
+		}
+		dispatcher := &durableDispatcher{snapshot: cloneHandoffSnapshot(app.durable.Snapshot)}
+		managerConfig.DurableDispatcher = dispatcher
+		app.managerConfig = managerConfig
+		app.manager = session.NewManager(managerConfig, connector, app.ids)
+		app.handoffs = NewHandoffCoordinator(app.durable.Service, app.manager, app.durable.HandoffQueueCapacity)
+		app.transcripts = NewTranscriptCoordinator(app.durable.ConversationWriter, app.manager, app.durable.TranscriptQueueCapacity)
+		if app.handoffs == nil || app.transcripts == nil {
+			return nil, errors.New("durable handoff coordinators are invalid")
+		}
+		if err := app.handoffs.configureJournal(app.durable.Journal, app.durable.DeliveryAffinity, app.durable.JournalOwner+":handoff", app.durable.JournalClaimLease); err != nil {
+			return nil, err
+		}
+		if err := app.transcripts.configureJournal(app.durable.Journal, app.durable.DeliveryAffinity, app.durable.JournalOwner+":transcript", app.durable.JournalClaimLease); err != nil {
+			return nil, err
+		}
+		dispatcher.handoffs = app.handoffs
+		dispatcher.transcripts = app.transcripts
+	} else {
+		if app.durable != nil {
+			return nil, errors.New("durable handoff dependencies supplied while feature is disabled")
+		}
+		app.manager = session.NewManager(managerConfig, connector, app.ids)
+	}
 	app.handler = &trackedHandler{next: transportws.NewHandler(wsOptions, app.manager, app.admission), active: &app.activeHandlers}
 	app.server = &http.Server{Addr: cfg.Gateway.ListenAddr, Handler: app.handler}
 	return app, nil
 }
 
-func (a *App) Run(ctx context.Context) error {
+type durableDispatcher struct {
+	handoffs    *HandoffCoordinator
+	transcripts *TranscriptCoordinator
+	snapshot    SessionHandoffSnapshot
+}
+
+func (d *durableDispatcher) DispatchTranscript(_ context.Context, trusted session.TrustedSessionContext, effect session.TranscriptRequestedEffect) error {
+	if d == nil || d.transcripts == nil {
+		return errors.New("transcript coordinator is unavailable")
+	}
+	return d.transcripts.Enqueue(TranscriptWork{
+		SessionID: trusted.IDs.SessionID, Incarnation: trusted.IDs.Incarnation,
+		Scope: handoff.Scope{TenantID: trusted.Subject.TenantID, UserID: trusted.Subject.UserID, ConversationID: trusted.IDs.ConversationID},
+		Turn:  effect.Turn, Sequence: effect.Sequence, Role: effect.Role, FinalText: effect.FinalText,
+	})
+}
+
+func (d *durableDispatcher) DispatchHandoff(_ context.Context, trusted session.TrustedSessionContext, effect session.HandoffRequestedEffect) error {
+	if d == nil || d.handoffs == nil {
+		return errors.New("handoff coordinator is unavailable")
+	}
+	return d.handoffs.Enqueue(HandoffWork{
+		SessionID: trusted.IDs.SessionID, Incarnation: trusted.IDs.Incarnation,
+		OriginEpoch: effect.OriginEpoch,
+		Scope:       handoff.Scope{TenantID: trusted.Subject.TenantID, UserID: trusted.Subject.UserID, ConversationID: trusted.IDs.ConversationID},
+		CallID:      effect.CallID, ResponseID: effect.ResponseID, ToolName: effect.ToolName,
+		Arguments: append(json.RawMessage(nil), effect.Arguments...), Turn: effect.Turn,
+		Transcript: effect.Transcript, Snapshot: cloneHandoffSnapshot(d.snapshot), RejectReason: effect.RejectReason,
+	})
+}
+
+func validateHandoffSnapshot(snapshot SessionHandoffSnapshot) error {
+	_, err := handoff.ValidateCreateRequest(handoff.CreateRequest{
+		Scope:     handoff.Scope{TenantID: "snapshot-validation", UserID: "snapshot-validation", ConversationID: "snapshot-validation"},
+		SessionID: "snapshot-validation", SourceTurn: identity.TurnKey{ID: "snapshot-validation", Revision: 1},
+		UserRequest: "snapshot-validation", Objective: "snapshot-validation",
+		ContextRef: snapshot.ContextRef, ContextHash: snapshot.ContextHash, Deadline: snapshot.Deadline,
+		TokenBudget: snapshot.TokenBudget, Priority: snapshot.Priority,
+		ToolAllowlist:  append([]string(nil), snapshot.ToolAllowlist...),
+		ApprovalPolicy: append(json.RawMessage(nil), snapshot.ApprovalPolicy...),
+		Versions:       snapshot.Versions, PresentationHint: snapshot.PresentationHint,
+		IdempotencyKey: "snapshot-validation",
+	}, time.Now().UTC())
+	return err
+}
+
+func (a *App) Run(ctx context.Context) (runErr error) {
 	if a == nil || a.server == nil {
 		return errors.New("gateway app is nil")
 	}
@@ -155,6 +256,20 @@ func (a *App) Run(ctx context.Context) error {
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if a.durable != nil {
+		affinityLock, err := a.durable.Journal.AcquireCoordinatorAffinity(ctx, a.durable.DeliveryAffinity)
+		if err != nil {
+			return fmt.Errorf("acquire coordinator delivery affinity: %w", err)
+		}
+		if isNil(affinityLock) {
+			return errors.New("acquire coordinator delivery affinity: nil lock")
+		}
+		defer func() {
+			if err := affinityLock.Close(); err != nil {
+				runErr = errors.Join(runErr, fmt.Errorf("release coordinator delivery affinity: %w", err))
+			}
+		}()
 	}
 	serveCtx, cancelServe := context.WithCancel(ctx)
 	defer cancelServe()
@@ -167,6 +282,32 @@ func (a *App) Run(ctx context.Context) error {
 		}
 	}
 	a.server.BaseContext = func(net.Listener) context.Context { return serveCtx }
+	type coordinatorRunResult struct {
+		name string
+		err  error
+	}
+	coordinatorResult := make(chan coordinatorRunResult, 2)
+	coordinatorDone := make(chan struct{})
+	coordinatorCount := 0
+	var coordinatorWG sync.WaitGroup
+	startCoordinator := func(name string, run func(context.Context) error) {
+		coordinatorCount++
+		coordinatorWG.Add(1)
+		go func() {
+			defer coordinatorWG.Done()
+			coordinatorResult <- coordinatorRunResult{name: name, err: run(serveCtx)}
+		}()
+	}
+	if a.transcripts != nil {
+		startCoordinator("transcript coordinator", a.transcripts.Run)
+	}
+	if a.handoffs != nil {
+		startCoordinator("handoff coordinator", a.handoffs.Run)
+	}
+	go func() {
+		coordinatorWG.Wait()
+		close(coordinatorDone)
+	}()
 	serveResult := make(chan error, 1)
 	go func() {
 		var err error
@@ -180,9 +321,17 @@ func (a *App) Run(ctx context.Context) error {
 
 	var serveErr error
 	serveObserved := false
+	var coordinatorErr error
 	select {
 	case serveErr = <-serveResult:
 		serveObserved = true
+	case result := <-coordinatorResult:
+		if result.err == nil && ctx.Err() == nil {
+			result.err = errors.New("stopped unexpectedly")
+		}
+		if result.err != nil {
+			coordinatorErr = fmt.Errorf("%s: %w", result.name, result.err)
+		}
 	case <-ctx.Done():
 	}
 
@@ -212,12 +361,19 @@ func (a *App) Run(ctx context.Context) error {
 		cleanupErrs = append(cleanupErrs, fmt.Errorf("wait for active gateway sessions: %w", err))
 		_ = a.server.Close()
 	}
+	if coordinatorCount != 0 {
+		select {
+		case <-coordinatorDone:
+		case <-shutdownCtx.Done():
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("wait for durable coordinators: %w", shutdownCtx.Err()))
+		}
+	}
 
 	var primaryErr error
 	if serveObserved && serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 		primaryErr = fmt.Errorf("serve gateway: %w", serveErr)
 	}
-	return errors.Join(append([]error{primaryErr}, cleanupErrs...)...)
+	return errors.Join(append([]error{coordinatorErr, primaryErr}, cleanupErrs...)...)
 }
 
 type trackedHandler struct {

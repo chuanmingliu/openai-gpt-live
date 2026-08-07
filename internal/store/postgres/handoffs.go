@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,10 +26,97 @@ const handoffColumns = `
 	result_summary, structured_result::text, usage::text, failure_code, failure_retryable,
 	failure_message, created_at, updated_at`
 
+const handoffCreateLockNamespace = "openai-gpt-live/handoff-create/v1\x00"
+
+func handoffCreateLockID(tenantID, idempotencyKey string) int64 {
+	digest := sha256.Sum256([]byte(handoffCreateLockNamespace + tenantID + "\x00" + idempotencyKey))
+	return int64(binary.BigEndian.Uint64(digest[:8]))
+}
+
+func (r *Repository) lockHandoffCreate(ctx context.Context, tx pgx.Tx, tenantID, idempotencyKey string) error {
+	if err := r.after("before_create_idempotency_lock"); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, handoffCreateLockID(tenantID, idempotencyKey)); err != nil {
+		return err
+	}
+	return r.after("create_idempotency_lock")
+}
+
+func (r *Repository) GetHandoffByIdempotencyKey(ctx context.Context, scope handoff.Scope, key string) (handoff.Snapshot, error) {
+	if err := validateContext(ctx); err != nil {
+		return handoff.Snapshot{}, err
+	}
+	if err := validateScope(scope); err != nil {
+		return handoff.Snapshot{}, err
+	}
+	if err := bounded("idempotency key", key, maxIdentityBytes, true); err != nil {
+		return handoff.Snapshot{}, err
+	}
+	snapshot, err := loadHandoffRow(r.pool.QueryRow(ctx, `SELECT `+handoffColumns+`
+		FROM handoffs
+		WHERE tenant_id=$1 AND conversation_id=$2 AND user_id=$3 AND idempotency_key=$4`,
+		scope.TenantID, scope.ConversationID, scope.UserID, key))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return handoff.Snapshot{}, handoff.ErrNotFound
+	}
+	if err != nil {
+		return handoff.Snapshot{}, err
+	}
+	return snapshot, nil
+}
+
 func (r *Repository) CreateHandoff(ctx context.Context, record handoff.CreateRecord) (handoff.Snapshot, bool, error) {
 	if err := validateContext(ctx); err != nil {
 		return handoff.Snapshot{}, false, err
 	}
+	static, err := handoff.NormalizeCreateRequest(record.Request)
+	if err != nil {
+		return handoff.Snapshot{}, false, err
+	}
+	if err := bounded("request hash", record.RequestHash, 512, true); err != nil {
+		return handoff.Snapshot{}, false, err
+	}
+	if record.CreatedAt.IsZero() {
+		return handoff.Snapshot{}, false, fmt.Errorf("%w: created timestamp is required", handoff.ErrInvalidRequest)
+	}
+	computedHash, err := handoff.CanonicalRequestHash(static)
+	if err != nil {
+		return handoff.Snapshot{}, false, err
+	}
+	if computedHash != record.RequestHash {
+		return handoff.Snapshot{}, false, handoff.ErrIdempotencyConflict
+	}
+	record.Request = static
+	record.CreatedAt = record.CreatedAt.UTC()
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return handoff.Snapshot{}, false, err
+	}
+	defer rollback(tx)
+	// Every creator takes the per-(tenant,idempotency-key) lock before any
+	// replay/deadline decision. New creates then take the global event-append
+	// lock. No path acquires these locks in the opposite order.
+	if err := r.lockHandoffCreate(ctx, tx, record.Request.Scope.TenantID, record.Request.IdempotencyKey); err != nil {
+		return handoff.Snapshot{}, false, err
+	}
+	existing, loadErr := loadHandoffRow(tx.QueryRow(ctx, `SELECT `+handoffColumns+`
+		FROM handoffs WHERE tenant_id=$1 AND idempotency_key=$2 FOR UPDATE`,
+		record.Request.Scope.TenantID, record.Request.IdempotencyKey))
+	if loadErr == nil {
+		if existing.RequestHash != record.RequestHash || existing.Request.Scope != record.Request.Scope {
+			return handoff.Snapshot{}, false, handoff.ErrIdempotencyConflict
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return handoff.Snapshot{}, false, err
+		}
+		return existing, false, nil
+	}
+	if !errors.Is(loadErr, pgx.ErrNoRows) {
+		return handoff.Snapshot{}, false, loadErr
+	}
+
 	normalized, err := handoff.ValidateCreateRequest(record.Request, record.CreatedAt)
 	if err != nil {
 		return handoff.Snapshot{}, false, err
@@ -39,31 +127,11 @@ func (r *Repository) CreateHandoff(ctx context.Context, record handoff.CreateRec
 	if err := bounded("event id", record.EventID, maxIdentityBytes, true); err != nil {
 		return handoff.Snapshot{}, false, err
 	}
-	if err := bounded("request hash", record.RequestHash, 512, true); err != nil {
-		return handoff.Snapshot{}, false, err
-	}
-	if record.CreatedAt.IsZero() {
-		return handoff.Snapshot{}, false, fmt.Errorf("%w: created timestamp is required", handoff.ErrInvalidRequest)
-	}
-	computedHash, err := handoff.CanonicalRequestHash(normalized)
-	if err != nil {
-		return handoff.Snapshot{}, false, err
-	}
-	if computedHash != record.RequestHash {
-		return handoff.Snapshot{}, false, handoff.ErrIdempotencyConflict
-	}
 	record.Request = normalized
-	record.CreatedAt = record.CreatedAt.UTC()
 	allowlist, err := json.Marshal(record.Request.ToolAllowlist)
 	if err != nil {
 		return handoff.Snapshot{}, false, err
 	}
-
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return handoff.Snapshot{}, false, err
-	}
-	defer rollback(tx)
 	if err := r.lockEventAppend(ctx, tx); err != nil {
 		return handoff.Snapshot{}, false, err
 	}

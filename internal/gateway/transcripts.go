@@ -1,0 +1,394 @@
+package gateway
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
+
+	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
+	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
+	"github.com/chuanmingliu/openai-gpt-live/internal/session"
+	"github.com/chuanmingliu/openai-gpt-live/internal/store/postgres"
+)
+
+var ErrCoordinatorOverflow = errors.New("durable coordinator queue is full")
+
+type TranscriptWork struct {
+	SessionID   identity.SessionID
+	Incarnation identity.Incarnation
+	Scope       handoff.Scope
+	Turn        identity.TurnKey
+	Sequence    uint64
+	Role        string
+	FinalText   string
+}
+
+type SessionSubmitter interface {
+	Submit(context.Context, identity.SessionID, identity.Incarnation, session.Input) error
+}
+
+type ConversationWriter interface {
+	AppendCommittedItem(context.Context, handoff.Scope, postgres.ConversationItem) (postgres.ConversationItem, error)
+}
+
+type CoordinatorJournal interface {
+	AcquireCoordinatorAffinity(context.Context, string) (io.Closer, error)
+	AdmitCoordinatorWork(context.Context, postgres.CoordinatorJournalRecord) (postgres.CoordinatorJournalRecord, error)
+	ClaimCoordinatorWork(context.Context, string, string, string, time.Duration, int) ([]postgres.CoordinatorJournalRecord, error)
+	RenewCoordinatorWork(context.Context, string, string, uint64, time.Duration) error
+	AckCoordinatorWork(context.Context, string, string, uint64) error
+}
+
+type TranscriptCoordinator struct {
+	writer          ConversationWriter
+	submit          SessionSubmitter
+	work            chan TranscriptWork
+	slots           chan struct{}
+	mu              sync.Mutex
+	retainedBytes   int
+	journal         CoordinatorJournal
+	journalAffinity string
+	journalOwner    string
+	claimLease      time.Duration
+}
+
+func (c *TranscriptCoordinator) configureJournal(journal CoordinatorJournal, affinity, owner string, lease time.Duration) error {
+	if c == nil || isNil(journal) || strings.TrimSpace(affinity) == "" || len(affinity) > session.DurableIdentifierBytes ||
+		strings.TrimSpace(owner) == "" || len(owner) > session.DurableIdentifierBytes ||
+		lease < postgres.CoordinatorMinLease || lease > postgres.CoordinatorMaxLease {
+		return errors.New("invalid transcript coordinator journal")
+	}
+	c.journal, c.journalAffinity, c.journalOwner, c.claimLease = journal, affinity, owner, lease
+	return nil
+}
+
+func NewTranscriptCoordinator(writer ConversationWriter, submit SessionSubmitter, capacity int) *TranscriptCoordinator {
+	if isNil(writer) || isNil(submit) || capacity <= 0 || capacity > 10_000 {
+		return nil
+	}
+	return &TranscriptCoordinator{
+		writer: writer, submit: submit, work: make(chan TranscriptWork, capacity), slots: make(chan struct{}, capacity),
+	}
+}
+
+func (c *TranscriptCoordinator) Enqueue(work TranscriptWork) error {
+	if c == nil || c.work == nil {
+		return errors.New("transcript coordinator is not configured")
+	}
+	retained, err := validateTranscriptWorkBounds(work)
+	if err != nil {
+		return err
+	}
+	select {
+	case c.slots <- struct{}{}:
+	default:
+		return ErrCoordinatorOverflow
+	}
+	c.mu.Lock()
+	if retained > CoordinatorAggregateBytes-c.retainedBytes {
+		c.mu.Unlock()
+		<-c.slots
+		return ErrCoordinatorOverflow
+	}
+	c.retainedBytes += retained
+	c.mu.Unlock()
+	c.work <- work
+	return nil
+}
+
+func (c *TranscriptCoordinator) Run(ctx context.Context) error {
+	if c == nil || c.work == nil || isNil(c.writer) || isNil(c.submit) {
+		return errors.New("transcript coordinator is not configured")
+	}
+	if ctx == nil {
+		return errors.New("transcript coordinator context is nil")
+	}
+	if c.journal != nil {
+		if err := c.drainJournal(ctx); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+	}
+	var replay <-chan time.Time
+	var ticker *time.Ticker
+	if c.journal != nil {
+		ticker = time.NewTicker(coordinatorReplayInterval(c.claimLease))
+		defer ticker.Stop()
+		replay = ticker.C
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-replay:
+			if err := c.drainJournal(ctx); err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				return err
+			}
+		case work := <-c.work:
+			var err error
+			if c.journal != nil {
+				err = c.admitJournal(ctx, work)
+				if err == nil {
+					err = c.drainJournal(ctx)
+				}
+			} else {
+				err = c.persist(ctx, work, work.Sequence)
+				if errors.Is(err, session.ErrSessionNotActive) {
+					err = nil
+				}
+			}
+			c.releaseWork(work)
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				return err
+			}
+		}
+	}
+}
+
+func coordinatorReplayInterval(lease time.Duration) time.Duration {
+	interval := lease / 2
+	if interval < 10*time.Millisecond {
+		return 10 * time.Millisecond
+	}
+	if interval > 5*time.Second {
+		return 5 * time.Second
+	}
+	return interval
+}
+
+func (c *TranscriptCoordinator) releaseWork(work TranscriptWork) {
+	retained, _ := validateTranscriptWorkBounds(work)
+	c.mu.Lock()
+	c.retainedBytes -= retained
+	c.mu.Unlock()
+	<-c.slots
+}
+
+func (c *TranscriptCoordinator) persist(ctx context.Context, work TranscriptWork, storageSequence uint64) error {
+	if err := c.append(ctx, work, storageSequence); err != nil {
+		return err
+	}
+	return c.submitPersisted(ctx, work)
+}
+
+func (c *TranscriptCoordinator) append(ctx context.Context, work TranscriptWork, storageSequence uint64) error {
+	hash := sha256.Sum256([]byte(work.FinalText))
+	now := time.Now().UTC()
+	item := postgres.ConversationItem{
+		SessionID: work.SessionID, Turn: work.Turn, Sequence: storageSequence,
+		Role: work.Role, Content: work.FinalText, ContentHash: hex.EncodeToString(hash[:]),
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if _, err := c.writer.AppendCommittedItem(ctx, work.Scope, item); err != nil {
+		return fmt.Errorf("append committed transcript: %w", err)
+	}
+	return nil
+}
+
+func (c *TranscriptCoordinator) submitPersisted(ctx context.Context, work TranscriptWork) error {
+	var input session.Input = session.TranscriptPersistedInput{Sequence: work.Sequence}
+	if work.Role == "user" {
+		input = session.TurnCommittedInput{Sequence: work.Sequence, Turn: work.Turn, Transcript: work.FinalText}
+	}
+	err := c.submit.Submit(ctx, work.SessionID, work.Incarnation, input)
+	if err != nil {
+		return fmt.Errorf("submit committed turn: %w", err)
+	}
+	return nil
+}
+
+func (c *TranscriptCoordinator) admitJournal(ctx context.Context, work TranscriptWork) error {
+	payload, err := json.Marshal(work)
+	if err != nil {
+		return fmt.Errorf("encode transcript journal work: %w", err)
+	}
+	_, err = c.journal.AdmitCoordinatorWork(ctx, postgres.CoordinatorJournalRecord{
+		WorkKey: transcriptWorkKey(work), Kind: postgres.CoordinatorKindTranscript,
+		Scope: work.Scope, SessionID: work.SessionID, Incarnation: work.Incarnation,
+		LocalSequence: work.Sequence, DeliveryAffinity: c.journalAffinity, Payload: payload,
+	})
+	return err
+}
+
+func (c *TranscriptCoordinator) drainJournal(ctx context.Context) error {
+	records, err := c.journal.ClaimCoordinatorWork(
+		ctx, postgres.CoordinatorKindTranscript, c.journalAffinity, c.journalOwner, c.claimLease, 1,
+	)
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
+		var work TranscriptWork
+		if err := decodeCoordinatorPayload(record.Payload, &work); err != nil {
+			return errors.New("corrupt transcript coordinator journal payload")
+		}
+		if _, err := validateTranscriptWorkBounds(work); err != nil || transcriptWorkKey(work) != record.WorkKey || record.StorageSequence == 0 ||
+			work.Scope != record.Scope || work.SessionID != record.SessionID || work.Incarnation != record.Incarnation || work.Sequence != record.LocalSequence {
+			return errors.New("corrupt transcript coordinator journal record")
+		}
+		operationCtx, guard := startCoordinatorLeaseGuard(
+			ctx, c.journal, record.WorkKey, c.journalOwner, record.ClaimGeneration, c.claimLease,
+		)
+		err := c.append(operationCtx, work, record.StorageSequence)
+		if err == nil {
+			err = c.submitPersisted(operationCtx, work)
+		}
+		var fenceErr error
+		if err == nil || errors.Is(err, session.ErrSessionNotActive) {
+			fenceErr = c.journal.RenewCoordinatorWork(
+				operationCtx, record.WorkKey, c.journalOwner, record.ClaimGeneration, c.claimLease,
+			)
+		}
+		leaseErr := guard.stopAndJoin()
+		if fenceErr != nil {
+			return fmt.Errorf("transcript coordinator lease lost: %w", fenceErr)
+		}
+		if leaseErr != nil {
+			return fmt.Errorf("transcript coordinator lease lost: %w", leaseErr)
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if errors.Is(err, session.ErrSessionNotActive) {
+			// The item is already durable and an exact incarnation cannot become
+			// active again. Terminate stale live delivery to avoid a permanent
+			// retry row; conversation replay is the reconnect recovery path.
+			if err := c.journal.AckCoordinatorWork(ctx, record.WorkKey, c.journalOwner, record.ClaimGeneration); err != nil {
+				return err
+			}
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if err := c.journal.AckCoordinatorWork(ctx, record.WorkKey, c.journalOwner, record.ClaimGeneration); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func decodeCoordinatorPayload(payload json.RawMessage, target any) error {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		if err == nil {
+			return errors.New("multiple coordinator payload values")
+		}
+		return err
+	}
+	canonical, err := json.Marshal(target)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(payload, canonical) {
+		return errors.New("non-canonical coordinator payload")
+	}
+	return nil
+}
+
+type coordinatorLeaseGuard struct {
+	stop   chan struct{}
+	done   chan error
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func startCoordinatorLeaseGuard(
+	ctx context.Context,
+	journal CoordinatorJournal,
+	workKey, owner string,
+	generation uint64,
+	lease time.Duration,
+) (context.Context, *coordinatorLeaseGuard) {
+	operationCtx, cancel := context.WithCancel(ctx)
+	guard := &coordinatorLeaseGuard{stop: make(chan struct{}), done: make(chan error, 1), cancel: cancel}
+	go func() {
+		ticker := time.NewTicker(coordinatorRenewInterval(lease))
+		defer ticker.Stop()
+		for {
+			select {
+			case <-guard.stop:
+				guard.done <- nil
+				return
+			case <-operationCtx.Done():
+				guard.done <- operationCtx.Err()
+				return
+			case <-ticker.C:
+				if err := journal.RenewCoordinatorWork(operationCtx, workKey, owner, generation, lease); err != nil {
+					cancel()
+					guard.done <- err
+					return
+				}
+			}
+		}
+	}()
+	return operationCtx, guard
+}
+
+func (g *coordinatorLeaseGuard) stopAndJoin() error {
+	g.once.Do(func() { close(g.stop) })
+	err := <-g.done
+	g.cancel()
+	return err
+}
+
+func coordinatorRenewInterval(lease time.Duration) time.Duration {
+	interval := lease / 3
+	if interval < time.Millisecond {
+		return time.Millisecond
+	}
+	return interval
+}
+
+func transcriptWorkKey(work TranscriptWork) string {
+	hash := sha256.New()
+	for _, value := range []string{
+		work.Scope.TenantID, string(work.Scope.ConversationID), string(work.SessionID),
+		fmt.Sprintf("%d", work.Incarnation), fmt.Sprintf("%d", work.Sequence),
+		work.Turn.ID, fmt.Sprintf("%d", work.Turn.Revision), work.Role,
+	} {
+		hash.Write([]byte(value))
+		hash.Write([]byte{0})
+	}
+	return "transcript:" + hex.EncodeToString(hash.Sum(nil))
+}
+
+func validateTranscriptWorkBounds(work TranscriptWork) (int, error) {
+	values := []string{
+		string(work.SessionID), work.Scope.TenantID, work.Scope.UserID, string(work.Scope.ConversationID), work.Turn.ID,
+	}
+	retained := len(work.FinalText) + len(work.Role)
+	for _, value := range values {
+		if strings.TrimSpace(value) == "" || !utf8.ValidString(value) || len(value) > session.DurableIdentifierBytes {
+			return 0, ErrCoordinatorWorkTooLarge
+		}
+		retained += len(value)
+	}
+	if work.Incarnation == 0 || work.Turn.Revision == 0 || work.Sequence == 0 ||
+		(work.Role != "user" && work.Role != "assistant") || !utf8.ValidString(work.FinalText) ||
+		len(work.FinalText) > session.DurableTranscriptBytes || retained > CoordinatorAggregateBytes {
+		return 0, ErrCoordinatorWorkTooLarge
+	}
+	return retained, nil
+}

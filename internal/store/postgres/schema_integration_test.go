@@ -4,6 +4,8 @@ package postgres_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"slices"
@@ -29,6 +31,12 @@ var requiredColumns = map[string]map[string]string{
 		"tenant_id": "text", "conversation_id": "text", "session_id": "text", "turn_id": "text",
 		"turn_revision": "bigint", "sequence": "bigint", "role": "text", "content": "text",
 		"content_hash": "text", "created_at": "timestamp with time zone", "updated_at": "timestamp with time zone",
+	},
+	"coordinator_work_journal": {
+		"work_key": "text", "kind": "text", "tenant_id": "text", "user_id": "text", "conversation_id": "text",
+		"session_id": "text", "delivery_affinity": "text", "incarnation": "bigint", "local_sequence": "bigint", "payload": "json",
+		"payload_hash": "text", "storage_sequence": "bigint", "delivered": "boolean", "claim_owner": "text",
+		"claim_until": "timestamp with time zone", "claim_generation": "bigint", "created_at": "timestamp with time zone", "delivered_at": "timestamp with time zone",
 	},
 	"handoffs": {
 		"tenant_id": "text", "conversation_id": "text", "id": "text", "user_id": "text", "session_id": "text",
@@ -74,38 +82,41 @@ var requiredColumns = map[string]map[string]string{
 }
 
 var requiredDefaults = map[string]string{
-	"conversations.status":                `'active'::text`,
-	"conversations.created_at":            `CURRENT_TIMESTAMP`,
-	"conversations.updated_at":            `CURRENT_TIMESTAMP`,
-	"conversation_items.created_at":       `CURRENT_TIMESTAMP`,
-	"conversation_items.updated_at":       `CURRENT_TIMESTAMP`,
-	"handoffs.priority":                   `0`,
-	"handoffs.tool_allowlist":             `'[]'::json`,
-	"handoffs.presentation_hint":          `''::text`,
-	"handoffs.state":                      `'pending'::text`,
-	"handoffs.objective_revision":         `0`,
-	"handoffs.input_revision":             `0`,
-	"handoffs.consumed_input_revision":    `0`,
-	"handoffs.ready_at":                   `CURRENT_TIMESTAMP`,
-	"handoffs.attempt":                    `0`,
-	"handoffs.retry_count":                `0`,
-	"handoffs.lease_version":              `0`,
-	"handoffs.created_at":                 `CURRENT_TIMESTAMP`,
-	"handoffs.updated_at":                 `CURRENT_TIMESTAMP`,
-	"handoff_events.seq":                  `nextval('handoff_events_seq_seq'::regclass)`,
-	"handoff_events.attempt":              `0`,
-	"handoff_events.created_at":           `CURRENT_TIMESTAMP`,
-	"outbox.id":                           `nextval('outbox_id_seq'::regclass)`,
-	"outbox.created_at":                   `CURRENT_TIMESTAMP`,
-	"outbox.attempts":                     `0`,
-	"tool_invocations.status":             `'pending'::text`,
-	"tool_invocations.created_at":         `CURRENT_TIMESTAMP`,
-	"tool_invocations.updated_at":         `CURRENT_TIMESTAMP`,
-	"delivery_cursors.last_sequence":      `0`,
-	"delivery_cursors.created_at":         `CURRENT_TIMESTAMP`,
-	"delivery_cursors.updated_at":         `CURRENT_TIMESTAMP`,
-	"session_admission_leases.created_at": `CURRENT_TIMESTAMP`,
-	"deletion_audits.deleted_at":          `CURRENT_TIMESTAMP`,
+	"conversations.status":                      `'active'::text`,
+	"conversations.created_at":                  `CURRENT_TIMESTAMP`,
+	"conversations.updated_at":                  `CURRENT_TIMESTAMP`,
+	"conversation_items.created_at":             `CURRENT_TIMESTAMP`,
+	"conversation_items.updated_at":             `CURRENT_TIMESTAMP`,
+	"coordinator_work_journal.delivered":        `false`,
+	"coordinator_work_journal.claim_generation": `0`,
+	"coordinator_work_journal.created_at":       `CURRENT_TIMESTAMP`,
+	"handoffs.priority":                         `0`,
+	"handoffs.tool_allowlist":                   `'[]'::json`,
+	"handoffs.presentation_hint":                `''::text`,
+	"handoffs.state":                            `'pending'::text`,
+	"handoffs.objective_revision":               `0`,
+	"handoffs.input_revision":                   `0`,
+	"handoffs.consumed_input_revision":          `0`,
+	"handoffs.ready_at":                         `CURRENT_TIMESTAMP`,
+	"handoffs.attempt":                          `0`,
+	"handoffs.retry_count":                      `0`,
+	"handoffs.lease_version":                    `0`,
+	"handoffs.created_at":                       `CURRENT_TIMESTAMP`,
+	"handoffs.updated_at":                       `CURRENT_TIMESTAMP`,
+	"handoff_events.seq":                        `nextval('handoff_events_seq_seq'::regclass)`,
+	"handoff_events.attempt":                    `0`,
+	"handoff_events.created_at":                 `CURRENT_TIMESTAMP`,
+	"outbox.id":                                 `nextval('outbox_id_seq'::regclass)`,
+	"outbox.created_at":                         `CURRENT_TIMESTAMP`,
+	"outbox.attempts":                           `0`,
+	"tool_invocations.status":                   `'pending'::text`,
+	"tool_invocations.created_at":               `CURRENT_TIMESTAMP`,
+	"tool_invocations.updated_at":               `CURRENT_TIMESTAMP`,
+	"delivery_cursors.last_sequence":            `0`,
+	"delivery_cursors.created_at":               `CURRENT_TIMESTAMP`,
+	"delivery_cursors.updated_at":               `CURRENT_TIMESTAMP`,
+	"session_admission_leases.created_at":       `CURRENT_TIMESTAMP`,
+	"deletion_audits.deleted_at":                `CURRENT_TIMESTAMP`,
 }
 
 var requiredNamedConstraintNames = strings.Fields(`
@@ -116,6 +127,12 @@ var requiredNamedConstraintNames = strings.Fields(`
 	conversation_items_session_id_size_check conversation_items_turn_id_size_check
 	conversation_items_turn_revision_check conversation_items_sequence_check conversation_items_role_check
 	conversation_items_content_size_check conversation_items_content_hash_size_check conversation_items_timestamps_check
+	coordinator_work_journal_kind_check coordinator_work_journal_work_key_size coordinator_work_journal_identity_size
+	coordinator_work_journal_incarnation_check coordinator_work_journal_local_sequence_check
+	coordinator_work_journal_payload_size coordinator_work_journal_payload_hash_size
+	coordinator_work_journal_payload_depth_check
+	coordinator_work_journal_storage_sequence_check coordinator_work_journal_delivery_check coordinator_work_journal_claim_check
+	coordinator_work_journal_claim_owner_size coordinator_work_journal_claim_generation_check
 	handoffs_tenant_idempotency_uniq handoffs_tenant_id_size_check handoffs_conversation_id_size_check
 	handoffs_id_size_check handoffs_user_id_size_check handoffs_session_id_size_check
 	handoffs_source_turn_id_size_check handoffs_source_turn_revision_check handoffs_user_request_size_check
@@ -158,11 +175,16 @@ func TestSchemaMigrationLifecycle(t *testing.T) {
 
 	version, dirty, err := migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
-	assert.Equal(t, uint(1), version)
+	assert.Equal(t, uint(2), version)
 	assert.False(t, dirty)
+	var journalPresent bool
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
+	assert.True(t, journalPresent)
 
 	require.NoError(t, migrations.Down(t.Context(), pool))
 	assert.Error(t, migrations.Check(t.Context(), pool))
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
+	assert.False(t, journalPresent)
 	for _, signature := range []string{
 		"canonical_tool_name_bytes(text)",
 		"canonical_json_depth_valid(json)",
@@ -176,6 +198,12 @@ func TestSchemaMigrationLifecycle(t *testing.T) {
 	require.NoError(t, migrations.Down(t.Context(), pool))
 	require.NoError(t, migrations.Up(t.Context(), pool))
 	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
+	version, dirty, err = migrations.Version(t.Context(), pool)
+	require.NoError(t, err)
+	assert.Equal(t, uint(1), version)
+	assert.False(t, dirty)
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
+	assert.False(t, journalPresent)
 	require.NoError(t, migrations.Steps(t.Context(), pool, 1))
 	require.NoError(t, migrations.Steps(t.Context(), pool, 0))
 	require.NoError(t, migrations.Check(t.Context(), pool))
@@ -281,11 +309,20 @@ func TestSchemaMigrationCancellationWhileExecutingSQL(t *testing.T) {
 	locked = false
 	version, dirty, err := migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
-	assert.Equal(t, uint(0), version)
+	assert.Equal(t, uint(1), version)
 	assert.True(t, dirty, "a cancelled down migration must never report a falsely clean schema")
 	assert.ErrorContains(t, migrations.Check(t.Context(), pool), "dirty")
-	_, err = pool.Exec(t.Context(), `UPDATE schema_migrations SET version=1, dirty=false`)
+	var coordinatorTablePresent bool
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&coordinatorTablePresent))
+	assert.True(t, coordinatorTablePresent, "the cancelled v2 down transaction must roll back its table drop")
+	_, err = pool.Exec(t.Context(), `UPDATE schema_migrations SET version=2, dirty=false`)
 	require.NoError(t, err)
+	require.NoError(t, migrations.Down(t.Context(), pool))
+	version, dirty, err = migrations.Version(t.Context(), pool)
+	require.NoError(t, err)
+	assert.Equal(t, uint(0), version)
+	assert.False(t, dirty)
+	require.NoError(t, migrations.Up(t.Context(), pool))
 	require.NoError(t, migrations.Check(t.Context(), pool))
 }
 
@@ -505,6 +542,14 @@ func TestSchemaEveryNamedCheckRejectsInvalidMutation(t *testing.T) {
 		(audit_id,tenant_id,conversation_hash,actor,reason_code)
 		VALUES ('audit-c','tenant-c','hash-c','actor-c','reason-c')`)
 	require.NoError(t, err)
+	coordinatorPayload := []byte(`{"kind":"handoff"}`)
+	coordinatorHash := sha256.Sum256(coordinatorPayload)
+	_, err = pool.Exec(t.Context(), `INSERT INTO coordinator_work_journal (
+		work_key,kind,tenant_id,user_id,conversation_id,session_id,delivery_affinity,
+		incarnation,local_sequence,payload,payload_hash,storage_sequence
+	) VALUES ('check-work','handoff','tenant-c','user','conversation-c','session-c','app-c',
+		1,1,$1::json,$2,NULL)`, coordinatorPayload, hex.EncodeToString(coordinatorHash[:]))
+	require.NoError(t, err)
 
 	mutations := map[string]string{
 		"conversations_tenant_id_size_check":              `UPDATE conversations SET tenant_id='' WHERE tenant_id='tenant-free'`,
@@ -523,6 +568,19 @@ func TestSchemaEveryNamedCheckRejectsInvalidMutation(t *testing.T) {
 		"conversation_items_content_size_check":           `UPDATE conversation_items SET content='' WHERE session_id='session-c'`,
 		"conversation_items_content_hash_size_check":      `UPDATE conversation_items SET content_hash='' WHERE session_id='session-c'`,
 		"conversation_items_timestamps_check":             `UPDATE conversation_items SET updated_at=created_at-interval '1 second' WHERE session_id='session-c'`,
+		"coordinator_work_journal_kind_check":             `UPDATE coordinator_work_journal SET kind='unknown' WHERE work_key='check-work'`,
+		"coordinator_work_journal_work_key_size":          `UPDATE coordinator_work_journal SET work_key='' WHERE work_key='check-work'`,
+		"coordinator_work_journal_identity_size":          `UPDATE coordinator_work_journal SET delivery_affinity='' WHERE work_key='check-work'`,
+		"coordinator_work_journal_incarnation_check":      `UPDATE coordinator_work_journal SET incarnation=0 WHERE work_key='check-work'`,
+		"coordinator_work_journal_local_sequence_check":   `UPDATE coordinator_work_journal SET local_sequence=-1 WHERE work_key='check-work'`,
+		"coordinator_work_journal_payload_size":           `UPDATE coordinator_work_journal SET payload=to_json(repeat('x',262145)) WHERE work_key='check-work'`,
+		"coordinator_work_journal_payload_depth_check":    `UPDATE coordinator_work_journal SET payload=(repeat('[',65)||repeat(']',65))::json WHERE work_key='check-work'`,
+		"coordinator_work_journal_payload_hash_size":      `UPDATE coordinator_work_journal SET payload_hash='' WHERE work_key='check-work'`,
+		"coordinator_work_journal_storage_sequence_check": `UPDATE coordinator_work_journal SET storage_sequence=1 WHERE work_key='check-work'`,
+		"coordinator_work_journal_delivery_check":         `UPDATE coordinator_work_journal SET delivered=true WHERE work_key='check-work'`,
+		"coordinator_work_journal_claim_check":            `UPDATE coordinator_work_journal SET claim_owner='worker' WHERE work_key='check-work'`,
+		"coordinator_work_journal_claim_owner_size":       `UPDATE coordinator_work_journal SET claim_owner='',claim_until=CURRENT_TIMESTAMP WHERE work_key='check-work'`,
+		"coordinator_work_journal_claim_generation_check": `UPDATE coordinator_work_journal SET claim_generation=-1 WHERE work_key='check-work'`,
 		"handoffs_tenant_id_size_check":                   `UPDATE handoffs SET tenant_id='' WHERE id='handoff-c'`,
 		"handoffs_conversation_id_size_check":             `UPDATE handoffs SET conversation_id='' WHERE id='handoff-c'`,
 		"handoffs_id_size_check":                          `UPDATE handoffs SET id='' WHERE id='handoff-c'`,
@@ -1237,6 +1295,8 @@ func allowedNullableColumn(table, column string) bool {
 		"outbox.published_at": true, "outbox.last_error": true,
 		"tool_invocations.approval_expires_at": true, "tool_invocations.result_metadata": true,
 		"tool_invocations.result": true, "tool_invocations.mutation_id": true,
+		"coordinator_work_journal.storage_sequence": true, "coordinator_work_journal.claim_owner": true,
+		"coordinator_work_journal.claim_until": true, "coordinator_work_journal.delivered_at": true,
 	}
 	return allowed[key]
 }

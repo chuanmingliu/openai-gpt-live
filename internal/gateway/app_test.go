@@ -16,13 +16,16 @@ import (
 	"time"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/config"
+	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
 	"github.com/chuanmingliu/openai-gpt-live/internal/session"
+	"github.com/chuanmingliu/openai-gpt-live/internal/store/postgres"
 	"github.com/chuanmingliu/openai-gpt-live/internal/testkit"
 	transportws "github.com/chuanmingliu/openai-gpt-live/internal/transport/ws"
 	"github.com/coder/websocket"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -107,6 +110,147 @@ func TestNewRejectsNilDependenciesInvalidTLSAndTypedNilIDs(t *testing.T) {
 	_, err = New(cfg, testkit.NewFakeConnector(4))
 	require.ErrorContains(t, err, "TLS")
 }
+
+func TestNewHandoffsFeatureFailsClosedAndFeatureOffStaysCompatible(t *testing.T) {
+	cfg := validConfig()
+	_, err := New(cfg, testkit.NewFakeConnector(4), WithIDGenerator(deterministicIDs{}))
+	require.NoError(t, err)
+
+	cfg.Features.Handoffs = true
+	_, err = New(cfg, testkit.NewFakeConnector(4), WithIDGenerator(deterministicIDs{}))
+	require.ErrorContains(t, err, "durable handoff dependencies")
+
+	service := &handoffServiceFake{creates: make(chan handoff.CreateRequest, 1)}
+	writer := &transcriptWriterFake{items: make(chan postgres.ConversationItem, 1)}
+	dependencies := DurableDependencies{
+		Service: service, ConversationWriter: writer, HandoffQueueCapacity: 2, TranscriptQueueCapacity: 2,
+		Journal: newCoordinatorJournalFake(), DeliveryAffinity: "app-test-affinity", JournalOwner: "app-test", JournalClaimLease: time.Minute,
+		Snapshot: validHandoffWork().Snapshot,
+	}
+	app, err := New(cfg, testkit.NewFakeConnector(4), WithIDGenerator(deterministicIDs{}), WithDurableHandoffs(dependencies))
+	require.NoError(t, err)
+	require.NotNil(t, app.handoffs)
+	require.NotNil(t, app.transcripts)
+	require.NotNil(t, app.managerConfig.DurableDispatcher)
+}
+
+func TestDurableDispatcherBuildsScopeOnlyFromTrustedManagerContext(t *testing.T) {
+	snapshot := validHandoffWork().Snapshot
+	handoffs := NewHandoffCoordinator(&handoffServiceFake{creates: make(chan handoff.CreateRequest, 1)}, &submitterFake{}, 1)
+	transcripts := NewTranscriptCoordinator(&transcriptWriterFake{}, &submitterFake{}, 1)
+	dispatcher := &durableDispatcher{handoffs: handoffs, transcripts: transcripts, snapshot: snapshot}
+	trusted := session.TrustedSessionContext{
+		IDs:     session.IDs{SessionID: "trusted-session", ConversationID: "trusted-conversation", Incarnation: 7},
+		Subject: session.Subject{TenantID: "trusted-tenant", UserID: "trusted-user"},
+	}
+	require.NoError(t, dispatcher.DispatchHandoff(t.Context(), trusted, session.HandoffRequestedEffect{
+		OriginEpoch: 3, Turn: identity.TurnKey{ID: "trusted-turn", Revision: 1}, Transcript: "trusted transcript",
+		ResponseID: "response", CallID: "call", ToolName: handoff.ToolCancelBackgroundTask,
+		Arguments: json.RawMessage(`{"handoff_id":"h-1"}`),
+	}))
+	queued := <-handoffs.work
+	assert.Equal(t, "trusted-tenant", queued.Scope.TenantID)
+	assert.Equal(t, "trusted-user", queued.Scope.UserID)
+	assert.Equal(t, identity.ConversationID("trusted-conversation"), queued.Scope.ConversationID)
+	assert.Equal(t, identity.SessionID("trusted-session"), queued.SessionID)
+	assert.Equal(t, identity.Incarnation(7), queued.Incarnation)
+	assert.Equal(t, snapshot, queued.Snapshot)
+}
+
+func TestRunPropagatesUnexpectedCoordinatorFailure(t *testing.T) {
+	sentinel := errors.New("transcript store failed")
+	cfg := validConfig()
+	cfg.Features.Handoffs = true
+	dependencies := DurableDependencies{
+		Service:              &handoffServiceFake{creates: make(chan handoff.CreateRequest, 1)},
+		ConversationWriter:   &transcriptWriterFake{err: sentinel},
+		Journal:              newCoordinatorJournalFake(),
+		DeliveryAffinity:     "run-test-affinity",
+		JournalOwner:         "run-test",
+		JournalClaimLease:    time.Minute,
+		HandoffQueueCapacity: 1, TranscriptQueueCapacity: 1, Snapshot: validHandoffWork().Snapshot,
+	}
+	app, err := New(cfg, testkit.NewFakeConnector(1), WithIDGenerator(deterministicIDs{}), WithDurableHandoffs(dependencies))
+	require.NoError(t, err)
+	listener := newBlockingListener()
+	app.listener = listener
+	require.NoError(t, app.transcripts.Enqueue(TranscriptWork{
+		SessionID: "session", Incarnation: 1,
+		Scope: handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "conversation"},
+		Turn:  identity.TurnKey{ID: "turn", Revision: 1}, Sequence: 1, Role: "user", FinalText: "text",
+	}))
+
+	err = app.Run(t.Context())
+	require.ErrorIs(t, err, sentinel)
+}
+
+func TestRunFailsBeforeServingWhenCoordinatorAffinityIsAlreadyOwned(t *testing.T) {
+	journal := newCoordinatorJournalFake()
+	journal.affinityErr = postgres.ErrCoordinatorAffinityInUse
+	cfg := validConfig()
+	cfg.Features.Handoffs = true
+	dependencies := DurableDependencies{
+		Service:            &handoffServiceFake{creates: make(chan handoff.CreateRequest, 1)},
+		ConversationWriter: &transcriptWriterFake{items: make(chan postgres.ConversationItem, 1)},
+		Journal:            journal, DeliveryAffinity: "shared-affinity", JournalOwner: "second-app", JournalClaimLease: time.Minute,
+		HandoffQueueCapacity: 1, TranscriptQueueCapacity: 1, Snapshot: validHandoffWork().Snapshot,
+	}
+	app, err := New(cfg, testkit.NewFakeConnector(1), WithIDGenerator(deterministicIDs{}), WithDurableHandoffs(dependencies))
+	require.NoError(t, err)
+	app.listener = newBlockingListener()
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+
+	err = app.Run(ctx)
+	require.ErrorIs(t, err, postgres.ErrCoordinatorAffinityInUse)
+}
+
+func TestRunRejectsNilAffinityLockAndJoinsReleaseFailure(t *testing.T) {
+	newDurableApp := func(journal *coordinatorJournalFake) *App {
+		cfg := validConfig()
+		cfg.Features.Handoffs = true
+		app, err := New(cfg, testkit.NewFakeConnector(1), WithIDGenerator(deterministicIDs{}), WithDurableHandoffs(DurableDependencies{
+			Service:            &handoffServiceFake{creates: make(chan handoff.CreateRequest, 1)},
+			ConversationWriter: &transcriptWriterFake{items: make(chan postgres.ConversationItem, 1)},
+			Journal:            journal, DeliveryAffinity: "app-affinity", JournalOwner: "app-owner", JournalClaimLease: time.Minute,
+			HandoffQueueCapacity: 1, TranscriptQueueCapacity: 1, Snapshot: validHandoffWork().Snapshot,
+		}))
+		require.NoError(t, err)
+		app.listener = newBlockingListener()
+		return app
+	}
+
+	nilJournal := newCoordinatorJournalFake()
+	nilJournal.affinityNil = true
+	require.ErrorContains(t, newDurableApp(nilJournal).Run(t.Context()), "nil lock")
+
+	releaseErr := errors.New("affinity connection close failed")
+	releaseJournal := newCoordinatorJournalFake()
+	releaseJournal.affinityLock = errorCloser{err: releaseErr}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- newDurableApp(releaseJournal).Run(ctx) }()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, releaseErr)
+}
+
+type blockingListener struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+type errorCloser struct{ err error }
+
+func (c errorCloser) Close() error { return c.err }
+
+func newBlockingListener() *blockingListener { return &blockingListener{closed: make(chan struct{})} }
+func (l *blockingListener) Accept() (net.Conn, error) {
+	<-l.closed
+	return nil, net.ErrClosed
+}
+func (l *blockingListener) Close() error { l.once.Do(func() { close(l.closed) }); return nil }
+func (*blockingListener) Addr() net.Addr { return staticAddr("blocking") }
 
 func TestLocalAdmissionUsesOnlyFixedTrustedDevelopmentSubject(t *testing.T) {
 	app, err := New(validConfig(), testkit.NewFakeConnector(4), WithIDGenerator(deterministicIDs{}))

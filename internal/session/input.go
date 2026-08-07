@@ -37,6 +37,33 @@ type DurableInput struct {
 	Payload  json.RawMessage
 }
 
+// TurnCommittedInput acknowledges that the exact finalized user transcript was
+// committed durably. Sequence belongs to the per-session durable-work stream,
+// not the realtime command stream.
+type TurnCommittedInput struct {
+	Sequence   uint64
+	Turn       identity.TurnKey
+	Transcript string
+}
+
+// TranscriptPersistedInput advances the durable-work fence for a finalized
+// non-user transcript without authorizing a user turn.
+type TranscriptPersistedInput struct {
+	Sequence uint64
+}
+
+// HandoffAcceptedInput reports the durable outcome for one reserved tool call.
+// A failed acceptance never carries a durable identifier.
+type HandoffAcceptedInput struct {
+	OriginEpoch identity.ResponseEpoch
+	Turn        identity.TurnKey
+	ResponseID  string
+	CallID      string
+	Accepted    bool
+	HandoffID   identity.HandoffID
+	Reason      string
+}
+
 type FailedInput struct {
 	Source string
 	Err    error
@@ -47,4 +74,7 @@ func (ClientInput) isSessionInput()                {}
 func (VoiceInput) isSessionInput()                 {}
 func (VoiceCommandCompletedInput) isSessionInput() {}
 func (DurableInput) isSessionInput()               {}
+func (TurnCommittedInput) isSessionInput()         {}
+func (TranscriptPersistedInput) isSessionInput()   {}
+func (HandoffAcceptedInput) isSessionInput()       {}
 func (FailedInput) isSessionInput()                {}

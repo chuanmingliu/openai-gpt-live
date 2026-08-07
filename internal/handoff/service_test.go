@@ -25,7 +25,7 @@ func TestNewService_RejectsNilDependencies(t *testing.T) {
 	assert.ErrorIs(t, err, ErrInvalidRequest)
 }
 
-func TestCreate_RequiresCommittedTurnBeforeGeneratingOrPersisting(t *testing.T) {
+func TestCreate_DelegatesCommittedTurnDecisionToAtomicRepositoryPath(t *testing.T) {
 	now := time.Date(2026, 8, 7, 4, 0, 0, 0, time.UTC)
 	repo := &fakeRepository{committed: false}
 	ids := &fixedIDs{handoffID: "handoff-1", eventID: "event-1"}
@@ -33,8 +33,8 @@ func TestCreate_RequiresCommittedTurnBeforeGeneratingOrPersisting(t *testing.T) 
 
 	_, err := service.Create(context.Background(), validCreateRequest(now))
 	assert.ErrorIs(t, err, ErrUncommittedTurn)
-	assert.Equal(t, 0, ids.calls)
-	assert.Equal(t, 0, repo.createCalls)
+	assert.Equal(t, 2, ids.calls)
+	assert.Equal(t, 1, repo.createCalls)
 }
 
 func TestCreate_GeneratesIDsAndTimeAndDoesNotRetainInput(t *testing.T) {
@@ -65,14 +65,14 @@ func TestCreate_GeneratesIDsAndTimeAndDoesNotRetainInput(t *testing.T) {
 	assert.Equal(t, byte('{'), repo.record.Request.ApprovalPolicy[0])
 }
 
-func TestCreate_BlankGeneratedIDsFailBeforeRepositoryMutation(t *testing.T) {
+func TestCreate_BlankGeneratedIDsFailInAtomicRepositoryPath(t *testing.T) {
 	now := time.Date(2026, 8, 7, 4, 0, 0, 0, time.UTC)
 	for _, ids := range []*fixedIDs{{handoffID: "", eventID: "event"}, {handoffID: "handoff", eventID: ""}} {
 		repo := &fakeRepository{committed: true}
 		service := mustService(t, repo, fixedClock{now: now}, ids)
 		_, err := service.Create(context.Background(), validCreateRequest(now))
 		assert.ErrorIs(t, err, ErrInvalidRequest)
-		assert.Zero(t, repo.createCalls)
+		assert.Equal(t, 1, repo.createCalls)
 	}
 }
 
@@ -105,6 +105,31 @@ func TestCreate_ReplayAndIdempotencyConflict(t *testing.T) {
 			assert.Equal(t, identity.HandoffID("existing"), got.ID)
 		})
 	}
+}
+
+func TestCreate_ReplaysExactExistingAfterDeadlineButRejectsExpiredAbsent(t *testing.T) {
+	createdAt := time.Date(2026, 8, 7, 4, 0, 0, 0, time.UTC)
+	request := validCreateRequest(createdAt)
+	hash, err := CanonicalRequestHash(request)
+	require.NoError(t, err)
+	existing := Snapshot{
+		ID: "already-committed", Request: cloneCreateRequest(request), RequestHash: hash,
+		State: StateRunning, CreatedAt: createdAt, UpdatedAt: createdAt,
+	}
+	later := request.Deadline.Add(time.Hour)
+
+	replayRepo := &fakeRepository{lookupSnapshot: existing}
+	replayService := mustService(t, replayRepo, fixedClock{now: later}, &fixedIDs{handoffID: "unused", eventID: "unused"})
+	replayed, err := replayService.Create(t.Context(), request)
+	require.NoError(t, err)
+	assert.Equal(t, identity.HandoffID("already-committed"), replayed.ID)
+	assert.Equal(t, 1, replayRepo.createCalls)
+
+	absentRepo := &fakeRepository{committed: true, lookupErr: ErrNotFound}
+	absentService := mustService(t, absentRepo, fixedClock{now: later}, &fixedIDs{handoffID: "must-not-generate", eventID: "must-not-generate"})
+	_, err = absentService.Create(t.Context(), request)
+	assert.ErrorIs(t, err, ErrInvalidRequest)
+	assert.Equal(t, 1, absentRepo.createCalls)
 }
 
 func TestCreate_RejectsBlankRepositorySnapshotID(t *testing.T) {
@@ -583,16 +608,18 @@ func (g *fixedIDs) NewHandoffID() identity.HandoffID { g.calls++; return g.hando
 func (g *fixedIDs) NewEventID() string               { g.calls++; return g.eventID }
 
 type fakeRepository struct {
-	committed     bool
-	committedErr  error
-	createFn      func(CreateRecord) (Snapshot, bool, error)
-	record        CreateRecord
-	createCalls   int
-	ioCalls       int
-	getSnapshot   Snapshot
-	getErr        error
-	listSnapshots []Snapshot
-	inputRequest  InputRequest
+	committed      bool
+	committedErr   error
+	createFn       func(CreateRecord) (Snapshot, bool, error)
+	record         CreateRecord
+	createCalls    int
+	ioCalls        int
+	getSnapshot    Snapshot
+	getErr         error
+	lookupSnapshot Snapshot
+	lookupErr      error
+	listSnapshots  []Snapshot
+	inputRequest   InputRequest
 }
 
 func (r *fakeRepository) IsCommittedTurn(context.Context, Scope, identity.TurnKey) (bool, error) {
@@ -603,11 +630,35 @@ func (r *fakeRepository) CreateHandoff(_ context.Context, record CreateRecord) (
 	if r.createFn != nil {
 		return r.createFn(record)
 	}
-	return Snapshot{}, false, nil
+	if r.lookupSnapshot.ID != "" {
+		if r.lookupSnapshot.RequestHash != record.RequestHash {
+			return Snapshot{}, false, ErrIdempotencyConflict
+		}
+		return r.lookupSnapshot, false, nil
+	}
+	if !r.committed {
+		return Snapshot{}, false, ErrUncommittedTurn
+	}
+	if _, err := ValidateCreateRequest(record.Request, record.CreatedAt); err != nil {
+		return Snapshot{}, false, err
+	}
+	if err := boundedRequired("generated handoff id", string(record.HandoffID), maxIdentityBytes); err != nil {
+		return Snapshot{}, false, err
+	}
+	if err := boundedRequired("generated event id", record.EventID, maxIdentityBytes); err != nil {
+		return Snapshot{}, false, err
+	}
+	return Snapshot{}, false, ErrNotFound
 }
 func (r *fakeRepository) GetHandoff(context.Context, Scope, identity.HandoffID) (Snapshot, error) {
 	r.ioCalls++
 	return r.getSnapshot, r.getErr
+}
+func (r *fakeRepository) GetHandoffByIdempotencyKey(context.Context, Scope, string) (Snapshot, error) {
+	if r.lookupSnapshot.ID == "" && r.lookupErr == nil {
+		return Snapshot{}, ErrNotFound
+	}
+	return r.lookupSnapshot, r.lookupErr
 }
 func (r *fakeRepository) ListActive(context.Context, Scope) ([]Snapshot, error) {
 	r.ioCalls++

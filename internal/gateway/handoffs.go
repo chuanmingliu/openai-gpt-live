@@ -1,0 +1,464 @@
+package gateway
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
+
+	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
+	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
+	"github.com/chuanmingliu/openai-gpt-live/internal/session"
+	"github.com/chuanmingliu/openai-gpt-live/internal/store/postgres"
+)
+
+type HandoffWork struct {
+	SessionID    identity.SessionID
+	Incarnation  identity.Incarnation
+	OriginEpoch  identity.ResponseEpoch
+	Scope        handoff.Scope
+	CallID       string
+	ResponseID   string
+	ToolName     string
+	Arguments    json.RawMessage
+	Turn         identity.TurnKey
+	Transcript   string
+	Snapshot     SessionHandoffSnapshot
+	RejectReason string
+}
+
+type SessionHandoffSnapshot struct {
+	ContextRef       string
+	ContextHash      string
+	Deadline         time.Time
+	TokenBudget      int
+	Priority         int16
+	ToolAllowlist    []string
+	ApprovalPolicy   json.RawMessage
+	Versions         handoff.Versions
+	PresentationHint string
+}
+
+type HandoffCoordinator struct {
+	service         handoff.Service
+	submit          SessionSubmitter
+	work            chan HandoffWork
+	slots           chan struct{}
+	mu              sync.Mutex
+	retainedBytes   int
+	journal         CoordinatorJournal
+	journalAffinity string
+	journalOwner    string
+	claimLease      time.Duration
+}
+
+func (c *HandoffCoordinator) configureJournal(journal CoordinatorJournal, affinity, owner string, lease time.Duration) error {
+	if c == nil || isNil(journal) || strings.TrimSpace(affinity) == "" || len(affinity) > session.DurableIdentifierBytes ||
+		strings.TrimSpace(owner) == "" || len(owner) > session.DurableIdentifierBytes ||
+		lease < postgres.CoordinatorMinLease || lease > postgres.CoordinatorMaxLease {
+		return errors.New("invalid handoff coordinator journal")
+	}
+	c.journal, c.journalAffinity, c.journalOwner, c.claimLease = journal, affinity, owner, lease
+	return nil
+}
+
+const CoordinatorAggregateBytes = 1 << 20
+
+var ErrCoordinatorWorkTooLarge = errors.New("durable coordinator work exceeds byte bounds")
+
+func NewHandoffCoordinator(service handoff.Service, submit SessionSubmitter, capacity int) *HandoffCoordinator {
+	if isNil(service) || isNil(submit) || capacity <= 0 || capacity > 10_000 {
+		return nil
+	}
+	return &HandoffCoordinator{
+		service: service, submit: submit, work: make(chan HandoffWork, capacity), slots: make(chan struct{}, capacity),
+	}
+}
+
+func (c *HandoffCoordinator) Enqueue(work HandoffWork) error {
+	if c == nil || c.work == nil {
+		return errors.New("handoff coordinator is not configured")
+	}
+	retained, err := validateHandoffWorkBounds(work)
+	if err != nil {
+		return err
+	}
+	select {
+	case c.slots <- struct{}{}:
+	default:
+		return ErrCoordinatorOverflow
+	}
+	c.mu.Lock()
+	if retained > CoordinatorAggregateBytes-c.retainedBytes {
+		c.mu.Unlock()
+		<-c.slots
+		return ErrCoordinatorOverflow
+	}
+	c.retainedBytes += retained
+	c.mu.Unlock()
+	owned := cloneHandoffWork(work)
+	c.work <- owned
+	return nil
+}
+
+func (c *HandoffCoordinator) Run(ctx context.Context) error {
+	if c == nil || c.work == nil || isNil(c.service) || isNil(c.submit) {
+		return errors.New("handoff coordinator is not configured")
+	}
+	if ctx == nil {
+		return errors.New("handoff coordinator context is nil")
+	}
+	if c.journal != nil {
+		if err := c.drainJournal(ctx); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+	}
+	var replay <-chan time.Time
+	var ticker *time.Ticker
+	if c.journal != nil {
+		ticker = time.NewTicker(coordinatorReplayInterval(c.claimLease))
+		defer ticker.Stop()
+		replay = ticker.C
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-replay:
+			if err := c.drainJournal(ctx); err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				return err
+			}
+		case work := <-c.work:
+			var err error
+			if c.journal != nil && work.RejectReason == "" {
+				canonical, canonicalErr := canonicalizeHandoffWork(work)
+				if canonicalErr == nil {
+					err = c.admitJournal(ctx, canonical)
+					if err == nil {
+						err = c.drainJournal(ctx)
+					}
+				} else {
+					completion, retryErr := c.process(ctx, work)
+					if retryErr != nil {
+						err = retryErr
+					} else {
+						err = c.submitCompletion(ctx, work, completion)
+					}
+				}
+			} else {
+				completion, retryErr := c.process(ctx, work)
+				if retryErr != nil {
+					err = retryErr
+				} else {
+					err = c.submitCompletion(ctx, work, completion)
+				}
+			}
+			c.releaseWork(work)
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				return err
+			}
+		}
+	}
+}
+
+func (c *HandoffCoordinator) submitCompletion(ctx context.Context, work HandoffWork, completion session.HandoffAcceptedInput) error {
+	err := c.submit.Submit(ctx, work.SessionID, work.Incarnation, completion)
+	if errors.Is(err, session.ErrSessionNotActive) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("submit handoff completion: %w", err)
+	}
+	return nil
+}
+
+func (c *HandoffCoordinator) releaseWork(work HandoffWork) {
+	retained, _ := validateHandoffWorkBounds(work)
+	c.mu.Lock()
+	c.retainedBytes -= retained
+	c.mu.Unlock()
+	<-c.slots
+}
+
+func (c *HandoffCoordinator) admitJournal(ctx context.Context, work HandoffWork) error {
+	payload, err := json.Marshal(work)
+	if err != nil {
+		return fmt.Errorf("encode handoff journal work: %w", err)
+	}
+	_, err = c.journal.AdmitCoordinatorWork(ctx, postgres.CoordinatorJournalRecord{
+		WorkKey: handoffWorkKey(work), Kind: postgres.CoordinatorKindHandoff,
+		Scope: work.Scope, SessionID: work.SessionID, Incarnation: work.Incarnation,
+		LocalSequence: uint64(work.OriginEpoch), DeliveryAffinity: c.journalAffinity, Payload: payload,
+	})
+	return err
+}
+
+func (c *HandoffCoordinator) drainJournal(ctx context.Context) error {
+	records, err := c.journal.ClaimCoordinatorWork(
+		ctx, postgres.CoordinatorKindHandoff, c.journalAffinity, c.journalOwner, c.claimLease, 1,
+	)
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
+		var work HandoffWork
+		if err := decodeCoordinatorPayload(record.Payload, &work); err != nil {
+			return errors.New("corrupt handoff coordinator journal payload")
+		}
+		canonical, err := canonicalizeHandoffWork(work)
+		if err != nil || handoffWorkKey(canonical) != record.WorkKey || uint64(canonical.OriginEpoch) != record.LocalSequence ||
+			canonical.Scope != record.Scope || canonical.SessionID != record.SessionID || canonical.Incarnation != record.Incarnation {
+			return errors.New("corrupt handoff coordinator journal record")
+		}
+		operationCtx, guard := startCoordinatorLeaseGuard(
+			ctx, c.journal, record.WorkKey, c.journalOwner, record.ClaimGeneration, c.claimLease,
+		)
+		completion, retryErr := c.process(operationCtx, canonical)
+		if retryErr != nil {
+			if leaseErr := guard.stopAndJoin(); leaseErr != nil {
+				return fmt.Errorf("handoff coordinator lease lost: %w", leaseErr)
+			}
+			return retryErr
+		}
+		if err := ctx.Err(); err != nil {
+			_ = guard.stopAndJoin()
+			return err
+		}
+		err = c.submit.Submit(operationCtx, canonical.SessionID, canonical.Incarnation, completion)
+		var fenceErr error
+		if err == nil || errors.Is(err, session.ErrSessionNotActive) {
+			fenceErr = c.journal.RenewCoordinatorWork(
+				operationCtx, record.WorkKey, c.journalOwner, record.ClaimGeneration, c.claimLease,
+			)
+		}
+		leaseErr := guard.stopAndJoin()
+		if fenceErr != nil {
+			return fmt.Errorf("handoff coordinator lease lost: %w", fenceErr)
+		}
+		if leaseErr != nil {
+			return fmt.Errorf("handoff coordinator lease lost: %w", leaseErr)
+		}
+		if errors.Is(err, session.ErrSessionNotActive) {
+			// Incarnations are immutable and cannot become active again. The
+			// durable handoff event remains the reconnect recovery source, so a
+			// stale live delivery is terminal instead of a poison journal row.
+			if err := c.journal.AckCoordinatorWork(ctx, record.WorkKey, c.journalOwner, record.ClaimGeneration); err != nil {
+				return err
+			}
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("submit handoff completion: %w", err)
+		}
+		if err := c.journal.AckCoordinatorWork(ctx, record.WorkKey, c.journalOwner, record.ClaimGeneration); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func canonicalizeHandoffWork(work HandoffWork) (HandoffWork, error) {
+	parsed, err := handoff.ParseReservedTool(work.ToolName, work.Arguments)
+	if err != nil {
+		return HandoffWork{}, err
+	}
+	canonical, err := json.Marshal(parsed)
+	if err != nil {
+		return HandoffWork{}, err
+	}
+	work.Arguments = canonical
+	if _, err := validateHandoffWorkBounds(work); err != nil {
+		return HandoffWork{}, err
+	}
+	return work, nil
+}
+
+func handoffWorkKey(work HandoffWork) string {
+	return "handoff:" + handoffIdempotencyKey(work, work.Arguments)
+}
+
+func (c *HandoffCoordinator) process(appCtx context.Context, work HandoffWork) (session.HandoffAcceptedInput, error) {
+	completion := session.HandoffAcceptedInput{
+		OriginEpoch: work.OriginEpoch, Turn: work.Turn, ResponseID: work.ResponseID, CallID: work.CallID,
+	}
+	if work.RejectReason == "" && (work.OriginEpoch == 0 || work.Turn.ID == "" || work.Turn.Revision == 0) {
+		completion.Reason = "missing_committed_turn"
+		return completion, nil
+	}
+	if work.RejectReason != "" {
+		completion.Reason = boundedReason(work.RejectReason)
+		return completion, nil
+	}
+	parsed, err := handoff.ParseReservedTool(work.ToolName, work.Arguments)
+	if err != nil {
+		completion.Reason = "invalid_reserved_tool"
+		return completion, nil
+	}
+
+	var snapshot handoff.Snapshot
+	switch args := parsed.(type) {
+	case handoff.StartBackgroundTaskArgs:
+		canonical, marshalErr := json.Marshal(args)
+		if marshalErr != nil {
+			completion.Reason = "invalid_reserved_tool"
+			return completion, nil
+		}
+		request := handoff.CreateRequest{
+			Scope: work.Scope, SessionID: work.SessionID, SourceTurn: work.Turn,
+			UserRequest: work.Transcript, Objective: args.Objective,
+			ContextRef: work.Snapshot.ContextRef, ContextHash: work.Snapshot.ContextHash,
+			Deadline: work.Snapshot.Deadline.UTC(), TokenBudget: work.Snapshot.TokenBudget,
+			Priority: work.Snapshot.Priority, ToolAllowlist: append([]string(nil), work.Snapshot.ToolAllowlist...),
+			ApprovalPolicy: append(json.RawMessage(nil), work.Snapshot.ApprovalPolicy...),
+			Versions:       work.Snapshot.Versions, PresentationHint: work.Snapshot.PresentationHint,
+			IdempotencyKey: handoffIdempotencyKey(work, canonical),
+		}
+		snapshot, err = c.service.Create(appCtx, request)
+	case handoff.SteerBackgroundTaskArgs:
+		current, getErr := c.service.Get(appCtx, work.Scope, args.HandoffID)
+		if getErr != nil {
+			err = getErr
+			break
+		}
+		if current.Request.Objective == args.Objective {
+			snapshot = current
+			break
+		}
+		canonical, _ := json.Marshal(args)
+		snapshot, err = c.service.Steer(appCtx, work.Scope, args.HandoffID, handoff.SteerRequest{
+			Objective: args.Objective, ExpectedRevision: current.ObjectiveRevision + 1,
+			Actor: "assistant", IdempotencyKey: handoffIdempotencyKey(work, canonical),
+		})
+	case handoff.CancelBackgroundTaskArgs:
+		canonical, _ := json.Marshal(args)
+		snapshot, err = c.service.Cancel(appCtx, work.Scope, args.HandoffID, handoff.CancelRequest{
+			Actor: "assistant", Reason: args.Reason, IdempotencyKey: handoffIdempotencyKey(work, canonical),
+		})
+	default:
+		err = handoff.ErrInvalidRequest
+	}
+	if err != nil {
+		if !isStableHandoffRejection(err) {
+			return session.HandoffAcceptedInput{}, fmt.Errorf("process handoff work: %w", err)
+		}
+		completion.Reason = "handoff_rejected"
+		return completion, nil
+	}
+	if snapshot.ID == "" {
+		return session.HandoffAcceptedInput{}, errors.New("process handoff work: empty handoff snapshot")
+	}
+	completion.Accepted = true
+	completion.HandoffID = snapshot.ID
+	return completion, nil
+}
+
+func isStableHandoffRejection(err error) bool {
+	for _, stable := range []error{
+		handoff.ErrInvalidRequest,
+		handoff.ErrNotFound,
+		handoff.ErrUncommittedTurn,
+		handoff.ErrIdempotencyConflict,
+		handoff.ErrRevisionConflict,
+		handoff.ErrInvalidTransition,
+		handoff.ErrTerminalState,
+	} {
+		if errors.Is(err, stable) {
+			return true
+		}
+	}
+	return false
+}
+
+func handoffIdempotencyKey(work HandoffWork, canonical []byte) string {
+	hash := sha256.New()
+	for _, value := range []string{
+		work.Scope.TenantID, string(work.Scope.ConversationID), work.Turn.ID,
+		fmt.Sprintf("%d", work.Turn.Revision), work.CallID, work.ToolName,
+	} {
+		hash.Write([]byte(value))
+		hash.Write([]byte{0})
+	}
+	hash.Write(canonical)
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func cloneHandoffWork(work HandoffWork) HandoffWork {
+	work.Arguments = append(json.RawMessage(nil), work.Arguments...)
+	work.Snapshot.ToolAllowlist = append([]string(nil), work.Snapshot.ToolAllowlist...)
+	work.Snapshot.ApprovalPolicy = append(json.RawMessage(nil), work.Snapshot.ApprovalPolicy...)
+	return work
+}
+
+func cloneHandoffSnapshot(snapshot SessionHandoffSnapshot) SessionHandoffSnapshot {
+	snapshot.ToolAllowlist = append([]string(nil), snapshot.ToolAllowlist...)
+	snapshot.ApprovalPolicy = append(json.RawMessage(nil), snapshot.ApprovalPolicy...)
+	return snapshot
+}
+
+func boundedReason(reason string) string {
+	if len(reason) > 1024 {
+		return reason[:1024]
+	}
+	return reason
+}
+
+func validateHandoffWorkBounds(work HandoffWork) (int, error) {
+	stringsToCheck := []string{
+		string(work.SessionID), work.Scope.TenantID, work.Scope.UserID, string(work.Scope.ConversationID),
+		work.CallID, work.ResponseID, work.ToolName,
+	}
+	retained := len(work.Arguments) + len(work.Transcript) + len(work.Snapshot.ApprovalPolicy)
+	for _, value := range stringsToCheck {
+		if strings.TrimSpace(value) == "" || !utf8.ValidString(value) || len(value) > session.DurableIdentifierBytes {
+			return 0, ErrCoordinatorWorkTooLarge
+		}
+		retained += len(value)
+	}
+	if work.Incarnation == 0 || work.OriginEpoch == 0 ||
+		len(work.Arguments) == 0 || len(work.Arguments) > session.DurableArgumentsBytes ||
+		len(work.Transcript) > session.DurableTranscriptBytes || !utf8.ValidString(work.Transcript) ||
+		len(work.Snapshot.ApprovalPolicy) > 64<<10 || len(work.Snapshot.ToolAllowlist) > 64 {
+		return 0, ErrCoordinatorWorkTooLarge
+	}
+	if work.RejectReason == "" {
+		if strings.TrimSpace(work.Turn.ID) == "" || !utf8.ValidString(work.Turn.ID) ||
+			len(work.Turn.ID) > session.DurableIdentifierBytes || work.Turn.Revision == 0 {
+			return 0, ErrCoordinatorWorkTooLarge
+		}
+		retained += len(work.Turn.ID)
+	} else if len(work.RejectReason) > 1024 || !utf8.ValidString(work.RejectReason) {
+		return 0, ErrCoordinatorWorkTooLarge
+	}
+	retained += len(work.RejectReason)
+	for _, value := range []string{work.Snapshot.ContextRef, work.Snapshot.ContextHash, work.Snapshot.PresentationHint} {
+		if !utf8.ValidString(value) || len(value) > 2048 {
+			return 0, ErrCoordinatorWorkTooLarge
+		}
+		retained += len(value)
+	}
+	for _, tool := range work.Snapshot.ToolAllowlist {
+		if strings.TrimSpace(tool) == "" || !utf8.ValidString(tool) || len(tool) > session.DurableIdentifierBytes {
+			return 0, ErrCoordinatorWorkTooLarge
+		}
+		retained += len(tool)
+	}
+	if retained > CoordinatorAggregateBytes {
+		return 0, ErrCoordinatorWorkTooLarge
+	}
+	return retained, nil
+}

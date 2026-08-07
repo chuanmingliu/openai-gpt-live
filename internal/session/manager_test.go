@@ -1341,6 +1341,59 @@ func TestManagerRejectsAsyncEffectsInsteadOfDroppingThem(t *testing.T) {
 	require.ErrorIs(t, err, ErrUnsupportedAsync)
 }
 
+type durableDispatcherFake struct {
+	trusted     chan TrustedSessionContext
+	transcripts chan TranscriptRequestedEffect
+	handoffs    chan HandoffRequestedEffect
+}
+
+func (f *durableDispatcherFake) DispatchTranscript(_ context.Context, trusted TrustedSessionContext, effect TranscriptRequestedEffect) error {
+	f.trusted <- trusted
+	f.transcripts <- effect
+	return nil
+}
+
+func (f *durableDispatcherFake) DispatchHandoff(_ context.Context, trusted TrustedSessionContext, effect HandoffRequestedEffect) error {
+	f.trusted <- trusted
+	f.handoffs <- effect
+	return nil
+}
+
+func TestManagerDispatchesTypedDurableEffectsWithTrustedRuntimeIdentity(t *testing.T) {
+	dispatcher := &durableDispatcherFake{
+		trusted: make(chan TrustedSessionContext, 2), transcripts: make(chan TranscriptRequestedEffect, 1),
+		handoffs: make(chan HandoffRequestedEffect, 1),
+	}
+	state := &runState{
+		ids:        IDs{SessionID: "session-trusted", ConversationID: "conversation-trusted", Incarnation: 9},
+		subject:    Subject{TenantID: "tenant-trusted", UserID: "user-trusted"},
+		dispatcher: dispatcher,
+	}
+	transcript := TranscriptRequestedEffect{Turn: identity.TurnKey{ID: "turn", Revision: 2}, Sequence: 3, Role: "user", FinalText: "final"}
+	handoffEffect := HandoffRequestedEffect{ResponseID: "response", CallID: "call", ToolName: StartBackgroundTaskTool, Arguments: json.RawMessage(`{"objective":"x"}`)}
+
+	require.NoError(t, state.dispatchEffects(t.Context(), []Effect{
+		{Transcript: &transcript},
+		{Handoff: &handoffEffect, Async: &AsyncEffect{Kind: AsyncKindStartBackgroundTask}},
+	}, 0, 0))
+	require.Equal(t, transcript, <-dispatcher.transcripts)
+	require.Equal(t, handoffEffect, <-dispatcher.handoffs)
+	for range 2 {
+		trusted := <-dispatcher.trusted
+		require.Equal(t, state.ids, trusted.IDs)
+		require.Equal(t, "tenant-trusted", trusted.Subject.TenantID)
+		require.Equal(t, "user-trusted", trusted.Subject.UserID)
+	}
+}
+
+func TestManagerTypedDurableEffectsFailClosedWithoutDispatcher(t *testing.T) {
+	state := &runState{ids: testIDs()}
+	err := state.dispatchEffects(t.Context(), []Effect{{Transcript: &TranscriptRequestedEffect{
+		Turn: identity.TurnKey{ID: "turn", Revision: 1}, Sequence: 1, Role: "user", FinalText: "text",
+	}}}, 0, 0)
+	require.ErrorIs(t, err, ErrUnsupportedAsync)
+}
+
 func TestManagerGracefulCloseDrainsOutputAndReturnsCleanupErrors(t *testing.T) {
 	providerErr := errors.New("provider cleanup failed")
 	clientErr := errors.New("client cleanup failed")

@@ -1326,6 +1326,459 @@ func TestDurableSequenceHighWaterRejectsGapsWithoutMutation(t *testing.T) {
 	assert.Equal(t, identity.ResponseEpoch(8), fence.Current())
 }
 
+func TestFinalTranscriptsEmitTypedPersistenceOnlyAtCompletion(t *testing.T) {
+	reactor, _ := testReactor(1)
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionDelta, ItemID: "user-turn", Text: "par",
+	}))
+
+	effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "user-turn", Text: "final user text",
+	}))
+	require.Len(t, effects, 1)
+	require.NotNil(t, effects[0].Transcript)
+	assert.Equal(t, TranscriptRequestedEffect{
+		Turn: identity.TurnKey{ID: "user-turn", Revision: 1}, Sequence: 1,
+		Role: "user", FinalText: "final user text",
+	}, *effects[0].Transcript)
+
+	epoch := startStreaming(t, reactor, "response-final")
+	effects = applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptDone, Epoch: epoch, ResponseID: "response-final",
+		ItemID: "assistant-item", Text: "final assistant text",
+	}))
+	require.Len(t, effects, 1)
+	require.NotNil(t, effects[0].Transcript)
+	assert.Equal(t, "assistant", effects[0].Transcript.Role)
+	assert.Equal(t, "final assistant text", effects[0].Transcript.FinalText)
+	assert.Equal(t, uint64(2), effects[0].Transcript.Sequence)
+	assert.Equal(t, identity.TurnKey{ID: "user-turn", Revision: 1}, effects[0].Transcript.Turn)
+}
+
+func TestIdenticalFinalTranscriptReplayDoesNotAllocateRevisionOrDurableWork(t *testing.T) {
+	reactor, _ := testReactor(1)
+	event := realtime.Event{Kind: realtime.EventTranscriptionCompleted, ItemID: "user-replay", Text: "same final"}
+	first := applyOK(t, reactor, currentVoice(reactor, event))
+	require.NotNil(t, first[0].Transcript)
+	turn := first[0].Transcript.Turn
+
+	second := applyOK(t, reactor, currentVoice(reactor, event))
+	require.Len(t, second, 1)
+	assert.Nil(t, second[0].Transcript)
+	assert.Equal(t, turn, reactor.activeTurn.key)
+}
+
+func TestTypedTurnCommitAttachesStartToExactTranscript(t *testing.T) {
+	reactor, _ := testReactor(1)
+	epoch := startStreaming(t, reactor, "response-start")
+	effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-exact", Text: "trusted transcript",
+	}))
+	require.NotNil(t, effects[0].Transcript)
+	turn := effects[0].Transcript.Turn
+
+	effects = applyOK(t, reactor, currentVoice(reactor, backgroundToolEvent(
+		epoch, "response-start", "call-start", json.RawMessage(`{"objective":"investigate"}`),
+	)))
+	require.Len(t, effects, 1, "start waits for committed transcript")
+
+	effects = applyOK(t, reactor, TurnCommittedInput{
+		Sequence: 1, Turn: turn, Transcript: "trusted transcript",
+	})
+	require.Len(t, effects, 1)
+	require.NotNil(t, effects[0].Handoff)
+	assert.Equal(t, HandoffRequestedEffect{
+		OriginEpoch: epoch, ResponseID: "response-start", CallID: "call-start", ToolName: StartBackgroundTaskTool,
+		Arguments: json.RawMessage(`{"objective":"investigate"}`), Turn: turn,
+		Transcript: "trusted transcript",
+	}, *effects[0].Handoff)
+
+	assert.Empty(t, applyOK(t, reactor, TurnCommittedInput{
+		Sequence: 1, Turn: turn, Transcript: "mutated replay",
+	}), "durable replay is ignored before payload inspection")
+}
+
+func TestReservedHandoffToolsExcludeOrdinaryCalls(t *testing.T) {
+	reactor, _ := testReactor(1)
+	epoch := startStreaming(t, reactor, "response-tools")
+
+	tests := []struct {
+		name string
+		args json.RawMessage
+		want bool
+	}{
+		{name: "lookup", args: json.RawMessage(`{"q":"x"}`), want: false},
+		{name: SteerBackgroundTaskTool, args: json.RawMessage(`{"handoff_id":"h-1","objective":"new"}`), want: true},
+		{name: CancelBackgroundTaskTool, args: json.RawMessage(`{"handoff_id":"h-1"}`), want: true},
+	}
+	for index, test := range tests {
+		effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+			Kind: realtime.EventFunctionCallDone, Epoch: epoch, ResponseID: "response-tools",
+			ItemID: fmt.Sprintf("tool-%d", index), CallID: fmt.Sprintf("call-%d", index),
+			Name: test.name, Arguments: test.args,
+		}))
+		require.Len(t, effects, 1)
+		if test.want {
+			require.NotNil(t, effects[0].Handoff)
+			assert.Equal(t, test.name, effects[0].Handoff.ToolName)
+		} else {
+			assert.Nil(t, effects[0].Handoff)
+		}
+	}
+}
+
+func TestSteerAndCancelCarryExactCommittedTurnAndRejectUnfencedCalls(t *testing.T) {
+	reactor, _ := testReactor(1)
+	epoch := startStreaming(t, reactor, "response-tools-fenced")
+	unfenced := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventFunctionCallDone, Epoch: epoch, ResponseID: "response-tools-fenced",
+		ItemID: "tool-unfenced", CallID: "call-unfenced", Name: SteerBackgroundTaskTool,
+		Arguments: json.RawMessage(`{"handoff_id":"h-1","objective":"new"}`),
+	}))
+	require.NotNil(t, unfenced[0].Handoff)
+	assert.Equal(t, "missing_committed_turn", unfenced[0].Handoff.RejectReason)
+
+	turn := identity.TurnKey{ID: "turn-tools", Revision: 1}
+	applyOK(t, reactor, TurnCommittedInput{Sequence: 1, Turn: turn, Transcript: "trusted request"})
+	for index, tool := range []struct {
+		name string
+		args json.RawMessage
+	}{
+		{name: SteerBackgroundTaskTool, args: json.RawMessage(`{"handoff_id":"h-1","objective":"revised"}`)},
+		{name: CancelBackgroundTaskTool, args: json.RawMessage(`{"handoff_id":"h-1","reason":"stop"}`)},
+	} {
+		effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+			Kind: realtime.EventFunctionCallDone, Epoch: epoch, ResponseID: "response-tools-fenced",
+			ItemID: fmt.Sprintf("tool-fenced-%d", index), CallID: fmt.Sprintf("call-fenced-%d", index),
+			Name: tool.name, Arguments: tool.args,
+		}))
+		require.NotNil(t, effects[0].Handoff)
+		assert.Equal(t, turn, effects[0].Handoff.Turn)
+		assert.Equal(t, "trusted request", effects[0].Handoff.Transcript)
+		assert.Equal(t, epoch, effects[0].Handoff.OriginEpoch)
+	}
+}
+
+func TestLateCompletionCannotRebindAfterResponseAndCallIDReuse(t *testing.T) {
+	reactor, _ := testReactor(1)
+	turn := identity.TurnKey{ID: "turn-reuse", Revision: 1}
+	applyOK(t, reactor, TurnCommittedInput{Sequence: 1, Turn: turn, Transcript: "request"})
+	firstEpoch := startStreaming(t, reactor, "response-reused")
+	applyOK(t, reactor, currentVoice(reactor, backgroundToolEvent(firstEpoch, "response-reused", "call-reused", json.RawMessage(`{"objective":"first"}`))))
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventResponseDone, Epoch: firstEpoch, ResponseID: "response-reused", Status: "completed"}))
+	first := applyOK(t, reactor, HandoffAcceptedInput{
+		OriginEpoch: firstEpoch, Turn: turn, ResponseID: "response-reused", CallID: "call-reused", Accepted: true, HandoffID: "h-first",
+	})
+	require.Len(t, first, 2)
+	acceptanceEpoch := first[1].VoiceCommand.Epoch
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventResponseCreated, Epoch: acceptanceEpoch, ResponseID: "acceptance-1", Status: "in_progress"}))
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventResponseDone, Epoch: acceptanceEpoch, ResponseID: "acceptance-1", Status: "completed"}))
+
+	secondEpoch := startStreaming(t, reactor, "response-reused")
+	applyOK(t, reactor, currentVoice(reactor, backgroundToolEvent(secondEpoch, "response-reused", "call-reused", json.RawMessage(`{"objective":"second"}`))))
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventResponseDone, Epoch: secondEpoch, ResponseID: "response-reused", Status: "completed"}))
+	assert.Empty(t, applyOK(t, reactor, HandoffAcceptedInput{
+		OriginEpoch: firstEpoch, Turn: turn, ResponseID: "response-reused", CallID: "call-reused", Accepted: true, HandoffID: "h-first",
+	}))
+	second := applyOK(t, reactor, HandoffAcceptedInput{
+		OriginEpoch: secondEpoch, Turn: turn, ResponseID: "response-reused", CallID: "call-reused", Accepted: true, HandoffID: "h-second",
+	})
+	require.Len(t, second, 2)
+	var item struct {
+		Output string `json:"output"`
+	}
+	require.NoError(t, json.Unmarshal(second[0].VoiceCommand.Item, &item))
+	assert.Contains(t, item.Output, "h-second")
+	assert.NotContains(t, item.Output, "h-first")
+}
+
+func TestAcceptedHandoffWaitsForOriginThenEmitsOrderedCommandsOnce(t *testing.T) {
+	reactor, fence := testReactor(4)
+	epoch := startStreaming(t, reactor, "response-origin")
+	turn := identity.TurnKey{ID: "turn-accepted", Revision: 1}
+	applyOK(t, reactor, TurnCommittedInput{Sequence: 1, Turn: turn, Transcript: "do it"})
+	applyOK(t, reactor, currentVoice(reactor, backgroundToolEvent(
+		epoch, "response-origin", "call-accepted", json.RawMessage(`{"objective":"do it"}`),
+	)))
+
+	assert.Empty(t, applyOK(t, reactor, HandoffAcceptedInput{
+		OriginEpoch: epoch, Turn: turn, ResponseID: "response-origin", CallID: "call-accepted", Accepted: true, HandoffID: "handoff-1",
+	}), "persistence-first completion waits for the originating response")
+
+	effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventResponseDone, Epoch: epoch, ResponseID: "response-origin", Status: "completed",
+	}))
+	require.Len(t, effects, 3)
+	require.NotNil(t, effects[1].VoiceCommand)
+	require.NotNil(t, effects[2].VoiceCommand)
+	assert.Equal(t, realtime.CommandCreateItem, effects[1].VoiceCommand.Kind)
+	assert.Equal(t, realtime.CommandCreateResponse, effects[2].VoiceCommand.Kind)
+	assert.Equal(t, identity.ResponseEpoch(6), effects[2].VoiceCommand.Epoch)
+	assert.Equal(t, effects[2].VoiceCommand.Epoch, fence.Current())
+	var item struct {
+		Type   string `json:"type"`
+		CallID string `json:"call_id"`
+		Output string `json:"output"`
+	}
+	require.NoError(t, json.Unmarshal(effects[1].VoiceCommand.Item, &item))
+	assert.Equal(t, "function_call_output", item.Type)
+	assert.Equal(t, "call-accepted", item.CallID)
+	assert.JSONEq(t, `{"accepted":true,"handoff_id":"handoff-1"}`, item.Output)
+
+	assert.Empty(t, applyOK(t, reactor, HandoffAcceptedInput{
+		OriginEpoch: epoch, Turn: turn, ResponseID: "response-origin", CallID: "call-accepted", Accepted: true, HandoffID: "handoff-1",
+	}), "duplicate completion cannot allocate another epoch")
+	assert.Equal(t, identity.ResponseEpoch(6), fence.Current())
+}
+
+func TestTerminalFirstHandoffFailureEmitsNoDurableIDAndIgnoresWrongCorrelation(t *testing.T) {
+	reactor, fence := testReactor(2)
+	epoch := startStreaming(t, reactor, "response-terminal-first")
+	turn := identity.TurnKey{ID: "turn-failure", Revision: 1}
+	applyOK(t, reactor, TurnCommittedInput{Sequence: 1, Turn: turn, Transcript: "request"})
+	applyOK(t, reactor, currentVoice(reactor, backgroundToolEvent(
+		epoch, "response-terminal-first", "call-failure", json.RawMessage(`{"objective":"request"}`),
+	)))
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventResponseDone, Epoch: epoch, ResponseID: "response-terminal-first", Status: "completed",
+	}))
+
+	assert.Empty(t, applyOK(t, reactor, HandoffAcceptedInput{
+		OriginEpoch: epoch, Turn: turn, ResponseID: "response-terminal-first", CallID: "unknown", Accepted: false, Reason: "rejected",
+	}))
+	assert.Equal(t, identity.ResponseEpoch(3), fence.Current())
+
+	effects := applyOK(t, reactor, HandoffAcceptedInput{
+		OriginEpoch: epoch, Turn: turn, ResponseID: "response-terminal-first", CallID: "call-failure", Accepted: false, Reason: "rejected",
+	})
+	require.Len(t, effects, 2)
+	assert.Equal(t, realtime.CommandCreateItem, effects[0].VoiceCommand.Kind)
+	assert.Equal(t, realtime.CommandCreateResponse, effects[1].VoiceCommand.Kind)
+	var item struct {
+		Output string `json:"output"`
+	}
+	require.NoError(t, json.Unmarshal(effects[0].VoiceCommand.Item, &item))
+	assert.JSONEq(t, `{"accepted":false,"reason":"rejected"}`, item.Output)
+	assert.NotContains(t, item.Output, "handoff_id")
+	assert.Equal(t, identity.ResponseEpoch(4), effects[1].VoiceCommand.Epoch)
+}
+
+func TestPendingAcceptanceTerminalPathsDrainNextReadyCompletion(t *testing.T) {
+	setup := func(t *testing.T, connect bool) (*Reactor, identity.ResponseEpoch) {
+		t.Helper()
+		reactor, _ := testReactor(1)
+		if connect {
+			applyOK(t, reactor, ConnectedInput{ProviderSession: json.RawMessage(`{}`)})
+		}
+		turn := identity.TurnKey{ID: "turn-drain", Revision: 1}
+		applyOK(t, reactor, TurnCommittedInput{Sequence: 1, Turn: turn, Transcript: "request"})
+		epoch := startStreaming(t, reactor, "response-drain-origin")
+		for _, callID := range []string{"call-drain-a", "call-drain-b"} {
+			applyOK(t, reactor, currentVoice(reactor, backgroundToolEvent(epoch, "response-drain-origin", callID, json.RawMessage(`{"objective":"work"}`))))
+			applyOK(t, reactor, HandoffAcceptedInput{
+				OriginEpoch: epoch, Turn: turn, ResponseID: "response-drain-origin", CallID: callID, Accepted: true, HandoffID: identity.HandoffID("h-" + callID),
+			})
+		}
+		effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+			Kind: realtime.EventResponseDone, Epoch: epoch, ResponseID: "response-drain-origin", Status: "completed",
+		}))
+		require.Len(t, effects, 3, "first acceptance starts its response")
+		return reactor, effects[2].VoiceCommand.Epoch
+	}
+
+	tests := []struct {
+		name    string
+		connect bool
+		apply   func(*testing.T, *Reactor, identity.ResponseEpoch) []Effect
+	}{
+		{
+			name: "provider error before response created",
+			apply: func(t *testing.T, reactor *Reactor, epoch identity.ResponseEpoch) []Effect {
+				return applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventError, Epoch: epoch, Reason: "failed"}))
+			},
+		},
+		{
+			name: "empty response id cancel",
+			apply: func(t *testing.T, reactor *Reactor, _ identity.ResponseEpoch) []Effect {
+				return applyOK(t, reactor, ClientInput{Event: protocol.ResponseCancelEvent{Type: "response.cancel"}})
+			},
+		},
+		{
+			name:    "reconnect terminalization",
+			connect: true,
+			apply: func(t *testing.T, reactor *Reactor, _ identity.ResponseEpoch) []Effect {
+				return applyOK(t, reactor, ConnectedInput{ProviderSession: json.RawMessage(`{}`)})
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			reactor, acceptanceEpoch := setup(t, test.connect)
+			effects := test.apply(t, reactor, acceptanceEpoch)
+			commands := make([]realtime.CommandKind, 0, 2)
+			for _, effect := range effects {
+				if effect.VoiceCommand != nil {
+					commands = append(commands, effect.VoiceCommand.Kind)
+				}
+			}
+			require.GreaterOrEqual(t, len(commands), 2)
+			assert.Equal(t, []realtime.CommandKind{realtime.CommandCreateItem, realtime.CommandCreateResponse}, commands[len(commands)-2:])
+		})
+	}
+}
+
+func TestDurableWorkByteBoundariesCoverImmediateReservedToolsTranscriptsAndIDs(t *testing.T) {
+	reservedArgs := func(name string, size int) json.RawMessage {
+		var prefix, suffix string
+		switch name {
+		case StartBackgroundTaskTool:
+			prefix, suffix = `{"objective":"`, `"}`
+		case SteerBackgroundTaskTool:
+			prefix, suffix = `{"handoff_id":"h","objective":"`, `"}`
+		case CancelBackgroundTaskTool:
+			prefix, suffix = `{"handoff_id":"h","reason":"`, `"}`
+		}
+		return json.RawMessage(prefix + strings.Repeat("x", size-len(prefix)-len(suffix)) + suffix)
+	}
+	for _, name := range []string{StartBackgroundTaskTool, SteerBackgroundTaskTool, CancelBackgroundTaskTool} {
+		t.Run(name, func(t *testing.T) {
+			for _, size := range []int{DurableArgumentsBytes, DurableArgumentsBytes + 1} {
+				reactor, _ := testReactor(1)
+				turn := identity.TurnKey{ID: "turn-bounds", Revision: 1}
+				applyOK(t, reactor, TurnCommittedInput{Sequence: 1, Turn: turn, Transcript: "request"})
+				epoch := startStreaming(t, reactor, "response-bounds")
+				effects, err := reactor.Apply(currentVoice(reactor, realtime.Event{
+					Kind: realtime.EventFunctionCallDone, Epoch: epoch, ResponseID: "response-bounds",
+					ItemID: "tool-bounds", CallID: "call-bounds", Name: name, Arguments: reservedArgs(name, size),
+				}))
+				if size == DurableArgumentsBytes {
+					require.NoError(t, err)
+					require.NotEmpty(t, effects)
+				} else {
+					require.ErrorIs(t, err, ErrPendingToolLimit)
+					assert.Empty(t, effects)
+				}
+			}
+		})
+	}
+
+	for _, size := range []int{DurableTranscriptBytes, DurableTranscriptBytes + 1} {
+		reactor, _ := testReactor(1)
+		effects, err := reactor.Apply(currentVoice(reactor, realtime.Event{
+			Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-transcript-bound", Text: strings.Repeat("t", size),
+		}))
+		if size == DurableTranscriptBytes {
+			require.NoError(t, err)
+			require.NotNil(t, effects[0].Transcript)
+		} else {
+			require.Error(t, err)
+			assert.Empty(t, effects)
+		}
+	}
+
+	reactor, _ := testReactor(1)
+	turn := identity.TurnKey{ID: "turn-id-bound", Revision: 1}
+	applyOK(t, reactor, TurnCommittedInput{Sequence: 1, Turn: turn, Transcript: "request"})
+	epoch := startStreaming(t, reactor, "response-id-bound")
+	_, err := reactor.Apply(currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventFunctionCallDone, Epoch: epoch, ResponseID: "response-id-bound", ItemID: "tool",
+		CallID: strings.Repeat("c", DurableIdentifierBytes+1), Name: CancelBackgroundTaskTool,
+		Arguments: json.RawMessage(`{"handoff_id":"h"}`),
+	}))
+	require.Error(t, err)
+}
+
+func TestFinalAssistantReplacementRemainsByteAccountedAfterEviction(t *testing.T) {
+	reactor, _ := testReactor(1)
+	turn := identity.TurnKey{ID: "turn-assistant-bounds", Revision: 1}
+	applyOK(t, reactor, TurnCommittedInput{Sequence: 1, Turn: turn, Transcript: "request"})
+	epoch := startStreaming(t, reactor, "response-assistant-bounds")
+	applyDone := func(itemID, text string) {
+		applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+			Kind: realtime.EventTranscriptDone, Epoch: epoch, ResponseID: "response-assistant-bounds",
+			ItemID: itemID, Text: text,
+		}))
+	}
+	applyDone("item-00", "x")
+	for index := 1; index < PendingBackgroundToolLimit; index++ {
+		applyDone(fmt.Sprintf("item-%02d", index), strings.Repeat("x", DurableTranscriptBytes))
+	}
+	applyDone("item-00", strings.Repeat("y", DurableTranscriptBytes))
+
+	assert.LessOrEqual(t, reactor.finalizedAssistantBytes, PendingBackgroundToolBytes)
+	assert.Len(t, reactor.finalizedAssistantOrder, len(reactor.finalizedAssistantTexts))
+	key := "response-assistant-bounds\x00item-00"
+	assert.Contains(t, reactor.finalizedAssistantOrder, key)
+	calculated := 0
+	for storedKey, finalized := range reactor.finalizedAssistantTexts {
+		calculated += len(storedKey) + len(finalized.text) + len(finalized.turn.ID)
+	}
+	assert.Equal(t, calculated, reactor.finalizedAssistantBytes)
+}
+
+func TestProviderResponseIDDurableBoundariesArePanicFreeAndAtomic(t *testing.T) {
+	for _, implicit := range []bool{false, true} {
+		mode := "explicit"
+		if implicit {
+			mode = "implicit"
+		}
+		for _, size := range []int{DurableIdentifierBytes, DurableIdentifierBytes + 1} {
+			t.Run(fmt.Sprintf("%s/%d", mode, size), func(t *testing.T) {
+				reactor, _ := testReactor(1)
+				responseID := strings.Repeat("r", size)
+				var input VoiceInput
+				if implicit {
+					input = currentVoice(reactor, realtime.Event{
+						Kind: realtime.EventResponseCreated, ResponseID: responseID,
+						Status: "in_progress", NeedsEpochBinding: true,
+					})
+				} else {
+					epoch, _ := createResponse(t, reactor)
+					input = currentVoice(reactor, realtime.Event{
+						Kind: realtime.EventResponseCreated, Epoch: epoch, ResponseID: responseID, Status: "in_progress",
+					})
+				}
+				before := reactor.Snapshot()
+				effects, err := reactor.Apply(input)
+				if size == DurableIdentifierBytes {
+					require.NoError(t, err)
+					require.NotEmpty(t, effects)
+					return
+				}
+				require.Error(t, err)
+				assert.Empty(t, effects)
+				assert.Equal(t, before, reactor.Snapshot())
+			})
+		}
+	}
+
+	for _, size := range []int{DurableIdentifierBytes, DurableIdentifierBytes + 1, PendingBackgroundToolBytes + 1} {
+		t.Run(fmt.Sprintf("assistant-transcript/%d", size), func(t *testing.T) {
+			reactor, _ := testReactor(1)
+			turn := identity.TurnKey{ID: "turn-response-bound", Revision: 1}
+			applyOK(t, reactor, TurnCommittedInput{Sequence: 1, Turn: turn, Transcript: "request"})
+			responseID := strings.Repeat("r", size)
+			reactor.fence.Advance()
+			reactor.state.Response = ResponseStreaming
+			reactor.activeResponseEpoch = 2
+			reactor.activeResponseID = responseID
+			before := reactor.Snapshot()
+			effects, err := reactor.Apply(currentVoice(reactor, realtime.Event{
+				Kind: realtime.EventTranscriptDone, Epoch: 2, ResponseID: responseID,
+				ItemID: "assistant-item", Text: "answer",
+			}))
+			if size == DurableIdentifierBytes {
+				require.NoError(t, err)
+				require.NotEmpty(t, effects)
+				return
+			}
+			require.Error(t, err)
+			assert.Empty(t, effects)
+			assert.Equal(t, before, reactor.Snapshot())
+		})
+	}
+}
+
 func committedTurnPayload(turn identity.TurnKey) json.RawMessage {
 	raw, err := json.Marshal(struct {
 		Turn identity.TurnKey `json:"turn"`
@@ -1400,13 +1853,15 @@ func TestPendingBackgroundToolByteBoundaryAndCopyIsolation(t *testing.T) {
 	epoch := startStreaming(t, reactor, "response-1")
 	turn := identity.TurnKey{ID: "turn-1", Revision: 9}
 	applyOK(t, reactor, DurableInput{Sequence: 1, Kind: DurableKindTurnProvisional, Payload: committedTurnPayload(turn)})
-	arguments := exactJSONString(PendingBackgroundToolBytes)
+	arguments := exactJSONString(DurableArgumentsBytes)
 	effects := applyOK(t, reactor, currentVoice(reactor, backgroundToolEvent(epoch, "response-1", "call-boundary", arguments)))
 	require.Len(t, effects, 1)
 	arguments[1] = 'Z'
 
 	before := reactor.Snapshot()
-	effects, err := reactor.Apply(currentVoice(reactor, backgroundToolEvent(epoch, "response-1", "call-over", json.RawMessage(`null`))))
+	effects, err := reactor.Apply(currentVoice(reactor, backgroundToolEvent(
+		epoch, "response-1", "call-over", exactJSONString(DurableArgumentsBytes+1),
+	)))
 	require.ErrorIs(t, err, ErrPendingToolLimit)
 	assert.Empty(t, effects)
 	assert.Equal(t, before, reactor.Snapshot())

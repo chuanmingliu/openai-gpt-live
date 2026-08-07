@@ -42,31 +42,17 @@ func NewService(repo Repository, clock Clock, ids IDGenerator) (Service, error) 
 
 func (s *service) Create(ctx context.Context, request CreateRequest) (Snapshot, error) {
 	now := s.clock.Now().UTC()
-	normalized, err := ValidateCreateRequest(request, now)
+	static, err := NormalizeCreateRequest(request)
 	if err != nil {
 		return Snapshot{}, err
 	}
-	committed, err := s.repo.IsCommittedTurn(ctx, normalized.Scope, normalized.SourceTurn)
-	if err != nil {
-		return Snapshot{}, fmt.Errorf("check committed turn: %w", err)
-	}
-	if !committed {
-		return Snapshot{}, ErrUncommittedTurn
-	}
-
-	hash, err := CanonicalRequestHash(normalized)
+	hash, err := CanonicalRequestHash(static)
 	if err != nil {
 		return Snapshot{}, err
 	}
 	handoffID := s.ids.NewHandoffID()
-	if err := boundedRequired("generated handoff id", string(handoffID), maxIdentityBytes); err != nil {
-		return Snapshot{}, err
-	}
 	eventID := s.ids.NewEventID()
-	if err := boundedRequired("generated event id", eventID, maxIdentityBytes); err != nil {
-		return Snapshot{}, err
-	}
-	record := CreateRecord{HandoffID: handoffID, EventID: eventID, Request: cloneRequest(normalized), RequestHash: hash, CreatedAt: now}
+	record := CreateRecord{HandoffID: handoffID, EventID: eventID, Request: cloneRequest(static), RequestHash: hash, CreatedAt: now}
 	snapshot, created, err := s.repo.CreateHandoff(ctx, record)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("create handoff: %w", err)
@@ -77,7 +63,7 @@ func (s *service) Create(ctx context.Context, request CreateRequest) (Snapshot, 
 	if created && snapshot.ID != handoffID {
 		return Snapshot{}, ErrNotFound
 	}
-	if !sameScope(snapshot.Request.Scope, normalized.Scope) {
+	if !sameScope(snapshot.Request.Scope, static.Scope) {
 		return Snapshot{}, ErrNotFound
 	}
 	if !created && snapshot.RequestHash != hash {

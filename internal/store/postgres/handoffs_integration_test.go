@@ -12,11 +12,20 @@ import (
 	"testing"
 	"time"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+type integrationHandoffIDs struct {
+	handoffID identity.HandoffID
+	eventID   string
+}
+
+func (i integrationHandoffIDs) NewHandoffID() identity.HandoffID { return i.handoffID }
+func (i integrationHandoffIDs) NewEventID() string               { return i.eventID }
 
 func validCreateRecord(scope handoff.Scope, suffix string) handoff.CreateRecord {
 	request := handoff.CreateRequest{
@@ -87,6 +96,152 @@ func TestCreateHandoffRoundTripIsAtomicAndIdempotent(t *testing.T) {
 	assert.Equal(t, []string{"handoff.dispatch", "handoff.event"}, seen)
 }
 
+func TestCreateHandoffReplayPrecedesDeadlineAndCandidateValidation(t *testing.T) {
+	repo, pool, _ := repositoryHarness(t)
+	scope := testScope("tenant-a", "conversation-replay-precedence")
+	insertConversation(t, pool, scope)
+	record := prepareCreate(t, repo, scope, "replay-precedence")
+	first, created, err := repo.CreateHandoff(t.Context(), record)
+	require.NoError(t, err)
+	assert.True(t, created)
+
+	replay := record
+	replay.HandoffID, replay.EventID = "", ""
+	replay.CreatedAt = record.Request.Deadline.Add(time.Hour)
+	got, created, err := repo.CreateHandoff(t.Context(), replay)
+	require.NoError(t, err)
+	assert.False(t, created)
+	assert.Equal(t, first, got)
+
+	conflict := replay
+	conflict.Request.Objective = "different exact request"
+	conflict.RequestHash, err = handoff.CanonicalRequestHash(conflict.Request)
+	require.NoError(t, err)
+	_, _, err = repo.CreateHandoff(t.Context(), conflict)
+	assert.ErrorIs(t, err, handoff.ErrIdempotencyConflict)
+
+	absent := replay
+	absent.Request.IdempotencyKey = "expired-absent"
+	absent.RequestHash, err = handoff.CanonicalRequestHash(absent.Request)
+	require.NoError(t, err)
+	_, _, err = repo.CreateHandoff(t.Context(), absent)
+	assert.ErrorIs(t, err, handoff.ErrInvalidRequest)
+	assert.Equal(t, int64(1), tableCount(t, pool, "handoffs"))
+}
+
+func TestCreateHandoffExactReplayDoesNotTakeGlobalEventLock(t *testing.T) {
+	repo, pool, _ := repositoryHarness(t)
+	scope := testScope("tenant-a", "conversation-replay-event-lock")
+	insertConversation(t, pool, scope)
+	record := prepareCreate(t, repo, scope, "replay-event-lock")
+	first, _, err := repo.CreateHandoff(t.Context(), record)
+	require.NoError(t, err)
+	repo.failpoint = func(step string) error {
+		if step == "before_event_lock" {
+			return errors.New("replay took global event lock")
+		}
+		return nil
+	}
+	replayed, created, err := repo.CreateHandoff(t.Context(), record)
+	require.NoError(t, err)
+	assert.False(t, created)
+	assert.Equal(t, first, replayed)
+}
+
+func TestCreateHandoffIdempotencyLockWaitIsContextCancellable(t *testing.T) {
+	repo, pool, _ := repositoryHarness(t)
+	scope := testScope("tenant-a", "conversation-create-lock-cancel")
+	insertConversation(t, pool, scope)
+	record := prepareCreate(t, repo, scope, "create-lock-cancel")
+	blocker, err := pool.Begin(t.Context())
+	require.NoError(t, err)
+	defer func() { _ = blocker.Rollback(context.Background()) }()
+	_, err = blocker.Exec(t.Context(), `SELECT pg_advisory_xact_lock($1)`, handoffCreateLockID(scope.TenantID, record.Request.IdempotencyKey))
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	_, _, err = repo.CreateHandoff(ctx, record)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Equal(t, int64(0), tableCount(t, pool, "handoffs"))
+	require.NoError(t, blocker.Rollback(t.Context()))
+	_, created, err := repo.CreateHandoff(t.Context(), record)
+	require.NoError(t, err)
+	assert.True(t, created)
+}
+
+func TestExpiredServiceCreateWaitsForConcurrentExactCommitThenReplays(t *testing.T) {
+	repoA, pool, _ := repositoryHarness(t)
+	repoB, err := NewRepository(pool, clock.NewManual(repositoryTestNow.Add(2*time.Hour)))
+	require.NoError(t, err)
+	scope := testScope("tenant-a", "conversation-expired-race")
+	insertConversation(t, pool, scope)
+	record := prepareCreate(t, repoA, scope, "expired-race")
+	actualNow := time.Now().UTC()
+	record.Request.Deadline = actualNow.Add(time.Hour)
+	request := record.Request
+	creator, err := handoff.NewService(repoA, clock.NewManual(actualNow), integrationHandoffIDs{
+		handoffID: record.HandoffID, eventID: record.EventID,
+	})
+	require.NoError(t, err)
+	expired, err := handoff.NewService(repoB, clock.NewManual(request.Deadline.Add(time.Hour)), integrationHandoffIDs{
+		handoffID: "must-not-create", eventID: "must-not-create-event",
+	})
+	require.NoError(t, err)
+
+	staged := make(chan struct{})
+	release := make(chan struct{})
+	var stagedOnce sync.Once
+	var releaseOnce sync.Once
+	repoA.failpoint = func(step string) error {
+		if step == "insert_wakeup" {
+			stagedOnce.Do(func() { close(staged) })
+			select {
+			case <-release:
+				return nil
+			case <-t.Context().Done():
+				return t.Context().Err()
+			}
+		}
+		return nil
+	}
+	cleanup := func() { releaseOnce.Do(func() { close(release) }) }
+	defer cleanup()
+	type result struct {
+		snapshot handoff.Snapshot
+		err      error
+	}
+	creatorDone := make(chan result, 1)
+	go func() {
+		snapshot, createErr := creator.Create(t.Context(), request)
+		creatorDone <- result{snapshot: snapshot, err: createErr}
+	}()
+	<-staged
+	expiredDone := make(chan result, 1)
+	go func() {
+		snapshot, createErr := expired.Create(t.Context(), request)
+		expiredDone <- result{snapshot: snapshot, err: createErr}
+	}()
+
+	var expiredResult result
+	returnedBeforeCommit := false
+	select {
+	case expiredResult = <-expiredDone:
+		returnedBeforeCommit = true
+	case <-time.After(100 * time.Millisecond):
+	}
+	cleanup()
+	creatorResult := <-creatorDone
+	if !returnedBeforeCommit {
+		expiredResult = <-expiredDone
+	}
+	require.NoError(t, creatorResult.err)
+	require.NoError(t, expiredResult.err)
+	assert.False(t, returnedBeforeCommit, "expired replay must serialize behind the in-flight exact creator")
+	assert.Equal(t, record.HandoffID, creatorResult.snapshot.ID)
+	assert.Equal(t, creatorResult.snapshot, expiredResult.snapshot)
+	assert.Equal(t, int64(1), tableCount(t, pool, "handoffs"))
+}
+
 func TestCreateHandoffRollbackAfterEveryStatement(t *testing.T) {
 	for _, step := range []string{"insert_handoff", "insert_event", "insert_dispatch", "insert_wakeup"} {
 		t.Run(step, func(t *testing.T) {
@@ -129,7 +284,9 @@ func TestCreateHandoffCommitResponseLossRetryAndHashConflict(t *testing.T) {
 	assert.Equal(t, record.HandoffID, original.ID)
 
 	mismatch := record
-	mismatch.RequestHash = "sha256:different"
+	mismatch.Request.Objective = "different committed request"
+	mismatch.RequestHash, err = handoff.CanonicalRequestHash(mismatch.Request)
+	require.NoError(t, err)
 	_, _, err = repo.CreateHandoff(t.Context(), mismatch)
 	assert.ErrorIs(t, err, handoff.ErrIdempotencyConflict)
 	assert.Equal(t, int64(1), tableCount(t, pool, "handoffs"))

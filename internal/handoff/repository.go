@@ -13,6 +13,7 @@ type EventReader interface {
 type Repository interface {
 	IsCommittedTurn(context.Context, Scope, identity.TurnKey) (bool, error)
 	CreateHandoff(context.Context, CreateRecord) (Snapshot, bool, error)
+	GetHandoffByIdempotencyKey(context.Context, Scope, string) (Snapshot, error)
 	GetHandoff(context.Context, Scope, identity.HandoffID) (Snapshot, error)
 	ListActive(context.Context, Scope) ([]Snapshot, error)
 	SteerHandoff(context.Context, Scope, identity.HandoffID, SteerRequest) (Snapshot, error)
