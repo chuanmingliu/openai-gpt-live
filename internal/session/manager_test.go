@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
+	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
@@ -19,9 +21,885 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type recoveryStoreFake struct {
+	snapshot RecoverySnapshot
+	err      error
+	calls    atomic.Int32
+}
+
+type blockingRecoveryStore struct {
+	snapshot RecoverySnapshot
+	started  chan struct{}
+	release  chan struct{}
+	once     sync.Once
+}
+
+type quiescenceRefreshStore struct {
+	preflight  RecoverySnapshot
+	refreshed  RecoverySnapshot
+	refreshErr error
+	committed  atomic.Bool
+	quiesced   <-chan struct{}
+	calls      atomic.Int32
+}
+
+func (s *quiescenceRefreshStore) LoadRecovery(context.Context, handoff.Scope, int, int) (RecoverySnapshot, error) {
+	switch s.calls.Add(1) {
+	case 1:
+		return cloneRecoverySnapshot(s.preflight), nil
+	case 2:
+		select {
+		case <-s.quiesced:
+		default:
+			return RecoverySnapshot{}, errors.New("recovery refresh ran before old runtime quiesced")
+		}
+		if !s.committed.Load() {
+			return RecoverySnapshot{}, errors.New("recovery refresh ran before durable commit")
+		}
+		if s.refreshErr != nil {
+			return RecoverySnapshot{}, s.refreshErr
+		}
+		return cloneRecoverySnapshot(s.refreshed), nil
+	default:
+		return RecoverySnapshot{}, errors.New("unexpected recovery read")
+	}
+}
+
+type commitOnCloseClient struct {
+	*channelClient
+	commit func()
+	once   sync.Once
+}
+
+func (c *commitOnCloseClient) Close(ctx context.Context, code int, reason string) error {
+	c.once.Do(c.commit)
+	return c.channelClient.Close(ctx, code, reason)
+}
+
+type notifyingReadClient struct {
+	*channelClient
+	readObserved chan struct{}
+	once         sync.Once
+}
+
+func (c *notifyingReadClient) Read(ctx context.Context) (protocol.ClientEvent, error) {
+	event, err := c.channelClient.Read(ctx)
+	if err == nil {
+		c.once.Do(func() { close(c.readObserved) })
+	}
+	return event, err
+}
+
+type replayRegistrarFake struct {
+	after int64
+	sub   handoff.EventSubscription
+}
+
+func (*replayRegistrarFake) Register(handoff.EventSubscription) error { return nil }
+func (*replayRegistrarFake) Unregister(handoff.EventSubscription)     {}
+func (r *replayRegistrarFake) RegisterReplay(sub handoff.EventSubscription, after int64) error {
+	r.sub, r.after = sub, after
+	return nil
+}
+
+func (s *blockingRecoveryStore) LoadRecovery(ctx context.Context, _ handoff.Scope, _, _ int) (RecoverySnapshot, error) {
+	s.once.Do(func() { close(s.started) })
+	select {
+	case <-ctx.Done():
+		return RecoverySnapshot{}, ctx.Err()
+	case <-s.release:
+		return cloneRecoverySnapshot(s.snapshot), nil
+	}
+}
+
+type zeroJitter struct{}
+
+func (zeroJitter) Duration(time.Duration) time.Duration { return 0 }
+
+type failingReconnectConnector struct {
+	calls atomic.Int32
+}
+
+type contextBlockingCloseClient struct {
+	created   chan struct{}
+	closeCall chan struct{}
+	once      sync.Once
+}
+
+func (c *contextBlockingCloseClient) Read(ctx context.Context) (protocol.ClientEvent, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (c *contextBlockingCloseClient) Write(_ context.Context, event protocol.ServerEvent) error {
+	if event.EventType() == "session.created" {
+		c.once.Do(func() { close(c.created) })
+	}
+	return nil
+}
+
+func (c *contextBlockingCloseClient) Close(ctx context.Context, _ int, _ string) error {
+	select {
+	case <-c.closeCall:
+	default:
+		close(c.closeCall)
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+type blockingProviderCloseVoice struct {
+	closeStarted chan struct{}
+	closeRelease chan struct{}
+	once         sync.Once
+}
+
+func (*blockingProviderCloseVoice) Send(context.Context, realtime.Command) error { return nil }
+func (*blockingProviderCloseVoice) Receive(ctx context.Context) (realtime.Event, error) {
+	<-ctx.Done()
+	return realtime.Event{}, ctx.Err()
+}
+func (v *blockingProviderCloseVoice) Close(context.Context) error {
+	v.once.Do(func() { close(v.closeStarted) })
+	<-v.closeRelease
+	return nil
+}
+
+type blockingProviderConnector struct {
+	voice *blockingProviderCloseVoice
+	calls atomic.Int32
+}
+
+func (c *blockingProviderConnector) Connect(context.Context, realtime.OpenRequest) (realtime.Session, error) {
+	c.calls.Add(1)
+	return c.voice, nil
+}
+
+func (c *failingReconnectConnector) Connect(context.Context, realtime.OpenRequest) (realtime.Session, error) {
+	c.calls.Add(1)
+	return nil, errors.New("raw provider detail")
+}
+
+func (s *recoveryStoreFake) LoadRecovery(context.Context, handoff.Scope, int, int) (RecoverySnapshot, error) {
+	s.calls.Add(1)
+	return cloneRecoverySnapshot(s.snapshot), s.err
+}
+
+func TestManagerReconnectCASRestoresBeforePublishingAndRejectsReplay(t *testing.T) {
+	connector := testkit.NewFakeConnector(8)
+	scope := handoff.Scope{TenantID: "tenant-reconnect", UserID: "user-reconnect", ConversationID: "conversation-reconnect"}
+	store := &recoveryStoreFake{snapshot: RecoverySnapshot{
+		ConversationID: scope.ConversationID,
+		CommittedItems: []CommittedItem{{Sequence: 1, Role: "user", Content: "durable history"}},
+		LastEventSeq:   7,
+	}}
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		RecoveryStore: store, RecoveryItemLimit: 8, RecoveryByteLimit: 1024,
+	}, connector, managerIDs{session: "logical-session", conversation: scope.ConversationID})
+
+	oldCtx, oldCancel := context.WithCancel(context.Background())
+	defer oldCancel()
+	oldClient := newChannelClient(8)
+	oldDone := make(chan error, 1)
+	go func() {
+		oldDone <- manager.Run(oldCtx, OpenRequest{Subject: Subject{
+			TenantID: scope.TenantID, UserID: scope.UserID, ExpiresAt: time.Now().Add(time.Hour),
+		}, ConversationID: scope.ConversationID}, oldClient)
+	}()
+	oldVoice, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "session.created", (<-oldClient.writes).EventType())
+	waitForActiveRuntime(t, manager, "logical-session", 1)
+
+	newCtx, newCancel := context.WithCancel(context.Background())
+	defer newCancel()
+	newClient := newChannelClient(8)
+	newDone := make(chan error, 1)
+	go func() {
+		newDone <- manager.Reconnect(newCtx, ReconnectRequest{
+			Scope: scope, SessionID: "logical-session", LastIncarnation: 1, LastEventSeq: 7,
+		}, newClient)
+	}()
+	newVoice, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	restored, err := newVoice.NextCommand(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, realtime.CommandCreateItem, restored.Kind)
+	require.Contains(t, string(restored.Item), "durable history")
+	require.Equal(t, "session.created", (<-newClient.writes).EventType())
+	require.Eventually(t, func() bool {
+		manager.activeMu.RLock()
+		defer manager.activeMu.RUnlock()
+		return manager.active[runtimeKey{sessionID: "logical-session", incarnation: 2}] != nil
+	}, time.Second, time.Millisecond)
+	require.ErrorIs(t, manager.Submit(t.Context(), "logical-session", 1, FailedInput{Source: "late", Err: errors.New("late")}), ErrSessionNotActive)
+	require.ErrorIs(t, manager.Reconnect(t.Context(), ReconnectRequest{
+		Scope: scope, SessionID: "logical-session", LastIncarnation: 1, LastEventSeq: 7,
+	}, newChannelClient(1)), ErrStaleReconnect)
+	require.Error(t, oldVoice.Emit(t.Context(), realtime.Event{Kind: realtime.EventResponseDone, Epoch: 1}), "old provider is closed before replacement publication")
+
+	newCancel()
+	select {
+	case <-newDone:
+	case <-time.After(time.Second):
+		t.Fatal("reconnected runtime did not stop")
+	}
+	select {
+	case <-oldDone:
+	case <-time.After(time.Second):
+		t.Fatal("old runtime did not quiesce")
+	}
+}
+
+func TestManagerReconnectFutureCursorDoesNotDisturbLiveRuntime(t *testing.T) {
+	connector := testkit.NewFakeConnector(4)
+	scope := handoff.Scope{TenantID: "tenant-future", UserID: "user", ConversationID: "conversation-future"}
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		RecoveryStore: &recoveryStoreFake{snapshot: RecoverySnapshot{ConversationID: scope.ConversationID, LastEventSeq: 4}},
+	}, connector, managerIDs{session: "future-session", conversation: scope.ConversationID})
+	ctx, cancel := context.WithCancel(t.Context())
+	client := newChannelClient(8)
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.Run(ctx, OpenRequest{Subject: Subject{
+			TenantID: scope.TenantID, UserID: scope.UserID, ExpiresAt: time.Now().Add(time.Hour),
+		}, ConversationID: scope.ConversationID}, client)
+	}()
+	voice, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "session.created", (<-client.writes).EventType())
+	waitForActiveRuntime(t, manager, "future-session", 1)
+
+	err = manager.Reconnect(t.Context(), ReconnectRequest{
+		Scope: scope, SessionID: "future-session", LastIncarnation: 1, LastEventSeq: 5,
+	}, newChannelClient(1))
+	require.ErrorIs(t, err, ErrStaleReconnect)
+	require.NoError(t, manager.Submit(t.Context(), "future-session", 1, ClientInput{Event: protocol.SessionUpdateEvent{
+		Type: "session.update", Session: protocol.SessionUpdate{Type: "realtime"},
+	}}))
+	command, err := voice.NextCommand(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, realtime.CommandSessionUpdate, command.Kind)
+	select {
+	case <-client.done:
+		t.Fatal("future cursor closed the valid live client")
+	default:
+	}
+	secondCtx, secondCancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer secondCancel()
+	_, err = connector.NextSession(secondCtx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	cancel()
+	<-done
+}
+
+func TestManagerReconnectRejectsClientVisibleInitialEstablishment(t *testing.T) {
+	registerReached := make(chan struct{})
+	releaseRegister := make(chan struct{})
+	var reachedOnce sync.Once
+	connector := testkit.NewFakeConnector(4)
+	scope := handoff.Scope{TenantID: "tenant-establish", UserID: "user", ConversationID: "conversation-establish"}
+	store := &recoveryStoreFake{snapshot: RecoverySnapshot{ConversationID: scope.ConversationID}}
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second, RecoveryStore: store,
+		initialRegisterGate: func() <-chan struct{} {
+			reachedOnce.Do(func() { close(registerReached) })
+			return releaseRegister
+		},
+	}, connector, managerIDs{session: "establish-session", conversation: scope.ConversationID})
+	runCtx, runCancel := context.WithCancel(t.Context())
+	defer runCancel()
+	client := newChannelClient(4)
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- manager.Run(runCtx, OpenRequest{Subject: Subject{
+			TenantID: scope.TenantID, UserID: scope.UserID, ExpiresAt: time.Now().Add(time.Hour),
+		}, ConversationID: scope.ConversationID}, client)
+	}()
+	_, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "session.created", (<-client.writes).EventType())
+	<-registerReached
+
+	err = manager.Reconnect(t.Context(), ReconnectRequest{
+		Scope: scope, SessionID: "establish-session", LastIncarnation: 1,
+	}, newChannelClient(1))
+	require.ErrorIs(t, err, ErrStaleReconnect)
+	require.Zero(t, store.calls.Load(), "establishing sessions do not begin recovery")
+	manager.activeMu.RLock()
+	logical := manager.logical["establish-session"]
+	require.NotNil(t, logical)
+	require.Equal(t, identity.Incarnation(1), logical.highWater)
+	require.False(t, logical.reconnecting)
+	require.Nil(t, logical.runtime)
+	require.Equal(t, logicalEstablishing, logical.state)
+	require.Empty(t, manager.active)
+	manager.activeMu.RUnlock()
+	shortCtx, shortCancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	_, err = connector.NextSession(shortCtx)
+	shortCancel()
+	require.ErrorIs(t, err, context.DeadlineExceeded, "reconnect cannot open a second provider while establishment is gated")
+
+	close(releaseRegister)
+	waitForActiveRuntime(t, manager, "establish-session", 1)
+	manager.activeMu.RLock()
+	require.Equal(t, identity.Incarnation(1), manager.logical["establish-session"].highWater)
+	require.False(t, manager.logical["establish-session"].reconnecting)
+	require.Equal(t, logicalActive, manager.logical["establish-session"].state)
+	manager.activeMu.RUnlock()
+	runCancel()
+	<-runDone
+}
+
+func TestManagerInitialEstablishmentFailureLeavesNonResurrectableTombstone(t *testing.T) {
+	registerReached := make(chan struct{})
+	releaseRegister := make(chan struct{})
+	connector := testkit.NewFakeConnector(4)
+	scope := handoff.Scope{TenantID: "tenant-establish-fail", UserID: "user", ConversationID: "conversation-establish-fail"}
+	store := &recoveryStoreFake{snapshot: RecoverySnapshot{ConversationID: scope.ConversationID}}
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second, RecoveryStore: store,
+		initialRegisterGate: func() <-chan struct{} {
+			select {
+			case <-registerReached:
+			default:
+				close(registerReached)
+			}
+			return releaseRegister
+		},
+	}, connector, managerIDs{session: "establish-fail-session", conversation: scope.ConversationID})
+	runCtx, runCancel := context.WithCancel(t.Context())
+	client := newChannelClient(4)
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- manager.Run(runCtx, OpenRequest{Subject: Subject{
+			TenantID: scope.TenantID, UserID: scope.UserID, ExpiresAt: time.Now().Add(time.Hour),
+		}, ConversationID: scope.ConversationID}, client)
+	}()
+	_, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "session.created", (<-client.writes).EventType())
+	<-registerReached
+	runCancel()
+	close(releaseRegister)
+	require.Error(t, <-runDone)
+
+	err = manager.Reconnect(t.Context(), ReconnectRequest{
+		Scope: scope, SessionID: "establish-fail-session", LastIncarnation: 1,
+	}, newChannelClient(1))
+	require.ErrorIs(t, err, ErrStaleReconnect)
+	require.Zero(t, store.calls.Load(), "failed establishment is not recovery input")
+	manager.activeMu.RLock()
+	logical := manager.logical["establish-fail-session"]
+	require.NotNil(t, logical)
+	require.Equal(t, identity.Incarnation(1), logical.highWater)
+	require.False(t, logical.reconnecting)
+	require.Nil(t, logical.runtime)
+	require.Equal(t, logicalEstablishmentFailed, logical.state)
+	require.Empty(t, manager.active)
+	manager.activeMu.RUnlock()
+	shortCtx, shortCancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer shortCancel()
+	_, err = connector.NextSession(shortCtx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+func TestManagerReconnectRefreshesRecoveryAfterOldRuntimeQuiesces(t *testing.T) {
+	connector := testkit.NewFakeConnector(8)
+	scope := handoff.Scope{TenantID: "tenant-refresh", UserID: "user", ConversationID: "conversation-refresh"}
+	store := &quiescenceRefreshStore{
+		preflight: RecoverySnapshot{
+			ConversationID: scope.ConversationID,
+			CommittedItems: []CommittedItem{{Sequence: 1, Role: "user", Content: "preflight text"}},
+			LastEventSeq:   3,
+		},
+		refreshed: RecoverySnapshot{
+			ConversationID: scope.ConversationID,
+			CommittedItems: []CommittedItem{
+				{Sequence: 1, Role: "user", Content: "preflight text"},
+				{Sequence: 2, Role: "assistant", Content: "committed while quiescing"},
+			},
+			LastEventSeq: 4,
+		},
+	}
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		RecoveryStore: store, RecoveryItemLimit: 8, RecoveryByteLimit: 1024,
+	}, connector, managerIDs{session: "refresh-session", conversation: scope.ConversationID})
+	oldCtx, oldCancel := context.WithCancel(t.Context())
+	defer oldCancel()
+	baseClient := newChannelClient(8)
+	oldClient := &commitOnCloseClient{channelClient: baseClient, commit: func() { store.committed.Store(true) }}
+	oldDone := make(chan error, 1)
+	go func() {
+		oldDone <- manager.Run(oldCtx, OpenRequest{Subject: Subject{
+			TenantID: scope.TenantID, UserID: scope.UserID, ExpiresAt: time.Now().Add(time.Hour),
+		}, ConversationID: scope.ConversationID}, oldClient)
+	}()
+	_, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "session.created", (<-baseClient.writes).EventType())
+	oldRuntime := waitForActiveRuntime(t, manager, "refresh-session", 1)
+	store.quiesced = oldRuntime.quiesced
+
+	newCtx, newCancel := context.WithCancel(t.Context())
+	defer newCancel()
+	newClient := newChannelClient(8)
+	reconnectDone := make(chan error, 1)
+	go func() {
+		reconnectDone <- manager.Reconnect(newCtx, ReconnectRequest{
+			Scope: scope, SessionID: "refresh-session", LastIncarnation: 1, LastEventSeq: 3,
+		}, newClient)
+	}()
+	newVoice, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, int32(2), store.calls.Load())
+	first, err := newVoice.NextCommand(t.Context())
+	require.NoError(t, err)
+	second, err := newVoice.NextCommand(t.Context())
+	require.NoError(t, err)
+	require.Contains(t, string(first.Item), "preflight text")
+	require.Contains(t, string(second.Item), "committed while quiescing")
+	shortCtx, shortCancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer shortCancel()
+	_, err = newVoice.NextCommand(shortCtx)
+	require.ErrorIs(t, err, context.DeadlineExceeded, "post-quiescence item is restored exactly once")
+	require.Equal(t, "session.created", (<-newClient.writes).EventType())
+	newCancel()
+	<-reconnectDone
+	<-oldDone
+}
+
+func TestManagerReconnectRefreshFailureNeverPublishesStaleSnapshot(t *testing.T) {
+	connector := testkit.NewFakeConnector(4)
+	scope := handoff.Scope{TenantID: "tenant-refresh-fail", UserID: "user", ConversationID: "conversation-refresh-fail"}
+	store := &quiescenceRefreshStore{
+		preflight:  RecoverySnapshot{ConversationID: scope.ConversationID, LastEventSeq: 2},
+		refreshErr: errors.New("refresh unavailable"),
+	}
+	store.committed.Store(true)
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second, RecoveryStore: store,
+	}, connector, managerIDs{session: "refresh-fail-session", conversation: scope.ConversationID})
+	oldCtx, oldCancel := context.WithCancel(t.Context())
+	defer oldCancel()
+	oldClient := newChannelClient(4)
+	oldDone := make(chan error, 1)
+	go func() {
+		oldDone <- manager.Run(oldCtx, OpenRequest{Subject: Subject{
+			TenantID: scope.TenantID, UserID: scope.UserID, ExpiresAt: time.Now().Add(time.Hour),
+		}, ConversationID: scope.ConversationID}, oldClient)
+	}()
+	_, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "session.created", (<-oldClient.writes).EventType())
+	oldRuntime := waitForActiveRuntime(t, manager, "refresh-fail-session", 1)
+	store.quiesced = oldRuntime.quiesced
+
+	newClient := newChannelClient(1)
+	err = manager.Reconnect(t.Context(), ReconnectRequest{
+		Scope: scope, SessionID: "refresh-fail-session", LastIncarnation: 1, LastEventSeq: 2,
+	}, newClient)
+	require.ErrorIs(t, err, ErrRecoveryUnavailable)
+	require.Equal(t, int32(2), store.calls.Load())
+	select {
+	case <-newClient.done:
+	default:
+		t.Fatal("failed refresh did not close the unpublished client")
+	}
+	shortCtx, shortCancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer shortCancel()
+	_, err = connector.NextSession(shortCtx)
+	require.ErrorIs(t, err, context.DeadlineExceeded, "stale preflight snapshot must not open a replacement provider")
+	require.Eventually(t, func() bool {
+		manager.activeMu.RLock()
+		defer manager.activeMu.RUnlock()
+		logical := manager.logical["refresh-fail-session"]
+		return logical != nil && logical.highWater == 1 && !logical.reconnecting && logical.runtime == nil
+	}, time.Second, time.Millisecond)
+	<-oldDone
+}
+
+func TestManagerReconnectFencesClientIntakeAtomicallyWithFinalBoundary(t *testing.T) {
+	boundarySampled := make(chan struct{})
+	releaseBoundary := make(chan struct{})
+	var sampleOnce sync.Once
+	connector := testkit.NewFakeConnector(8)
+	scope := handoff.Scope{TenantID: "tenant-late", UserID: "user", ConversationID: "conversation-late"}
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		RecoveryStore: &recoveryStoreFake{snapshot: RecoverySnapshot{ConversationID: scope.ConversationID}},
+		reconnectBoundaryGate: func() <-chan struct{} {
+			sampleOnce.Do(func() { close(boundarySampled) })
+			return releaseBoundary
+		},
+	}, connector, managerIDs{session: "late-session", conversation: scope.ConversationID})
+	oldCtx, oldCancel := context.WithCancel(t.Context())
+	defer oldCancel()
+	baseClient := newChannelClient(8)
+	oldClient := &notifyingReadClient{channelClient: baseClient, readObserved: make(chan struct{})}
+	oldDone := make(chan error, 1)
+	go func() {
+		oldDone <- manager.Run(oldCtx, OpenRequest{Subject: Subject{
+			TenantID: scope.TenantID, UserID: scope.UserID, ExpiresAt: time.Now().Add(time.Hour),
+		}, ConversationID: scope.ConversationID}, oldClient)
+	}()
+	_, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "session.created", (<-baseClient.writes).EventType())
+	oldRuntime := waitForActiveRuntime(t, manager, "late-session", 1)
+	acceptedBefore := oldRuntime.state.controlAccepted.Load()
+	externalBefore := oldRuntime.state.externalAccepted.Load()
+
+	newCtx, newCancel := context.WithCancel(t.Context())
+	defer newCancel()
+	newClient := newChannelClient(8)
+	reconnectDone := make(chan error, 1)
+	go func() {
+		reconnectDone <- manager.Reconnect(newCtx, ReconnectRequest{
+			Scope: scope, SessionID: "late-session", LastIncarnation: 1,
+		}, newClient)
+	}()
+	<-boundarySampled
+	baseClient.reads <- protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}
+	<-oldClient.readObserved
+	close(releaseBoundary)
+	_, err = connector.NextSession(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "session.created", (<-newClient.writes).EventType())
+	require.Equal(t, acceptedBefore, oldRuntime.state.controlAccepted.Load(), "late client event was rejected before acceptance")
+	require.Equal(t, externalBefore, oldRuntime.state.externalAccepted.Load(), "late client event did not cross the external intake fence")
+	newCancel()
+	<-reconnectDone
+	<-oldDone
+}
+
+func TestManagerReconnectRejectsQueuedCommitUntilReactorAppliesIt(t *testing.T) {
+	commitGate := make(chan struct{})
+	connector := testkit.NewFakeConnector(8)
+	scope := handoff.Scope{TenantID: "tenant-commit", UserID: "user", ConversationID: "conversation-commit"}
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		RecoveryStore: &recoveryStoreFake{snapshot: RecoverySnapshot{ConversationID: scope.ConversationID}},
+		reactorApplyGate: func(input Input) <-chan struct{} {
+			clientInput, ok := input.(ClientInput)
+			if !ok {
+				return nil
+			}
+			if _, ok := clientInput.Event.(protocol.InputAudioBufferCommitEvent); ok {
+				return commitGate
+			}
+			return nil
+		},
+	}, connector, managerIDs{session: "commit-session", conversation: scope.ConversationID})
+	ctx, cancel := context.WithCancel(t.Context())
+	client := newChannelClient(8)
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.Run(ctx, OpenRequest{Subject: Subject{
+			TenantID: scope.TenantID, UserID: scope.UserID, ExpiresAt: time.Now().Add(time.Hour),
+		}, ConversationID: scope.ConversationID}, client)
+	}()
+	voice, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "session.created", (<-client.writes).EventType())
+	frame := base64.StdEncoding.EncodeToString(make([]byte, 960))
+	client.reads <- protocol.InputAudioBufferAppendEvent{Type: "input_audio_buffer.append", Audio: frame}
+	appendCommand, err := voice.NextCommand(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, realtime.CommandAppendAudio, appendCommand.Kind)
+	client.reads <- protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}
+	require.Eventually(t, func() bool {
+		manager.activeMu.RLock()
+		runtime := manager.active[runtimeKey{sessionID: "commit-session", incarnation: 1}]
+		manager.activeMu.RUnlock()
+		return runtime != nil && runtime.state.controlAccepted.Load() > runtime.state.controlApplied.Load()
+	}, time.Second, time.Millisecond)
+
+	err = manager.Reconnect(t.Context(), ReconnectRequest{
+		Scope: scope, SessionID: "commit-session", LastIncarnation: 1,
+	}, newChannelClient(1))
+	require.ErrorIs(t, err, ErrReconnectNotAtBoundary)
+	close(commitGate)
+	commitCommand, err := voice.NextCommand(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, realtime.CommandCommitAudio, commitCommand.Kind)
+	cancel()
+	<-done
+}
+
+func TestManagerReconnectRevalidatesBoundaryAfterRecoveryPreflight(t *testing.T) {
+	commitGate := make(chan struct{})
+	connector := testkit.NewFakeConnector(8)
+	scope := handoff.Scope{TenantID: "tenant-cas", UserID: "user", ConversationID: "conversation-cas"}
+	store := &blockingRecoveryStore{
+		snapshot: RecoverySnapshot{ConversationID: scope.ConversationID},
+		started:  make(chan struct{}), release: make(chan struct{}),
+	}
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second, RecoveryStore: store,
+		reactorApplyGate: func(input Input) <-chan struct{} {
+			if clientInput, ok := input.(ClientInput); ok {
+				if _, ok := clientInput.Event.(protocol.InputAudioBufferCommitEvent); ok {
+					return commitGate
+				}
+			}
+			return nil
+		},
+	}, connector, managerIDs{session: "cas-session", conversation: scope.ConversationID})
+	ctx, cancel := context.WithCancel(t.Context())
+	client := newChannelClient(8)
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- manager.Run(ctx, OpenRequest{Subject: Subject{
+			TenantID: scope.TenantID, UserID: scope.UserID, ExpiresAt: time.Now().Add(time.Hour),
+		}, ConversationID: scope.ConversationID}, client)
+	}()
+	voice, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	select {
+	case event := <-client.writes:
+		require.Equal(t, "session.created", event.EventType())
+	case <-time.After(time.Second):
+		t.Fatal("initial session.created was not delivered")
+	}
+	waitForActiveRuntime(t, manager, "cas-session", 1)
+
+	reconnectDone := make(chan error, 1)
+	go func() {
+		reconnectDone <- manager.Reconnect(t.Context(), ReconnectRequest{
+			Scope: scope, SessionID: "cas-session", LastIncarnation: 1,
+		}, newChannelClient(1))
+	}()
+	select {
+	case <-store.started:
+	case <-time.After(time.Second):
+		t.Fatal("reconnect did not enter recovery preflight")
+	}
+	frame := base64.StdEncoding.EncodeToString(make([]byte, 960))
+	client.reads <- protocol.InputAudioBufferAppendEvent{Type: "input_audio_buffer.append", Audio: frame}
+	commandCtx, commandCancel := context.WithTimeout(t.Context(), time.Second)
+	_, err = voice.NextCommand(commandCtx)
+	commandCancel()
+	require.NoError(t, err)
+	client.reads <- protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}
+	require.Eventually(t, func() bool {
+		manager.activeMu.RLock()
+		runtime := manager.active[runtimeKey{sessionID: "cas-session", incarnation: 1}]
+		manager.activeMu.RUnlock()
+		return runtime != nil && runtime.state.controlAccepted.Load() > runtime.state.controlApplied.Load()
+	}, time.Second, time.Millisecond)
+	close(store.release)
+	select {
+	case reconnectErr := <-reconnectDone:
+		require.ErrorIs(t, reconnectErr, ErrReconnectNotAtBoundary)
+	case <-time.After(time.Second):
+		t.Fatal("reconnect did not complete after recovery preflight was released")
+	}
+	select {
+	case <-client.done:
+		t.Fatal("failed CAS revalidation disturbed old runtime")
+	default:
+	}
+	close(commitGate)
+	commandCtx, commandCancel = context.WithTimeout(t.Context(), time.Second)
+	command, err := voice.NextCommand(commandCtx)
+	commandCancel()
+	require.NoError(t, err)
+	require.Equal(t, realtime.CommandCommitAudio, command.Kind)
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(time.Second):
+		t.Fatal("initial runtime did not stop after cancellation")
+	}
+}
+
+func TestManagerReplacementRegistersClientReplayCursor(t *testing.T) {
+	scope := handoff.Scope{TenantID: "tenant-replay", UserID: "user", ConversationID: "conversation-replay"}
+	registrar := &replayRegistrarFake{}
+	manager := &Manager{
+		cfg:    Config{HandoffConsumerID: "client", HandoffSubscriptions: registrar},
+		active: make(map[runtimeKey]*sessionRuntime), current: make(map[handoff.Scope]*sessionRuntime),
+		logical: make(map[identity.SessionID]*logicalSession),
+	}
+	logical := &logicalSession{scope: scope, highWater: 1, reconnecting: true, state: logicalTombstoned}
+	manager.logical["session-replay"] = logical
+	replayAfter := int64(17)
+	runtime := &sessionRuntime{
+		key:         runtimeKey{sessionID: "session-replay", incarnation: 2},
+		subject:     Subject{TenantID: scope.TenantID, UserID: scope.UserID},
+		state:       &runState{ids: IDs{SessionID: "session-replay", ConversationID: scope.ConversationID, Incarnation: 2}, fence: NewEpochFence(3)},
+		replayAfter: &replayAfter,
+	}
+	require.NoError(t, manager.registerReplacement(runtime, logical, 1))
+	require.Equal(t, replayAfter, registrar.after)
+	require.Equal(t, handoff.EventSubscription{ConsumerID: "client", Scope: scope}, registrar.sub)
+}
+
+func TestManagerReconnectRejectsWrongScopeAndIncarnationOverflow(t *testing.T) {
+	manager := NewManager(Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second},
+		testkit.NewFakeConnector(1), managerIDs{})
+	manager.activeMu.Lock()
+	manager.logical = map[identity.SessionID]*logicalSession{"session": {
+		scope:     handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "conversation"},
+		highWater: identity.Incarnation(^uint64(0)),
+		state:     logicalTombstoned,
+	}}
+	manager.activeMu.Unlock()
+	request := ReconnectRequest{Scope: handoff.Scope{TenantID: "tenant", UserID: "wrong", ConversationID: "conversation"},
+		SessionID: "session", LastIncarnation: identity.Incarnation(^uint64(0))}
+	require.ErrorIs(t, manager.Reconnect(t.Context(), request, newChannelClient(1)), ErrStaleReconnect)
+	request.Scope.UserID = "user"
+	require.ErrorIs(t, manager.Reconnect(t.Context(), request, newChannelClient(1)), ErrStaleReconnect)
+}
+
+func TestManagerReconnectRetryIsBoundedCancellableAndOnlyAtTurnBoundary(t *testing.T) {
+	connector := &failingReconnectConnector{}
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "conversation"}
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		RecoveryStore:       &recoveryStoreFake{snapshot: RecoverySnapshot{ConversationID: scope.ConversationID}},
+		ReconnectMaxRetries: 2, ReconnectRetryBase: time.Second, ReconnectRetryMax: time.Second,
+		Clock: clock.NewManual(time.Unix(0, 0)), Jitter: zeroJitter{},
+	}, connector, managerIDs{})
+	manager.activeMu.Lock()
+	manager.logical["session"] = &logicalSession{
+		scope: scope, subject: Subject{TenantID: scope.TenantID, UserID: scope.UserID, ExpiresAt: time.Now().Add(time.Hour)},
+		highWater: 1, turnBoundary: false, state: logicalTombstoned,
+	}
+	manager.activeMu.Unlock()
+	request := ReconnectRequest{Scope: scope, SessionID: "session", LastIncarnation: 1}
+	require.ErrorIs(t, manager.Reconnect(t.Context(), request, newChannelClient(1)), ErrReconnectNotAtBoundary)
+	require.Zero(t, connector.calls.Load())
+
+	manager.activeMu.Lock()
+	manager.logical["session"].turnBoundary = true
+	manager.activeMu.Unlock()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- manager.Reconnect(ctx, request, newChannelClient(1)) }()
+	require.Eventually(t, func() bool { return connector.calls.Load() == 1 }, time.Second, time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, context.Canceled)
+		require.NotContains(t, err.Error(), "raw provider detail")
+	case <-time.After(time.Second):
+		t.Fatal("reconnect retry did not stop on cancellation")
+	}
+	require.Equal(t, int32(1), connector.calls.Load())
+}
+
+func TestManagerReconnectCleanupIsDeadlineBoundedAndNeverPublishesEarly(t *testing.T) {
+	t.Run("client close honors reconnect deadline", func(t *testing.T) {
+		connector := testkit.NewFakeConnector(4)
+		scope := handoff.Scope{TenantID: "tenant-close", UserID: "user", ConversationID: "conversation-close"}
+		manager := NewManager(Config{
+			IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+			RecoveryStore: &recoveryStoreFake{snapshot: RecoverySnapshot{ConversationID: scope.ConversationID}},
+		}, connector, managerIDs{session: "close-session", conversation: scope.ConversationID})
+		client := &contextBlockingCloseClient{created: make(chan struct{}), closeCall: make(chan struct{})}
+		runDone := make(chan error, 1)
+		go func() {
+			runDone <- manager.Run(t.Context(), OpenRequest{Subject: Subject{
+				TenantID: scope.TenantID, UserID: scope.UserID, ExpiresAt: time.Now().Add(time.Hour),
+			}, ConversationID: scope.ConversationID}, client)
+		}()
+		_, err := connector.NextSession(t.Context())
+		require.NoError(t, err)
+		<-client.created
+		require.Eventually(t, func() bool {
+			manager.activeMu.RLock()
+			defer manager.activeMu.RUnlock()
+			return manager.active[runtimeKey{sessionID: "close-session", incarnation: 1}] != nil
+		}, time.Second, time.Millisecond)
+		reconnectCtx, cancel := context.WithTimeout(t.Context(), 25*time.Millisecond)
+		defer cancel()
+		started := time.Now()
+		err = manager.Reconnect(reconnectCtx, ReconnectRequest{
+			Scope: scope, SessionID: "close-session", LastIncarnation: 1,
+		}, newChannelClient(1))
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		require.Less(t, time.Since(started), 250*time.Millisecond)
+		<-client.closeCall
+		secondCtx, secondCancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+		defer secondCancel()
+		_, err = connector.NextSession(secondCtx)
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		select {
+		case <-runDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("old runtime did not finish bounded client cleanup")
+		}
+	})
+
+	t.Run("provider close cannot permit premature replacement", func(t *testing.T) {
+		voice := &blockingProviderCloseVoice{closeStarted: make(chan struct{}), closeRelease: make(chan struct{})}
+		connector := &blockingProviderConnector{voice: voice}
+		scope := handoff.Scope{TenantID: "tenant-provider-close", UserID: "user", ConversationID: "conversation-provider-close"}
+		manager := NewManager(Config{
+			IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+			RecoveryStore: &recoveryStoreFake{snapshot: RecoverySnapshot{ConversationID: scope.ConversationID}},
+		}, connector, managerIDs{session: "provider-close-session", conversation: scope.ConversationID})
+		client := newChannelClient(4)
+		runDone := make(chan error, 1)
+		go func() {
+			runDone <- manager.Run(t.Context(), OpenRequest{Subject: Subject{
+				TenantID: scope.TenantID, UserID: scope.UserID, ExpiresAt: time.Now().Add(time.Hour),
+			}, ConversationID: scope.ConversationID}, client)
+		}()
+		require.Equal(t, "session.created", (<-client.writes).EventType())
+		require.Eventually(t, func() bool {
+			manager.activeMu.RLock()
+			defer manager.activeMu.RUnlock()
+			return manager.active[runtimeKey{sessionID: "provider-close-session", incarnation: 1}] != nil
+		}, time.Second, time.Millisecond)
+		reconnectCtx, cancel := context.WithTimeout(t.Context(), 25*time.Millisecond)
+		defer cancel()
+		err := manager.Reconnect(reconnectCtx, ReconnectRequest{
+			Scope: scope, SessionID: "provider-close-session", LastIncarnation: 1,
+		}, newChannelClient(1))
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		<-voice.closeStarted
+		require.Equal(t, int32(1), connector.calls.Load(), "replacement provider was never opened")
+		manager.activeMu.RLock()
+		_, published := manager.active[runtimeKey{sessionID: "provider-close-session", incarnation: 2}]
+		manager.activeMu.RUnlock()
+		require.False(t, published)
+		retryCtx, retryCancel := context.WithTimeout(t.Context(), 15*time.Millisecond)
+		retryErr := manager.Reconnect(retryCtx, ReconnectRequest{
+			Scope: scope, SessionID: "provider-close-session", LastIncarnation: 1,
+		}, newChannelClient(1))
+		retryCancel()
+		require.ErrorIs(t, retryErr, context.DeadlineExceeded)
+		require.Equal(t, int32(1), connector.calls.Load(), "retry also waits for original provider cleanup")
+		close(voice.closeRelease)
+		select {
+		case <-runDone:
+		case <-time.After(time.Second):
+			t.Fatal("old runtime did not finish after provider close released")
+		}
+	})
+}
+
 type managerIDs struct {
 	session      identity.SessionID
 	conversation identity.ConversationID
+}
+
+func waitForActiveRuntime(t *testing.T, manager *Manager, sessionID identity.SessionID, incarnation identity.Incarnation) *sessionRuntime {
+	t.Helper()
+	var runtime *sessionRuntime
+	require.Eventually(t, func() bool {
+		manager.activeMu.RLock()
+		runtime = manager.active[runtimeKey{sessionID: sessionID, incarnation: incarnation}]
+		manager.activeMu.RUnlock()
+		return runtime != nil
+	}, time.Second, time.Millisecond)
+	return runtime
 }
 
 func (i managerIDs) NewSessionID() identity.SessionID           { return i.session }
@@ -238,7 +1116,7 @@ func (c *closeErrorClient) Write(_ context.Context, event protocol.ServerEvent) 
 	return nil
 }
 
-func (c *closeErrorClient) Close(int, string) error {
+func (c *closeErrorClient) Close(context.Context, int, string) error {
 	c.writes <- "client.close"
 	c.once.Do(func() { close(c.closed) })
 	return c.closeErr
@@ -270,7 +1148,7 @@ func (c *failureClient) Write(ctx context.Context, _ protocol.ServerEvent) error
 	}
 }
 
-func (c *failureClient) Close(int, string) error {
+func (c *failureClient) Close(context.Context, int, string) error {
 	c.closes.Add(1)
 	return c.closeErr
 }
@@ -297,7 +1175,7 @@ func (c *blockingWriteClient) Write(ctx context.Context, event protocol.ServerEv
 	return ctx.Err()
 }
 
-func (c *blockingWriteClient) Close(int, string) error {
+func (c *blockingWriteClient) Close(context.Context, int, string) error {
 	c.closeOnce.Do(func() { close(c.closed) })
 	return nil
 }
@@ -322,7 +1200,7 @@ func (c *lifecycleClient) Write(ctx context.Context, event protocol.ServerEvent)
 	return ctx.Err()
 }
 
-func (c *lifecycleClient) Close(int, string) error {
+func (c *lifecycleClient) Close(context.Context, int, string) error {
 	c.closes.Add(1)
 	c.closeOnce.Do(func() { close(c.closed) })
 	return nil
@@ -386,7 +1264,7 @@ func (c *channelClient) Write(ctx context.Context, event protocol.ServerEvent) e
 	}
 }
 
-func (c *channelClient) Close(int, string) error {
+func (c *channelClient) Close(context.Context, int, string) error {
 	c.closeOnce.Do(func() { close(c.done) })
 	return nil
 }

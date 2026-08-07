@@ -64,6 +64,7 @@ type App struct {
 type DurableDependencies struct {
 	Service                 handoff.Service
 	ConversationWriter      ConversationWriter
+	RecoveryStore           session.RecoveryStore
 	Journal                 CoordinatorJournal
 	DeliveryAffinity        string
 	JournalOwner            string
@@ -147,6 +148,11 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 		WriterControlEvents: cfg.Gateway.Session.WriterControlEvents,
 		IngressBlockTimeout: cfg.Gateway.Session.IngressBlockTimeout,
 		EgressBlockTimeout:  cfg.Gateway.Session.EgressBlockTimeout,
+		RecoveryItemLimit:   session.DefaultRecoveryItemLimit,
+		RecoveryByteLimit:   session.DefaultRecoveryByteLimit,
+		ReconnectMaxRetries: cfg.Gateway.Reconnect.MaxRetries,
+		ReconnectRetryBase:  cfg.Gateway.Reconnect.RetryBase,
+		ReconnectRetryMax:   cfg.Gateway.Reconnect.RetryMax,
 	}
 	if managerConfig.IngressBlockTimeout == 0 {
 		managerConfig.IngressBlockTimeout = defaultIngressBlockTimeout
@@ -231,6 +237,13 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 		managerConfig.HandoffSubscriptions = app.eventPump
 		managerConfig.PresentationPolicy = app.presentation.Policy
 		managerConfig.SafetyPolicy = app.presentation.Safety
+		managerConfig.RecoveryStore = app.durable.RecoveryStore
+		if isNil(managerConfig.RecoveryStore) {
+			if store, ok := app.durable.ConversationWriter.(session.RecoveryStore); ok {
+				managerConfig.RecoveryStore = store
+			}
+		}
+		managerConfig.Clock = app.presentation.Clock
 		dispatcher := &durableDispatcher{snapshot: cloneHandoffSnapshot(app.durable.Snapshot)}
 		managerConfig.DurableDispatcher = dispatcher
 		app.managerConfig = managerConfig
@@ -240,6 +253,17 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 		app.transcripts = NewTranscriptCoordinator(app.durable.ConversationWriter, app.manager, app.durable.TranscriptQueueCapacity)
 		if app.handoffs == nil || app.transcripts == nil {
 			return nil, errors.New("durable handoff coordinators are invalid")
+		}
+		if cfg.Gateway.StorageGrace > 0 {
+			health := &durabilityHealth{}
+			app.handoffs.health = health
+			app.transcripts.health = health
+			if err := app.handoffs.configureOutage(cfg.Gateway.StorageGrace, app.presentation.Clock); err != nil {
+				return nil, err
+			}
+			if err := app.transcripts.configureOutage(cfg.Gateway.StorageGrace, app.presentation.Clock); err != nil {
+				return nil, err
+			}
 		}
 		if err := app.handoffs.configureJournal(app.durable.Journal, app.durable.DeliveryAffinity, app.durable.JournalOwner+":handoff", app.durable.JournalClaimLease); err != nil {
 			return nil, err

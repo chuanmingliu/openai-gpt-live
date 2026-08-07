@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
@@ -509,6 +510,61 @@ func TestHandoffCoordinatorTransientServiceFailureDoesNotSubmitOrAck(t *testing.
 		t.Fatalf("transient service failure submitted terminal completion: %#v", input)
 	default:
 	}
+}
+
+func TestHandoffCoordinatorFailsClosedForNewWorkDuringDurabilityOutage(t *testing.T) {
+	manual := clock.NewManual(time.Unix(0, 0))
+	coordinator := NewHandoffCoordinator(&handoffServiceFake{
+		creates: make(chan handoff.CreateRequest, 1), err: fmt.Errorf("%w: database unavailable", ErrTransientDurability),
+	}, &submitterFake{}, 2)
+	require.NoError(t, coordinator.configureOutage(30*time.Second, manual))
+	require.NoError(t, coordinator.Enqueue(validHandoffWork()))
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- coordinator.Run(ctx) }()
+	require.Eventually(t, func() bool { return coordinator.unavailable.Load() }, time.Second, time.Millisecond)
+	require.ErrorIs(t, coordinator.Enqueue(validHandoffWork()), ErrDurabilityUnavailable)
+	cancel()
+	require.NoError(t, <-done)
+}
+
+func TestDurabilityHealthKeepsIndependentLaneFailuresFenced(t *testing.T) {
+	health := &durabilityHealth{}
+	transcripts := NewTranscriptCoordinator(&transcriptWriterFake{}, &submitterFake{}, 1)
+	handoffs := NewHandoffCoordinator(&handoffServiceFake{}, &submitterFake{}, 2)
+	transcripts.health, handoffs.health = health, health
+	transcripts.outageClock, handoffs.outageClock = clock.Real{}, clock.Real{}
+
+	transcripts.beginOutage()
+	// A healthy/no-op handoff lane may clear only its own bit.
+	handoffs.beginOutage()
+	handoffs.endOutage()
+	require.ErrorIs(t, handoffs.Enqueue(validHandoffWork()), ErrDurabilityUnavailable)
+	transcripts.endOutage()
+	require.NoError(t, handoffs.Enqueue(validHandoffWork()))
+}
+
+func TestHandoffPeriodicReplayUsesSameStorageGraceDeadline(t *testing.T) {
+	manual := clock.NewManual(time.Unix(0, 0))
+	journal := newCoordinatorJournalFake()
+	coordinator := NewHandoffCoordinator(&handoffServiceFake{}, &submitterFake{}, 1)
+	require.NoError(t, coordinator.configureJournal(journal, "handoff-timer-affinity", "handoff-timer-owner", 100*time.Millisecond))
+	require.NoError(t, coordinator.configureOutage(30*time.Second, manual))
+	done := make(chan error, 1)
+	go func() { done <- coordinator.Run(t.Context()) }()
+	require.Eventually(t, func() bool {
+		journal.mu.Lock()
+		defer journal.mu.Unlock()
+		return journal.claimCalls >= 1
+	}, time.Second, time.Millisecond)
+	journal.mu.Lock()
+	journal.claimErr = fmt.Errorf("%w: handoff replay unavailable", ErrTransientDurability)
+	journal.mu.Unlock()
+	manual.Advance(50 * time.Millisecond)
+	require.Eventually(t, func() bool { return coordinator.unavailable.Load() }, time.Second, time.Millisecond)
+	time.Sleep(time.Millisecond)
+	manual.Advance(30 * time.Second)
+	require.ErrorIs(t, <-done, ErrDurabilityGraceExpired)
 }
 
 func TestHandoffCoordinatorTransientGetSteerAndCancelFailuresRemainReplayable(t *testing.T) {

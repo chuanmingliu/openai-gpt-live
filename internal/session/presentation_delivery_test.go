@@ -121,7 +121,7 @@ func (c *deliveryClient) Write(ctx context.Context, event protocol.ServerEvent) 
 	return nil
 }
 
-func (c *deliveryClient) Close(int, string) error {
+func (c *deliveryClient) Close(context.Context, int, string) error {
 	c.closeOnce.Do(func() { close(c.done) })
 	return nil
 }

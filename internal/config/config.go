@@ -23,6 +23,9 @@ const (
 	defaultWriterControlEvents = 64
 	defaultSampleRate          = 24_000
 	defaultPCMFrameBytes       = 960
+	defaultReconnectRetries    = 2
+	defaultReconnectRetryBase  = 100 * time.Millisecond
+	defaultReconnectRetryMax   = time.Second
 )
 
 type Config struct {
@@ -264,6 +267,15 @@ func (c *Config) applyDefaults() {
 	if c.Gateway.StorageGrace == 0 {
 		c.Gateway.StorageGrace = 30 * time.Second
 	}
+	if c.Gateway.Reconnect.MaxRetries == 0 {
+		c.Gateway.Reconnect.MaxRetries = defaultReconnectRetries
+	}
+	if c.Gateway.Reconnect.RetryBase == 0 {
+		c.Gateway.Reconnect.RetryBase = defaultReconnectRetryBase
+	}
+	if c.Gateway.Reconnect.RetryMax == 0 {
+		c.Gateway.Reconnect.RetryMax = defaultReconnectRetryMax
+	}
 	if c.Worker.Concurrency == 0 {
 		c.Worker.Concurrency = 1
 	}
@@ -339,6 +351,15 @@ func (c Config) Validate() error {
 	}
 	if c.Gateway.Session.IngressFrames <= 0 || c.Gateway.Session.EgressFrames <= 0 || c.Gateway.Session.ControlEvents <= 0 || c.Gateway.Session.WriterControlEvents <= 0 || c.Gateway.Session.IngressFrames > 10_000 || c.Gateway.Session.EgressFrames > 10_000 || c.Gateway.Session.ControlEvents > 10_000 || c.Gateway.Session.WriterControlEvents > 10_000 {
 		return errors.New("gateway session queue sizes must be positive and bounded")
+	}
+	if c.Gateway.StorageGrace < 0 || c.Gateway.StorageGrace > 10*time.Minute {
+		return errors.New("gateway.storage_grace must be positive and bounded when set")
+	}
+	if c.Gateway.Reconnect.MaxRetries < 0 || c.Gateway.Reconnect.MaxRetries > 16 ||
+		c.Gateway.Reconnect.RetryBase < 0 || c.Gateway.Reconnect.RetryMax < 0 ||
+		c.Gateway.Reconnect.RetryBase > 0 && c.Gateway.Reconnect.RetryMax < c.Gateway.Reconnect.RetryBase ||
+		c.Gateway.Reconnect.RetryMax > time.Minute {
+		return errors.New("gateway reconnect retry limits must be bounded")
 	}
 	if c.Worker.Concurrency <= 0 {
 		return errors.New("worker.concurrency must be positive")

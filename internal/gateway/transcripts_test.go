@@ -6,12 +6,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/session"
@@ -70,6 +72,8 @@ type coordinatorJournalFake struct {
 	affinityErr     error
 	affinityLock    io.Closer
 	affinityNil     bool
+	claimErr        error
+	claimCalls      int
 }
 
 func newCoordinatorJournalFake() *coordinatorJournalFake {
@@ -114,6 +118,10 @@ func (f *coordinatorJournalFake) AdmitCoordinatorWork(_ context.Context, record 
 func (f *coordinatorJournalFake) ClaimCoordinatorWork(_ context.Context, kind, affinity, owner string, lease time.Duration, _ int) ([]postgres.CoordinatorJournalRecord, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.claimCalls++
+	if f.claimErr != nil {
+		return nil, f.claimErr
+	}
 	now := time.Now()
 	var records []postgres.CoordinatorJournalRecord
 	for key, record := range f.records {
@@ -266,6 +274,150 @@ func TestTranscriptCoordinatorOverflowCopyAndStorageFailure(t *testing.T) {
 		t.Fatalf("storage failure submitted committed input: %#v", input)
 	default:
 	}
+}
+
+type outageTranscriptWriter struct {
+	mu      sync.Mutex
+	failing bool
+	items   []postgres.ConversationItem
+}
+
+func (w *outageTranscriptWriter) AppendCommittedItem(_ context.Context, _ handoff.Scope, item postgres.ConversationItem) (postgres.ConversationItem, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.failing {
+		return postgres.ConversationItem{}, fmt.Errorf("%w: database unavailable", ErrTransientDurability)
+	}
+	w.items = append(w.items, item)
+	return item, nil
+}
+
+func TestTranscriptCoordinatorBuffersBoundedlyAndFlushesInOrderDuringStorageGrace(t *testing.T) {
+	manual := clock.NewManual(time.Unix(0, 0))
+	writer := &outageTranscriptWriter{failing: true}
+	inputs := make(chan session.Input, 2)
+	coordinator := NewTranscriptCoordinator(writer, &submitterFake{inputs: inputs}, 2)
+	require.NoError(t, coordinator.configureOutage(30*time.Second, manual))
+	first, second := validTranscriptWork(), validTranscriptWork()
+	first.Sequence, first.FinalText = 1, "first"
+	second.Sequence, second.FinalText = 2, "second"
+	require.NoError(t, coordinator.Enqueue(first))
+	require.NoError(t, coordinator.Enqueue(second))
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- coordinator.Run(ctx) }()
+	require.Eventually(t, func() bool { return coordinator.unavailable.Load() }, time.Second, time.Millisecond)
+	writer.mu.Lock()
+	writer.failing = false
+	writer.mu.Unlock()
+	manual.Advance(time.Second)
+	require.Equal(t, uint64(1), (<-inputs).(session.TurnCommittedInput).Sequence)
+	require.Equal(t, uint64(2), (<-inputs).(session.TurnCommittedInput).Sequence)
+	writer.mu.Lock()
+	require.Equal(t, []string{"first", "second"}, []string{writer.items[0].Content, writer.items[1].Content})
+	writer.mu.Unlock()
+	cancel()
+	require.NoError(t, <-done)
+}
+
+func TestTranscriptCoordinatorClosesAtStorageGraceDeadline(t *testing.T) {
+	manual := clock.NewManual(time.Unix(0, 0))
+	coordinator := NewTranscriptCoordinator(&transcriptWriterFake{err: fmt.Errorf("%w: database unavailable", ErrTransientDurability)}, &submitterFake{}, 1)
+	require.NoError(t, coordinator.configureOutage(30*time.Second, manual))
+	require.NoError(t, coordinator.Enqueue(validTranscriptWork()))
+	done := make(chan error, 1)
+	go func() { done <- coordinator.Run(t.Context()) }()
+	require.Eventually(t, func() bool { return coordinator.unavailable.Load() }, time.Second, time.Millisecond)
+	// Let the retry waiter register with the manual clock before crossing the
+	// entire deadline in one deterministic step.
+	time.Sleep(time.Millisecond)
+	manual.Advance(30 * time.Second)
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, ErrDurabilityGraceExpired)
+	case <-time.After(time.Second):
+		t.Fatal("coordinator did not close at the durability grace deadline")
+	}
+}
+
+func TestTranscriptPeriodicReplayHonorsAbsoluteStorageGrace(t *testing.T) {
+	for _, recoverBeforeDeadline := range []bool{true, false} {
+		name := "expires_at_deadline"
+		if recoverBeforeDeadline {
+			name = "recovers_before_deadline"
+		}
+		t.Run(name, func(t *testing.T) {
+			manual := clock.NewManual(time.Unix(0, 0))
+			journal := newCoordinatorJournalFake()
+			coordinator := NewTranscriptCoordinator(&transcriptWriterFake{}, &submitterFake{}, 1)
+			require.NoError(t, coordinator.configureJournal(journal, "timer-affinity", "timer-owner", 100*time.Millisecond))
+			require.NoError(t, coordinator.configureOutage(30*time.Second, manual))
+			ctx, cancel := context.WithCancel(t.Context())
+			done := make(chan error, 1)
+			go func() { done <- coordinator.Run(ctx) }()
+			require.Eventually(t, func() bool {
+				journal.mu.Lock()
+				defer journal.mu.Unlock()
+				return journal.claimCalls >= 1
+			}, time.Second, time.Millisecond)
+			journal.mu.Lock()
+			journal.claimErr = fmt.Errorf("%w: replay database unavailable", ErrTransientDurability)
+			journal.mu.Unlock()
+			manual.Advance(50 * time.Millisecond)
+			require.Eventually(t, func() bool { return coordinator.unavailable.Load() }, time.Second, time.Millisecond)
+			manual.Advance(29 * time.Second)
+			select {
+			case err := <-done:
+				t.Fatalf("periodic replay ended before grace deadline: %v", err)
+			default:
+			}
+			if recoverBeforeDeadline {
+				journal.mu.Lock()
+				journal.claimErr = nil
+				journal.mu.Unlock()
+			}
+			time.Sleep(time.Millisecond)
+			manual.Advance(time.Second)
+			if recoverBeforeDeadline {
+				require.Eventually(t, func() bool { return !coordinator.unavailable.Load() }, time.Second, time.Millisecond)
+				cancel()
+				require.NoError(t, <-done)
+			} else {
+				require.ErrorIs(t, <-done, ErrDurabilityGraceExpired)
+				cancel()
+			}
+		})
+	}
+}
+
+func TestDurabilityRetryClassificationExcludesDeterministicAndControlErrors(t *testing.T) {
+	for name, err := range map[string]error{
+		"transient":     fmt.Errorf("%w: unavailable", ErrTransientDurability),
+		"corrupt":       errors.New("corrupt coordinator journal payload"),
+		"lease lost":    handoff.ErrRevisionConflict,
+		"stale session": session.ErrSessionNotActive,
+		"cancelled":     context.Canceled,
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, name == "transient", transientDurabilityError(err))
+		})
+	}
+	manual := clock.NewManual(time.Unix(0, 0))
+	coordinator := NewTranscriptCoordinator(&transcriptWriterFake{}, &submitterFake{}, 1)
+	require.NoError(t, coordinator.configureOutage(30*time.Second, manual))
+	corrupt := errors.New("corrupt coordinator journal payload")
+	calls := 0
+	err := coordinator.retryDurability(t.Context(), func() error { calls++; return corrupt })
+	require.ErrorIs(t, err, corrupt)
+	require.Equal(t, 1, calls)
+	require.False(t, coordinator.unavailable.Load())
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	err = coordinator.retryDurability(cancelled, func() error {
+		return fmt.Errorf("%w: unavailable", ErrTransientDurability)
+	})
+	require.ErrorIs(t, err, context.Canceled)
+	require.False(t, coordinator.unavailable.Load())
 }
 
 func TestTranscriptCoordinatorRejectsInvalidDependencies(t *testing.T) {

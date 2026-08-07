@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/session"
@@ -56,6 +58,78 @@ type HandoffCoordinator struct {
 	journalAffinity string
 	journalOwner    string
 	claimLease      time.Duration
+	outageGrace     time.Duration
+	outageClock     clock.Clock
+	unavailable     atomic.Bool
+	health          *durabilityHealth
+	outageStarted   time.Time
+}
+
+func (c *HandoffCoordinator) configureOutage(grace time.Duration, source clock.Clock) error {
+	if c == nil || grace <= 0 || grace > 10*time.Minute || isNil(source) {
+		return errors.New("invalid durability outage policy")
+	}
+	c.outageGrace, c.outageClock = grace, source
+	if c.health == nil {
+		c.health = &durabilityHealth{}
+	}
+	return nil
+}
+
+func (c *HandoffCoordinator) beginOutage() {
+	if c.unavailable.CompareAndSwap(false, true) {
+		c.outageStarted = c.outageClock.Now()
+	}
+	c.health.markUnavailable(handoffLane)
+}
+
+func (c *HandoffCoordinator) endOutage() {
+	if c.unavailable.CompareAndSwap(true, false) {
+		c.health.markHealthy(handoffLane)
+	}
+	c.outageStarted = time.Time{}
+}
+
+func (c *HandoffCoordinator) retryDurability(ctx context.Context, operation func() error) error {
+	for {
+		err := operation()
+		if err == nil {
+			c.endOutage()
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if c.outageGrace <= 0 || !transientDurabilityError(err) {
+			return err
+		}
+		c.beginOutage()
+		if waitErr := c.waitOutage(ctx); waitErr != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return errors.Join(ErrDurabilityGraceExpired, err)
+		}
+	}
+}
+
+func (c *HandoffCoordinator) waitOutage(ctx context.Context) error {
+	remaining := c.outageGrace - c.outageClock.Now().Sub(c.outageStarted)
+	if remaining <= 0 {
+		return ErrDurabilityGraceExpired
+	}
+	delay := time.Second
+	if remaining < delay {
+		delay = remaining
+	}
+	ticker := c.outageClock.NewTicker(delay)
+	defer ticker.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-ticker.C():
+		return nil
+	}
 }
 
 func (c *HandoffCoordinator) configureJournal(journal CoordinatorJournal, affinity, owner string, lease time.Duration) error {
@@ -84,6 +158,9 @@ func NewHandoffCoordinator(service handoff.Service, submit SessionSubmitter, cap
 func (c *HandoffCoordinator) Enqueue(work HandoffWork) error {
 	if c == nil || c.work == nil {
 		return errors.New("handoff coordinator is not configured")
+	}
+	if c.unavailable.Load() || c.health.anyUnavailable() {
+		return ErrDurabilityUnavailable
 	}
 	retained, err := validateHandoffWorkBounds(work)
 	if err != nil {
@@ -115,7 +192,7 @@ func (c *HandoffCoordinator) Run(ctx context.Context) error {
 		return errors.New("handoff coordinator context is nil")
 	}
 	if c.journal != nil {
-		if err := c.drainJournal(ctx); err != nil {
+		if err := c.retryDurability(ctx, func() error { return c.drainJournal(ctx) }); err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -123,48 +200,47 @@ func (c *HandoffCoordinator) Run(ctx context.Context) error {
 		}
 	}
 	var replay <-chan time.Time
-	var ticker *time.Ticker
+	stopReplay := func() {}
 	if c.journal != nil {
-		ticker = time.NewTicker(coordinatorReplayInterval(c.claimLease))
-		defer ticker.Stop()
-		replay = ticker.C
+		replay, stopReplay = durabilityTicker(c.outageClock, coordinatorReplayInterval(c.claimLease))
+		defer stopReplay()
 	}
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-replay:
-			if err := c.drainJournal(ctx); err != nil {
+			if err := c.retryDurability(ctx, func() error { return c.drainJournal(ctx) }); err != nil {
 				if ctx.Err() != nil {
 					return nil
 				}
 				return err
 			}
 		case work := <-c.work:
-			var err error
-			if c.journal != nil && work.RejectReason == "" {
-				canonical, canonicalErr := canonicalizeHandoffWork(work)
-				if canonicalErr == nil {
-					err = c.admitJournal(ctx, canonical)
-					if err == nil {
-						err = c.drainJournal(ctx)
+			err := c.retryDurability(ctx, func() error {
+				if c.journal != nil && work.RejectReason == "" {
+					canonical, canonicalErr := canonicalizeHandoffWork(work)
+					if canonicalErr == nil {
+						err := c.admitJournal(ctx, canonical)
+						if err == nil {
+							err = c.drainJournal(ctx)
+						}
+						return err
+					} else {
+						completion, retryErr := c.process(ctx, work)
+						if retryErr != nil {
+							return retryErr
+						}
+						return c.submitCompletion(ctx, work, completion)
 					}
 				} else {
 					completion, retryErr := c.process(ctx, work)
 					if retryErr != nil {
-						err = retryErr
-					} else {
-						err = c.submitCompletion(ctx, work, completion)
+						return retryErr
 					}
+					return c.submitCompletion(ctx, work, completion)
 				}
-			} else {
-				completion, retryErr := c.process(ctx, work)
-				if retryErr != nil {
-					err = retryErr
-				} else {
-					err = c.submitCompletion(ctx, work, completion)
-				}
-			}
+			})
 			c.releaseWork(work)
 			if err != nil {
 				if ctx.Err() != nil {

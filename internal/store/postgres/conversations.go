@@ -9,8 +9,11 @@ import (
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
+	"github.com/chuanmingliu/openai-gpt-live/internal/session"
 	"github.com/jackc/pgx/v5"
 )
+
+const maximumRecoveryHandoffs = 1000
 
 type ConversationItem struct {
 	SessionID   identity.SessionID
@@ -22,6 +25,158 @@ type ConversationItem struct {
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 }
+
+// LoadRecovery reads one ownership-consistent, observational recovery view.
+// The transaction is read-only and repeatable so items, active jobs, and the
+// event high-water cannot come from different durable moments.
+func (r *Repository) LoadRecovery(ctx context.Context, scope handoff.Scope, itemLimit, byteLimit int) (session.RecoverySnapshot, error) {
+	if err := validateContext(ctx); err != nil {
+		return session.RecoverySnapshot{}, err
+	}
+	if err := validateScope(scope); err != nil {
+		return session.RecoverySnapshot{}, err
+	}
+	if itemLimit <= 0 || itemLimit > session.MaximumRecoveryItemLimit || byteLimit <= 0 || byteLimit > session.MaximumRecoveryByteLimit {
+		return session.RecoverySnapshot{}, session.ErrInvalidRecoveryBounds
+	}
+	tx, err := r.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return session.RecoverySnapshot{}, err
+	}
+	defer rollback(tx)
+
+	var owned bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (
+		SELECT 1 FROM conversations WHERE tenant_id=$1 AND id=$2 AND user_id=$3 AND status <> 'deleted'
+	)`, scope.TenantID, scope.ConversationID, scope.UserID).Scan(&owned); err != nil {
+		return session.RecoverySnapshot{}, err
+	}
+	if !owned {
+		return session.RecoverySnapshot{}, handoff.ErrNotFound
+	}
+
+	rows, err := tx.Query(ctx, `
+		WITH ordered AS MATERIALIZED (
+			SELECT session_id,turn_id,turn_revision,sequence,role,content,created_at
+			FROM conversation_items
+			WHERE tenant_id=$1 AND conversation_id=$2 AND role IN ('user','assistant')
+			ORDER BY sequence DESC,created_at DESC,session_id DESC,turn_id DESC,role DESC
+			LIMIT $3
+		), bounded AS (
+			SELECT *,sum(octet_length(content)) OVER (
+				ORDER BY sequence DESC,created_at DESC,session_id DESC,turn_id DESC,role DESC
+				ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+			) AS cumulative_bytes
+			FROM ordered
+		)
+		SELECT session_id,turn_id,turn_revision,sequence,role,content,created_at
+		FROM bounded WHERE cumulative_bytes <= $4
+		ORDER BY sequence DESC,created_at DESC,session_id DESC,turn_id DESC,role DESC`,
+		scope.TenantID, scope.ConversationID, itemLimit, byteLimit)
+	if err != nil {
+		return session.RecoverySnapshot{}, err
+	}
+	newest := make([]session.CommittedItem, 0, itemLimit)
+	retainedBytes := 0
+	for rows.Next() {
+		var item session.CommittedItem
+		var revision, sequence int64
+		if err := rows.Scan(&item.SessionID, &item.Turn.ID, &revision, &sequence, &item.Role, &item.Content, &item.CreatedAt); err != nil {
+			rows.Close()
+			return session.RecoverySnapshot{}, err
+		}
+		if revision <= 0 || revision > math.MaxUint32 || sequence < 0 {
+			rows.Close()
+			return session.RecoverySnapshot{}, session.ErrRecoveryUnavailable
+		}
+		if len(item.Content) > byteLimit-retainedBytes {
+			break
+		}
+		item.Turn.Revision = uint32(revision)
+		item.Sequence = uint64(sequence)
+		item.CreatedAt = item.CreatedAt.UTC()
+		retainedBytes += len(item.Content)
+		newest = append(newest, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return session.RecoverySnapshot{}, err
+	}
+	rows.Close()
+	items := make([]session.CommittedItem, len(newest))
+	for index := range newest {
+		items[len(newest)-1-index] = newest[index]
+	}
+
+	handoffRows, err := tx.Query(ctx, `SELECT id,tenant_id,conversation_id,user_id,state,objective,objective_revision,
+		attempt,retry_count,presentation_hint,created_at,updated_at FROM handoffs
+		WHERE tenant_id=$1 AND conversation_id=$2 AND user_id=$3
+		  AND state IN ('pending','leased','running','needs_input')
+		ORDER BY created_at,id LIMIT $4`, scope.TenantID, scope.ConversationID, scope.UserID, maximumRecoveryHandoffs+1)
+	if err != nil {
+		return session.RecoverySnapshot{}, err
+	}
+	active := make([]handoff.Snapshot, 0)
+	for handoffRows.Next() {
+		if len(active) == maximumRecoveryHandoffs {
+			handoffRows.Close()
+			return session.RecoverySnapshot{}, session.ErrRecoveryExhausted
+		}
+		snapshot, err := loadRecoveryHandoffRow(handoffRows)
+		if err != nil {
+			handoffRows.Close()
+			return session.RecoverySnapshot{}, err
+		}
+		active = append(active, snapshot)
+	}
+	if err := handoffRows.Err(); err != nil {
+		handoffRows.Close()
+		return session.RecoverySnapshot{}, err
+	}
+	handoffRows.Close()
+
+	var lastEventSeq int64
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(max(seq),0) FROM handoff_events
+		WHERE tenant_id=$1 AND conversation_id=$2`, scope.TenantID, scope.ConversationID).Scan(&lastEventSeq); err != nil {
+		return session.RecoverySnapshot{}, err
+	}
+	if lastEventSeq < 0 {
+		return session.RecoverySnapshot{}, session.ErrRecoveryUnavailable
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return session.RecoverySnapshot{}, err
+	}
+	return session.RecoverySnapshot{
+		ConversationID: scope.ConversationID, CommittedItems: items,
+		ActiveHandoffs: active, LastEventSeq: lastEventSeq,
+	}, nil
+}
+
+func loadRecoveryHandoffRow(row pgx.Row) (handoff.Snapshot, error) {
+	var snapshot handoff.Snapshot
+	var tenant, conversation, user, state string
+	var objectiveRevision, attempt, retryCount int64
+	if err := row.Scan(&snapshot.ID, &tenant, &conversation, &user, &state, &snapshot.Request.Objective,
+		&objectiveRevision, &attempt, &retryCount, &snapshot.Request.PresentationHint,
+		&snapshot.CreatedAt, &snapshot.UpdatedAt); err != nil {
+		return handoff.Snapshot{}, err
+	}
+	for _, value := range []int64{objectiveRevision, attempt, retryCount} {
+		if value < 0 || value > math.MaxUint32 {
+			return handoff.Snapshot{}, session.ErrRecoveryUnavailable
+		}
+	}
+	snapshot.Request.Scope = handoff.Scope{
+		TenantID: tenant, UserID: user, ConversationID: identity.ConversationID(conversation),
+	}
+	snapshot.State = handoff.State(state)
+	snapshot.ObjectiveRevision = uint32(objectiveRevision)
+	snapshot.Attempt, snapshot.RetryCount = uint32(attempt), uint32(retryCount)
+	snapshot.CreatedAt, snapshot.UpdatedAt = snapshot.CreatedAt.UTC(), snapshot.UpdatedAt.UTC()
+	return snapshot, nil
+}
+
+var _ session.RecoveryStore = (*Repository)(nil)
 
 func (r *Repository) AppendCommittedItem(ctx context.Context, scope handoff.Scope, item ConversationItem) (ConversationItem, error) {
 	if err := validateContext(ctx); err != nil {

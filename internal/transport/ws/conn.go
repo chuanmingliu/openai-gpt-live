@@ -115,11 +115,48 @@ func (c *clientConn) Write(ctx context.Context, event protocol.ServerEvent) erro
 
 // Close defers the manager's routine normal cleanup until the handler knows
 // whether Run succeeded. Non-normal closes are terminal immediately.
-func (c *clientConn) Close(code int, reason string) error {
+func (c *clientConn) Close(ctx context.Context, code int, reason string) error {
+	if ctx == nil {
+		return errors.New("close context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if websocket.StatusCode(code) == websocket.StatusNormalClosure {
 		return nil
 	}
-	return c.closeNow(websocket.StatusCode(code), reason)
+	return c.closeNowContext(ctx, websocket.StatusCode(code), reason)
+}
+
+func (c *clientConn) closeNowContext(ctx context.Context, code websocket.StatusCode, reason string) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.writeGate:
+	}
+	defer func() { c.writeGate <- struct{}{} }()
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	c.closeMu.Lock()
+	if c.closed {
+		err := c.closeErr
+		c.closeMu.Unlock()
+		return err
+	}
+	c.closed = true
+	c.closeMu.Unlock()
+	done := make(chan error, 1)
+	go func() { done <- c.conn.Close(code, boundedCloseReason(reason)) }()
+	select {
+	case err := <-done:
+		c.closeMu.Lock()
+		c.closeErr = err
+		c.closeMu.Unlock()
+		return err
+	case <-ctx.Done():
+		_ = c.conn.CloseNow()
+		return ctx.Err()
+	}
 }
 
 func (c *clientConn) finish(runErr error) error {

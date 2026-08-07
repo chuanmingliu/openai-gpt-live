@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	rand "math/rand/v2"
 	"reflect"
 	"strings"
 	"sync"
@@ -13,6 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/presentation"
@@ -31,6 +34,10 @@ const (
 	pcmFrameBytes              = 960
 	internalCloseTimeout       = time.Second
 	presentationOfferTimeout   = 250 * time.Millisecond
+	defaultReconnectRetries    = 2
+	defaultReconnectRetryBase  = 100 * time.Millisecond
+	defaultReconnectRetryMax   = time.Second
+	maximumLogicalSessions     = 10_000
 )
 
 var (
@@ -49,26 +56,41 @@ var errEgressInvalidated = errors.New("egress epoch invalidated")
 type ClientConn interface {
 	Read(context.Context) (protocol.ClientEvent, error)
 	Write(context.Context, protocol.ServerEvent) error
-	Close(code int, reason string) error
+	Close(context.Context, int, string) error
 }
 
 type Config struct {
-	IngressFrames        int
-	EgressFrames         int
-	ControlEvents        int
-	WriterControlEvents  int
-	IngressBlockTimeout  time.Duration
-	EgressBlockTimeout   time.Duration
-	DurableDispatcher    DurableEffectDispatcher
-	HandoffConsumerID    string
-	HandoffSubscriptions HandoffSubscriptionRegistrar
-	PresentationPolicy   presentation.Policy
-	SafetyPolicy         safety.Policy
+	IngressFrames         int
+	EgressFrames          int
+	ControlEvents         int
+	WriterControlEvents   int
+	IngressBlockTimeout   time.Duration
+	EgressBlockTimeout    time.Duration
+	DurableDispatcher     DurableEffectDispatcher
+	HandoffConsumerID     string
+	HandoffSubscriptions  HandoffSubscriptionRegistrar
+	PresentationPolicy    presentation.Policy
+	SafetyPolicy          safety.Policy
+	RecoveryStore         RecoveryStore
+	RecoveryItemLimit     int
+	RecoveryByteLimit     int
+	ReconnectMaxRetries   int
+	ReconnectRetryBase    time.Duration
+	ReconnectRetryMax     time.Duration
+	Clock                 clock.Clock
+	Jitter                clock.JitterSource
+	reactorApplyGate      func(Input) <-chan struct{}
+	reconnectBoundaryGate func() <-chan struct{}
+	initialRegisterGate   func() <-chan struct{}
 }
 
 type HandoffSubscriptionRegistrar interface {
 	Register(handoff.EventSubscription) error
 	Unregister(handoff.EventSubscription)
+}
+
+type HandoffReplayRegistrar interface {
+	RegisterReplay(handoff.EventSubscription, int64) error
 }
 
 type TrustedSessionContext struct {
@@ -137,8 +159,39 @@ type Manager struct {
 	activeMu      sync.RWMutex
 	active        map[runtimeKey]*sessionRuntime
 	current       map[handoff.Scope]*sessionRuntime
+	logical       map[identity.SessionID]*logicalSession
 	metricsMu     sync.RWMutex
 	metrics       MetricsHooks
+}
+
+type logicalSession struct {
+	scope         handoff.Scope
+	subject       Subject
+	model         string
+	highWater     identity.Incarnation
+	responseEpoch identity.ResponseEpoch
+	runtime       *sessionRuntime
+	reconnecting  bool
+	turnBoundary  bool
+	state         logicalSessionState
+}
+
+type logicalSessionState uint8
+
+const (
+	logicalEstablishing logicalSessionState = iota
+	logicalActive
+	logicalTombstoned
+	logicalEstablishmentFailed
+)
+
+type managerJitter struct{}
+
+func (managerJitter) Duration(max time.Duration) time.Duration {
+	if max <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int64N(int64(max) + 1))
 }
 
 type runtimeKey struct {
@@ -154,15 +207,88 @@ type sessionRuntime struct {
 	quiesced <-chan struct{}
 	state    *runState
 
-	mu         sync.Mutex
-	accepting  bool
-	inboxSlots chan struct{}
+	mu          sync.Mutex
+	accepting   bool
+	inboxSlots  chan struct{}
+	replayAfter *int64
+}
+
+// fenceAtTurnBoundary linearizes the final boundary decision with every
+// external intake path. Callers that acquired the acceptance gate first are
+// fully represented in the boundary high-waters; callers arriving afterward
+// observe a closed gate and cannot enqueue into the old runtime.
+func (r *sessionRuntime) fenceAtTurnBoundary(ctx context.Context, gate func() <-chan struct{}) error {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.accepting {
+		// A previous reconnect may have closed intake but timed out while
+		// waiting for bounded cleanup. A later caller is allowed to continue
+		// waiting on that same fenced runtime; concurrent reconnects remain
+		// excluded by logicalSession.reconnecting under activeMu.
+		if !r.atTurnBoundary() {
+			return ErrReconnectNotAtBoundary
+		}
+		return nil
+	}
+	if !r.atTurnBoundary() {
+		return ErrReconnectNotAtBoundary
+	}
+	if gate != nil {
+		if wait := gate(); wait != nil {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-wait:
+			}
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r.accepting = false
+	// Internal provider/control completion can move the boundary while the
+	// test barrier is open. Recheck after closing intake and reopen the gate if
+	// the session is no longer clean.
+	if !r.atTurnBoundary() {
+		r.accepting = true
+		return ErrReconnectNotAtBoundary
+	}
+	return nil
+}
+
+func (r *sessionRuntime) handoffSubscription(consumer string) handoff.EventSubscription {
+	return handoff.EventSubscription{ConsumerID: consumer, Scope: r.handoffScope()}
 }
 
 func (r *sessionRuntime) stop() {
 	r.mu.Lock()
 	r.accepting = false
 	r.mu.Unlock()
+}
+
+func (r *sessionRuntime) atTurnBoundary() bool {
+	if r == nil || r.state == nil || r.state.partialInput.Load() {
+		return false
+	}
+	if r.state.ingressCompleted.Load() != r.state.latestIngressSequence() {
+		return false
+	}
+	if r.state.controlAccepted.Load() != r.state.controlApplied.Load() || r.state.pendingVoice.Load() != 0 {
+		return false
+	}
+	if r.state.externalAccepted.Load() != r.state.externalApplied.Load() {
+		return false
+	}
+	r.state.boundaryMu.RLock()
+	snapshot := r.state.boundary
+	r.state.boundaryMu.RUnlock()
+	if snapshot.UserSpeaking {
+		return false
+	}
+	return snapshot.Response == ResponseIdle || snapshot.Response == ResponseTerminal
 }
 
 type reactorMessage struct {
@@ -172,6 +298,7 @@ type reactorMessage struct {
 	done                chan error
 	requireClientWrites bool
 	offerCtx            context.Context
+	controlSequence     uint64
 }
 
 type ingressFrame struct {
@@ -343,6 +470,7 @@ func (a *activeAudioWrite) cancelAndWait() error {
 type runState struct {
 	cfg          Config
 	ids          IDs
+	runtime      *sessionRuntime
 	voice        realtime.Session
 	client       ClientConn
 	fence        *EpochFence
@@ -371,10 +499,22 @@ type runState struct {
 	outputOrder uint64
 
 	closeClientOnce sync.Once
+	closeClientDone chan struct{}
+	closeClientMu   sync.Mutex
 	closeClientErr  error
 	graceful        atomic.Bool
 
 	cancel context.CancelFunc
+
+	boundaryMu       sync.RWMutex
+	boundary         Snapshot
+	partialInput     atomic.Bool
+	ingressCompleted atomic.Uint64
+	controlAccepted  atomic.Uint64
+	controlApplied   atomic.Uint64
+	externalAccepted atomic.Uint64
+	externalApplied  atomic.Uint64
+	pendingVoice     atomic.Int64
 }
 
 func NewManager(cfg Config, connector realtime.Connector, ids IDGenerator) *Manager {
@@ -386,6 +526,7 @@ func NewManager(cfg Config, connector realtime.Connector, ids IDGenerator) *Mana
 		validationErr: err,
 		active:        make(map[runtimeKey]*sessionRuntime),
 		current:       make(map[handoff.Scope]*sessionRuntime),
+		logical:       make(map[identity.SessionID]*logicalSession),
 		metrics:       normalizeMetricsHooks(MetricsHooks{}),
 	}
 }
@@ -428,6 +569,37 @@ func normalizeManagerConfig(cfg Config) (Config, error) {
 	}
 	if cfg.EgressBlockTimeout <= 0 {
 		return cfg, fmt.Errorf("%w: egress block timeout must be positive", ErrInvalidManagerConfig)
+	}
+	if cfg.RecoveryItemLimit == 0 {
+		cfg.RecoveryItemLimit = DefaultRecoveryItemLimit
+	}
+	if cfg.RecoveryByteLimit == 0 {
+		cfg.RecoveryByteLimit = DefaultRecoveryByteLimit
+	}
+	if cfg.RecoveryItemLimit < 0 || cfg.RecoveryItemLimit > MaximumRecoveryItemLimit ||
+		cfg.RecoveryByteLimit < 0 || cfg.RecoveryByteLimit > MaximumRecoveryByteLimit {
+		return cfg, fmt.Errorf("%w: recovery bounds are unsafe", ErrInvalidManagerConfig)
+	}
+	if cfg.ReconnectMaxRetries == 0 {
+		cfg.ReconnectMaxRetries = defaultReconnectRetries
+	}
+	if cfg.ReconnectMaxRetries < 0 || cfg.ReconnectMaxRetries > 16 {
+		return cfg, fmt.Errorf("%w: reconnect retries are unsafe", ErrInvalidManagerConfig)
+	}
+	if cfg.ReconnectRetryBase == 0 {
+		cfg.ReconnectRetryBase = defaultReconnectRetryBase
+	}
+	if cfg.ReconnectRetryMax == 0 {
+		cfg.ReconnectRetryMax = defaultReconnectRetryMax
+	}
+	if cfg.ReconnectRetryBase < time.Millisecond || cfg.ReconnectRetryMax < cfg.ReconnectRetryBase || cfg.ReconnectRetryMax > time.Minute {
+		return cfg, fmt.Errorf("%w: reconnect retry bounds are unsafe", ErrInvalidManagerConfig)
+	}
+	if isNilInterface(cfg.Clock) {
+		cfg.Clock = clock.Real{}
+	}
+	if isNilInterface(cfg.Jitter) {
+		cfg.Jitter = managerJitter{}
 	}
 	presentationConfigured := cfg.HandoffConsumerID != "" || !isNilInterface(cfg.HandoffSubscriptions) ||
 		!isNilInterface(cfg.PresentationPolicy) || !isNilInterface(cfg.SafetyPolicy)
@@ -477,6 +649,22 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 		return errors.New("conversation ID is empty")
 	}
 	ids := IDs{SessionID: sessionID, ConversationID: conversationID, Incarnation: 1}
+	scope := handoff.Scope{TenantID: subject.TenantID, UserID: subject.UserID, ConversationID: conversationID}
+	m.activeMu.Lock()
+	if m.logical == nil {
+		m.logical = make(map[identity.SessionID]*logicalSession)
+	}
+	if _, exists := m.logical[sessionID]; exists || len(m.logical) >= maximumLogicalSessions {
+		m.activeMu.Unlock()
+		return ErrSessionAlreadyActive
+	}
+	logical := &logicalSession{
+		scope: scope, subject: cloneSubject(subject), model: request.RequestedModel, highWater: ids.Incarnation, turnBoundary: false,
+		state: logicalEstablishing,
+	}
+	m.logical[sessionID] = logical
+	m.activeMu.Unlock()
+	defer m.failInitialEstablishment(sessionID, logical)
 
 	sessionCtx, cancel := context.WithDeadline(parent, subject.ExpiresAt)
 	defer cancel()
@@ -510,6 +698,7 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 		accepting:  true,
 		inboxSlots: state.inboxSlots,
 	}
+	state.runtime = runtime
 	var firstErr error
 	var firstErrOnce sync.Once
 	runLoop := func(name string, loop func(context.Context) error) func() error {
@@ -549,6 +738,7 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	// This prevents the durable pump from overtaking session establishment.
 	<-state.inboxSlots
 	connected := reactorMessage{input: ConnectedInput{ProviderSession: json.RawMessage(`{}`)}, done: make(chan error, 1), requireClientWrites: true}
+	state.acceptControl(&connected)
 	state.inbox <- connected
 	select {
 	case err := <-connected.done:
@@ -557,6 +747,18 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 		}
 	case <-groupCtx.Done():
 		return abortBeforePublication(groupCtx.Err())
+	}
+	if err := groupCtx.Err(); err != nil {
+		return abortBeforePublication(err)
+	}
+	if m.cfg.initialRegisterGate != nil {
+		if gate := m.cfg.initialRegisterGate(); gate != nil {
+			select {
+			case <-groupCtx.Done():
+				return abortBeforePublication(groupCtx.Err())
+			case <-gate:
+			}
+		}
 	}
 	if err := groupCtx.Err(); err != nil {
 		return abortBeforePublication(err)
@@ -577,7 +779,7 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	if firstErr != nil {
 		return firstErr
 	}
-	cleanupErr := errors.Join(state.closeClientErr, closeErr)
+	cleanupErr := errors.Join(state.clientCloseError(), closeErr)
 	if errors.Is(waitErr, errGracefulSessionClose) || state.graceful.Load() {
 		return cleanupErr
 	}
@@ -593,28 +795,373 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	return nil
 }
 
+func (m *Manager) failInitialEstablishment(sessionID identity.SessionID, logical *logicalSession) {
+	m.activeMu.Lock()
+	defer m.activeMu.Unlock()
+	if m.logical[sessionID] != logical || logical.state != logicalEstablishing {
+		return
+	}
+	logical.state = logicalEstablishmentFailed
+	logical.runtime = nil
+	logical.reconnecting = false
+	logical.turnBoundary = false
+}
+
+// Reconnect replaces a logical session through an exact-incarnation
+// compare-and-swap. Scope is expected to come from the authenticated transport
+// and is checked against the immutable scope retained by the manager.
+func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, client ClientConn) error {
+	if m == nil || m.validationErr != nil {
+		if m != nil && m.validationErr != nil {
+			return m.validationErr
+		}
+		return ErrStaleReconnect
+	}
+	if parent == nil || isNilInterface(client) {
+		return ErrStaleReconnect
+	}
+	if err := validateReconnectRequest(request); err != nil {
+		return err
+	}
+	m.activeMu.RLock()
+	logical := m.logical[request.SessionID]
+	checkErr := m.checkReconnectLocked(request, logical)
+	m.activeMu.RUnlock()
+	if checkErr != nil {
+		return checkErr
+	}
+	if isNilInterface(m.cfg.RecoveryStore) {
+		return ErrRecoveryUnavailable
+	}
+
+	// The durable cursor preflight is observational and intentionally happens
+	// before the current runtime is fenced. Client-invalid future cursors and
+	// unavailable recovery cannot disturb an otherwise healthy live session.
+	snapshot, err := m.cfg.RecoveryStore.LoadRecovery(parent, request.Scope, m.cfg.RecoveryItemLimit, m.cfg.RecoveryByteLimit)
+	if err != nil {
+		if parent.Err() != nil {
+			return parent.Err()
+		}
+		return ErrRecoveryUnavailable
+	}
+	snapshot, err = validateRecoverySnapshot(request.Scope, snapshot, m.cfg.RecoveryItemLimit, m.cfg.RecoveryByteLimit)
+	if err != nil {
+		return err
+	}
+	if request.LastEventSeq > snapshot.LastEventSeq {
+		return ErrStaleReconnect
+	}
+	if err := parent.Err(); err != nil {
+		return err
+	}
+
+	// Re-run the complete CAS after the preflight read. A competing reconnect,
+	// new accepted control, or boundary transition loses without being stopped.
+	m.activeMu.Lock()
+	if m.logical[request.SessionID] != logical {
+		m.activeMu.Unlock()
+		return ErrStaleReconnect
+	}
+	if err := m.checkReconnectLocked(request, logical); err != nil {
+		m.activeMu.Unlock()
+		return err
+	}
+	old := logical.runtime
+	if old != nil {
+		if err := old.fenceAtTurnBoundary(parent, m.cfg.reconnectBoundaryGate); err != nil {
+			m.activeMu.Unlock()
+			return err
+		}
+	}
+	logical.reconnecting = true
+	subject := cloneSubject(logical.subject)
+	model := logical.model
+	initialEpoch := logical.responseEpoch + 1
+	newIncarnation := logical.highWater + 1
+	m.activeMu.Unlock()
+
+	published := false
+	defer func() {
+		if published {
+			return
+		}
+		m.activeMu.Lock()
+		if current := m.logical[request.SessionID]; current == logical && current.highWater == request.LastIncarnation {
+			current.reconnecting = false
+		}
+		m.activeMu.Unlock()
+	}()
+	if old != nil {
+		if err := m.stopAndQuiesceRuntimeReason(parent, old, 1001, "session reconnected"); err != nil {
+			m.closeUnpublishedClient(parent, client, 1011, "recovery unavailable")
+			return err
+		}
+	}
+	if err := parent.Err(); err != nil {
+		return err
+	}
+
+	// The preflight exists only to reject an invalid client cursor without
+	// disturbing the live runtime. Once old intake is fenced and the runtime is
+	// fully quiesced, read a fresh authoritative snapshot so durable commits
+	// completed before quiescence are included in provider restoration.
+	snapshot, err = m.cfg.RecoveryStore.LoadRecovery(parent, request.Scope, m.cfg.RecoveryItemLimit, m.cfg.RecoveryByteLimit)
+	if err != nil {
+		m.closeUnpublishedClient(parent, client, 1011, "recovery unavailable")
+		if parent.Err() != nil {
+			return parent.Err()
+		}
+		return ErrRecoveryUnavailable
+	}
+	snapshot, err = validateRecoverySnapshot(request.Scope, snapshot, m.cfg.RecoveryItemLimit, m.cfg.RecoveryByteLimit)
+	if err != nil || request.LastEventSeq > snapshot.LastEventSeq {
+		m.closeUnpublishedClient(parent, client, 1011, "recovery unavailable")
+		if parent.Err() != nil {
+			return parent.Err()
+		}
+		return ErrRecoveryUnavailable
+	}
+
+	sessionCtx, cancel := context.WithDeadline(parent, subject.ExpiresAt)
+	defer cancel()
+	voice, err := m.connectReplacement(sessionCtx, realtime.OpenRequest{
+		SessionID: request.SessionID, Incarnation: newIncarnation, Model: model,
+	})
+	if err != nil {
+		m.closeUnpublishedClient(parent, client, 1011, "recovery unavailable")
+		if sessionCtx.Err() != nil {
+			return sessionCtx.Err()
+		}
+		return ErrRecoveryExhausted
+	}
+	commands, err := recoveryCommands(snapshot.CommittedItems)
+	if err == nil {
+		for _, command := range commands {
+			if err = voice.Send(sessionCtx, command); err != nil {
+				break
+			}
+		}
+	}
+	if err != nil {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), internalCloseTimeout)
+		_ = voice.Close(closeCtx)
+		closeCancel()
+		m.closeUnpublishedClient(parent, client, 1011, "recovery unavailable")
+		if sessionCtx.Err() != nil {
+			return sessionCtx.Err()
+		}
+		return ErrRecoveryUnavailable
+	}
+
+	ids := IDs{SessionID: request.SessionID, ConversationID: request.Scope.ConversationID, Incarnation: newIncarnation}
+	err = m.runReplacement(sessionCtx, cancel, subject, ids, client, voice, initialEpoch, logical, request.LastIncarnation, request.LastEventSeq)
+	m.activeMu.RLock()
+	published = logical.highWater == newIncarnation
+	m.activeMu.RUnlock()
+	return err
+}
+
+// activeMu must be held for reading or writing.
+func (m *Manager) checkReconnectLocked(request ReconnectRequest, logical *logicalSession) error {
+	if logical == nil || logical.scope != request.Scope || logical.highWater != request.LastIncarnation || logical.reconnecting ||
+		uint64(logical.highWater) == math.MaxUint64 || uint64(logical.responseEpoch) == math.MaxUint64 {
+		return ErrStaleReconnect
+	}
+	if logical.state == logicalEstablishing || logical.state == logicalEstablishmentFailed {
+		return ErrStaleReconnect
+	}
+	if logical.state == logicalActive && logical.runtime == nil || logical.state == logicalTombstoned && logical.runtime != nil {
+		return ErrStaleReconnect
+	}
+	if logical.runtime != nil && !logical.runtime.atTurnBoundary() || logical.runtime == nil && !logical.turnBoundary {
+		return ErrReconnectNotAtBoundary
+	}
+	return nil
+}
+
+func (m *Manager) connectReplacement(ctx context.Context, request realtime.OpenRequest) (realtime.Session, error) {
+	var lastErr error
+	for attempt := 0; attempt <= m.cfg.ReconnectMaxRetries; attempt++ {
+		voice, err := m.connector.Connect(ctx, request)
+		if err == nil && !isNilInterface(voice) {
+			return voice, nil
+		}
+		lastErr = err
+		if attempt == m.cfg.ReconnectMaxRetries {
+			break
+		}
+		delay := m.cfg.ReconnectRetryBase
+		for step := 0; step < attempt && delay < m.cfg.ReconnectRetryMax; step++ {
+			if delay > m.cfg.ReconnectRetryMax/2 {
+				delay = m.cfg.ReconnectRetryMax
+				break
+			}
+			delay *= 2
+		}
+		if delay < m.cfg.ReconnectRetryMax {
+			delay += m.cfg.Jitter.Duration(delay)
+			if delay > m.cfg.ReconnectRetryMax {
+				delay = m.cfg.ReconnectRetryMax
+			}
+		}
+		ticker := m.cfg.Clock.NewTicker(delay)
+		select {
+		case <-ctx.Done():
+			ticker.Stop()
+			return nil, ctx.Err()
+		case <-ticker.C():
+			ticker.Stop()
+		}
+	}
+	return nil, lastErr
+}
+
+func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.CancelFunc, subject Subject, ids IDs, client ClientConn,
+	voice realtime.Session, initialEpoch identity.ResponseEpoch, logical *logicalSession, expected identity.Incarnation, replayAfter int64,
+) error {
+	group, groupCtx := errgroup.WithContext(sessionCtx)
+	quiesced := make(chan struct{})
+	var quiescedOnce sync.Once
+	markQuiesced := func() { quiescedOnce.Do(func() { close(quiesced) }) }
+	state := newRunState(m.cfg, ids, voice, client, cancel)
+	state.fence = NewEpochFence(initialEpoch)
+	state.boundary = Snapshot{IDs: ids, Response: ResponseIdle, ResponseEpoch: initialEpoch}
+	state.subject = cloneSubject(subject)
+	state.metrics = m.metricsSnapshot()
+	runtime := &sessionRuntime{
+		key: runtimeKey{sessionID: ids.SessionID, incarnation: ids.Incarnation}, subject: subject,
+		inbox: state.inbox, done: groupCtx.Done(), quiesced: quiesced, state: state,
+		accepting: true, inboxSlots: state.inboxSlots,
+	}
+	state.runtime = runtime
+	runtime.replayAfter = &replayAfter
+	var firstErr error
+	var firstErrOnce sync.Once
+	runLoop := func(name string, loop func(context.Context) error) func() error {
+		return func() error {
+			err := loop(groupCtx)
+			runtime.stop()
+			if err != nil && !errors.Is(err, errGracefulSessionClose) && !state.graceful.Load() &&
+				!(errors.Is(err, context.Canceled) && groupCtx.Err() != nil) {
+				firstErrOnce.Do(func() { firstErr = fmt.Errorf("%s: %w", name, err) })
+			}
+			return err
+		}
+	}
+	group.Go(runLoop("client reader", state.clientReader))
+	group.Go(runLoop("voice writer", state.voiceWriter))
+	group.Go(runLoop("voice reader", state.voiceReader))
+	group.Go(runLoop("client writer", state.clientWriter))
+	group.Go(runLoop("reactor", state.reactorLoop))
+	abort := func(cause error) error {
+		cancel()
+		_ = group.Wait()
+		state.closeClient(1000, "session ended")
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), internalCloseTimeout)
+		_ = voice.Close(closeCtx)
+		closeCancel()
+		markQuiesced()
+		if firstErr != nil {
+			return firstErr
+		}
+		return cause
+	}
+	<-state.inboxSlots
+	connected := reactorMessage{input: ConnectedInput{ProviderSession: json.RawMessage(`{}`)}, done: make(chan error, 1), requireClientWrites: true}
+	state.acceptControl(&connected)
+	state.inbox <- connected
+	select {
+	case err := <-connected.done:
+		if err != nil {
+			return abort(ErrRecoveryUnavailable)
+		}
+	case <-groupCtx.Done():
+		return abort(groupCtx.Err())
+	}
+	if err := m.registerReplacement(runtime, logical, expected); err != nil {
+		return abort(err)
+	}
+	defer m.unregister(runtime.key, runtime)
+
+	waitErr := group.Wait()
+	cancel()
+	state.closeClient(1000, "session ended")
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), internalCloseTimeout)
+	closeErr := voice.Close(closeCtx)
+	closeCancel()
+	markQuiesced()
+	if firstErr != nil {
+		return firstErr
+	}
+	cleanupErr := errors.Join(state.clientCloseError(), closeErr)
+	if errors.Is(waitErr, errGracefulSessionClose) || state.graceful.Load() {
+		return cleanupErr
+	}
+	if sessionCtx.Err() != nil {
+		return sessionCtx.Err()
+	}
+	if waitErr != nil {
+		return waitErr
+	}
+	return cleanupErr
+}
+
+func (m *Manager) registerReplacement(runtime *sessionRuntime, logical *logicalSession, expected identity.Incarnation) error {
+	m.activeMu.Lock()
+	defer m.activeMu.Unlock()
+	if m.logical[runtime.key.sessionID] != logical || !logical.reconnecting || logical.highWater != expected ||
+		logical.scope != runtime.handoffScope() || runtime.key.incarnation != expected+1 ||
+		logical.state == logicalEstablishing || logical.state == logicalEstablishmentFailed {
+		return ErrStaleReconnect
+	}
+	if _, exists := m.active[runtime.key]; exists {
+		return ErrStaleReconnect
+	}
+	scope := runtime.handoffScope()
+	if !isNilInterface(m.cfg.HandoffSubscriptions) {
+		replay, ok := m.cfg.HandoffSubscriptions.(HandoffReplayRegistrar)
+		if !ok || isNilInterface(replay) {
+			return ErrRecoveryUnavailable
+		}
+		if err := replay.RegisterReplay(runtime.handoffSubscription(m.cfg.HandoffConsumerID), *runtime.replayAfter); err != nil {
+			return ErrRecoveryUnavailable
+		}
+	}
+	m.active[runtime.key] = runtime
+	m.current[scope] = runtime
+	logical.highWater = runtime.key.incarnation
+	logical.responseEpoch = runtime.state.fence.Current()
+	logical.runtime = runtime
+	logical.reconnecting = false
+	logical.turnBoundary = true
+	logical.state = logicalActive
+	return nil
+}
+
 func newRunState(cfg Config, ids IDs, voice realtime.Session, client ClientConn, cancel context.CancelFunc) *runState {
 	state := &runState{
-		cfg:          cfg,
-		ids:          ids,
-		voice:        voice,
-		client:       client,
-		fence:        NewEpochFence(0),
-		inbox:        make(chan reactorMessage, cfg.ControlEvents),
-		ingress:      make(chan ingressFrame, cfg.IngressFrames),
-		ingressSlots: make(chan struct{}, cfg.IngressFrames),
-		voiceCtl:     make(chan voiceControl, cfg.WriterControlEvents),
-		egress:       make(chan egressFrame, cfg.EgressFrames),
-		clientCtl:    make(chan clientControl, cfg.WriterControlEvents),
-		inboxSlots:   make(chan struct{}, cfg.ControlEvents),
-		voiceSlots:   make(chan struct{}, cfg.WriterControlEvents),
-		clientSlots:  make(chan struct{}, cfg.WriterControlEvents),
-		egressSlots:  make(chan struct{}, cfg.EgressFrames),
-		progress:     newSequenceProgress(),
-		activeWrite:  &activeAudioWrite{},
-		metrics:      normalizeMetricsHooks(MetricsHooks{}),
-		dispatcher:   cfg.DurableDispatcher,
-		cancel:       cancel,
+		cfg:             cfg,
+		ids:             ids,
+		voice:           voice,
+		client:          client,
+		fence:           NewEpochFence(0),
+		inbox:           make(chan reactorMessage, cfg.ControlEvents),
+		ingress:         make(chan ingressFrame, cfg.IngressFrames),
+		ingressSlots:    make(chan struct{}, cfg.IngressFrames),
+		voiceCtl:        make(chan voiceControl, cfg.WriterControlEvents),
+		egress:          make(chan egressFrame, cfg.EgressFrames),
+		clientCtl:       make(chan clientControl, cfg.WriterControlEvents),
+		inboxSlots:      make(chan struct{}, cfg.ControlEvents),
+		voiceSlots:      make(chan struct{}, cfg.WriterControlEvents),
+		clientSlots:     make(chan struct{}, cfg.WriterControlEvents),
+		egressSlots:     make(chan struct{}, cfg.EgressFrames),
+		progress:        newSequenceProgress(),
+		activeWrite:     &activeAudioWrite{},
+		closeClientDone: make(chan struct{}),
+		metrics:         normalizeMetricsHooks(MetricsHooks{}),
+		dispatcher:      cfg.DurableDispatcher,
+		cancel:          cancel,
+		boundary:        Snapshot{IDs: ids, Response: ResponseIdle},
 	}
 	for range cfg.ControlEvents {
 		state.inboxSlots <- struct{}{}
@@ -683,6 +1230,7 @@ func (m *Manager) Submit(ctx context.Context, sessionID identity.SessionID, inca
 		return ErrSessionNotActive
 	default:
 	}
+	runtime.state.acceptControl(&message)
 	runtime.inbox <- message
 	runtime.mu.Unlock()
 	select {
@@ -717,8 +1265,26 @@ func (m *Manager) register(runtime *sessionRuntime) error {
 		return ErrSessionAlreadyActive
 	}
 	scope := runtime.handoffScope()
+	if m.logical == nil {
+		m.logical = make(map[identity.SessionID]*logicalSession)
+	}
+	logical := m.logical[runtime.key.sessionID]
+	if logical == nil {
+		// register is also used by focused package tests that construct a
+		// runtime directly. Treat that as an initial publication, never as a
+		// reconnect or a reset of an existing high-water record.
+		logical = &logicalSession{
+			scope: scope, subject: cloneSubject(runtime.subject), highWater: runtime.key.incarnation,
+			state: logicalEstablishing,
+		}
+		m.logical[runtime.key.sessionID] = logical
+	}
+	if logical.scope != scope || logical.highWater != runtime.key.incarnation || logical.state != logicalEstablishing ||
+		logical.runtime != nil || logical.reconnecting {
+		return ErrStaleReconnect
+	}
 	if !isNilInterface(m.cfg.HandoffSubscriptions) {
-		if err := m.cfg.HandoffSubscriptions.Register(handoff.EventSubscription{ConsumerID: m.cfg.HandoffConsumerID, Scope: scope}); err != nil {
+		if err := m.cfg.HandoffSubscriptions.Register(runtime.handoffSubscription(m.cfg.HandoffConsumerID)); err != nil {
 			return fmt.Errorf("register handoff presentation: %w", err)
 		}
 	}
@@ -727,6 +1293,11 @@ func (m *Manager) register(runtime *sessionRuntime) error {
 	}
 	m.active[runtime.key] = runtime
 	m.current[scope] = runtime
+	logical.runtime = runtime
+	logical.responseEpoch = runtime.state.fence.Current()
+	logical.reconnecting = false
+	logical.turnBoundary = true
+	logical.state = logicalActive
 	return nil
 }
 
@@ -740,9 +1311,15 @@ func (m *Manager) unregister(key runtimeKey, runtime *sessionRuntime) {
 	if unregisterPresentation {
 		delete(m.current, scope)
 	}
+	if logical := m.logical[key.sessionID]; logical != nil && logical.runtime == runtime {
+		logical.runtime = nil
+		logical.responseEpoch = runtime.state.fence.Current()
+		logical.turnBoundary = runtime.atTurnBoundary()
+		logical.state = logicalTombstoned
+	}
 	m.activeMu.Unlock()
 	if unregisterPresentation && !isNilInterface(m.cfg.HandoffSubscriptions) {
-		m.cfg.HandoffSubscriptions.Unregister(handoff.EventSubscription{ConsumerID: m.cfg.HandoffConsumerID, Scope: scope})
+		m.cfg.HandoffSubscriptions.Unregister(runtime.handoffSubscription(m.cfg.HandoffConsumerID))
 	}
 }
 
@@ -815,6 +1392,7 @@ func (m *Manager) OfferHandoffEvent(ctx context.Context, scope handoff.Scope, ev
 		return handoff.ErrNoLiveSession
 	default:
 	}
+	runtime.state.acceptControl(&message)
 	runtime.inbox <- message
 	runtime.mu.Unlock()
 	select {
@@ -849,21 +1427,42 @@ func (m *Manager) OfferHandoffEvent(ctx context.Context, scope handoff.Scope, ev
 }
 
 func (m *Manager) stopAndQuiesceRuntime(runtime *sessionRuntime) {
+	_ = m.stopAndQuiesceRuntimeReason(context.Background(), runtime, 1011, "handoff presentation delivery timed out")
+}
+
+func (m *Manager) stopAndQuiesceRuntimeReason(parent context.Context, runtime *sessionRuntime, code int, reason string) error {
 	if runtime == nil {
-		return
+		return nil
 	}
+	cleanupCtx, cleanupCancel := context.WithTimeout(parent, internalCloseTimeout)
+	defer cleanupCancel()
 	runtime.stop()
 	if runtime.state != nil {
 		if runtime.state.cancel != nil {
 			runtime.state.cancel()
 		}
 		if !isNilInterface(runtime.state.client) {
-			runtime.state.closeClient(1011, "handoff presentation delivery timed out")
+			runtime.state.closeClientContext(cleanupCtx, code, reason)
 		}
 	}
 	if runtime.quiesced != nil {
-		<-runtime.quiesced
+		select {
+		case <-runtime.quiesced:
+			return nil
+		case <-cleanupCtx.Done():
+			return cleanupCtx.Err()
+		}
 	}
+	return nil
+}
+
+func (m *Manager) closeUnpublishedClient(parent context.Context, client ClientConn, code int, reason string) {
+	if isNilInterface(client) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(parent, internalCloseTimeout)
+	defer cancel()
+	_ = client.Close(ctx, code, reason)
 }
 
 func (s *runState) clientReader(ctx context.Context) error {
@@ -874,51 +1473,84 @@ func (s *runState) clientReader(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		switch typed := event.(type) {
-		case protocol.InputAudioBufferAppendEvent:
-			pcm, err := protocol.DecodePCM24k(typed, s.cfg.IngressFrames*pcmFrameBytes)
-			if err != nil {
-				return err
-			}
-			frames, err := framer.Push(pcm)
-			if err != nil {
-				return err
-			}
-			for _, audio := range frames {
-				latestSequence = s.nextIngressSequence()
-				if err := s.enqueueIngress(ctx, ingressFrame{sequence: latestSequence, audio: append([]byte(nil), audio...)}); err != nil {
-					return err
+		if s.runtime == nil {
+			return ErrSessionNotActive
+		}
+		err = s.runtime.acceptClientEvent(ctx, func() error {
+			switch typed := event.(type) {
+			case protocol.InputAudioBufferAppendEvent:
+				pcm, decodeErr := protocol.DecodePCM24k(typed, s.cfg.IngressFrames*pcmFrameBytes)
+				if decodeErr != nil {
+					return decodeErr
 				}
-			}
-		case protocol.InputAudioBufferCommitEvent:
-			tail, err := framer.Flush()
-			if err != nil {
-				if queueErr := s.enqueueClientControl(clientControl{event: protocol.ErrorEvent{
-					Type:    "error",
-					EventID: s.nextManagerEventID(),
-					Error: protocol.ProtocolError{
-						Type: "invalid_request_error", Code: "invalid_audio_commit", Message: err.Error(),
-					},
-				}}); queueErr != nil {
-					return queueErr
+				if len(pcm) != 0 {
+					s.partialInput.Store(true)
 				}
-				continue
-			}
-			if len(tail) != 0 {
-				latestSequence = s.nextIngressSequence()
-				if err := s.enqueueIngress(ctx, ingressFrame{sequence: latestSequence, audio: append([]byte(nil), tail...)}); err != nil {
-					return err
+				frames, pushErr := framer.Push(pcm)
+				if pushErr != nil {
+					return pushErr
 				}
+				for _, audio := range frames {
+					latestSequence = s.nextIngressSequence()
+					if enqueueErr := s.enqueueIngress(ctx, ingressFrame{sequence: latestSequence, audio: append([]byte(nil), audio...)}); enqueueErr != nil {
+						return enqueueErr
+					}
+				}
+			case protocol.InputAudioBufferCommitEvent:
+				tail, flushErr := framer.Flush()
+				if flushErr != nil {
+					return s.enqueueClientControl(clientControl{event: protocol.ErrorEvent{
+						Type:    "error",
+						EventID: s.nextManagerEventID(),
+						Error: protocol.ProtocolError{
+							Type: "invalid_request_error", Code: "invalid_audio_commit", Message: flushErr.Error(),
+						},
+					}})
+				}
+				if len(tail) != 0 {
+					latestSequence = s.nextIngressSequence()
+					if enqueueErr := s.enqueueIngress(ctx, ingressFrame{sequence: latestSequence, audio: append([]byte(nil), tail...)}); enqueueErr != nil {
+						return enqueueErr
+					}
+				}
+				if enqueueErr := s.enqueueReactor(reactorMessage{input: ClientInput{Event: typed}, ingressAfter: latestSequence}); enqueueErr != nil {
+					return enqueueErr
+				}
+				s.partialInput.Store(false)
+			default:
+				return s.enqueueReactor(reactorMessage{input: ClientInput{Event: event}, ingressAfter: latestSequence})
 			}
-			if err := s.enqueueReactor(reactorMessage{input: ClientInput{Event: typed}, ingressAfter: latestSequence}); err != nil {
-				return err
-			}
-		default:
-			if err := s.enqueueReactor(reactorMessage{input: ClientInput{Event: event}, ingressAfter: latestSequence}); err != nil {
-				return err
-			}
+			return nil
+		})
+		if err != nil {
+			return err
 		}
 	}
+}
+
+func (r *sessionRuntime) acceptClientEvent(ctx context.Context, accept func() error) error {
+	r.mu.Lock()
+	if err := ctx.Err(); err != nil {
+		r.mu.Unlock()
+		return err
+	}
+	if !r.accepting {
+		r.mu.Unlock()
+		return ErrSessionNotActive
+	}
+	select {
+	case <-r.done:
+		r.mu.Unlock()
+		return ErrSessionNotActive
+	default:
+	}
+	sequence := r.state.externalAccepted.Add(1)
+	r.mu.Unlock()
+	if err := accept(); err != nil {
+		return err
+	}
+	r.state.externalApplied.Store(sequence)
+	return nil
 }
 
 func (s *runState) enqueueIngress(ctx context.Context, frame ingressFrame) error {
@@ -943,8 +1575,13 @@ func (s *runState) enqueueReactor(message reactorMessage) error {
 		s.metrics.queueOverflow("reactor")
 		return ErrControlOverflow
 	}
+	s.acceptControl(&message)
 	s.inbox <- message
 	return nil
+}
+
+func (s *runState) acceptControl(message *reactorMessage) {
+	message.controlSequence = s.controlAccepted.Add(1)
 }
 
 func (s *runState) enqueueReactorSync(ctx context.Context, message reactorMessage) error {
@@ -1013,6 +1650,7 @@ func (s *runState) voiceWriter(ctx context.Context) error {
 				return err
 			}
 			completedMedia = frame.sequence
+			s.ingressCompleted.Store(completedMedia)
 		}
 	}
 }
@@ -1142,6 +1780,15 @@ func (s *runState) reactorLoop(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case message := <-s.inbox:
+			if s.cfg.reactorApplyGate != nil {
+				if gate := s.cfg.reactorApplyGate(message.input); gate != nil {
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-gate:
+					}
+				}
+			}
 			dispatchCtx, finishDispatch := offerDispatchContext(ctx, message.offerCtx)
 			effects, err := reactor.ApplyContext(dispatchCtx, message.input)
 			if err == nil {
@@ -1154,7 +1801,16 @@ func (s *runState) reactorLoop(ctx context.Context) error {
 				}
 				err = s.dispatchEffects(dispatchCtx, effects, message.ingressAfter, message.egressAfter)
 			}
+			if err == nil {
+				s.boundaryMu.Lock()
+				s.boundary = reactor.Snapshot()
+				s.boundaryMu.Unlock()
+				if _, ok := message.input.(VoiceCommandCompletedInput); ok {
+					s.pendingVoice.Add(-1)
+				}
+			}
 			finishDispatch()
+			s.controlApplied.Store(message.controlSequence)
 			s.inboxSlots <- struct{}{}
 			if message.done != nil {
 				message.done <- err
@@ -1235,6 +1891,7 @@ func (s *runState) dispatchEffects(ctx context.Context, effects []Effect, ingres
 			s.metrics.queueOverflow("voice_control")
 			return ErrControlOverflow
 		}
+		s.pendingVoice.Add(1)
 		s.voiceCtl <- voiceControl{command: command}
 	}
 	for _, effect := range effects {
@@ -1408,9 +2065,34 @@ func (s *runState) releaseEgressSlot() {
 }
 
 func (s *runState) closeClient(code int, reason string) {
+	ctx, cancel := context.WithTimeout(context.Background(), internalCloseTimeout)
+	defer cancel()
+	s.closeClientContext(ctx, code, reason)
+}
+
+func (s *runState) closeClientContext(ctx context.Context, code int, reason string) {
 	s.closeClientOnce.Do(func() {
-		s.closeClientErr = s.client.Close(code, reason)
+		if s.closeClientDone == nil {
+			s.closeClientDone = make(chan struct{})
+		}
+		go func() {
+			err := s.client.Close(ctx, code, reason)
+			s.closeClientMu.Lock()
+			s.closeClientErr = err
+			s.closeClientMu.Unlock()
+			close(s.closeClientDone)
+		}()
 	})
+	select {
+	case <-s.closeClientDone:
+	case <-ctx.Done():
+	}
+}
+
+func (s *runState) clientCloseError() error {
+	s.closeClientMu.Lock()
+	defer s.closeClientMu.Unlock()
+	return s.closeClientErr
 }
 
 func (s *runState) nextIngressSequence() uint64 {

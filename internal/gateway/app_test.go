@@ -115,6 +115,8 @@ func TestNewMapsConfigAndAppliesBoundedTimeoutDefaults(t *testing.T) {
 	require.Positive(t, app.managerConfig.EgressBlockTimeout)
 	require.Equal(t, cfg.Gateway.Session.IngressFrames, app.managerConfig.IngressFrames)
 	require.Equal(t, cfg.Gateway.Session.EgressFrames, app.managerConfig.EgressFrames)
+	require.Equal(t, session.DefaultRecoveryItemLimit, app.managerConfig.RecoveryItemLimit)
+	require.Equal(t, session.DefaultRecoveryByteLimit, app.managerConfig.RecoveryByteLimit)
 
 	cfg.Gateway.WebSocket.ReadTimeout = 17 * time.Second
 	cfg.Gateway.WebSocket.WriteTimeout = 19 * time.Second
@@ -126,6 +128,33 @@ func TestNewMapsConfigAndAppliesBoundedTimeoutDefaults(t *testing.T) {
 	require.Equal(t, 19*time.Second, app.wsOptions.WriteTimeout)
 	require.Equal(t, 23*time.Millisecond, app.managerConfig.IngressBlockTimeout)
 	require.Equal(t, 29*time.Millisecond, app.managerConfig.EgressBlockTimeout)
+}
+
+func TestNewWiresRecoveryStoreAndReconnectRetryConfiguration(t *testing.T) {
+	cfg := validConfig()
+	cfg.Features.Handoffs = true
+	cfg.Gateway.Reconnect = config.ReconnectConfig{MaxRetries: 4, RetryBase: 20 * time.Millisecond, RetryMax: 80 * time.Millisecond}
+	store := &gatewayRecoveryStore{}
+	dependencies := DurableDependencies{
+		Service:            &handoffServiceFake{creates: make(chan handoff.CreateRequest, 1)},
+		ConversationWriter: &transcriptWriterFake{}, RecoveryStore: store,
+		Journal: newCoordinatorJournalFake(), DeliveryAffinity: "recovery-affinity", JournalOwner: "recovery-owner",
+		JournalClaimLease: time.Minute, HandoffQueueCapacity: 1, TranscriptQueueCapacity: 1,
+		Snapshot: validHandoffWork().Snapshot,
+	}
+	app, err := New(cfg, testkit.NewFakeConnector(2), WithIDGenerator(deterministicIDs{}),
+		WithDurableHandoffs(dependencies), testHandoffPresentationOption())
+	require.NoError(t, err)
+	require.Same(t, store, app.managerConfig.RecoveryStore)
+	require.Equal(t, 4, app.managerConfig.ReconnectMaxRetries)
+	require.Equal(t, 20*time.Millisecond, app.managerConfig.ReconnectRetryBase)
+	require.Equal(t, 80*time.Millisecond, app.managerConfig.ReconnectRetryMax)
+}
+
+type gatewayRecoveryStore struct{}
+
+func (*gatewayRecoveryStore) LoadRecovery(_ context.Context, scope handoff.Scope, _, _ int) (session.RecoverySnapshot, error) {
+	return session.RecoverySnapshot{ConversationID: scope.ConversationID}, nil
 }
 
 func TestNewUsesRandomURLSafeIDsAndAllowsInjection(t *testing.T) {

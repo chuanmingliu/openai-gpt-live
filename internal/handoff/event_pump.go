@@ -38,6 +38,13 @@ type EventSubscription struct {
 	Scope      Scope
 }
 
+// ReplayRegistrar installs a one-shot per-live-session replay overlay. The
+// durable global cursor remains monotonic; original events are offered again
+// from afterSeq until the overlay catches the stored cursor.
+type ReplayRegistrar interface {
+	RegisterReplay(EventSubscription, int64) error
+}
+
 type EventPump struct {
 	Reader        EventReader
 	Cursors       DeliveryCursorStore
@@ -48,8 +55,32 @@ type EventPump struct {
 
 	mu            sync.Mutex
 	subscriptions map[EventSubscription]struct{}
+	replays       map[EventSubscription]int64
 	changed       chan struct{}
 	running       bool
+}
+
+func (p *EventPump) RegisterReplay(subscription EventSubscription, afterSeq int64) error {
+	if afterSeq < 0 {
+		return errors.New("event pump replay cursor is negative")
+	}
+	if err := p.Register(subscription); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	if p.replays == nil {
+		p.replays = make(map[EventSubscription]int64)
+	}
+	if current, exists := p.replays[subscription]; !exists || afterSeq < current {
+		p.replays[subscription] = afterSeq
+	}
+	changed := p.changed
+	p.mu.Unlock()
+	select {
+	case changed <- struct{}{}:
+	default:
+	}
+	return nil
 }
 
 func (p *EventPump) Register(subscription EventSubscription) error {
@@ -87,6 +118,7 @@ func (p *EventPump) Unregister(subscription EventSubscription) {
 	}
 	p.mu.Lock()
 	delete(p.subscriptions, subscription)
+	delete(p.replays, subscription)
 	p.mu.Unlock()
 }
 
@@ -177,13 +209,21 @@ func (p *EventPump) subscriptionSnapshot(notification *EventWakeup) []EventSubsc
 }
 
 func (p *EventPump) deliverSubscription(ctx context.Context, subscription EventSubscription) error {
-	cursor, err := p.Cursors.LoadDeliveryCursor(ctx, subscription.ConsumerID, subscription.Scope)
+	storedCursor, err := p.Cursors.LoadDeliveryCursor(ctx, subscription.ConsumerID, subscription.Scope)
 	if err != nil {
 		return err
 	}
-	if cursor < 0 {
+	if storedCursor < 0 {
 		return errors.New("event pump cursor is negative")
 	}
+	cursor := storedCursor
+	p.mu.Lock()
+	if replay, ok := p.replays[subscription]; ok && replay < cursor {
+		cursor = replay
+	} else if ok {
+		delete(p.replays, subscription)
+	}
+	p.mu.Unlock()
 	for {
 		events, err := p.Reader.ReadEvents(ctx, subscription.Scope, cursor, eventPumpPageSize)
 		if err != nil {
@@ -206,10 +246,21 @@ func (p *EventPump) deliverSubscription(ctx context.Context, subscription EventS
 				return err
 			}
 			for acknowledged := index; acknowledged < end; acknowledged++ {
-				if err := p.Cursors.AdvanceDeliveryCursor(ctx, subscription.ConsumerID, subscription.Scope, events[acknowledged].Seq); err != nil {
-					return err
+				if events[acknowledged].Seq > storedCursor {
+					if err := p.Cursors.AdvanceDeliveryCursor(ctx, subscription.ConsumerID, subscription.Scope, events[acknowledged].Seq); err != nil {
+						return err
+					}
 				}
 				cursor = events[acknowledged].Seq
+				p.mu.Lock()
+				if replay, ok := p.replays[subscription]; ok && replay <= cursor {
+					if cursor >= storedCursor {
+						delete(p.replays, subscription)
+					} else {
+						p.replays[subscription] = cursor
+					}
+				}
+				p.mu.Unlock()
 			}
 			index = end
 		}

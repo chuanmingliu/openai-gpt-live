@@ -3,19 +3,92 @@
 package postgres
 
 import (
+	"fmt"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
+	"github.com/chuanmingliu/openai-gpt-live/internal/session"
 	"github.com/chuanmingliu/openai-gpt-live/internal/testkit"
 	"github.com/chuanmingliu/openai-gpt-live/migrations"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestLoadRecoveryBoundsNewestCommittedTextAndIsolatesOwnership(t *testing.T) {
+	repo, pool, _ := repositoryHarness(t)
+	scope := testScope("tenant-recovery", "conversation-recovery")
+	insertConversation(t, pool, scope)
+	for index, text := range []string{"old", "中", "new"} {
+		_, err := repo.AppendCommittedItem(t.Context(), scope, ConversationItem{
+			SessionID: "session-1", Turn: identity.TurnKey{ID: "turn-" + text, Revision: 1},
+			Sequence: uint64(index + 1), Role: "user", Content: text, ContentHash: "hash-" + text,
+			CreatedAt: repositoryTestNow.Add(time.Duration(index) * time.Second),
+		})
+		require.NoError(t, err)
+	}
+
+	snapshot, err := repo.LoadRecovery(t.Context(), scope, 2, len("中")+len("new"))
+	require.NoError(t, err)
+	require.Len(t, snapshot.CommittedItems, 2)
+	assert.Equal(t, []string{"中", "new"}, []string{snapshot.CommittedItems[0].Content, snapshot.CommittedItems[1].Content})
+	assert.Equal(t, scope.ConversationID, snapshot.ConversationID)
+
+	wrong := scope
+	wrong.UserID = "other-user"
+	_, err = repo.LoadRecovery(t.Context(), wrong, 2, 32)
+	assert.ErrorIs(t, err, handoff.ErrNotFound)
+	_, err = repo.LoadRecovery(t.Context(), scope, 0, 32)
+	assert.ErrorIs(t, err, session.ErrInvalidRecoveryBounds)
+}
+
+func TestLoadRecoveryReturnsActiveAllowlistAndLastScopedEventSequence(t *testing.T) {
+	repo, pool, _ := repositoryHarness(t)
+	scope := testScope("tenant-recovery-active", "conversation-recovery-active")
+	insertConversation(t, pool, scope)
+	record := prepareCreate(t, repo, scope, "recovery-active")
+	created, _, err := repo.CreateHandoff(t.Context(), record)
+	require.NoError(t, err)
+	_, err = pool.Exec(t.Context(), `UPDATE handoffs SET state='needs_input',input_revision=1,input='{"secret":"credential"}'::jsonb,
+		safety_decision='{"internal":"deny"}'::jsonb
+		WHERE tenant_id=$1 AND conversation_id=$2 AND id=$3`, scope.TenantID, scope.ConversationID, created.ID)
+	require.NoError(t, err)
+
+	snapshot, err := repo.LoadRecovery(t.Context(), scope, 8, 1024)
+	require.NoError(t, err)
+	require.Len(t, snapshot.ActiveHandoffs, 1)
+	assert.Equal(t, handoff.StateNeedsInput, snapshot.ActiveHandoffs[0].State)
+	assert.Nil(t, snapshot.ActiveHandoffs[0].Input)
+	assert.Nil(t, snapshot.ActiveHandoffs[0].Request.ApprovalPolicy)
+	assert.Empty(t, snapshot.ActiveHandoffs[0].Request.ContextRef)
+	assert.Empty(t, snapshot.ActiveHandoffs[0].Request.IdempotencyKey)
+	assert.Nil(t, snapshot.ActiveHandoffs[0].Result)
+	assert.Nil(t, snapshot.ActiveHandoffs[0].Failure)
+	assert.Positive(t, snapshot.LastEventSeq)
+}
+
+func TestLoadRecoveryAppliesByteBudgetInsideNewestFirstQuery(t *testing.T) {
+	repo, pool, _ := repositoryHarness(t)
+	scope := testScope("tenant-recovery-bytes", "conversation-recovery-bytes")
+	insertConversation(t, pool, scope)
+	for index := 0; index < 16; index++ {
+		text := strings.Repeat(string(rune('a'+index)), 60_000)
+		_, err := repo.AppendCommittedItem(t.Context(), scope, ConversationItem{
+			SessionID: "session-bytes", Turn: identity.TurnKey{ID: fmt.Sprintf("turn-%02d", index), Revision: 1},
+			Sequence: uint64(index + 1), Role: "user", Content: text, ContentHash: fmt.Sprintf("hash-%02d", index),
+			CreatedAt: repositoryTestNow.Add(time.Duration(index) * time.Second),
+		})
+		require.NoError(t, err)
+	}
+	snapshot, err := repo.LoadRecovery(t.Context(), scope, 10_000, 8)
+	require.NoError(t, err)
+	assert.Empty(t, snapshot.CommittedItems, "an oversized newest item prevents older fallback and large row transfer")
+}
 
 var repositoryTestNow = time.Date(2026, 8, 7, 4, 0, 0, 123456000, time.UTC)
 

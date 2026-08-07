@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"reflect"
 	"strings"
 	"unicode/utf8"
@@ -16,6 +17,29 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// IsTransientDurabilityError classifies only connection/resource/transaction
+// failures that are safe to retry after a bounded delay. Semantic constraint,
+// corruption, ownership, and cancellation errors are deliberately excluded.
+func IsTransientDurabilityError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if pgconn.SafeToRetry(err) {
+		return true
+	}
+	var network net.Error
+	if errors.As(err, &network) {
+		return true
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	return strings.HasPrefix(pgErr.Code, "08") || strings.HasPrefix(pgErr.Code, "53") ||
+		pgErr.Code == "40001" || pgErr.Code == "40P01" || pgErr.Code == "57P01" ||
+		pgErr.Code == "57P02" || pgErr.Code == "57P03"
+}
 
 const (
 	maxIdentityBytes = 256

@@ -144,6 +144,33 @@ func TestEventPumpOrdersOffersAndAdvancesEachExactCursor(t *testing.T) {
 	}, time.Second, time.Millisecond)
 }
 
+func TestEventPumpReconnectReplayUsesClientCursorWithoutRollingBackGlobalCursor(t *testing.T) {
+	scope := handoff.Scope{TenantID: "tenant-replay", UserID: "user", ConversationID: "conversation"}
+	store := newPumpStore()
+	for seq := int64(1); seq <= 6; seq++ {
+		kind, state := "handoff.progress", handoff.StateRunning
+		if seq == 4 {
+			kind, state = "handoff.needs_input", handoff.StateNeedsInput
+		}
+		store.events[scope] = append(store.events[scope], pumpEvent(scope, seq, kind, state))
+	}
+	subscription := handoff.EventSubscription{ConsumerID: "client", Scope: scope}
+	store.cursors[pumpKey(subscription.ConsumerID, scope)] = 5
+	pump := &handoff.EventPump{Reader: store, Cursors: store, Sink: store, Clock: clock.NewManual(time.Unix(0, 0)), PollInterval: time.Second}
+	require.NoError(t, pump.RegisterReplay(subscription, 2))
+	_, _ = runPump(t, pump)
+
+	for _, seq := range []int64{3, 4, 6} {
+		event := <-store.offered
+		assert.Equal(t, seq, event.Seq)
+		assert.Equal(t, pumpEvent(scope, seq, event.Kind, event.State).EventID, event.EventID)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	assert.Equal(t, int64(6), store.cursors[pumpKey(subscription.ConsumerID, scope)])
+	assert.Equal(t, []int64{6}, store.advances, "replay ACKs never roll the global cursor backward")
+}
+
 func TestEventPumpCoalescesOnlyConsecutiveProgressWithoutCursorSkips(t *testing.T) {
 	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "conversation"}
 	store := newPumpStore()

@@ -394,7 +394,7 @@ func TestConnectionFirstCloseCodeAndBoundedReasonWinOnce(t *testing.T) {
 	adapter, client := openConnectionAdapter(t, Options{MaxFrameBytes: 1024})
 	longReason := strings.Repeat("first-", 40)
 	firstResult := make(chan error, 1)
-	go func() { firstResult <- adapter.Close(int(websocket.StatusUnsupportedData), longReason) }()
+	go func() { firstResult <- adapter.Close(t.Context(), int(websocket.StatusUnsupportedData), longReason) }()
 	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
 	defer cancel()
 	_, _, err := client.Read(ctx)
@@ -405,7 +405,7 @@ func TestConnectionFirstCloseCodeAndBoundedReasonWinOnce(t *testing.T) {
 	require.Equal(t, boundedCloseReason(longReason), closeErr.Reason)
 	require.LessOrEqual(t, len(closeErr.Reason), 123)
 	require.NoError(t, <-firstResult)
-	require.NoError(t, adapter.Close(int(websocket.StatusInternalError), "second"))
+	require.NoError(t, adapter.Close(t.Context(), int(websocket.StatusInternalError), "second"))
 	require.Equal(t, websocket.StatusUnsupportedData, closeErr.Code)
 }
 
