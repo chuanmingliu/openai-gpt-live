@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"regexp"
@@ -141,10 +142,20 @@ type RetentionConfig struct {
 }
 
 type AuthConfig struct {
-	OIDCIssuer      string   `yaml:"oidc_issuer"`
-	OIDCAudience    string   `yaml:"oidc_audience"`
-	StaticBearerEnv string   `yaml:"static_bearer_env"`
-	AllowedOrigins  []string `yaml:"allowed_origins"`
+	OIDCIssuer         string        `yaml:"oidc_issuer"`
+	OIDCAudience       string        `yaml:"oidc_audience"`
+	OIDCTenantClaim    string        `yaml:"oidc_tenant_claim"`
+	OIDCUserClaim      string        `yaml:"oidc_user_claim"`
+	OIDCScopeClaim     string        `yaml:"oidc_scope_claim"`
+	OIDCRequiredScopes []string      `yaml:"oidc_required_scopes"`
+	OIDCCacheOutage    time.Duration `yaml:"oidc_cache_outage"`
+	OIDCHTTPTimeout    time.Duration `yaml:"oidc_http_timeout"`
+	StaticBearerEnv    string        `yaml:"static_bearer_env"`
+	StaticTenantID     string        `yaml:"static_tenant_id"`
+	StaticUserID       string        `yaml:"static_user_id"`
+	StaticScopes       []string      `yaml:"static_scopes"`
+	AllowedOrigins     []string      `yaml:"allowed_origins"`
+	AllowNonBrowser    bool          `yaml:"allow_non_browser"`
 }
 
 type AdmissionConfig struct {
@@ -152,6 +163,14 @@ type AdmissionConfig struct {
 	MaxSessionsPerTenant int           `yaml:"max_sessions_per_tenant"`
 	MaxSessionsPerUser   int           `yaml:"max_sessions_per_user"`
 	LeaseDuration        time.Duration `yaml:"lease_duration"`
+	HeartbeatInterval    time.Duration `yaml:"heartbeat_interval"`
+	GlobalRate           float64       `yaml:"global_rate"`
+	GlobalBurst          int           `yaml:"global_burst"`
+	IPRate               float64       `yaml:"ip_rate"`
+	IPBurst              int           `yaml:"ip_burst"`
+	IPKeyTTL             time.Duration `yaml:"ip_key_ttl"`
+	MaxIPKeys            int           `yaml:"max_ip_keys"`
+	InstanceID           string        `yaml:"instance_id"`
 }
 
 type SafetyConfig struct {
@@ -276,6 +295,54 @@ func (c *Config) applyDefaults() {
 	if c.Gateway.Reconnect.RetryMax == 0 {
 		c.Gateway.Reconnect.RetryMax = defaultReconnectRetryMax
 	}
+	if c.Auth.OIDCTenantClaim == "" {
+		c.Auth.OIDCTenantClaim = "tenant_id"
+	}
+	if c.Auth.OIDCUserClaim == "" {
+		c.Auth.OIDCUserClaim = "sub"
+	}
+	if c.Auth.OIDCScopeClaim == "" {
+		c.Auth.OIDCScopeClaim = "scope"
+	}
+	if c.Auth.OIDCCacheOutage == 0 {
+		c.Auth.OIDCCacheOutage = 15 * time.Minute
+	}
+	if c.Auth.OIDCHTTPTimeout == 0 {
+		c.Auth.OIDCHTTPTimeout = 5 * time.Second
+	}
+	if c.Admission.MaxSessions == 0 {
+		c.Admission.MaxSessions = 1000
+	}
+	if c.Admission.MaxSessionsPerTenant == 0 {
+		c.Admission.MaxSessionsPerTenant = 100
+	}
+	if c.Admission.MaxSessionsPerUser == 0 {
+		c.Admission.MaxSessionsPerUser = 10
+	}
+	if c.Admission.LeaseDuration == 0 {
+		c.Admission.LeaseDuration = 30 * time.Second
+	}
+	if c.Admission.HeartbeatInterval == 0 {
+		c.Admission.HeartbeatInterval = 10 * time.Second
+	}
+	if c.Admission.GlobalRate == 0 {
+		c.Admission.GlobalRate = 100
+	}
+	if c.Admission.GlobalBurst == 0 {
+		c.Admission.GlobalBurst = 100
+	}
+	if c.Admission.IPRate == 0 {
+		c.Admission.IPRate = 10
+	}
+	if c.Admission.IPBurst == 0 {
+		c.Admission.IPBurst = 20
+	}
+	if c.Admission.IPKeyTTL == 0 {
+		c.Admission.IPKeyTTL = 10 * time.Minute
+	}
+	if c.Admission.MaxIPKeys == 0 {
+		c.Admission.MaxIPKeys = 10_000
+	}
 	if c.Worker.Concurrency == 0 {
 		c.Worker.Concurrency = 1
 	}
@@ -376,6 +443,40 @@ func (c Config) Validate() error {
 	if c.Shutdown.DrainTimeout < 0 || c.Shutdown.DrainTimeout > 10*time.Minute {
 		return errors.New("shutdown.drain_timeout must be positive and bounded when set")
 	}
+	if len(c.Auth.AllowedOrigins) > 128 || len(c.Auth.OIDCRequiredScopes) > 64 || len(c.Auth.StaticScopes) > 64 ||
+		c.Auth.OIDCCacheOutage < 0 || c.Auth.OIDCCacheOutage > 24*time.Hour || c.Auth.OIDCCacheOutage > 0 && c.Auth.OIDCCacheOutage < time.Second || c.Auth.OIDCHTTPTimeout < 0 || c.Auth.OIDCHTTPTimeout > 30*time.Second || c.Auth.OIDCHTTPTimeout > 0 && c.Auth.OIDCHTTPTimeout < 100*time.Millisecond {
+		return errors.New("authentication lists and cache outage must be bounded")
+	}
+	for _, values := range [][]string{c.Auth.AllowedOrigins, c.Auth.OIDCRequiredScopes, c.Auth.StaticScopes} {
+		for _, value := range values {
+			if value == "" || len(value) > 2048 || !utf8.ValidString(value) {
+				return errors.New("authentication values must be non-empty and bounded")
+			}
+		}
+	}
+	for _, origin := range c.Auth.AllowedOrigins {
+		u, err := url.Parse(origin)
+		if err != nil || strings.Contains(origin, "*") || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" {
+			return errors.New("auth.allowed_origins must contain exact HTTP origins")
+		}
+	}
+	if len(c.Gateway.TrustedProxies) > 128 {
+		return errors.New("gateway.trusted_proxies is too large")
+	}
+	for _, proxy := range c.Gateway.TrustedProxies {
+		if _, _, err := net.ParseCIDR(proxy); err != nil {
+			return errors.New("gateway.trusted_proxies must contain CIDRs")
+		}
+	}
+	if c.Admission.MaxSessions < 0 || c.Admission.MaxSessionsPerTenant < 0 || c.Admission.MaxSessionsPerUser < 0 ||
+		c.Admission.MaxSessions > 1_000_000 || c.Admission.MaxSessions > 0 && c.Admission.MaxSessionsPerTenant > c.Admission.MaxSessions || c.Admission.MaxSessionsPerTenant > 0 && c.Admission.MaxSessionsPerUser > c.Admission.MaxSessionsPerTenant ||
+		c.Admission.LeaseDuration < 0 || c.Admission.LeaseDuration > 24*time.Hour || c.Admission.LeaseDuration > 0 && c.Admission.LeaseDuration < 3*time.Second || c.Admission.HeartbeatInterval < 0 || c.Admission.HeartbeatInterval > 0 && c.Admission.HeartbeatInterval < time.Second || c.Admission.LeaseDuration > 0 && c.Admission.HeartbeatInterval*2 >= c.Admission.LeaseDuration ||
+		c.Admission.GlobalRate < 0 || c.Admission.IPRate < 0 || c.Admission.GlobalBurst < 0 || c.Admission.IPBurst < 0 || c.Admission.IPKeyTTL < 0 || c.Admission.IPKeyTTL > 24*time.Hour || c.Admission.IPKeyTTL > 0 && c.Admission.IPKeyTTL < time.Second || c.Admission.MaxIPKeys < 0 || c.Admission.MaxIPKeys > 1_000_000 {
+		return errors.New("admission limits must be positive, ordered, and bounded")
+	}
+	if c.Admission.InstanceID != "" && (!validKeyID(c.Admission.InstanceID) || len(c.Admission.InstanceID) > 256) {
+		return errors.New("admission.instance_id is invalid")
+	}
 	if c.Features.ToolEncryptionKeyEnv != "" {
 		if !validKeyID(c.Features.ToolEncryptionKeyID) {
 			return errors.New("features.tool_encryption_key_id must be a non-empty immutable key identifier")
@@ -384,20 +485,40 @@ func (c Config) Validate() error {
 		return errors.New("features.tool_encryption_key_id requires tool_encryption_key_env")
 	}
 	if c.Mode == "production" {
+		hasCert, hasKey := c.Gateway.TLS.CertFile != "", c.Gateway.TLS.KeyFile != ""
+		if hasCert != hasKey {
+			return errors.New("production direct TLS requires both certificate and key")
+		}
+		if c.Gateway.BehindIngress {
+			if hasCert || len(c.Gateway.TrustedProxies) == 0 {
+				return errors.New("production ingress mode requires trusted proxies and no direct TLS files")
+			}
+		} else if !hasCert || len(c.Gateway.TrustedProxies) > 0 {
+			return errors.New("production direct mode requires TLS certificate and key without ingress proxies")
+		}
 		if strings.Contains(c.Store.URL, "sslmode=disable") {
 			return errors.New("production store.url must not disable SSL")
 		}
 		if c.Auth.StaticBearerEnv != "" {
 			return errors.New("production static authentication is not allowed")
 		}
+		if c.Auth.OIDCIssuer == "" || c.Auth.OIDCAudience == "" || len(c.Auth.OIDCRequiredScopes) == 0 {
+			return errors.New("production OIDC issuer, audience, and required scopes are required")
+		}
+		if len(c.Auth.AllowedOrigins) == 0 && !c.Auth.AllowNonBrowser {
+			return errors.New("production origin or non-browser policy is required")
+		}
+		if c.Store.URL == "" && c.Store.DatabaseURLEnv == "" {
+			return errors.New("production admission requires PostgreSQL storage")
+		}
 		for _, origin := range c.Auth.AllowedOrigins {
-			if origin == "*" {
+			if strings.Contains(origin, "*") {
 				return errors.New("production wildcard origins are not allowed")
 			}
 		}
-		if c.Gateway.BehindIngress && len(c.Gateway.TrustedProxies) == 0 {
-			return errors.New("production ingress requires trusted proxies")
-		}
+	}
+	if c.Mode == "local" && c.Auth.StaticBearerEnv != "" && (strings.TrimSpace(c.Auth.StaticTenantID) == "" || strings.TrimSpace(c.Auth.StaticUserID) == "" || len(c.Auth.StaticScopes) == 0) {
+		return errors.New("static authentication requires configured tenant, user, and scopes")
 	}
 	return nil
 }

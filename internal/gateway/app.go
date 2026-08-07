@@ -34,7 +34,6 @@ const (
 	defaultWebSocketReadTimeout  = 30 * time.Second
 	defaultWebSocketWriteTimeout = 10 * time.Second
 	defaultShutdownTimeout       = 10 * time.Second
-	defaultDevelopmentSubjectTTL = 15 * time.Minute
 	defaultMaxJSONDepth          = 32
 )
 
@@ -528,10 +527,9 @@ type developmentAdmission struct{}
 
 func (developmentAdmission) Admit(context.Context, *http.Request) (session.Subject, func(), error) {
 	return session.Subject{
-		TenantID:  "development",
-		UserID:    "local-simulator",
-		Scopes:    map[string]struct{}{"realtime": {}},
-		ExpiresAt: time.Now().Add(defaultDevelopmentSubjectTTL),
+		TenantID: "development",
+		UserID:   "local-simulator",
+		Scopes:   map[string]struct{}{"realtime": {}},
 	}, func() {}, nil
 }
 

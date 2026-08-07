@@ -13,18 +13,49 @@ import (
 	"testing"
 	"time"
 
+	admissionpkg "github.com/chuanmingliu/openai-gpt-live/internal/admission"
+	"github.com/chuanmingliu/openai-gpt-live/internal/auth"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
 	"github.com/chuanmingliu/openai-gpt-live/internal/session"
 	"github.com/chuanmingliu/openai-gpt-live/internal/testkit"
 	"github.com/coder/websocket"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 const testTimeout = 3 * time.Second
 
 type fixedIDs struct{}
+
+type e2eLeaseStore struct{ calls, releases atomic.Int32 }
+
+type forgedOriginAdmission struct {
+	*admissionpkg.Controller
+	releases atomic.Int32
+}
+
+func (f *forgedOriginAdmission) Admit(context.Context, *http.Request) (session.Subject, func(), error) {
+	return session.Subject{TenantID: "tenant", UserID: "user", ExpiresAt: time.Now().Add(time.Minute)}, func() {
+		f.releases.Add(1)
+	}, nil
+}
+
+// ExactOriginValidated intentionally matches the removed public marker. It
+// must not grant the package-sealed origin capability.
+func (*forgedOriginAdmission) ExactOriginValidated() {}
+
+func (*e2eLeaseStore) Ready(context.Context) error { return nil }
+func (s *e2eLeaseStore) Acquire(context.Context, session.Subject, admissionpkg.Limits) (func(), error) {
+	s.calls.Add(1)
+	var once atomic.Bool
+	return func() {
+		if once.CompareAndSwap(false, true) {
+			s.releases.Add(1)
+		}
+	}, nil
+}
 
 func (fixedIDs) NewSessionID() identity.SessionID           { return "session-test" }
 func (fixedIDs) NewConversationID() identity.ConversationID { return "conversation-test" }
@@ -220,6 +251,160 @@ func TestAdmissionRejectionStaysHTTP(t *testing.T) {
 	_ = response.Body.Close()
 }
 
+func TestAdmissionTypedErrorsMapToContentFreeHTTPResponses(t *testing.T) {
+	tests := []struct {
+		err    error
+		status int
+		header string
+	}{
+		{admissionpkg.ErrMalformed, http.StatusBadRequest, ""},
+		{admissionpkg.ErrUnauthorized, http.StatusUnauthorized, "WWW-Authenticate"},
+		{admissionpkg.ErrForbidden, http.StatusForbidden, ""},
+		{admissionpkg.ErrLimited, http.StatusTooManyRequests, "Retry-After"},
+		{admissionpkg.ErrUnavailable, http.StatusServiceUnavailable, "Retry-After"},
+	}
+	for _, test := range tests {
+		recorder := httptest.NewRecorder()
+		handler := NewHandler(Options{}, validManager(testkit.NewFakeConnector(1)), AdmissionFunc(func(context.Context, *http.Request) (session.Subject, func(), error) {
+			return session.Subject{}, nil, test.err
+		}))
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/realtime", nil))
+		require.Equal(t, test.status, recorder.Code)
+		require.Equal(t, "no-store", recorder.Header().Get("Cache-Control"))
+		require.Empty(t, recorder.Body.Bytes())
+		if test.header != "" {
+			require.NotEmpty(t, recorder.Header().Get(test.header))
+		}
+	}
+}
+
+func TestRealAdmissionOriginPolicyAndWebSocketUpgradeAgree(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		origin   func(string) string
+		allowed  func(string) []string
+		empty    bool
+		accepted bool
+	}{
+		{"cross origin", func(string) string { return "http://app.example" }, func(string) []string { return []string{"http://app.example"} }, false, true},
+		{"same origin", func(g string) string { return g }, func(g string) []string { return []string{g} }, false, true},
+		{"empty origin", func(string) string { return "" }, func(string) []string { return nil }, true, true},
+		{"rejected origin", func(string) string { return "http://evil.example" }, func(string) []string { return []string{"http://app.example"} }, false, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			gatewayOrigin := "http://" + listener.Addr().String()
+			store := &e2eLeaseStore{}
+			static := auth.NewStatic([]byte("development-token"), auth.Principal{TenantID: "tenant", UserID: "user", Scopes: map[string]struct{}{"realtime": {}}})
+			controller, err := admissionpkg.New(static, admissionpkg.Config{AllowedOrigins: test.allowed(gatewayOrigin), AllowEmptyOrigin: test.empty, GlobalRate: 100, GlobalBurst: 10, IPRate: 100, IPBurst: 10, IPKeyTTL: time.Minute, MaxIPKeys: 10, RequiredScopes: []string{"realtime"}, Limits: admissionpkg.Limits{Global: 10, PerTenant: 10, PerUser: 10}}, store)
+			require.NoError(t, err)
+			server := httptest.NewUnstartedServer(NewHandler(Options{}, validManager(testkit.NewFakeConnector(2)), controller))
+			server.Listener = listener
+			server.Start()
+			defer server.Close()
+			headers := http.Header{"Authorization": []string{"Bearer development-token"}}
+			if origin := test.origin(gatewayOrigin); origin != "" {
+				headers.Set("Origin", origin)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+			defer cancel()
+			conn, response, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/v1/realtime", &websocket.DialOptions{HTTPHeader: headers})
+			if test.accepted {
+				require.NoError(t, err)
+				require.NotNil(t, conn)
+				require.Equal(t, "session.created", readServerType(t, conn))
+				require.NoError(t, conn.Close(websocket.StatusNormalClosure, "done"))
+				require.Eventually(t, func() bool { return store.releases.Load() == 1 }, testTimeout, 10*time.Millisecond)
+				assert.Equal(t, int32(1), store.calls.Load())
+			} else {
+				require.Error(t, err)
+				require.Nil(t, conn)
+				require.NotNil(t, response)
+				body, readErr := io.ReadAll(response.Body)
+				require.NoError(t, readErr)
+				response.Body.Close()
+				require.Empty(t, body)
+				require.Zero(t, store.calls.Load())
+				require.Zero(t, store.releases.Load())
+			}
+		})
+	}
+}
+
+func TestCustomAdmissionCannotForgeOriginCapability(t *testing.T) {
+	// Embedding the real controller would promote any structural marker it
+	// implemented. Exact concrete-type recognition must still reject this fake.
+	forged := &forgedOriginAdmission{Controller: new(admissionpkg.Controller)}
+	server := httptest.NewServer(NewHandler(Options{}, validManager(testkit.NewFakeConnector(2)), forged))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+	defer cancel()
+	conn, response, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/v1/realtime", &websocket.DialOptions{
+		HTTPHeader: http.Header{"Origin": []string{"http://evil.example"}},
+	})
+	require.Error(t, err)
+	require.Nil(t, conn)
+	require.NotNil(t, response)
+	body, readErr := io.ReadAll(response.Body)
+	require.NoError(t, readErr)
+	response.Body.Close()
+	require.Equal(t, http.StatusForbidden, response.StatusCode)
+	require.Equal(t, "no-store", response.Header.Get("Cache-Control"))
+	require.Empty(t, body)
+	require.Equal(t, int32(1), forged.releases.Load())
+}
+
+func TestOrdinaryCustomAdmissionRetainsSameOriginFallback(t *testing.T) {
+	var releases atomic.Int32
+	server := httptest.NewServer(NewHandler(Options{}, validManager(testkit.NewFakeConnector(2)), trustedAdmission(&releases)))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+	defer cancel()
+	cross, response, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/v1/realtime", &websocket.DialOptions{
+		HTTPHeader: http.Header{"Origin": []string{"http://evil.example"}},
+	})
+	require.Error(t, err)
+	require.Nil(t, cross)
+	require.NotNil(t, response)
+	body, readErr := io.ReadAll(response.Body)
+	require.NoError(t, readErr)
+	response.Body.Close()
+	require.Equal(t, http.StatusForbidden, response.StatusCode)
+	require.Equal(t, "no-store", response.Header.Get("Cache-Control"))
+	require.Empty(t, body)
+
+	sameOrigin := strings.TrimPrefix(server.URL, "http://")
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/v1/realtime", &websocket.DialOptions{
+		HTTPHeader: http.Header{"Origin": []string{"http://" + sameOrigin}},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	require.Equal(t, "session.created", readServerType(t, conn))
+	require.NoError(t, conn.Close(websocket.StatusNormalClosure, "done"))
+	require.Eventually(t, func() bool { return releases.Load() == 2 }, testTimeout, 10*time.Millisecond)
+}
+
+func TestHandshakeFailureAfterAdmissionReleasesExactLeaseWithEmptyBody(t *testing.T) {
+	store := &e2eLeaseStore{}
+	static := auth.NewStatic([]byte("development-token"), auth.Principal{TenantID: "tenant", UserID: "user", Scopes: map[string]struct{}{"realtime": {}}})
+	controller, err := admissionpkg.New(static, admissionpkg.Config{AllowedOrigins: []string{"http://app.example"}, GlobalRate: 10, GlobalBurst: 10, IPRate: 10, IPBurst: 10, IPKeyTTL: time.Minute, MaxIPKeys: 10, RequiredScopes: []string{"realtime"}, Limits: admissionpkg.Limits{Global: 10, PerTenant: 10, PerUser: 10}}, store)
+	require.NoError(t, err)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "http://gateway.example/v1/realtime", nil)
+	request.RemoteAddr = "192.0.2.1:1234"
+	request.Header.Set("Origin", "http://app.example")
+	request.Header.Set("Authorization", "Bearer development-token")
+	NewHandler(Options{}, validManager(testkit.NewFakeConnector(1)), controller).ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.Empty(t, recorder.Body.Bytes())
+	require.Equal(t, "no-store", recorder.Header().Get("Cache-Control"))
+	require.Equal(t, int32(1), store.calls.Load())
+	require.Equal(t, int32(1), store.releases.Load())
+}
+
 func TestConnectionRejectsBinaryMalformedUnknownAndOversizeFrames(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -255,7 +440,8 @@ func TestHandlerReleaseRunsOnUpgradeFailure(t *testing.T) {
 	handler := NewHandler(Options{MaxFrameBytes: 1024}, validManager(testkit.NewFakeConnector(4)), trustedAdmission(&releases))
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/realtime", nil))
-	require.Equal(t, http.StatusUpgradeRequired, recorder.Code)
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.Empty(t, recorder.Body.Bytes())
 	require.Equal(t, int32(1), releases.Load())
 }
 

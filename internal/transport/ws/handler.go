@@ -3,13 +3,17 @@ package ws
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"math"
 	"net/http"
+	"net/url"
 	"reflect"
+	"strings"
 	"time"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/admission"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
 	"github.com/chuanmingliu/openai-gpt-live/internal/session"
 	"github.com/coder/websocket"
@@ -91,19 +95,35 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) serveRealtime(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	subject, release, err := h.admission.Admit(r.Context(), r)
 	if err != nil {
-		http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+		writeAdmissionError(w, err)
 		return
 	}
 	if release == nil {
 		release = func() {}
 	}
 	defer release()
+	if !r.ProtoAtLeast(1, 1) || !validHandshake(r.Header) {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	exactOrigin := false
+	if _, ok := h.admission.(*admission.Controller); ok {
+		exactOrigin = true
+	} else if !sameOrigin(r) {
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
 
 	sessionCtx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	conn, err := websocket.Accept(w, r, nil)
+	acceptOptions := &websocket.AcceptOptions{}
+	if exactOrigin {
+		acceptOptions.InsecureSkipVerify = true
+	}
+	conn, err := websocket.Accept(w, r, acceptOptions)
 	if err != nil {
 		return
 	}
@@ -113,6 +133,75 @@ func (h *handler) serveRealtime(w http.ResponseWriter, r *http.Request) {
 		RequestedModel: r.URL.Query().Get("model"),
 	}, client)
 	_ = client.finish(runErr)
+}
+
+func sameOrigin(r *http.Request) bool {
+	raw := r.Header.Get("Origin")
+	if raw == "" {
+		return true
+	}
+	origin, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(origin.Host, r.Host)
+}
+
+func writeAdmissionError(w http.ResponseWriter, err error) {
+	w.Header().Set("Cache-Control", "no-store")
+	status := http.StatusServiceUnavailable
+	switch admission.ErrorClass(err) {
+	case admission.ClassMalformed:
+		status = http.StatusBadRequest
+	case admission.ClassUnauthorized:
+		status = http.StatusUnauthorized
+		w.Header().Set("WWW-Authenticate", `Bearer realm="realtime"`)
+	case admission.ClassForbidden:
+		status = http.StatusForbidden
+	case admission.ClassLimited:
+		status = http.StatusTooManyRequests
+		w.Header().Set("Retry-After", "1")
+	case admission.ClassUnavailable:
+		status = http.StatusServiceUnavailable
+		w.Header().Set("Retry-After", "1")
+	}
+	w.WriteHeader(status)
+}
+
+func validHandshake(header http.Header) bool {
+	if !headerHasToken(header.Values("Connection"), "upgrade") {
+		return false
+	}
+	upgrade := header.Values("Upgrade")
+	if len(upgrade) != 1 || !strings.EqualFold(strings.TrimSpace(upgrade[0]), "websocket") {
+		return false
+	}
+	version := header.Values("Sec-WebSocket-Version")
+	if len(version) != 1 || version[0] != "13" {
+		return false
+	}
+	keys := header.Values("Sec-WebSocket-Key")
+	if len(keys) != 1 || len(keys[0]) > 64 {
+		return false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(keys[0])
+	return err == nil && len(decoded) == 16
+}
+func headerHasToken(values []string, want string) bool {
+	if len(values) == 0 || len(values) > 8 {
+		return false
+	}
+	for _, value := range values {
+		if len(value) > 512 {
+			return false
+		}
+		for _, token := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), want) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func normalizeOptions(opts Options) (Options, protocol.Limits, error) {

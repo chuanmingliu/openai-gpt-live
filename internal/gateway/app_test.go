@@ -357,12 +357,19 @@ func TestLocalAdmissionUsesOnlyFixedTrustedDevelopmentSubject(t *testing.T) {
 	require.Equal(t, "development", subject.TenantID)
 	require.Equal(t, "local-simulator", subject.UserID)
 	require.Contains(t, subject.Scopes, "realtime")
-	require.WithinDuration(t, time.Now().Add(defaultDevelopmentSubjectTTL), subject.ExpiresAt, 2*time.Second)
+	require.True(t, subject.ExpiresAt.IsZero())
 }
 
 func TestProductionFailsClosedWithoutExplicitAdmission(t *testing.T) {
 	cfg := validConfig()
 	cfg.Mode = "production"
+	cfg.Gateway.TLS.CertFile = "server.crt"
+	cfg.Gateway.TLS.KeyFile = "server.key"
+	cfg.Auth.OIDCIssuer = "https://issuer.example"
+	cfg.Auth.OIDCAudience = "live"
+	cfg.Auth.OIDCRequiredScopes = []string{"realtime"}
+	cfg.Auth.AllowedOrigins = []string{"https://app.example"}
+	cfg.Store.DatabaseURLEnv = "DATABASE_URL"
 	_, err := New(cfg, testkit.NewFakeConnector(4), WithIDGenerator(deterministicIDs{}))
 	require.ErrorContains(t, err, "admission")
 

@@ -666,7 +666,7 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	m.activeMu.Unlock()
 	defer m.failInitialEstablishment(sessionID, logical)
 
-	sessionCtx, cancel := context.WithDeadline(parent, subject.ExpiresAt)
+	sessionCtx, cancel := subjectContext(parent, subject.ExpiresAt)
 	defer cancel()
 	if err := sessionCtx.Err(); err != nil {
 		return fmt.Errorf("subject expired: %w", err)
@@ -922,7 +922,7 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 		return ErrRecoveryUnavailable
 	}
 
-	sessionCtx, cancel := context.WithDeadline(parent, subject.ExpiresAt)
+	sessionCtx, cancel := subjectContext(parent, subject.ExpiresAt)
 	defer cancel()
 	voice, err := m.connectReplacement(sessionCtx, realtime.OpenRequest{
 		SessionID: request.SessionID, Incarnation: newIncarnation, Model: model,
@@ -2135,10 +2135,17 @@ func validateSubject(subject Subject) error {
 	if strings.TrimSpace(subject.UserID) == "" {
 		return errors.New("subject user ID is required")
 	}
-	if subject.ExpiresAt.IsZero() || !subject.ExpiresAt.After(time.Now()) {
+	if !subject.ExpiresAt.IsZero() && !subject.ExpiresAt.After(time.Now()) {
 		return errors.New("subject is expired")
 	}
 	return nil
+}
+
+func subjectContext(parent context.Context, expiresAt time.Time) (context.Context, context.CancelFunc) {
+	if expiresAt.IsZero() {
+		return context.WithCancel(parent)
+	}
+	return context.WithDeadline(parent, expiresAt)
 }
 
 func cloneSubject(subject Subject) Subject {

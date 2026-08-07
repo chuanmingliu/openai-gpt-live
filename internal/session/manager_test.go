@@ -1335,6 +1335,42 @@ func TestManagerRejectsExpiredSubjectBeforeConnect(t *testing.T) {
 	require.False(t, errors.Is(err, context.Canceled))
 }
 
+func TestManagerZeroExpiryInheritsParentAndFiniteExpiryCancelsExactly(t *testing.T) {
+	t.Run("zero expiry", func(t *testing.T) {
+		connector := testkit.NewFakeConnector(1)
+		manager := NewManager(Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second}, connector, managerIDs{session: "zero-session", conversation: "zero-conversation"})
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() {
+			done <- manager.Run(ctx, OpenRequest{Subject: Subject{TenantID: "tenant", UserID: "user"}}, newChannelClient(1))
+		}()
+		_, err := connector.NextSession(t.Context())
+		require.NoError(t, err)
+		select {
+		case err := <-done:
+			t.Fatalf("zero-expiry session ended early: %v", err)
+		default:
+		}
+		cancel()
+		require.ErrorIs(t, <-done, context.Canceled)
+	})
+	t.Run("finite expiry", func(t *testing.T) {
+		connector := testkit.NewFakeConnector(1)
+		manager := NewManager(Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second}, connector, managerIDs{session: "finite-session", conversation: "finite-conversation"})
+		expires := time.Now().Add(80 * time.Millisecond)
+		done := make(chan error, 1)
+		go func() {
+			done <- manager.Run(t.Context(), OpenRequest{Subject: Subject{TenantID: "tenant", UserID: "user", ExpiresAt: expires}}, newChannelClient(1))
+		}()
+		_, err := connector.NextSession(t.Context())
+		require.NoError(t, err)
+		started := time.Now()
+		err = <-done
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+		require.GreaterOrEqual(t, time.Since(started), time.Until(expires)-20*time.Millisecond)
+	})
+}
+
 func TestManagerConfigDefaultsAndBounds(t *testing.T) {
 	connector := testkit.NewFakeConnector(1)
 	ids := managerIDs{session: "session-1", conversation: "conversation-1"}

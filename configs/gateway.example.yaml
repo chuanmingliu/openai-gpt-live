@@ -23,5 +23,22 @@ store:
   database_url_env: DATABASE_URL
 auth:
   static_bearer_env: LIVE_STATIC_BEARER_TOKEN
+  static_tenant_id: development
+  static_user_id: local-simulator
+  static_scopes: [realtime]
+  allowed_origins: [http://127.0.0.1:3000]
+  oidc_http_timeout: 5s
+admission:
+  max_sessions: 1000
+  max_sessions_per_tenant: 100
+  max_sessions_per_user: 10
+  lease_duration: 30s
+  heartbeat_interval: 10s
+  global_rate: 100
+  global_burst: 100
+  ip_rate: 10
+  ip_burst: 20
+  ip_key_ttl: 10m
+  max_ip_keys: 10000
 safety:
   privacy_hmac_key_env: LIVE_PRIVACY_HMAC_KEY
