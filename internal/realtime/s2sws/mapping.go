@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
@@ -129,6 +130,7 @@ func marshalCommand(command realtime.Command) ([]byte, error) {
 		metadata["live_epoch"] = epoch
 		return json.Marshal(struct {
 			Type     string `json:"type"`
+			EventID  string `json:"event_id"`
 			Response struct {
 				Instructions string                     `json:"instructions,omitempty"`
 				ToolChoice   json.RawMessage            `json:"tool_choice,omitempty"`
@@ -136,7 +138,7 @@ func marshalCommand(command realtime.Command) ([]byte, error) {
 				Input        json.RawMessage            `json:"input,omitempty"`
 			} `json:"response"`
 		}{
-			Type: "response.create",
+			Type: "response.create", EventID: responseCreateEventID(command.Epoch),
 			Response: struct {
 				Instructions string                     `json:"instructions,omitempty"`
 				ToolChoice   json.RawMessage            `json:"tool_choice,omitempty"`
@@ -159,6 +161,24 @@ func marshalCommand(command realtime.Command) ([]byte, error) {
 	default:
 		return nil, fmt.Errorf("unsupported realtime command kind %d", command.Kind)
 	}
+}
+
+const responseCreateEventPrefix = "live-response-create-"
+
+func responseCreateEventID(epoch identity.ResponseEpoch) string {
+	return responseCreateEventPrefix + strconv.FormatUint(uint64(epoch), 10)
+}
+
+func responseCreateEpoch(eventID string) identity.ResponseEpoch {
+	if !strings.HasPrefix(eventID, responseCreateEventPrefix) {
+		return 0
+	}
+	raw := strings.TrimPrefix(eventID, responseCreateEventPrefix)
+	value, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil || value == 0 || strconv.FormatUint(value, 10) != raw {
+		return 0
+	}
+	return identity.ResponseEpoch(value)
 }
 
 func validateAudioFormat(format realtime.AudioFormat) error {
@@ -417,12 +437,14 @@ func mapServerEvent(raw []byte, maxFrameBytes int64) (mappedServerEvent, error) 
 		var event struct {
 			Error struct {
 				Message string `json:"message"`
+				EventID string `json:"event_id"`
 			} `json:"error"`
 		}
 		if err := json.Unmarshal(raw, &event); err != nil {
 			return mappedServerEvent{}, fmt.Errorf("decode provider error: %w", err)
 		}
 		mapped.event.Kind, mapped.event.Reason = realtime.EventError, event.Error.Message
+		mapped.event.Epoch = responseCreateEpoch(event.Error.EventID)
 	default:
 		return mappedServerEvent{}, fmt.Errorf("unsupported provider event type %q", envelope.Type)
 	}

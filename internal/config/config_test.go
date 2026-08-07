@@ -68,6 +68,22 @@ func TestMissingSecretEnvironmentVariable(t *testing.T) {
 	assert.Contains(t, err.Error(), "DEEPSEEK_API_KEY")
 }
 
+func TestLoadUnresolvedPreservesStructuralValidationWithoutSecretLookup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte("gateway:\n  voice:\n    api_key_env: PROVIDER_KEY\n"), 0o600))
+	cfg, err := LoadUnresolved(path)
+	require.NoError(t, err)
+	assert.Equal(t, "PROVIDER_KEY", cfg.Gateway.Voice.APIKeyEnv)
+
+	require.NoError(t, os.WriteFile(path, []byte("gateway:\n  voice:\n    api_key_env: invalid-name\n"), 0o600))
+	_, err = LoadUnresolved(path)
+	assert.ErrorContains(t, err, "environment variable name")
+
+	require.NoError(t, os.WriteFile(path, []byte("gateway:\n  session:\n    control_events: -1\n"), 0o600))
+	_, err = LoadUnresolved(path)
+	assert.ErrorContains(t, err, "queue sizes")
+}
+
 // TestRejectsDatabasePasswordInURLQuery catches a secret scanner regression that
 // accepts a PostgreSQL URL whose password is supplied as a query parameter.
 func TestRejectsDatabasePasswordInURLQuery(t *testing.T) {

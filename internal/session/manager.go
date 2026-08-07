@@ -11,10 +11,14 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
+	"github.com/chuanmingliu/openai-gpt-live/internal/presentation"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
+	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -26,6 +30,7 @@ const (
 	maximumQueueCapacity       = 10_000
 	pcmFrameBytes              = 960
 	internalCloseTimeout       = time.Second
+	presentationOfferTimeout   = 250 * time.Millisecond
 )
 
 var (
@@ -48,13 +53,22 @@ type ClientConn interface {
 }
 
 type Config struct {
-	IngressFrames       int
-	EgressFrames        int
-	ControlEvents       int
-	WriterControlEvents int
-	IngressBlockTimeout time.Duration
-	EgressBlockTimeout  time.Duration
-	DurableDispatcher   DurableEffectDispatcher
+	IngressFrames        int
+	EgressFrames         int
+	ControlEvents        int
+	WriterControlEvents  int
+	IngressBlockTimeout  time.Duration
+	EgressBlockTimeout   time.Duration
+	DurableDispatcher    DurableEffectDispatcher
+	HandoffConsumerID    string
+	HandoffSubscriptions HandoffSubscriptionRegistrar
+	PresentationPolicy   presentation.Policy
+	SafetyPolicy         safety.Policy
+}
+
+type HandoffSubscriptionRegistrar interface {
+	Register(handoff.EventSubscription) error
+	Unregister(handoff.EventSubscription)
 }
 
 type TrustedSessionContext struct {
@@ -122,6 +136,7 @@ type Manager struct {
 	validationErr error
 	activeMu      sync.RWMutex
 	active        map[runtimeKey]*sessionRuntime
+	current       map[handoff.Scope]*sessionRuntime
 	metricsMu     sync.RWMutex
 	metrics       MetricsHooks
 }
@@ -132,11 +147,12 @@ type runtimeKey struct {
 }
 
 type sessionRuntime struct {
-	key     runtimeKey
-	subject Subject
-	inbox   chan reactorMessage
-	done    <-chan struct{}
-	state   *runState
+	key      runtimeKey
+	subject  Subject
+	inbox    chan reactorMessage
+	done     <-chan struct{}
+	quiesced <-chan struct{}
+	state    *runState
 
 	mu         sync.Mutex
 	accepting  bool
@@ -150,10 +166,12 @@ func (r *sessionRuntime) stop() {
 }
 
 type reactorMessage struct {
-	input        Input
-	ingressAfter uint64
-	egressAfter  uint64
-	done         chan error
+	input               Input
+	ingressAfter        uint64
+	egressAfter         uint64
+	done                chan error
+	requireClientWrites bool
+	offerCtx            context.Context
 }
 
 type ingressFrame struct {
@@ -234,6 +252,8 @@ type clientControl struct {
 	afterSeq uint64
 	event    protocol.ServerEvent
 	close    *CloseEffect
+	written  chan error
+	writeCtx context.Context
 }
 
 type sequenceProgress struct {
@@ -365,6 +385,7 @@ func NewManager(cfg Config, connector realtime.Connector, ids IDGenerator) *Mana
 		ids:           ids,
 		validationErr: err,
 		active:        make(map[runtimeKey]*sessionRuntime),
+		current:       make(map[handoff.Scope]*sessionRuntime),
 		metrics:       normalizeMetricsHooks(MetricsHooks{}),
 	}
 }
@@ -407,6 +428,15 @@ func normalizeManagerConfig(cfg Config) (Config, error) {
 	}
 	if cfg.EgressBlockTimeout <= 0 {
 		return cfg, fmt.Errorf("%w: egress block timeout must be positive", ErrInvalidManagerConfig)
+	}
+	presentationConfigured := cfg.HandoffConsumerID != "" || !isNilInterface(cfg.HandoffSubscriptions) ||
+		!isNilInterface(cfg.PresentationPolicy) || !isNilInterface(cfg.SafetyPolicy)
+	if presentationConfigured {
+		if strings.TrimSpace(cfg.HandoffConsumerID) == "" || len(cfg.HandoffConsumerID) > DurableIdentifierBytes ||
+			!utf8.ValidString(cfg.HandoffConsumerID) ||
+			isNilInterface(cfg.HandoffSubscriptions) || isNilInterface(cfg.PresentationPolicy) || isNilInterface(cfg.SafetyPolicy) {
+			return cfg, fmt.Errorf("%w: handoff presentation dependencies are incomplete", ErrInvalidManagerConfig)
+		}
 	}
 	return cfg, nil
 }
@@ -464,6 +494,9 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	}
 
 	group, groupCtx := errgroup.WithContext(sessionCtx)
+	quiesced := make(chan struct{})
+	var quiescedOnce sync.Once
+	markQuiesced := func() { quiescedOnce.Do(func() { close(quiesced) }) }
 	state := newRunState(m.cfg, ids, voice, client, cancel)
 	state.subject = cloneSubject(subject)
 	state.metrics = m.metricsSnapshot()
@@ -472,21 +505,11 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 		subject:    subject,
 		inbox:      state.inbox,
 		done:       groupCtx.Done(),
+		quiesced:   quiesced,
 		state:      state,
 		accepting:  true,
 		inboxSlots: state.inboxSlots,
 	}
-	if err := m.register(runtime); err != nil {
-		closeCtx, closeCancel := context.WithTimeout(context.Background(), internalCloseTimeout)
-		defer closeCancel()
-		_ = voice.Close(closeCtx)
-		return err
-	}
-	defer m.unregister(runtime.key, runtime)
-
-	<-state.inboxSlots
-	state.inbox <- reactorMessage{input: ConnectedInput{ProviderSession: json.RawMessage(`{}`)}}
-
 	var firstErr error
 	var firstErrOnce sync.Once
 	runLoop := func(name string, loop func(context.Context) error) func() error {
@@ -507,6 +530,41 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	group.Go(runLoop("voice reader", state.voiceReader))
 	group.Go(runLoop("client writer", state.clientWriter))
 	group.Go(runLoop("reactor", state.reactorLoop))
+	abortBeforePublication := func(cause error) error {
+		cancel()
+		_ = group.Wait()
+		state.closeClient(1000, "session ended")
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), internalCloseTimeout)
+		_ = voice.Close(closeCtx)
+		closeCancel()
+		markQuiesced()
+		if firstErr != nil {
+			return firstErr
+		}
+		return cause
+	}
+
+	// A runtime is not externally discoverable until ConnectedInput has been
+	// processed and the session.created frame has actually reached ClientConn.
+	// This prevents the durable pump from overtaking session establishment.
+	<-state.inboxSlots
+	connected := reactorMessage{input: ConnectedInput{ProviderSession: json.RawMessage(`{}`)}, done: make(chan error, 1), requireClientWrites: true}
+	state.inbox <- connected
+	select {
+	case err := <-connected.done:
+		if err != nil {
+			return abortBeforePublication(fmt.Errorf("establish client session: %w", err))
+		}
+	case <-groupCtx.Done():
+		return abortBeforePublication(groupCtx.Err())
+	}
+	if err := groupCtx.Err(); err != nil {
+		return abortBeforePublication(err)
+	}
+	if err := m.register(runtime); err != nil {
+		return abortBeforePublication(err)
+	}
+	defer m.unregister(runtime.key, runtime)
 
 	waitErr := group.Wait()
 	cancel()
@@ -514,6 +572,7 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	closeCtx, closeCancel := context.WithTimeout(context.Background(), internalCloseTimeout)
 	closeErr := voice.Close(closeCtx)
 	closeCancel()
+	markQuiesced()
 
 	if firstErr != nil {
 		return firstErr
@@ -657,7 +716,17 @@ func (m *Manager) register(runtime *sessionRuntime) error {
 	if _, exists := m.active[runtime.key]; exists {
 		return ErrSessionAlreadyActive
 	}
+	scope := runtime.handoffScope()
+	if !isNilInterface(m.cfg.HandoffSubscriptions) {
+		if err := m.cfg.HandoffSubscriptions.Register(handoff.EventSubscription{ConsumerID: m.cfg.HandoffConsumerID, Scope: scope}); err != nil {
+			return fmt.Errorf("register handoff presentation: %w", err)
+		}
+	}
+	if m.current == nil {
+		m.current = make(map[handoff.Scope]*sessionRuntime)
+	}
 	m.active[runtime.key] = runtime
+	m.current[scope] = runtime
 	return nil
 }
 
@@ -666,7 +735,135 @@ func (m *Manager) unregister(key runtimeKey, runtime *sessionRuntime) {
 	if m.active[key] == runtime {
 		delete(m.active, key)
 	}
+	scope := runtime.handoffScope()
+	unregisterPresentation := m.current[scope] == runtime
+	if unregisterPresentation {
+		delete(m.current, scope)
+	}
 	m.activeMu.Unlock()
+	if unregisterPresentation && !isNilInterface(m.cfg.HandoffSubscriptions) {
+		m.cfg.HandoffSubscriptions.Unregister(handoff.EventSubscription{ConsumerID: m.cfg.HandoffConsumerID, Scope: scope})
+	}
+}
+
+func (r *sessionRuntime) handoffScope() handoff.Scope {
+	if r == nil || r.state == nil {
+		return handoff.Scope{}
+	}
+	return handoff.Scope{TenantID: r.subject.TenantID, UserID: r.subject.UserID, ConversationID: r.state.ids.ConversationID}
+}
+
+// OfferHandoffEvent atomically resolves and submits to the current runtime for
+// the full trusted scope. It deliberately stores neither a session ID nor an
+// incarnation between offers.
+func (m *Manager) OfferHandoffEvent(ctx context.Context, scope handoff.Scope, event handoff.Event) error {
+	if m == nil {
+		return handoff.ErrNoLiveSession
+	}
+	if ctx == nil {
+		return errors.New("handoff offer context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	for name, value := range map[string]string{
+		"tenant ID": scope.TenantID, "user ID": scope.UserID, "conversation ID": string(scope.ConversationID),
+	} {
+		if strings.TrimSpace(value) == "" || len(value) > DurableIdentifierBytes || !utf8.ValidString(value) {
+			return fmt.Errorf("handoff offer %s is invalid", name)
+		}
+	}
+
+	timeout := m.cfg.EgressBlockTimeout
+	if timeout <= 0 {
+		timeout = presentationOfferTimeout
+	}
+	offerCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	m.activeMu.RLock()
+	runtime := m.current[scope]
+	if runtime == nil {
+		m.activeMu.RUnlock()
+		return handoff.ErrNoLiveSession
+	}
+	defer m.activeMu.RUnlock()
+	select {
+	case <-runtime.inboxSlots:
+	case <-runtime.done:
+		return handoff.ErrNoLiveSession
+	case <-offerCtx.Done():
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return ErrControlOverflow
+	}
+	message := reactorMessage{
+		input:        HandoffEventInput{Scope: scope, Event: handoff.CloneEvent(event)},
+		ingressAfter: runtime.state.latestIngressSequence(), done: make(chan error, 1),
+		offerCtx: offerCtx,
+	}
+	runtime.mu.Lock()
+	if !runtime.accepting {
+		runtime.mu.Unlock()
+		runtime.inboxSlots <- struct{}{}
+		return handoff.ErrNoLiveSession
+	}
+	select {
+	case <-runtime.done:
+		runtime.mu.Unlock()
+		runtime.inboxSlots <- struct{}{}
+		return handoff.ErrNoLiveSession
+	default:
+	}
+	runtime.inbox <- message
+	runtime.mu.Unlock()
+	select {
+	case err := <-message.done:
+		if err != nil && offerCtx.Err() != nil {
+			m.stopAndQuiesceRuntime(runtime)
+		}
+		return err
+	case <-runtime.done:
+		m.stopAndQuiesceRuntime(runtime)
+		select {
+		case err := <-message.done:
+			return err
+		default:
+			return handoff.ErrNoLiveSession
+		}
+	case <-offerCtx.Done():
+		select {
+		case err := <-message.done:
+			if err != nil {
+				m.stopAndQuiesceRuntime(runtime)
+			}
+			return err
+		default:
+			m.stopAndQuiesceRuntime(runtime)
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return ErrControlOverflow
+		}
+	}
+}
+
+func (m *Manager) stopAndQuiesceRuntime(runtime *sessionRuntime) {
+	if runtime == nil {
+		return
+	}
+	runtime.stop()
+	if runtime.state != nil {
+		if runtime.state.cancel != nil {
+			runtime.state.cancel()
+		}
+		if !isNilInterface(runtime.state.client) {
+			runtime.state.closeClient(1011, "handoff presentation delivery timed out")
+		}
+	}
+	if runtime.quiesced != nil {
+		<-runtime.quiesced
+	}
 }
 
 func (s *runState) clientReader(ctx context.Context) error {
@@ -939,16 +1136,25 @@ func (s *runState) enqueueEgress(ctx context.Context, event realtime.Event, audi
 }
 
 func (s *runState) reactorLoop(ctx context.Context) error {
-	reactor := NewReactor(s.ids, s.fence)
+	reactor := NewReactorWithPresentation(s.ids, s.fence, s.cfg.PresentationPolicy, s.cfg.SafetyPolicy)
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case message := <-s.inbox:
-			effects, err := reactor.Apply(message.input)
+			dispatchCtx, finishDispatch := offerDispatchContext(ctx, message.offerCtx)
+			effects, err := reactor.ApplyContext(dispatchCtx, message.input)
 			if err == nil {
-				err = s.dispatchEffects(ctx, effects, message.ingressAfter, message.egressAfter)
+				if message.requireClientWrites {
+					for index := range effects {
+						if _, ok := effects[index].ClientEvent.(protocol.SessionCreatedEvent); ok {
+							effects[index].RequireClientWrite = true
+						}
+					}
+				}
+				err = s.dispatchEffects(dispatchCtx, effects, message.ingressAfter, message.egressAfter)
 			}
+			finishDispatch()
 			s.inboxSlots <- struct{}{}
 			if message.done != nil {
 				message.done <- err
@@ -960,6 +1166,18 @@ func (s *runState) reactorLoop(ctx context.Context) error {
 	}
 }
 
+func offerDispatchContext(sessionCtx, offerCtx context.Context) (context.Context, func()) {
+	if offerCtx == nil {
+		return sessionCtx, func() {}
+	}
+	ctx, cancel := context.WithCancel(offerCtx)
+	stop := context.AfterFunc(sessionCtx, cancel)
+	return ctx, func() {
+		stop()
+		cancel()
+	}
+}
+
 func (s *runState) dispatchEffects(ctx context.Context, effects []Effect, ingressAfter, egressAfter uint64) error {
 	for _, effect := range effects {
 		if effect.FlushBefore != 0 {
@@ -968,9 +1186,18 @@ func (s *runState) dispatchEffects(ctx context.Context, effects []Effect, ingres
 			}
 		}
 	}
+	writeAcks := make([]<-chan error, 0, len(effects))
 	for _, effect := range effects {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if effect.ClientEvent != nil {
-			if err := s.enqueueClientControl(clientControl{afterSeq: egressAfter, event: effect.ClientEvent}); err != nil {
+			control := clientControl{afterSeq: egressAfter, event: effect.ClientEvent, writeCtx: ctx}
+			if effect.RequireClientWrite {
+				control.written = make(chan error, 1)
+				writeAcks = append(writeAcks, control.written)
+			}
+			if err := s.enqueueClientControl(control); err != nil {
 				return err
 			}
 		}
@@ -981,7 +1208,20 @@ func (s *runState) dispatchEffects(ctx context.Context, effects []Effect, ingres
 			}
 		}
 	}
+	for _, written := range writeAcks {
+		select {
+		case err := <-written:
+			if err != nil {
+				return err
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	for _, effect := range effects {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if effect.VoiceCommand == nil {
 			continue
 		}
@@ -1057,7 +1297,22 @@ func (s *runState) clientWriter(ctx context.Context) error {
 			pendingControl = nil
 			nextOrder++
 			if control.event != nil {
-				if err := s.client.Write(ctx, control.event); err != nil {
+				writeCtx := ctx
+				if control.writeCtx != nil {
+					writeCtx = control.writeCtx
+				}
+				if err := writeCtx.Err(); err != nil {
+					if control.written != nil {
+						control.written <- err
+					}
+					s.releaseClientSlot()
+					return err
+				}
+				err := s.client.Write(writeCtx, control.event)
+				if control.written != nil {
+					control.written <- err
+				}
+				if err != nil {
 					s.releaseClientSlot()
 					return err
 				}

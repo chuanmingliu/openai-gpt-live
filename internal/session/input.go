@@ -3,6 +3,7 @@ package session
 import (
 	"encoding/json"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
@@ -64,6 +65,14 @@ type HandoffAcceptedInput struct {
 	Reason      string
 }
 
+// HandoffEventInput carries one durable event from the current-session
+// directory into the serialized reactor. Scope is trusted server context, not
+// provider or client input.
+type HandoffEventInput struct {
+	Scope handoff.Scope
+	Event handoff.Event
+}
+
 type FailedInput struct {
 	Source string
 	Err    error
@@ -77,4 +86,5 @@ func (DurableInput) isSessionInput()               {}
 func (TurnCommittedInput) isSessionInput()         {}
 func (TranscriptPersistedInput) isSessionInput()   {}
 func (HandoffAcceptedInput) isSessionInput()       {}
+func (HandoffEventInput) isSessionInput()          {}
 func (FailedInput) isSessionInput()                {}

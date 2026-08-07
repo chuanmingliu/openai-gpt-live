@@ -12,13 +12,18 @@ import (
 	"net"
 	"net/http"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
 	"github.com/chuanmingliu/openai-gpt-live/internal/config"
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
+	"github.com/chuanmingliu/openai-gpt-live/internal/presentation"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
+	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
 	"github.com/chuanmingliu/openai-gpt-live/internal/session"
 	transportws "github.com/chuanmingliu/openai-gpt-live/internal/transport/ws"
 )
@@ -50,6 +55,10 @@ type App struct {
 	durable         *DurableDependencies
 	handoffs        *HandoffCoordinator
 	transcripts     *TranscriptCoordinator
+	presentation    *HandoffPresentationDependencies
+	eventPump       *handoff.EventPump
+	eventListener   HandoffEventListener
+	eventWakeups    chan handoff.EventWakeup
 }
 
 type DurableDependencies struct {
@@ -62,6 +71,30 @@ type DurableDependencies struct {
 	HandoffQueueCapacity    int
 	TranscriptQueueCapacity int
 	Snapshot                SessionHandoffSnapshot
+}
+
+type HandoffEventListener interface {
+	Run(context.Context, chan<- handoff.EventWakeup) error
+}
+
+type HandoffPresentationDependencies struct {
+	Reader         handoff.EventReader
+	Cursors        handoff.DeliveryCursorStore
+	Listener       HandoffEventListener
+	Clock          clock.Clock
+	PollInterval   time.Duration
+	ConsumerID     string
+	WakeupCapacity int
+	Policy         presentation.Policy
+	Safety         safety.Policy
+}
+
+func WithHandoffPresentation(dependencies HandoffPresentationDependencies) Option {
+	return func(app *App) error {
+		copy := dependencies
+		app.presentation = &copy
+		return nil
+	}
 }
 
 func WithDurableHandoffs(dependencies DurableDependencies) Option {
@@ -173,10 +206,36 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 			validateHandoffSnapshot(app.durable.Snapshot) != nil {
 			return nil, errors.New("durable handoff dependencies and valid server snapshot are required")
 		}
+		if app.presentation == nil || isNil(app.presentation.Reader) || isNil(app.presentation.Cursors) ||
+			isNil(app.presentation.Listener) || isNil(app.presentation.Clock) || strings.TrimSpace(app.presentation.ConsumerID) == "" ||
+			len(app.presentation.ConsumerID) > session.DurableIdentifierBytes || !utf8.ValidString(app.presentation.ConsumerID) || app.presentation.PollInterval < time.Millisecond ||
+			app.presentation.PollInterval > 24*time.Hour || app.presentation.WakeupCapacity < 0 || app.presentation.WakeupCapacity > 10_000 {
+			return nil, errors.New("handoff presentation dependencies are required and must be bounded")
+		}
+		if app.presentation.WakeupCapacity == 0 {
+			app.presentation.WakeupCapacity = 64
+		}
+		if isNil(app.presentation.Policy) {
+			app.presentation.Policy = presentation.NewPolicy(presentation.Config{})
+		}
+		if isNil(app.presentation.Safety) {
+			app.presentation.Safety = safety.DenyAll{}
+		}
+		app.eventWakeups = make(chan handoff.EventWakeup, app.presentation.WakeupCapacity)
+		app.eventPump = &handoff.EventPump{
+			Reader: app.presentation.Reader, Cursors: app.presentation.Cursors, Notifications: app.eventWakeups,
+			Clock: app.presentation.Clock, PollInterval: app.presentation.PollInterval,
+		}
+		app.eventListener = app.presentation.Listener
+		managerConfig.HandoffConsumerID = app.presentation.ConsumerID
+		managerConfig.HandoffSubscriptions = app.eventPump
+		managerConfig.PresentationPolicy = app.presentation.Policy
+		managerConfig.SafetyPolicy = app.presentation.Safety
 		dispatcher := &durableDispatcher{snapshot: cloneHandoffSnapshot(app.durable.Snapshot)}
 		managerConfig.DurableDispatcher = dispatcher
 		app.managerConfig = managerConfig
 		app.manager = session.NewManager(managerConfig, connector, app.ids)
+		app.eventPump.Sink = app.manager
 		app.handoffs = NewHandoffCoordinator(app.durable.Service, app.manager, app.durable.HandoffQueueCapacity)
 		app.transcripts = NewTranscriptCoordinator(app.durable.ConversationWriter, app.manager, app.durable.TranscriptQueueCapacity)
 		if app.handoffs == nil || app.transcripts == nil {
@@ -191,7 +250,7 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 		dispatcher.handoffs = app.handoffs
 		dispatcher.transcripts = app.transcripts
 	} else {
-		if app.durable != nil {
+		if app.durable != nil || app.presentation != nil {
 			return nil, errors.New("durable handoff dependencies supplied while feature is disabled")
 		}
 		app.manager = session.NewManager(managerConfig, connector, app.ids)
@@ -286,7 +345,7 @@ func (a *App) Run(ctx context.Context) (runErr error) {
 		name string
 		err  error
 	}
-	coordinatorResult := make(chan coordinatorRunResult, 2)
+	coordinatorResult := make(chan coordinatorRunResult, 4)
 	coordinatorDone := make(chan struct{})
 	coordinatorCount := 0
 	var coordinatorWG sync.WaitGroup
@@ -303,6 +362,12 @@ func (a *App) Run(ctx context.Context) (runErr error) {
 	}
 	if a.handoffs != nil {
 		startCoordinator("handoff coordinator", a.handoffs.Run)
+	}
+	if a.eventListener != nil {
+		startCoordinator("handoff event listener", func(ctx context.Context) error { return a.eventListener.Run(ctx, a.eventWakeups) })
+	}
+	if a.eventPump != nil {
+		startCoordinator("handoff event pump", a.eventPump.Run)
 	}
 	go func() {
 		coordinatorWG.Wait()

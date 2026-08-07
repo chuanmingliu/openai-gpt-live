@@ -288,7 +288,10 @@ func (c *blockingWriteClient) Read(ctx context.Context) (protocol.ClientEvent, e
 	}
 }
 
-func (c *blockingWriteClient) Write(ctx context.Context, _ protocol.ServerEvent) error {
+func (c *blockingWriteClient) Write(ctx context.Context, event protocol.ServerEvent) error {
+	if event.EventType() == "session.created" {
+		return nil
+	}
 	c.startOnce.Do(func() { close(c.started) })
 	<-ctx.Done()
 	return ctx.Err()
@@ -722,9 +725,13 @@ func TestManagerTransportFailureClosesOnceUnregistersAndPreservesCause(t *testin
 
 	delete(scopes, "live")
 	permissions[2] = 'X'
-	manager.activeMu.RLock()
-	runtime := manager.active[runtimeKey{sessionID: "session-lifecycle", incarnation: 1}]
-	manager.activeMu.RUnlock()
+	var runtime *sessionRuntime
+	require.Eventually(t, func() bool {
+		manager.activeMu.RLock()
+		runtime = manager.active[runtimeKey{sessionID: "session-lifecycle", incarnation: 1}]
+		manager.activeMu.RUnlock()
+		return runtime != nil
+	}, time.Second, time.Millisecond)
 	require.NotNil(t, runtime)
 	require.Contains(t, runtime.subject.Scopes, "live")
 	require.JSONEq(t, `{"allow":true}`, string(runtime.subject.Permissions))
@@ -920,15 +927,18 @@ func TestManagerClientControlAcceptsCapacityAndFailsOnFirstExcessControl(t *test
 	}()
 	voice, err := connector.NextSession(context.Background())
 	require.NoError(t, err)
-	select {
-	case <-client.started:
-	case <-time.After(time.Second):
-		t.Fatal("client writer did not consume session.created")
-	}
 	commandCtx, stop := context.WithTimeout(context.Background(), time.Second)
 	defer stop()
 	require.NoError(t, voice.Emit(commandCtx, realtime.Event{
 		Kind: realtime.EventSpeechStarted, ProviderEventID: "speech-start", ItemID: "input-item",
+	}))
+	select {
+	case <-client.started:
+	case <-time.After(time.Second):
+		t.Fatal("client writer did not consume first post-ready event")
+	}
+	require.NoError(t, voice.Emit(commandCtx, realtime.Event{
+		Kind: realtime.EventSpeechStopped, ProviderEventID: "speech-stop", ItemID: "input-item",
 	}))
 	require.ErrorIs(t, <-runResult, ErrControlOverflow)
 }
@@ -1412,6 +1422,11 @@ func TestManagerGracefulCloseDrainsOutputAndReturnsCleanupErrors(t *testing.T) {
 	}()
 	<-connector.connected
 	require.Equal(t, "session.created", <-client.writes)
+	require.Eventually(t, func() bool {
+		manager.activeMu.RLock()
+		defer manager.activeMu.RUnlock()
+		return manager.active[runtimeKey{sessionID: "session-close-errors", incarnation: 1}] != nil
+	}, time.Second, time.Millisecond, "runtime is published only after session.created Write returns")
 	require.NoError(t, manager.Submit(context.Background(), "session-close-errors", 1, FailedInput{
 		Source: "test", Err: errors.New("graceful terminal"),
 	}))

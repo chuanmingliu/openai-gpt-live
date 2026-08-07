@@ -582,6 +582,11 @@ func (s *voiceSession) handleMapped(mapped mappedServerEvent) error {
 	if mapped.created != nil {
 		return s.handleResponseCreated(mapped)
 	}
+	if mapped.event.Kind == realtime.EventError && mapped.event.Epoch != 0 {
+		// A provider rejection of response.create is terminal for that pending
+		// command even though no response.created will arrive to consume it.
+		delete(s.pending, mapped.event.Epoch)
+	}
 	if !mapped.responseSpecific {
 		return s.deliver(s.ctx, mapped.event)
 	}

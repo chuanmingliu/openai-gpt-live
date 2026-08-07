@@ -179,6 +179,20 @@ type FeatureConfig struct {
 // Load reads a YAML file, resolves only secret environment names, supplies
 // operational defaults, and rejects insecure or incomplete settings.
 func Load(path string, lookup func(string) (string, bool)) (Config, error) {
+	cfg, err := LoadUnresolved(path)
+	if err != nil {
+		return Config{}, err
+	}
+	if err := cfg.ResolveSecrets(lookup); err != nil {
+		return Config{}, err
+	}
+	return cfg, nil
+}
+
+// LoadUnresolved parses, defaults, and structurally validates configuration
+// without performing any environment lookup. Composition roots can therefore
+// reject unsupported feature combinations before touching secrets.
+func LoadUnresolved(path string) (Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return Config{}, fmt.Errorf("read config: %w", err)
@@ -193,13 +207,18 @@ func Load(path string, lookup func(string) (string, bool)) (Config, error) {
 		return Config{}, fmt.Errorf("parse config: %w", err)
 	}
 	cfg.applyDefaults()
-	if err := cfg.validateSecrets(lookup); err != nil {
+	if err := cfg.validateSecretReferences(); err != nil {
 		return Config{}, err
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+// ResolveSecrets validates referenced environment names and values.
+func (c Config) ResolveSecrets(lookup func(string) (string, bool)) error {
+	return c.validateSecrets(lookup)
 }
 
 func (c *Config) applyDefaults() {
@@ -377,15 +396,15 @@ func validateHTTPURL(raw, name string, requireHTTPS bool) error {
 }
 
 func (c Config) validateSecrets(lookup func(string) (string, bool)) error {
+	if err := c.validateSecretReferences(); err != nil {
+		return err
+	}
 	if lookup == nil {
 		lookup = os.LookupEnv
 	}
 	for _, name := range []string{c.Gateway.Voice.APIKeyEnv, c.Worker.Reasoner.APIKeyEnv, c.Store.DatabaseURLEnv, c.Auth.StaticBearerEnv, c.Safety.PrivacyHMACKeyEnv} {
 		if name == "" {
 			continue
-		}
-		if !environmentName(name) {
-			return fmt.Errorf("secret environment variable name %q is invalid", name)
 		}
 		value, ok := lookup(name)
 		if !ok {
@@ -397,9 +416,6 @@ func (c Config) validateSecrets(lookup func(string) (string, bool)) error {
 	}
 	if c.Features.ToolEncryptionKeyEnv != "" {
 		name := c.Features.ToolEncryptionKeyEnv
-		if !environmentName(name) {
-			return fmt.Errorf("secret environment variable name %q is invalid", name)
-		}
 		value, ok := lookup(name)
 		if !ok {
 			return fmt.Errorf("required secret environment variable %q is not set", name)
@@ -407,6 +423,15 @@ func (c Config) validateSecrets(lookup func(string) (string, bool)) error {
 		key, err := base64.StdEncoding.DecodeString(value)
 		if err != nil || len(key) != 32 {
 			return fmt.Errorf("%s must contain a base64-encoded 32-byte key", name)
+		}
+	}
+	return nil
+}
+
+func (c Config) validateSecretReferences() error {
+	for _, name := range []string{c.Gateway.Voice.APIKeyEnv, c.Worker.Reasoner.APIKeyEnv, c.Store.DatabaseURLEnv, c.Auth.StaticBearerEnv, c.Safety.PrivacyHMACKeyEnv, c.Features.ToolEncryptionKeyEnv} {
+		if name != "" && !environmentName(name) {
+			return fmt.Errorf("secret environment variable name %q is invalid", name)
 		}
 	}
 	return nil

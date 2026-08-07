@@ -481,7 +481,7 @@ func TestSendMapsEveryCommandToGoldenJSON(t *testing.T) {
 	}))
 
 	assert.JSONEq(t,
-		`{"type":"response.create","response":{"instructions":"answer","tool_choice":"none","metadata":{"caller":"kept","live_epoch":"42"},"input":[{"type":"message","role":"user"}]}}`,
+		`{"type":"response.create","event_id":"live-response-create-42","response":{"instructions":"answer","tool_choice":"none","metadata":{"caller":"kept","live_epoch":"42"},"input":[{"type":"message","role":"user"}]}}`,
 		string(server.nextClientFrame(t)),
 	)
 	assert.JSONEq(t,
@@ -674,6 +674,39 @@ func TestReceiveMapsEveryProviderEvent(t *testing.T) {
 	assert.Equal(t, realtime.EventError, providerError.Kind)
 	assert.Equal(t, "pool exhausted", providerError.Reason)
 	assert.Contains(t, string(providerError.Payload), `"available":0`)
+}
+
+func TestPresentationProviderErrorsRetainCreateEpochBeforeDuringAndAfterStreaming(t *testing.T) {
+	server := newTestVoiceServer(t)
+	session := connectTestSession(t, server.URL, nil, realtime.OpenRequest{Model: "model"})
+
+	for _, epoch := range []identity.ResponseEpoch{21, 22} {
+		require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCreateResponse, Epoch: epoch}))
+		var outbound map[string]any
+		require.NoError(t, json.Unmarshal(server.nextClientFrame(t), &outbound))
+		createEventID, ok := outbound["event_id"].(string)
+		require.True(t, ok)
+		assert.Equal(t, fmt.Sprintf("live-response-create-%d", epoch), createEventID)
+		if epoch == 22 {
+			created := sendAndReceiveEvent(t, server, session, map[string]any{
+				"type": "response.created", "event_id": "created-22",
+				"response": map[string]any{"id": "response-22", "status": "in_progress", "metadata": map[string]any{"live_epoch": "22"}},
+			})
+			assert.Equal(t, epoch, created.Epoch)
+		}
+		errorEvent := sendAndReceiveEvent(t, server, session, map[string]any{
+			"type": "error", "event_id": fmt.Sprintf("error-%d", epoch),
+			"error": map[string]any{"type": "invalid_request_error", "event_id": createEventID, "message": "private provider detail"},
+		})
+		assert.Equal(t, realtime.EventError, errorEvent.Kind)
+		assert.Equal(t, epoch, errorEvent.Epoch)
+	}
+
+	late := sendAndReceiveEvent(t, server, session, map[string]any{
+		"type": "error", "event_id": "late-error-22",
+		"error": map[string]any{"type": "invalid_request_error", "event_id": "live-response-create-22", "message": "late private detail"},
+	})
+	assert.Equal(t, identity.ResponseEpoch(22), late.Epoch)
 }
 
 // TestImplicitResponseWaitsForReactorEpochBinding catches output leaking with

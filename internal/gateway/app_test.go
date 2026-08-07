@@ -15,11 +15,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
 	"github.com/chuanmingliu/openai-gpt-live/internal/config"
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
+	"github.com/chuanmingliu/openai-gpt-live/internal/presentation"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
+	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
 	"github.com/chuanmingliu/openai-gpt-live/internal/session"
 	"github.com/chuanmingliu/openai-gpt-live/internal/store/postgres"
 	"github.com/chuanmingliu/openai-gpt-live/internal/testkit"
@@ -35,6 +38,47 @@ type deterministicIDs struct{}
 
 func (deterministicIDs) NewSessionID() identity.SessionID           { return "session-fixed" }
 func (deterministicIDs) NewConversationID() identity.ConversationID { return "conversation-fixed" }
+
+type gatewayEventStoreFake struct{}
+
+func (gatewayEventStoreFake) ReadEvents(context.Context, handoff.Scope, int64, int) ([]handoff.Event, error) {
+	return nil, nil
+}
+func (gatewayEventStoreFake) LoadDeliveryCursor(context.Context, string, handoff.Scope) (int64, error) {
+	return 0, nil
+}
+func (gatewayEventStoreFake) AdvanceDeliveryCursor(context.Context, string, handoff.Scope, int64) error {
+	return nil
+}
+
+type gatewayEventListenerFake struct{ err error }
+
+func (l gatewayEventListenerFake) Run(ctx context.Context, _ chan<- handoff.EventWakeup) error {
+	if l.err != nil {
+		return l.err
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+type gatewayAllowSafety struct{}
+
+func (gatewayAllowSafety) EvaluateWorkerResult(context.Context, safety.WorkerResultCandidate) (safety.Decision, error) {
+	return safety.Decision{Action: safety.ActionAllow, ReasonCode: "test"}, nil
+}
+
+func testHandoffPresentationOption() Option {
+	return testHandoffPresentationOptionWithListener(gatewayEventListenerFake{})
+}
+
+func testHandoffPresentationOptionWithListener(listener HandoffEventListener) Option {
+	store := gatewayEventStoreFake{}
+	return WithHandoffPresentation(HandoffPresentationDependencies{
+		Reader: store, Cursors: store, Listener: listener, Clock: clock.Real{},
+		PollInterval: 10 * time.Millisecond, ConsumerID: "gateway-test", WakeupCapacity: 8,
+		Policy: presentation.NewPolicy(presentation.Config{}), Safety: gatewayAllowSafety{},
+	})
+}
 
 func validConfig() config.Config {
 	return config.Config{
@@ -127,7 +171,9 @@ func TestNewHandoffsFeatureFailsClosedAndFeatureOffStaysCompatible(t *testing.T)
 		Journal: newCoordinatorJournalFake(), DeliveryAffinity: "app-test-affinity", JournalOwner: "app-test", JournalClaimLease: time.Minute,
 		Snapshot: validHandoffWork().Snapshot,
 	}
-	app, err := New(cfg, testkit.NewFakeConnector(4), WithIDGenerator(deterministicIDs{}), WithDurableHandoffs(dependencies))
+	_, err = New(cfg, testkit.NewFakeConnector(4), WithIDGenerator(deterministicIDs{}), WithDurableHandoffs(dependencies))
+	require.ErrorContains(t, err, "handoff presentation")
+	app, err := New(cfg, testkit.NewFakeConnector(4), WithIDGenerator(deterministicIDs{}), WithDurableHandoffs(dependencies), testHandoffPresentationOption())
 	require.NoError(t, err)
 	require.NotNil(t, app.handoffs)
 	require.NotNil(t, app.transcripts)
@@ -170,7 +216,7 @@ func TestRunPropagatesUnexpectedCoordinatorFailure(t *testing.T) {
 		JournalClaimLease:    time.Minute,
 		HandoffQueueCapacity: 1, TranscriptQueueCapacity: 1, Snapshot: validHandoffWork().Snapshot,
 	}
-	app, err := New(cfg, testkit.NewFakeConnector(1), WithIDGenerator(deterministicIDs{}), WithDurableHandoffs(dependencies))
+	app, err := New(cfg, testkit.NewFakeConnector(1), WithIDGenerator(deterministicIDs{}), WithDurableHandoffs(dependencies), testHandoffPresentationOption())
 	require.NoError(t, err)
 	listener := newBlockingListener()
 	app.listener = listener
@@ -179,6 +225,24 @@ func TestRunPropagatesUnexpectedCoordinatorFailure(t *testing.T) {
 		Scope: handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "conversation"},
 		Turn:  identity.TurnKey{ID: "turn", Revision: 1}, Sequence: 1, Role: "user", FinalText: "text",
 	}))
+
+	err = app.Run(t.Context())
+	require.ErrorIs(t, err, sentinel)
+}
+
+func TestRunPropagatesUnexpectedHandoffListenerFailure(t *testing.T) {
+	sentinel := errors.New("event listener failed")
+	cfg := validConfig()
+	cfg.Features.Handoffs = true
+	dependencies := DurableDependencies{
+		Service:            &handoffServiceFake{creates: make(chan handoff.CreateRequest, 1)},
+		ConversationWriter: &transcriptWriterFake{items: make(chan postgres.ConversationItem, 1)},
+		Journal:            newCoordinatorJournalFake(), DeliveryAffinity: "listener-test-affinity", JournalOwner: "listener-test", JournalClaimLease: time.Minute,
+		HandoffQueueCapacity: 1, TranscriptQueueCapacity: 1, Snapshot: validHandoffWork().Snapshot,
+	}
+	app, err := New(cfg, testkit.NewFakeConnector(1), WithIDGenerator(deterministicIDs{}), WithDurableHandoffs(dependencies), testHandoffPresentationOptionWithListener(gatewayEventListenerFake{err: sentinel}))
+	require.NoError(t, err)
+	app.listener = newBlockingListener()
 
 	err = app.Run(t.Context())
 	require.ErrorIs(t, err, sentinel)
@@ -195,7 +259,7 @@ func TestRunFailsBeforeServingWhenCoordinatorAffinityIsAlreadyOwned(t *testing.T
 		Journal:            journal, DeliveryAffinity: "shared-affinity", JournalOwner: "second-app", JournalClaimLease: time.Minute,
 		HandoffQueueCapacity: 1, TranscriptQueueCapacity: 1, Snapshot: validHandoffWork().Snapshot,
 	}
-	app, err := New(cfg, testkit.NewFakeConnector(1), WithIDGenerator(deterministicIDs{}), WithDurableHandoffs(dependencies))
+	app, err := New(cfg, testkit.NewFakeConnector(1), WithIDGenerator(deterministicIDs{}), WithDurableHandoffs(dependencies), testHandoffPresentationOption())
 	require.NoError(t, err)
 	app.listener = newBlockingListener()
 	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
@@ -214,7 +278,7 @@ func TestRunRejectsNilAffinityLockAndJoinsReleaseFailure(t *testing.T) {
 			ConversationWriter: &transcriptWriterFake{items: make(chan postgres.ConversationItem, 1)},
 			Journal:            journal, DeliveryAffinity: "app-affinity", JournalOwner: "app-owner", JournalClaimLease: time.Minute,
 			HandoffQueueCapacity: 1, TranscriptQueueCapacity: 1, Snapshot: validHandoffWork().Snapshot,
-		}))
+		}), testHandoffPresentationOption())
 		require.NoError(t, err)
 		app.listener = newBlockingListener()
 		return app

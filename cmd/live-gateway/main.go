@@ -36,8 +36,14 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 	if *configPath == "" {
 		return errors.New("-config is required")
 	}
-	cfg, err := config.Load(*configPath, lookup)
+	cfg, err := config.LoadUnresolved(*configPath)
 	if err != nil {
+		return fmt.Errorf("load gateway configuration: %w", err)
+	}
+	if err := validateComposition(cfg); err != nil {
+		return err
+	}
+	if err := cfg.ResolveSecrets(lookup); err != nil {
 		return fmt.Errorf("load gateway configuration: %w", err)
 	}
 	apiKey := ""
@@ -63,4 +69,15 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 		return fmt.Errorf("configure gateway: %w", err)
 	}
 	return app.Run(ctx)
+}
+
+func validateComposition(cfg config.Config) error {
+	if cfg.Features.Handoffs {
+		// Task 17 supplies authenticated production admission and Task 18 supplies
+		// the configured safety policy. Starting durable delivery before both are
+		// available would either route an untrusted scope or silently suppress all
+		// presentation, so this composition root remains explicit and fail closed.
+		return errors.New("handoff delivery is unavailable until authenticated admission and configured presentation safety are installed")
+	}
+	return nil
 }

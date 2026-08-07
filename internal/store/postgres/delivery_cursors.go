@@ -97,3 +97,5 @@ func validateCursorArguments(consumerID string, scope handoff.Scope, sequence in
 	}
 	return nil
 }
+
+var _ handoff.DeliveryCursorStore = (*Repository)(nil)

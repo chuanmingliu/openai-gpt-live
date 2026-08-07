@@ -137,7 +137,7 @@ func TestAppsHoldExclusiveCoordinatorAffinityUntilTeardown(t *testing.T) {
 			Service: service, ConversationWriter: repository, Journal: journal,
 			DeliveryAffinity: affinity, JournalOwner: owner, JournalClaimLease: 100 * time.Millisecond,
 			HandoffQueueCapacity: 1, TranscriptQueueCapacity: 1, Snapshot: validHandoffWork().Snapshot,
-		}))
+		}), testHandoffPresentationOption())
 		require.NoError(t, appErr)
 		app.listener = newBlockingListener()
 		return app, ready

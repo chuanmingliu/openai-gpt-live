@@ -190,6 +190,54 @@ func TestPendingExplicitResolutionValidationWithoutSocket(t *testing.T) {
 	assert.False(t, matched)
 }
 
+func TestCorrelatedProviderErrorReleasesPendingExplicitBudget(t *testing.T) {
+	session := &voiceSession{
+		ctx: context.Background(), events: make(chan realtime.Event, 1),
+		pending: map[identity.ResponseEpoch]struct{}{7: {}},
+	}
+	require.NoError(t, session.handleMapped(mappedServerEvent{event: realtime.Event{Kind: realtime.EventError, Epoch: 7}}))
+	assert.Empty(t, session.pending)
+	assert.Equal(t, identity.ResponseEpoch(7), (<-session.events).Epoch)
+}
+
+func TestCorrelatedRejectionsBeyondPendingLimitRemainRecoverable(t *testing.T) {
+	session := &voiceSession{ctx: context.Background(), events: make(chan realtime.Event, explicitPendingLimit+8), pending: make(map[identity.ResponseEpoch]struct{})}
+	for value := 1; value <= explicitPendingLimit+5; value++ {
+		epoch := identity.ResponseEpoch(value)
+		require.NoError(t, session.registerExplicit(epoch))
+		require.NoError(t, session.handleMapped(mappedServerEvent{event: realtime.Event{Kind: realtime.EventError, Epoch: epoch}}))
+		assert.Empty(t, session.pending)
+		delivered := <-session.events
+		assert.Equal(t, realtime.EventError, delivered.Kind)
+		assert.Equal(t, epoch, delivered.Epoch)
+	}
+}
+
+func TestEpochZeroErrorPreservesPendingCreateAndValidCreationBinds(t *testing.T) {
+	session := &voiceSession{
+		ctx: context.Background(), events: make(chan realtime.Event, 3),
+		pending: map[identity.ResponseEpoch]struct{}{7: {}}, responses: make(map[string]*responseCorrelation),
+	}
+	require.NoError(t, session.handleMapped(mappedServerEvent{event: realtime.Event{Kind: realtime.EventError}}))
+	assert.Contains(t, session.pending, identity.ResponseEpoch(7), "uncorrelated error must preserve the valid create")
+	assert.Equal(t, realtime.EventError, (<-session.events).Kind)
+
+	require.NoError(t, session.handleMapped(mappedServerEvent{
+		event:   realtime.Event{Kind: realtime.EventResponseCreated, ResponseID: "healthy", Status: "in_progress"},
+		created: &responseCreatedDetails{responseID: "healthy", hasEpoch: true, epoch: 7},
+	}))
+	assert.Empty(t, session.pending)
+	created := <-session.events
+	assert.Equal(t, realtime.EventResponseCreated, created.Kind)
+	assert.Equal(t, identity.ResponseEpoch(7), created.Epoch)
+	assert.False(t, created.NeedsEpochBinding)
+
+	session.pending[101] = struct{}{}
+	session.pending[102] = struct{}{}
+	require.NoError(t, session.handleMapped(mappedServerEvent{event: realtime.Event{Kind: realtime.EventError}}))
+	assert.Len(t, session.pending, 2, "ambiguous error must preserve every pending create")
+}
+
 func TestCloseWaitersShareSocketAttemptWithoutNetwork(t *testing.T) {
 	closeStarted := make(chan struct{})
 	closeRelease := make(chan struct{})
