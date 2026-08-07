@@ -175,7 +175,7 @@ func TestSchemaMigrationLifecycle(t *testing.T) {
 
 	version, dirty, err := migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
-	assert.Equal(t, uint(2), version)
+	assert.Equal(t, uint(3), version)
 	assert.False(t, dirty)
 	var journalPresent bool
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
@@ -200,13 +200,89 @@ func TestSchemaMigrationLifecycle(t *testing.T) {
 	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
 	version, dirty, err = migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
+	assert.Equal(t, uint(2), version)
+	assert.False(t, dirty)
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
+	assert.True(t, journalPresent)
+	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
+	version, dirty, err = migrations.Version(t.Context(), pool)
+	require.NoError(t, err)
 	assert.Equal(t, uint(1), version)
 	assert.False(t, dirty)
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
 	assert.False(t, journalPresent)
-	require.NoError(t, migrations.Steps(t.Context(), pool, 1))
+	require.NoError(t, migrations.Steps(t.Context(), pool, 2))
 	require.NoError(t, migrations.Steps(t.Context(), pool, 0))
 	require.NoError(t, migrations.Check(t.Context(), pool))
+}
+
+func TestSchemaTask12ToolInvocationScopeConstraint(t *testing.T) {
+	pool := migratedPostgres(t)
+	assertToolInvocationStableConstraintColumns(t, pool, []string{
+		"tenant_id", "conversation_id", "handoff_id", "objective_revision",
+		"tool_ordinal", "tool_name", "canonical_arguments_hash",
+	})
+
+	insertConversation(t, pool, "tenant-scope", "conversation-a")
+	insertConversation(t, pool, "tenant-scope", "conversation-b")
+	require.NoError(t, insertHandoff(t, pool, "tenant-scope", "conversation-a", "same-handoff", "handoff-idem-a"))
+	require.NoError(t, insertHandoff(t, pool, "tenant-scope", "conversation-b", "same-handoff", "handoff-idem-b"))
+	require.NoError(t, insertToolInvocation(t, pool, "invocation-a", "tenant-scope", "conversation-a", "same-handoff", "tool-idem-a"))
+	require.NoError(t, insertToolInvocation(t, pool, "invocation-b", "tenant-scope", "conversation-b", "same-handoff", "tool-idem-b"))
+
+	err := insertToolInvocation(t, pool, "invocation-duplicate", "tenant-scope", "conversation-a", "same-handoff", "tool-idem-duplicate")
+	assertConstraint(t, err, "tool_invocations_stable_uniq")
+}
+
+func TestSchemaTask12ToolInvocationScopeSafeDownAndUp(t *testing.T) {
+	pool := migratedPostgres(t)
+	insertConversation(t, pool, "tenant-safe", "conversation-safe")
+	require.NoError(t, insertHandoff(t, pool, "tenant-safe", "conversation-safe", "handoff-safe", "handoff-idem-safe"))
+	require.NoError(t, insertToolInvocation(t, pool, "invocation-safe", "tenant-safe", "conversation-safe", "handoff-safe", "tool-idem-safe"))
+
+	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
+	version, dirty, err := migrations.Version(t.Context(), pool)
+	require.NoError(t, err)
+	assert.Equal(t, uint(2), version)
+	assert.False(t, dirty)
+	assertToolInvocationStableConstraintColumns(t, pool, []string{
+		"tenant_id", "handoff_id", "objective_revision", "tool_ordinal", "tool_name", "canonical_arguments_hash",
+	})
+
+	require.NoError(t, migrations.Up(t.Context(), pool))
+	require.NoError(t, migrations.Check(t.Context(), pool))
+	assertToolInvocationStableConstraintColumns(t, pool, []string{
+		"tenant_id", "conversation_id", "handoff_id", "objective_revision",
+		"tool_ordinal", "tool_name", "canonical_arguments_hash",
+	})
+	var count int
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM tool_invocations WHERE invocation_id='invocation-safe'`).Scan(&count))
+	assert.Equal(t, 1, count)
+}
+
+func TestSchemaTask12ToolInvocationScopeConflictingDownRefusalPreservesV3(t *testing.T) {
+	pool := migratedPostgres(t)
+	insertConversation(t, pool, "tenant-conflict", "conversation-a")
+	insertConversation(t, pool, "tenant-conflict", "conversation-b")
+	require.NoError(t, insertHandoff(t, pool, "tenant-conflict", "conversation-a", "same-handoff", "handoff-idem-a"))
+	require.NoError(t, insertHandoff(t, pool, "tenant-conflict", "conversation-b", "same-handoff", "handoff-idem-b"))
+	require.NoError(t, insertToolInvocation(t, pool, "invocation-a", "tenant-conflict", "conversation-a", "same-handoff", "tool-idem-a"))
+	require.NoError(t, insertToolInvocation(t, pool, "invocation-b", "tenant-conflict", "conversation-b", "same-handoff", "tool-idem-b"))
+
+	err := migrations.Steps(t.Context(), pool, -1)
+	require.ErrorIs(t, err, migrations.ErrToolInvocationScopeConflict)
+	version, dirty, versionErr := migrations.Version(t.Context(), pool)
+	require.NoError(t, versionErr)
+	assert.Equal(t, uint(3), version)
+	assert.False(t, dirty)
+	require.NoError(t, migrations.Check(t.Context(), pool))
+	assertToolInvocationStableConstraintColumns(t, pool, []string{
+		"tenant_id", "conversation_id", "handoff_id", "objective_revision",
+		"tool_ordinal", "tool_name", "canonical_arguments_hash",
+	})
+	var count int
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM tool_invocations WHERE tenant_id='tenant-conflict'`).Scan(&count))
+	assert.Equal(t, 2, count)
 }
 
 // Replacing caller cancellation with a post-operation ctx.Err check leaves a
@@ -280,6 +356,7 @@ func TestSchemaMigrationLockTimeoutLeavesNoOrphan(t *testing.T) {
 // backend, roll back the statement, and preserve a clean schema version.
 func TestSchemaMigrationCancellationWhileExecutingSQL(t *testing.T) {
 	pool := migratedPostgres(t)
+	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
 	locker, err := pool.Acquire(t.Context())
 	require.NoError(t, err)
 	defer locker.Release()
@@ -1226,6 +1303,46 @@ func insertHandoff(t *testing.T, pool *pgxpool.Pool, tenant, conversation, id, i
 		CURRENT_TIMESTAMP + interval '1 day',1024,'["read"]','{"mode":"auto"}','model','prompt','tools','config',$4,'request-hash')`,
 		tenant, conversation, id, idempotencyKey)
 	return err
+}
+
+func insertToolInvocation(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	invocationID, tenant, conversation, handoffID, idempotencyKey string,
+) error {
+	t.Helper()
+	_, err := pool.Exec(t.Context(), `INSERT INTO tool_invocations (
+		invocation_id,tenant_id,conversation_id,handoff_id,attempt,objective_revision,tool_ordinal,tool_name,
+		approval_state,idempotency_key,canonical_arguments_hash,arguments_ciphertext,arguments_nonce,arguments_key_id)
+	VALUES ($1,$2,$3,$4,1,2,3,'read','approved',$5,'arguments-hash',
+		decode(repeat('00',16),'hex'),decode(repeat('00',12),'hex'),'key')`,
+		invocationID, tenant, conversation, handoffID, idempotencyKey)
+	return err
+}
+
+func assertToolInvocationStableConstraintColumns(t *testing.T, pool *pgxpool.Pool, want []string) {
+	t.Helper()
+	rows, err := pool.Query(t.Context(), `
+		SELECT attribute.attname
+		FROM pg_catalog.pg_constraint constraint_definition
+		CROSS JOIN LATERAL unnest(constraint_definition.conkey) WITH ORDINALITY AS key_column(attnum, ordinal)
+		JOIN pg_catalog.pg_attribute attribute
+			ON attribute.attrelid=constraint_definition.conrelid AND attribute.attnum=key_column.attnum
+		WHERE constraint_definition.connamespace=(SELECT oid FROM pg_catalog.pg_namespace WHERE nspname=current_schema())
+			AND constraint_definition.conrelid='tool_invocations'::regclass
+			AND constraint_definition.conname='tool_invocations_stable_uniq'
+			AND constraint_definition.contype='u'
+		ORDER BY key_column.ordinal`)
+	require.NoError(t, err)
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var column string
+		require.NoError(t, rows.Scan(&column))
+		got = append(got, column)
+	}
+	require.NoError(t, rows.Err())
+	assert.Equal(t, want, got, "tool invocation stable uniqueness scope and ordering")
 }
 
 func insertEvent(t *testing.T, pool *pgxpool.Pool, eventID, tenant, conversation, handoff string) int64 {

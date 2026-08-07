@@ -283,6 +283,7 @@ func TestCoordinatorJournalDownMigrationRefusesPendingAndPermitsDelivered(t *tes
 	} {
 		t.Run("pending refuses "+operation.name+" without dirtying schema", func(t *testing.T) {
 			repo, pool, _ := repositoryHarness(t)
+			requireCoordinatorMigrationVersion2(t, pool)
 			scope := testScope("tenant-journal", "conversation-down-pending-"+operation.name)
 			insertConversation(t, pool, scope)
 			record := coordinatorRecord(scope, CoordinatorKindHandoff, "down-pending-"+operation.name, 1)
@@ -295,7 +296,7 @@ func TestCoordinatorJournalDownMigrationRefusesPendingAndPermitsDelivered(t *tes
 			require.NoError(t, versionErr)
 			assert.Equal(t, uint(2), version)
 			assert.False(t, dirty)
-			require.NoError(t, migrations.Check(t.Context(), pool))
+			assert.ErrorContains(t, migrations.Check(t.Context(), pool), "schema version is behind")
 			var present bool
 			require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&present))
 			assert.True(t, present)
@@ -310,6 +311,7 @@ func TestCoordinatorJournalDownMigrationRefusesPendingAndPermitsDelivered(t *tes
 
 	t.Run("delivered permits downgrade", func(t *testing.T) {
 		repo, pool, _ := repositoryHarness(t)
+		requireCoordinatorMigrationVersion2(t, pool)
 		scope := testScope("tenant-journal", "conversation-down-delivered")
 		insertConversation(t, pool, scope)
 		record := coordinatorRecord(scope, CoordinatorKindHandoff, "down-delivered", 1)
@@ -328,6 +330,7 @@ func TestCoordinatorJournalDownMigrationRefusesPendingAndPermitsDelivered(t *tes
 
 func TestCoordinatorJournalDownWaitsForConcurrentAdmissionThenRefuses(t *testing.T) {
 	_, pool, _ := repositoryHarness(t)
+	requireCoordinatorMigrationVersion2(t, pool)
 	scope := testScope("tenant-journal", "conversation-down-race")
 	insertConversation(t, pool, scope)
 	record := coordinatorRecord(scope, CoordinatorKindHandoff, "down-race", 1)
@@ -360,4 +363,13 @@ func TestCoordinatorJournalDownWaitsForConcurrentAdmissionThenRefuses(t *testing
 	var count int
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM coordinator_work_journal WHERE work_key=$1`, record.WorkKey).Scan(&count))
 	assert.Equal(t, 1, count)
+}
+
+func requireCoordinatorMigrationVersion2(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
+	version, dirty, err := migrations.Version(t.Context(), pool)
+	require.NoError(t, err)
+	assert.Equal(t, uint(2), version)
+	assert.False(t, dirty)
 }

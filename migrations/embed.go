@@ -20,7 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const latestVersion uint = 2
+const latestVersion uint = 3
 
 const (
 	migrationCancelTimeout     = 2 * time.Second
@@ -32,6 +32,7 @@ const (
 var migrationRunnerSequence atomic.Uint64
 
 var ErrCoordinatorPendingWork = errors.New("coordinator journal contains undelivered replay work")
+var ErrToolInvocationScopeConflict = errors.New("tool invocation rows conflict under legacy scope")
 
 //go:embed *.sql
 var files embed.FS
@@ -306,6 +307,12 @@ func (d *cancellablePGXDriver) Run(migration io.Reader) error {
 	}
 	if _, err := tx.Exec(d.ctx, string(statement)); err != nil {
 		_ = tx.Rollback(context.Background())
+		if isToolInvocationScopeRefusal(err) {
+			if recoveryErr := d.recoverToolInvocationScopeRefusal(); recoveryErr != nil {
+				return errors.Join(err, fmt.Errorf("recover tool invocation scope downgrade refusal: %w", recoveryErr))
+			}
+			return errors.Join(ErrToolInvocationScopeConflict, err)
+		}
 		if isCoordinatorPendingRefusal(err) {
 			if recoveryErr := d.recoverCoordinatorPendingRefusal(); recoveryErr != nil {
 				return errors.Join(err, fmt.Errorf("recover coordinator downgrade refusal: %w", recoveryErr))
@@ -320,6 +327,50 @@ func (d *cancellablePGXDriver) Run(migration io.Reader) error {
 func isCoordinatorPendingRefusal(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "55000" && pgErr.Message == ErrCoordinatorPendingWork.Error()
+}
+
+func isToolInvocationScopeRefusal(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "55000" && pgErr.Message == ErrToolInvocationScopeConflict.Error()
+}
+
+func (d *cancellablePGXDriver) recoverToolInvocationScopeRefusal() error {
+	if d.ctx == nil || d.ctx.Err() != nil {
+		return errors.New("migration context is not active")
+	}
+	version, dirty, err := d.Version()
+	if err != nil {
+		return err
+	}
+	if version != 2 || !dirty {
+		return fmt.Errorf("unexpected migration state version=%d dirty=%t", version, dirty)
+	}
+	var v3ConstraintPresent bool
+	if err := d.connection.QueryRow(d.ctx, `SELECT EXISTS (
+		SELECT 1
+		FROM pg_catalog.pg_constraint constraint_definition
+		WHERE constraint_definition.connamespace=(
+			SELECT oid FROM pg_catalog.pg_namespace WHERE nspname=$1
+		)
+			AND constraint_definition.conrelid='tool_invocations'::regclass
+			AND constraint_definition.conname='tool_invocations_stable_uniq'
+			AND constraint_definition.contype='u'
+			AND (
+				SELECT array_agg(attribute.attname::text ORDER BY key_column.ordinal)
+				FROM unnest(constraint_definition.conkey) WITH ORDINALITY AS key_column(attnum, ordinal)
+				JOIN pg_catalog.pg_attribute attribute
+					ON attribute.attrelid=constraint_definition.conrelid AND attribute.attnum=key_column.attnum
+			) = ARRAY[
+				'tenant_id','conversation_id','handoff_id','objective_revision',
+				'tool_ordinal','tool_name','canonical_arguments_hash'
+			]::text[]
+	)`, d.schema).Scan(&v3ConstraintPresent); err != nil {
+		return err
+	}
+	if !v3ConstraintPresent {
+		return errors.New("v3 tool invocation scope constraint is absent or has unexpected columns")
+	}
+	return d.SetVersion(3, false)
 }
 
 func (d *cancellablePGXDriver) recoverCoordinatorPendingRefusal() error {

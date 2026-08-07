@@ -11,6 +11,7 @@ import (
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
+	"github.com/chuanmingliu/openai-gpt-live/internal/worker"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -27,19 +28,41 @@ const (
 type Repository struct {
 	pool      *pgxpool.Pool
 	clock     clock.Clock
+	toolGate  worker.ToolGate
 	failpoint func(string) error
 }
 
 var _ handoff.Repository = (*Repository)(nil)
 
-func NewRepository(pool *pgxpool.Pool, repositoryClock clock.Clock) (*Repository, error) {
+type RepositoryOption func(*Repository) error
+
+func WithToolGate(gate worker.ToolGate) RepositoryOption {
+	return func(repository *Repository) error {
+		if nilInterface(gate) {
+			return errors.New("postgres repository tool gate is required")
+		}
+		repository.toolGate = gate
+		return nil
+	}
+}
+
+func NewRepository(pool *pgxpool.Pool, repositoryClock clock.Clock, options ...RepositoryOption) (*Repository, error) {
 	if pool == nil {
 		return nil, errors.New("postgres repository pool is required")
 	}
 	if nilInterface(repositoryClock) {
 		return nil, errors.New("postgres repository clock is required")
 	}
-	return &Repository{pool: pool, clock: repositoryClock}, nil
+	repository := &Repository{pool: pool, clock: repositoryClock}
+	for _, option := range options {
+		if option == nil {
+			return nil, errors.New("postgres repository option is required")
+		}
+		if err := option(repository); err != nil {
+			return nil, err
+		}
+	}
+	return repository, nil
 }
 
 func (r *Repository) after(step string) error {
