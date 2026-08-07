@@ -186,12 +186,17 @@ type SafetyConfig struct {
 }
 
 type TelemetryConfig struct {
-	OTLPEndpoint string `yaml:"otlp_endpoint"`
-	ServiceName  string `yaml:"service_name"`
+	OTLPEndpoint  string        `yaml:"otlp_endpoint"`
+	ServiceName   string        `yaml:"service_name"`
+	Protocol      string        `yaml:"protocol"`
+	ExportTimeout time.Duration `yaml:"export_timeout"`
 }
 
 type ShutdownConfig struct {
-	DrainTimeout time.Duration `yaml:"drain_timeout"`
+	DrainTimeout        time.Duration `yaml:"drain_timeout"` // Deprecated compatibility field.
+	GatewayDrainTimeout time.Duration `yaml:"gateway_drain_timeout"`
+	WorkerDrainTimeout  time.Duration `yaml:"worker_drain_timeout"`
+	CleanupTimeout      time.Duration `yaml:"cleanup_timeout"`
 }
 
 type AdminConfig struct {
@@ -386,6 +391,12 @@ func (c *Config) applyDefaults() {
 	if c.Safety.PolicyVersion == "" {
 		c.Safety.PolicyVersion = "static-v1"
 	}
+	if c.Telemetry.Protocol == "" {
+		c.Telemetry.Protocol = "http/protobuf"
+	}
+	if c.Telemetry.ExportTimeout == 0 {
+		c.Telemetry.ExportTimeout = 5 * time.Second
+	}
 	if c.Safety.Mode == "" {
 		c.Safety.Mode = "enforce"
 	}
@@ -403,6 +414,15 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Shutdown.DrainTimeout == 0 {
 		c.Shutdown.DrainTimeout = 10 * time.Second
+	}
+	if c.Shutdown.GatewayDrainTimeout == 0 {
+		c.Shutdown.GatewayDrainTimeout = 30 * time.Second
+	}
+	if c.Shutdown.WorkerDrainTimeout == 0 {
+		c.Shutdown.WorkerDrainTimeout = 120 * time.Second
+	}
+	if c.Shutdown.CleanupTimeout == 0 {
+		c.Shutdown.CleanupTimeout = 5 * time.Second
 	}
 	if c.Features.SideEffectingTools && c.Features.ToolEncryptionKeyEnv == "" {
 		c.Features.ToolEncryptionKeyEnv = "LIVE_TOOL_ENCRYPTION_KEY"
@@ -437,6 +457,18 @@ func (c Config) Validate() error {
 	if c.Mode != "local" && c.Mode != "production" {
 		return fmt.Errorf("mode must be local or production")
 	}
+	if c.Admin.ListenAddr != "" {
+		host, _, err := net.SplitHostPort(c.Admin.ListenAddr)
+		if err != nil {
+			return errors.New("admin.listen_addr must include a bounded host and port")
+		}
+		if c.Mode == "production" {
+			ip := net.ParseIP(strings.Trim(host, "[]"))
+			if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+				return errors.New("production admin.listen_addr must be loopback")
+			}
+		}
+	}
 	if c.Gateway.Voice.URL != "" {
 		u, err := url.Parse(c.Gateway.Voice.URL)
 		if err != nil || (u.Scheme != "ws" && u.Scheme != "wss") || u.Host == "" {
@@ -454,6 +486,9 @@ func (c Config) Validate() error {
 	}
 	if err := validateHTTPURL(c.Telemetry.OTLPEndpoint, "telemetry.otlp_endpoint", c.Mode == "production"); err != nil {
 		return err
+	}
+	if c.Telemetry.Protocol != "" && c.Telemetry.Protocol != "http/protobuf" || c.Telemetry.ExportTimeout < 0 || c.Telemetry.ExportTimeout > 0 && c.Telemetry.ExportTimeout < 10*time.Millisecond || c.Telemetry.ExportTimeout > time.Minute {
+		return errors.New("telemetry protocol or export timeout is invalid")
 	}
 	if c.Gateway.Audio.SampleRate != defaultSampleRate || c.Gateway.Audio.Channels != 1 || c.Gateway.Audio.BytesPerSample != 2 {
 		return errors.New("gateway.audio must be 24kHz mono PCM16LE")
@@ -504,6 +539,9 @@ func (c Config) Validate() error {
 	}
 	if c.Shutdown.DrainTimeout < 0 || c.Shutdown.DrainTimeout > 10*time.Minute {
 		return errors.New("shutdown.drain_timeout must be positive and bounded when set")
+	}
+	if c.Shutdown.GatewayDrainTimeout < 0 || c.Shutdown.GatewayDrainTimeout > 10*time.Minute || c.Shutdown.WorkerDrainTimeout < 0 || c.Shutdown.WorkerDrainTimeout > 10*time.Minute || c.Shutdown.CleanupTimeout < 0 || c.Shutdown.CleanupTimeout > time.Minute {
+		return errors.New("shutdown service drain and cleanup timeouts must be positive and bounded")
 	}
 	if len(c.Auth.AllowedOrigins) > 128 || len(c.Auth.OIDCRequiredScopes) > 64 || len(c.Auth.StaticScopes) > 64 ||
 		c.Auth.OIDCCacheOutage < 0 || c.Auth.OIDCCacheOutage > 24*time.Hour || c.Auth.OIDCCacheOutage > 0 && c.Auth.OIDCCacheOutage < time.Second || c.Auth.OIDCHTTPTimeout < 0 || c.Auth.OIDCHTTPTimeout > 30*time.Second || c.Auth.OIDCHTTPTimeout > 0 && c.Auth.OIDCHTTPTimeout < 100*time.Millisecond {

@@ -25,7 +25,7 @@ auth:
   static_bearer_env: LIVE_STATIC_BEARER_TOKEN
   static_tenant_id: development
   static_user_id: local-simulator
-  static_scopes: [realtime]
+  static_scopes: [realtime, live.admin]
   allowed_origins: [http://127.0.0.1:3000]
   oidc_http_timeout: 5s
 admission:
@@ -49,3 +49,12 @@ safety:
   redacted_summary: A background task completed with protected details removed.
   clarification_prompt: Approval is required before this task can continue.
   redaction_denied_keys: []
+telemetry:
+  service_name: live-gateway
+  protocol: http/protobuf
+  export_timeout: 5s
+admin:
+  listen_addr: 127.0.0.1:9090
+shutdown:
+  gateway_drain_timeout: 30s
+  cleanup_timeout: 5s

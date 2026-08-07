@@ -479,6 +479,7 @@ func (r *Repository) SweepExpired(ctx context.Context, now time.Time, limit int)
 			return 0, err
 		}
 	}
+	expiredLeases := 0
 	for _, c := range candidates {
 		if c.attempt < 0 || c.attempt > math.MaxUint32 {
 			return 0, errors.New("postgres: sweep attempt out of range")
@@ -496,6 +497,9 @@ func (r *Repository) SweepExpired(ctx context.Context, now time.Time, limit int)
 			mutation = "deadline"
 		} else if state == handoff.StateLeased {
 			state = handoff.StatePending
+		}
+		if kind == "handoff.lease_expired" {
+			expiredLeases++
 		}
 		terminal := state == handoff.StateCancelled || state == handoff.StateExpired
 		if terminal {
@@ -516,6 +520,9 @@ func (r *Repository) SweepExpired(ctx context.Context, now time.Time, limit int)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, err
+	}
+	if expiredLeases > 0 && r.expiredLeaseObserver != nil {
+		r.expiredLeaseObserver(expiredLeases)
 	}
 	return len(candidates), nil
 }

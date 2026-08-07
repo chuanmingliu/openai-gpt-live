@@ -21,11 +21,13 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/config"
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
+	"github.com/chuanmingliu/openai-gpt-live/internal/lifecycle"
 	"github.com/chuanmingliu/openai-gpt-live/internal/presentation"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
 	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
 	"github.com/chuanmingliu/openai-gpt-live/internal/session"
 	transportws "github.com/chuanmingliu/openai-gpt-live/internal/transport/ws"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -51,6 +53,10 @@ type App struct {
 	listener        net.Listener
 	shutdownTimeout time.Duration
 	activeHandlers  handlerTracker
+	drainer         *lifecycle.Drainer
+	metricsHooks    session.MetricsHooks
+	handoffMetrics  HandoffMetricsHooks
+	tracer          trace.Tracer
 	durable         *DurableDependencies
 	handoffs        *HandoffCoordinator
 	transcripts     *TranscriptCoordinator
@@ -89,6 +95,12 @@ type HandoffPresentationDependencies struct {
 	Safety         safety.Policy
 }
 
+type HandoffMetricsHooks struct {
+	Acknowledgement func(time.Duration, string)
+	Presentation    func(time.Duration, string)
+	Duplicate       func(string)
+}
+
 func WithHandoffPresentation(dependencies HandoffPresentationDependencies) Option {
 	return func(app *App) error {
 		copy := dependencies
@@ -122,6 +134,38 @@ func WithAdmission(admission transportws.Admission) Option {
 			return errors.New("admission is required")
 		}
 		app.admission = admission
+		return nil
+	}
+}
+
+func WithDrainer(drainer *lifecycle.Drainer) Option {
+	return func(app *App) error {
+		if drainer == nil {
+			return errors.New("gateway drainer is required")
+		}
+		app.drainer = drainer
+		return nil
+	}
+}
+
+func WithSessionMetrics(hooks session.MetricsHooks) Option {
+	return func(app *App) error {
+		app.metricsHooks = hooks
+		return nil
+	}
+}
+func WithHandoffMetrics(hooks HandoffMetricsHooks) Option {
+	return func(app *App) error {
+		app.handoffMetrics = hooks
+		return nil
+	}
+}
+func WithTracer(tracer trace.Tracer) Option {
+	return func(app *App) error {
+		if tracer == nil {
+			return errors.New("gateway tracer is required")
+		}
+		app.tracer = tracer
 		return nil
 	}
 }
@@ -172,9 +216,9 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 	if wsOptions.WriteTimeout == 0 {
 		wsOptions.WriteTimeout = defaultWebSocketWriteTimeout
 	}
-	shutdownTimeout := cfg.Shutdown.DrainTimeout
+	shutdownTimeout := cfg.Shutdown.GatewayDrainTimeout
 	if shutdownTimeout == 0 {
-		shutdownTimeout = defaultShutdownTimeout
+		shutdownTimeout = 30 * time.Second
 	}
 	if managerConfig.IngressBlockTimeout < 0 || managerConfig.EgressBlockTimeout < 0 ||
 		wsOptions.ReadTimeout < 0 || wsOptions.WriteTimeout < 0 || shutdownTimeout < 0 {
@@ -183,8 +227,9 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 
 	app := &App{
 		cfg: cfg, ids: randomIDs{}, managerConfig: managerConfig,
-		wsOptions: wsOptions, shutdownTimeout: shutdownTimeout,
+		wsOptions: wsOptions, shutdownTimeout: shutdownTimeout, drainer: lifecycle.NewDrainer(),
 	}
+	app.tracer = trace.NewNoopTracerProvider().Tracer("live.gateway")
 	for _, option := range opts {
 		if option == nil {
 			return nil, errors.New("gateway option is nil")
@@ -230,6 +275,8 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 		app.eventPump = &handoff.EventPump{
 			Reader: app.presentation.Reader, Cursors: app.presentation.Cursors, Notifications: app.eventWakeups,
 			Clock: app.presentation.Clock, PollInterval: app.presentation.PollInterval,
+			Metrics: handoff.EventPumpMetrics{Presentation: app.handoffMetrics.Presentation, Duplicate: app.handoffMetrics.Duplicate},
+			Tracer:  app.tracer,
 		}
 		app.eventListener = app.presentation.Listener
 		managerConfig.HandoffConsumerID = app.presentation.ConsumerID
@@ -249,6 +296,9 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 		app.manager = session.NewManager(managerConfig, connector, app.ids)
 		app.eventPump.Sink = app.manager
 		app.handoffs = NewHandoffCoordinator(app.durable.Service, app.manager, app.durable.HandoffQueueCapacity)
+		app.handoffs.tracer = app.tracer
+		app.handoffs.metricsClock = app.presentation.Clock
+		app.handoffs.ackMetric = app.handoffMetrics.Acknowledgement
 		app.transcripts = NewTranscriptCoordinator(app.durable.ConversationWriter, app.manager, app.durable.TranscriptQueueCapacity)
 		if app.handoffs == nil || app.transcripts == nil {
 			return nil, errors.New("durable handoff coordinators are invalid")
@@ -278,7 +328,8 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 		}
 		app.manager = session.NewManager(managerConfig, connector, app.ids)
 	}
-	app.handler = &trackedHandler{next: transportws.NewHandler(wsOptions, app.manager, app.admission), active: &app.activeHandlers}
+	app.manager.SetMetricsHooks(app.metricsHooks)
+	app.handler = &trackedHandler{next: transportws.NewHandler(wsOptions, app.manager, app.admission), active: &app.activeHandlers, drainer: app.drainer}
 	app.server = &http.Server{Addr: cfg.Gateway.ListenAddr, Handler: app.handler}
 	return app, nil
 }
@@ -353,7 +404,12 @@ func (a *App) Run(ctx context.Context) (runErr error) {
 			}
 		}()
 	}
-	serveCtx, cancelServe := context.WithCancel(ctx)
+	// Process cancellation is a request to begin draining, not permission to
+	// tear down already-admitted client/provider streams. The drain sequence
+	// below owns the only cancellation of serving I/O.
+	serveCtx, cancelServe := context.WithCancel(context.WithoutCancel(ctx))
+	serveCtx, runSpan := a.tracer.Start(serveCtx, "gateway.run")
+	defer runSpan.End()
 	defer cancelServe()
 	listener := a.listener
 	if listener == nil {
@@ -410,10 +466,13 @@ func (a *App) Run(ctx context.Context) (runErr error) {
 	var serveErr error
 	serveObserved := false
 	var coordinatorErr error
+	forceCancellation := false
 	select {
 	case serveErr = <-serveResult:
 		serveObserved = true
+		forceCancellation = true
 	case result := <-coordinatorResult:
+		forceCancellation = true
 		if result.err == nil && ctx.Err() == nil {
 			result.err = errors.New("stopped unexpectedly")
 		}
@@ -421,16 +480,33 @@ func (a *App) Run(ctx context.Context) (runErr error) {
 			coordinatorErr = fmt.Errorf("%s: %w", result.name, result.err)
 		}
 	case <-ctx.Done():
+	case <-a.drainer.Begun():
 	}
 
 	// Every exit after Serve starts owns the same bounded teardown. In
 	// particular, a permanent listener failure does not cancel request contexts
 	// on its own, and Shutdown does not track hijacked WebSockets.
-	cancelServe()
+	a.drainer.Begin()
+	if forceCancellation {
+		cancelServe()
+	}
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), a.shutdownTimeout)
 	defer cancelShutdown()
 	var cleanupErrs []error
-	if err := a.server.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- a.server.Shutdown(shutdownCtx) }()
+	activeDone := make(chan error, 1)
+	go func() { activeDone <- a.activeHandlers.drain(shutdownCtx) }()
+	drainErr := a.drainer.Wait(shutdownCtx)
+	if drainErr != nil {
+		cleanupErrs = append(cleanupErrs, fmt.Errorf("drain tracked gateway work: %w", drainErr))
+		_ = a.server.Close()
+	}
+	// Existing sessions keep their contexts until work finishes or the public
+	// drain deadline expires. Only then are remaining provider/client I/O calls
+	// force-cancelled.
+	cancelServe()
+	if err := <-shutdownDone; err != nil && !errors.Is(err, http.ErrServerClosed) {
 		cleanupErrs = append(cleanupErrs, fmt.Errorf("shutdown gateway: %w", err))
 		if closeErr := a.server.Close(); closeErr != nil && !errors.Is(closeErr, http.ErrServerClosed) {
 			cleanupErrs = append(cleanupErrs, fmt.Errorf("close gateway: %w", closeErr))
@@ -445,15 +521,26 @@ func (a *App) Run(ctx context.Context) (runErr error) {
 			_ = a.server.Close()
 		}
 	}
-	if err := a.activeHandlers.drain(shutdownCtx); err != nil {
+	if err := <-activeDone; err != nil {
 		cleanupErrs = append(cleanupErrs, fmt.Errorf("wait for active gateway sessions: %w", err))
 		_ = a.server.Close()
+	}
+	cleanupTimeout := a.cfg.Shutdown.CleanupTimeout
+	if cleanupTimeout <= 0 {
+		cleanupTimeout = 5 * time.Second
+	}
+	cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), cleanupTimeout)
+	defer cancelCleanup()
+	if drainErr != nil {
+		if err := a.drainer.Wait(cleanupCtx); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("force-clean active gateway sessions: %w", err))
+		}
 	}
 	if coordinatorCount != 0 {
 		select {
 		case <-coordinatorDone:
-		case <-shutdownCtx.Done():
-			cleanupErrs = append(cleanupErrs, fmt.Errorf("wait for durable coordinators: %w", shutdownCtx.Err()))
+		case <-cleanupCtx.Done():
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("wait for durable coordinators: %w", cleanupCtx.Err()))
 		}
 	}
 
@@ -465,17 +552,46 @@ func (a *App) Run(ctx context.Context) (runErr error) {
 }
 
 type trackedHandler struct {
-	next   http.Handler
-	active *handlerTracker
+	next    http.Handler
+	active  *handlerTracker
+	drainer *lifecycle.Drainer
 }
 
 func (h *trackedHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	token, ok := h.drainer.Acquire()
+	if !ok {
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	defer token.Release()
 	if !h.active.begin() {
 		http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
 		return
 	}
 	defer h.active.end()
 	h.next.ServeHTTP(w, r)
+}
+
+func (a *App) ActiveSessions() int64 {
+	if a == nil || a.manager == nil {
+		return 0
+	}
+	return a.manager.ActiveSessions()
+}
+func (a *App) CapacitySnapshot() (active, limit int64) {
+	if a == nil {
+		return 0, 0
+	}
+	active = a.ActiveSessions()
+	limit = int64(a.cfg.Admission.MaxSessions)
+	return active, limit
+}
+func (a *App) Drainer() *lifecycle.Drainer {
+	if a == nil {
+		return nil
+	}
+	return a.drainer
 }
 
 type handlerTracker struct {

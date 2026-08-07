@@ -80,6 +80,7 @@ type Controller struct {
 	origins map[string]struct{}
 	limiter *limiter
 	store   LeaseStore
+	metrics func(string)
 }
 
 func New(authn auth.Authenticator, cfg Config, stores ...LeaseStore) (*Controller, error) {
@@ -143,6 +144,12 @@ func New(authn auth.Authenticator, cfg Config, stores ...LeaseStore) (*Controlle
 }
 
 func (c *Controller) Admit(ctx context.Context, request *http.Request) (session.Subject, ReleaseFunc, error) {
+	result := "rejected"
+	defer func() {
+		if c != nil && c.metrics != nil {
+			c.metrics(result)
+		}
+	}()
 	if c == nil || request == nil || ctx == nil {
 		return session.Subject{}, nil, ErrMalformed
 	}
@@ -178,6 +185,7 @@ func (c *Controller) Admit(ctx context.Context, request *http.Request) (session.
 	}
 	subject := session.Subject{TenantID: principal.TenantID, UserID: principal.UserID, Scopes: cloneScopes(principal.Scopes), ExpiresAt: principal.ExpiresAt}
 	if c.store == nil {
+		result = "ok"
 		return subject, func() {}, nil
 	}
 	if err := c.store.Ready(ctx); err != nil {
@@ -193,7 +201,37 @@ func (c *Controller) Admit(ctx context.Context, request *http.Request) (session.
 	if release == nil {
 		return session.Subject{}, nil, ErrUnavailable
 	}
+	result = "ok"
 	return subject, release, nil
+}
+
+func (c *Controller) SetMetricsObserver(observer func(string)) {
+	if c != nil {
+		c.metrics = observer
+	}
+}
+
+// Authenticate exposes the already configured strict authentication boundary
+// for the separately loopback-bound admin server.
+func (c *Controller) Authenticate(ctx context.Context, token string) (auth.Principal, error) {
+	if c == nil || c.authn == nil {
+		return auth.Principal{}, auth.ErrUnauthorized
+	}
+	return c.authn.Authenticate(ctx, token)
+}
+
+// Check reports authoritative distributed admission readiness.
+func (c *Controller) Check(ctx context.Context) error {
+	if c == nil {
+		return ErrUnavailable
+	}
+	if c.store == nil {
+		if c.cfg.RequireStore {
+			return ErrUnavailable
+		}
+		return nil
+	}
+	return c.store.Ready(ctx)
 }
 
 func (c *Controller) validatePrincipal(p auth.Principal) error {

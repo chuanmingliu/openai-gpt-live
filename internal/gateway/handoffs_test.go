@@ -20,6 +20,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/store/postgres"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
 type handoffServiceFake struct {
@@ -39,6 +40,25 @@ type blockingHandoffService struct {
 	started chan struct{}
 	release chan struct{}
 }
+
+type spanCapture struct {
+	mu    sync.Mutex
+	names []string
+	attrs []string
+}
+
+func (c *spanCapture) ExportSpans(_ context.Context, spans []sdktrace.ReadOnlySpan) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, span := range spans {
+		c.names = append(c.names, span.Name())
+		for _, attr := range span.Attributes() {
+			c.attrs = append(c.attrs, string(attr.Key)+"="+attr.Value.Emit())
+		}
+	}
+	return nil
+}
+func (*spanCapture) Shutdown(context.Context) error { return nil }
 
 func (f *blockingHandoffService) Create(ctx context.Context, request handoff.CreateRequest) (handoff.Snapshot, error) {
 	f.creates <- request
@@ -157,6 +177,46 @@ func TestHandoffCoordinatorRejectsAdversarialArgumentsAndOverflow(t *testing.T) 
 	}
 	cancel()
 	require.NoError(t, <-done)
+}
+
+func TestHandoffCoordinatorRecordsRealAcknowledgementBoundaryAndBoundedSpan(t *testing.T) {
+	manual := clock.NewManual(time.Unix(100, 0).UTC())
+	capture := &spanCapture{}
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(capture))
+	t.Cleanup(func() { _ = provider.Shutdown(t.Context()) })
+	service := &handoffServiceFake{creates: make(chan handoff.CreateRequest, 1), result: handoff.Snapshot{ID: "handoff-observed"}}
+	inputs := make(chan session.Input, 1)
+	coordinator := NewHandoffCoordinator(service, &submitterFake{inputs: inputs}, 1)
+	coordinator.metricsClock = manual
+	observed := make(chan struct {
+		duration time.Duration
+		result   string
+	}, 1)
+	coordinator.ackMetric = func(duration time.Duration, result string) {
+		observed <- struct {
+			duration time.Duration
+			result   string
+		}{duration, result}
+	}
+	coordinator.tracer = provider.Tracer("test")
+	work := validHandoffWork()
+	work.CallID = "raw-private-call-id"
+	require.NoError(t, coordinator.Enqueue(work))
+	manual.Advance(25 * time.Millisecond)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- coordinator.Run(ctx) }()
+	<-inputs
+	metric := <-observed
+	assert.Equal(t, 25*time.Millisecond, metric.duration)
+	assert.Equal(t, "ok", metric.result)
+	cancel()
+	require.NoError(t, <-done)
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+	assert.Contains(t, capture.names, "gateway.handoff.ack")
+	assert.NotContains(t, strings.Join(capture.attrs, " "), work.CallID)
+	assert.Equal(t, []string{"result=ok"}, capture.attrs)
 }
 
 func TestHandoffCoordinatorRejectsInvalidDependencies(t *testing.T) {

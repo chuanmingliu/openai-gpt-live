@@ -13,6 +13,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -55,12 +57,19 @@ type EventPump struct {
 	Sink          PresentationSink
 	Clock         clock.Clock
 	PollInterval  time.Duration
+	Metrics       EventPumpMetrics
+	Tracer        trace.Tracer
 
 	mu            sync.Mutex
 	subscriptions map[EventSubscription]struct{}
 	replays       map[EventSubscription]int64
 	changed       chan struct{}
 	running       bool
+}
+
+type EventPumpMetrics struct {
+	Presentation func(time.Duration, string)
+	Duplicate    func(string)
 }
 
 func (p *EventPump) RegisterReplay(subscription EventSubscription, afterSeq int64) error {
@@ -245,8 +254,35 @@ func (p *EventPump) deliverSubscription(ctx context.Context, subscription EventS
 					end++
 				}
 			}
-			if err := p.Sink.OfferHandoffEvent(ctx, subscription.Scope, CloneEvent(events[end-1])); err != nil && err != ErrPresentationSuppressed {
-				return err
+			event := events[end-1]
+			if event.Seq <= storedCursor && p.Metrics.Duplicate != nil {
+				p.Metrics.Duplicate("replay")
+			}
+			offerCtx := ctx
+			var span trace.Span
+			if p.Tracer != nil {
+				offerCtx, span = p.Tracer.Start(ctx, "gateway.presentation.offer")
+			}
+			offerErr := p.Sink.OfferHandoffEvent(offerCtx, subscription.Scope, CloneEvent(event))
+			result := "ok"
+			if offerErr == ErrPresentationSuppressed {
+				result = "suppressed"
+			} else if offerErr != nil {
+				result = "error"
+			}
+			if p.Metrics.Presentation != nil {
+				delay := p.Clock.Now().Sub(event.CreatedAt)
+				if delay < 0 {
+					delay = 0
+				}
+				p.Metrics.Presentation(delay, result)
+			}
+			if span != nil {
+				span.SetAttributes(attribute.String("result", result))
+				span.End()
+			}
+			if offerErr != nil && offerErr != ErrPresentationSuppressed {
+				return offerErr
 			}
 			for acknowledged := index; acknowledged < end; acknowledged++ {
 				if events[acknowledged].Seq > storedCursor {

@@ -50,10 +50,20 @@ const (
 )
 
 type Repository struct {
-	pool      *pgxpool.Pool
-	clock     clock.Clock
-	toolGate  worker.ToolGate
-	failpoint func(string) error
+	pool                 *pgxpool.Pool
+	clock                clock.Clock
+	toolGate             worker.ToolGate
+	failpoint            func(string) error
+	expiredLeaseObserver func(int)
+}
+
+// SetExpiredLeaseObserver installs a process-local observer for successfully
+// committed lease-expiry recoveries. Deadline expiry and cancellation are not
+// counted because they are distinct terminal transitions.
+func (r *Repository) SetExpiredLeaseObserver(observer func(int)) {
+	if r != nil {
+		r.expiredLeaseObserver = observer
+	}
 }
 
 var _ handoff.Repository = (*Repository)(nil)

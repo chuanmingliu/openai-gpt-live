@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -37,7 +40,7 @@ func TestProductionRuntimeGracefullyDrainsComponents(t *testing.T) {
 	runtimeUnderTest.Close()
 }
 
-func TestProductionRuntimeDrainTimeoutDefersResourceCloseUntilStuckComponentReturns(t *testing.T) {
+func TestProductionRuntimeDrainTimeoutClosesResourcesEvenWhenComponentIsStuck(t *testing.T) {
 	manual := clock.NewManual(time.Now().UTC())
 	started, release := make(chan struct{}), make(chan struct{})
 	sealer, err := worker.NewAESArgumentSealer("rotation-v2", make([]byte, 32), strings.NewReader(strings.Repeat("n", 24)))
@@ -63,7 +66,7 @@ func TestProductionRuntimeDrainTimeoutDefersResourceCloseUntilStuckComponentRetu
 timedOut:
 	runtimeUnderTest.Close()
 	_, err = sealer.Seal([]byte(`{}`))
-	require.NoError(t, err, "resources must remain open while a component is still running")
+	assert.ErrorContains(t, err, "closed", "the cleanup bound must force resource closure")
 	close(release)
 	for !runtimeUnderTest.drained.Load() {
 		runtime.Gosched()
@@ -71,6 +74,84 @@ timedOut:
 	runtimeUnderTest.Close()
 	_, err = sealer.Seal([]byte(`{}`))
 	assert.ErrorContains(t, err, "closed")
+}
+
+func TestProductionRuntimeComponentFailureDrainsAndBoundsIgnoringPeer(t *testing.T) {
+	manual := clock.NewManual(time.Now().UTC())
+	fault := errors.New("component fault")
+	fail := make(chan struct{})
+	release := make(chan struct{})
+	peerStarted := make(chan struct{})
+	runtimeUnderTest := &productionRuntime{
+		clock: manual, drainTimeout: time.Second, cleanupTimeout: time.Second,
+		components: []func(context.Context) error{
+			func(context.Context) error { <-fail; return fault },
+			func(context.Context) error { close(peerStarted); <-release; return nil },
+		},
+	}
+	done := make(chan error, 1)
+	go func() { done <- runtimeUnderTest.Run(t.Context()) }()
+	<-peerStarted
+	close(fail)
+	for runtimeUnderTest.drainer == nil || runtimeUnderTest.drainer.Accepting() {
+		runtime.Gosched()
+	}
+	var runErr error
+	for runErr == nil {
+		manual.Advance(time.Second)
+		runtime.Gosched()
+		select {
+		case runErr = <-done:
+		default:
+		}
+	}
+	assert.ErrorIs(t, runErr, fault)
+	assert.ErrorContains(t, runErr, "worker drain timeout")
+	close(release)
+}
+
+type diagnosticFailureListener struct{ err error }
+
+func (l diagnosticFailureListener) Accept() (net.Conn, error) { return nil, l.err }
+func (diagnosticFailureListener) Close() error                { return nil }
+func (diagnosticFailureListener) Addr() net.Addr              { return diagnosticFailureAddr("diagnostics") }
+
+type diagnosticFailureAddr string
+
+func (a diagnosticFailureAddr) Network() string { return "test" }
+func (a diagnosticFailureAddr) String() string  { return string(a) }
+
+func TestProductionRuntimeDiagnosticsFailureUsesSameBoundedDrain(t *testing.T) {
+	manual := clock.NewManual(time.Now().UTC())
+	fault := errors.New("diagnostic listener fault")
+	release := make(chan struct{})
+	peerStarted := make(chan struct{})
+	runtimeUnderTest := &productionRuntime{
+		clock: manual, drainTimeout: time.Second, cleanupTimeout: time.Second,
+		diagnostics:        &http.Server{Handler: http.NewServeMux()},
+		diagnosticListener: diagnosticFailureListener{err: fault},
+		components: []func(context.Context) error{
+			func(context.Context) error { close(peerStarted); <-release; return nil },
+		},
+	}
+	done := make(chan error, 1)
+	go func() { done <- runtimeUnderTest.Run(t.Context()) }()
+	<-peerStarted
+	for runtimeUnderTest.drainer == nil || runtimeUnderTest.drainer.Accepting() {
+		runtime.Gosched()
+	}
+	var runErr error
+	for runErr == nil {
+		manual.Advance(time.Second)
+		runtime.Gosched()
+		select {
+		case runErr = <-done:
+		default:
+		}
+	}
+	assert.ErrorContains(t, runErr, fault.Error())
+	assert.ErrorContains(t, runErr, "worker drain timeout")
+	close(release)
 }
 
 func (r *fakeRuntime) Run(ctx context.Context) error {
@@ -183,4 +264,48 @@ func TestRunRejectsMissingConfiguredSecretBeforeStartup(t *testing.T) {
 		return nil, nil
 	})
 	assert.ErrorContains(t, err, "TEST_PRIVACY_KEY")
+}
+
+func TestConfigCommandsDoNotLookupSecretsOrBuildRuntime(t *testing.T) {
+	path := writeWorkerConfig(t)
+	old := commandOutput
+	defer func() { commandOutput = old }()
+	var output bytes.Buffer
+	commandOutput = &output
+	lookup := func(string) (string, bool) { t.Fatal("secret lookup"); return "", false }
+	builder := func(context.Context, config.Config, resolvedSecrets) (serviceRuntime, error) {
+		t.Fatal("builder called")
+		return nil, nil
+	}
+	if err := runWithBuilder(t.Context(), []string{"check-config", "--config", path}, lookup, builder); err != nil {
+		t.Fatal(err)
+	}
+	if err := runWithBuilder(t.Context(), []string{"config-hash", "--config", path}, lookup, builder); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(output.String(), "v1:") {
+		t.Fatalf("output %q", output.String())
+	}
+}
+
+func TestExpectedHashMismatchPrecedesSecretResolutionAndBuilder(t *testing.T) {
+	path := writeWorkerConfig(t)
+	lookups := 0
+	lookup := func(name string) (string, bool) {
+		lookups++
+		if name != "LIVE_EXPECTED_CONFIG_HASH" {
+			t.Fatalf("unexpected lookup %s", name)
+		}
+		return "v1:" + strings.Repeat("0", 64), true
+	}
+	err := runWithBuilder(t.Context(), []string{"--config", path}, lookup, func(context.Context, config.Config, resolvedSecrets) (serviceRuntime, error) {
+		t.Fatal("builder called")
+		return nil, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "config hash mismatch") {
+		t.Fatalf("got %v", err)
+	}
+	if lookups != 1 {
+		t.Fatalf("lookups=%d", lookups)
+	}
 }

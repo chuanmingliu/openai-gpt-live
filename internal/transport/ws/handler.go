@@ -112,7 +112,8 @@ func (h *handler) serveRealtime(w http.ResponseWriter, r *http.Request) {
 	exactOrigin := false
 	if _, ok := h.admission.(*admission.Controller); ok {
 		exactOrigin = true
-	} else if !sameOrigin(r) {
+	}
+	if !exactOrigin && !sameOrigin(r) {
 		w.WriteHeader(http.StatusForbidden)
 		return
 	}

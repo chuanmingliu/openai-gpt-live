@@ -164,6 +164,40 @@ func TestEventPumpExplicitSafetySuppressionAdvancesCursor(t *testing.T) {
 	assert.ErrorIs(t, <-done, context.Canceled)
 }
 
+func TestEventPumpRecordsPresentationDelayAndReplayDuplicateAtDeliveryBoundary(t *testing.T) {
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "conversation"}
+	store := newPumpStore()
+	event := pumpEvent(scope, 1, "handoff.completed", handoff.StateSucceeded)
+	store.events[scope] = []handoff.Event{event}
+	store.cursors[pumpKey("consumer", scope)] = 1
+	manual := clock.NewManual(event.CreatedAt.Add(40 * time.Millisecond))
+	presented := make(chan struct {
+		delay  time.Duration
+		result string
+	}, 1)
+	duplicates := make(chan string, 1)
+	pump := &handoff.EventPump{
+		Reader: store, Cursors: store, Sink: store, Clock: manual, PollInterval: time.Second,
+		Metrics: handoff.EventPumpMetrics{
+			Presentation: func(delay time.Duration, result string) {
+				presented <- struct {
+					delay  time.Duration
+					result string
+				}{delay, result}
+			},
+			Duplicate: func(result string) { duplicates <- result },
+		},
+	}
+	subscription := handoff.EventSubscription{ConsumerID: "consumer", Scope: scope}
+	require.NoError(t, pump.RegisterReplay(subscription, 0))
+	runPump(t, pump)
+	assert.Equal(t, int64(1), (<-store.offered).Seq)
+	metric := <-presented
+	assert.Equal(t, 40*time.Millisecond, metric.delay)
+	assert.Equal(t, "ok", metric.result)
+	assert.Equal(t, "replay", <-duplicates)
+}
+
 func TestEventPumpRejectsWrappedJoinedAndForgedPresentationSuppression(t *testing.T) {
 	tests := map[string]error{
 		"wrapped": fmt.Errorf("context: %w", handoff.ErrPresentationSuppressed),

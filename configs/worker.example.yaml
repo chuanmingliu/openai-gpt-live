@@ -11,6 +11,11 @@ worker:
     api_key_env: DEEPSEEK_API_KEY
 store:
   database_url_env: DATABASE_URL
+auth:
+  static_bearer_env: LIVE_STATIC_BEARER_TOKEN
+  static_tenant_id: development
+  static_user_id: local-operator
+  static_scopes: [live.admin]
 safety:
   policy_version: static-v1
   mode: enforce
@@ -21,7 +26,14 @@ safety:
   clarification_prompt: Approval is required before this task can continue.
   redaction_denied_keys: []
 shutdown:
-  drain_timeout: 10s
+  worker_drain_timeout: 120s
+  cleanup_timeout: 5s
+telemetry:
+  service_name: live-worker
+  protocol: http/protobuf
+  export_timeout: 5s
+admin:
+  listen_addr: 127.0.0.1:9091
 features:
   side_effecting_tools: true
   tool_encryption_key_env: LIVE_TOOL_ENCRYPTION_KEY

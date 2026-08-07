@@ -11,6 +11,8 @@ import (
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const notificationChannel = "gpt_live_handoff_events"
@@ -22,11 +24,27 @@ type OutboxPublisherConfig struct {
 }
 
 type OutboxPublisher struct {
-	pool   *pgxpool.Pool
-	clock  clock.Clock
-	jitter clock.JitterSource
-	config OutboxPublisherConfig
-	hook   func(context.Context, string) error
+	pool        *pgxpool.Pool
+	clock       clock.Clock
+	jitter      clock.JitterSource
+	config      OutboxPublisherConfig
+	hook        func(context.Context, string) error
+	lagObserver func(time.Duration)
+	tracer      trace.Tracer
+}
+
+func (p *OutboxPublisher) SetTracer(tracer trace.Tracer) {
+	if p != nil {
+		p.tracer = tracer
+	}
+}
+
+// SetLagObserver installs a bounded aggregate metric hook. It receives only a
+// duration and never durable payloads or identifiers.
+func (p *OutboxPublisher) SetLagObserver(observer func(time.Duration)) {
+	if p != nil {
+		p.lagObserver = observer
+	}
 }
 
 func NewOutboxPublisher(pool *pgxpool.Pool, publisherClock clock.Clock, jitter clock.JitterSource, config OutboxPublisherConfig) (*OutboxPublisher, error) {
@@ -55,12 +73,25 @@ func (p *OutboxPublisher) Run(ctx context.Context) error {
 }
 
 type outboxRow struct {
-	ID      int64
-	Topic   string
-	Payload []byte
+	ID        int64
+	Topic     string
+	Payload   []byte
+	CreatedAt time.Time
 }
 
-func (p *OutboxPublisher) publishBatch(ctx context.Context) (int, error) {
+func (p *OutboxPublisher) publishBatch(ctx context.Context) (published int, runErr error) {
+	var span trace.Span
+	if p != nil && p.tracer != nil {
+		ctx, span = p.tracer.Start(ctx, "store.outbox.publish_batch")
+		defer func() {
+			result := "ok"
+			if runErr != nil {
+				result = "error"
+			}
+			span.SetAttributes(attribute.String("result", result))
+			span.End()
+		}()
+	}
 	if err := validateContext(ctx); err != nil {
 		return 0, err
 	}
@@ -69,7 +100,7 @@ func (p *OutboxPublisher) publishBatch(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	defer rollback(tx)
-	rows, err := tx.Query(ctx, `SELECT id,topic,payload::text FROM outbox
+	rows, err := tx.Query(ctx, `SELECT id,topic,payload::text,created_at FROM outbox
 		WHERE published_at IS NULL ORDER BY attempts,created_at,id FOR UPDATE SKIP LOCKED LIMIT $1`, p.config.BatchSize)
 	if err != nil {
 		return 0, err
@@ -77,7 +108,7 @@ func (p *OutboxPublisher) publishBatch(ctx context.Context) (int, error) {
 	claimed := make([]outboxRow, 0, p.config.BatchSize)
 	for rows.Next() {
 		var row outboxRow
-		if err := rows.Scan(&row.ID, &row.Topic, &row.Payload); err != nil {
+		if err := rows.Scan(&row.ID, &row.Topic, &row.Payload, &row.CreatedAt); err != nil {
 			rows.Close()
 			return 0, err
 		}
@@ -94,8 +125,15 @@ func (p *OutboxPublisher) publishBatch(ctx context.Context) (int, error) {
 		}
 	}
 	now := p.clock.Now().UTC()
-	published := 0
+	published = 0
 	for _, row := range claimed {
+		if p.lagObserver != nil {
+			lag := now.Sub(row.CreatedAt)
+			if lag < 0 {
+				lag = 0
+			}
+			p.lagObserver(lag)
+		}
 		if !validOutboxPayload(row.Topic, row.Payload) {
 			_, err := tx.Exec(ctx, `UPDATE outbox
 				SET attempts=CASE WHEN attempts < 2147483647 THEN attempts+1 ELSE attempts END,

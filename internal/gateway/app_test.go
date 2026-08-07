@@ -18,6 +18,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
 	"github.com/chuanmingliu/openai-gpt-live/internal/config"
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
+	"github.com/chuanmingliu/openai-gpt-live/internal/health"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/presentation"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
@@ -582,68 +583,105 @@ func (l *acceptOnceThenErrorListener) Accept() (net.Conn, error) {
 	return nil, l.err
 }
 
-func TestRunWaitsForActiveWebSocketReleaseDuringShutdown(t *testing.T) {
-	releaseStarted := make(chan struct{})
-	allowRelease := make(chan struct{})
-	var allowReleaseOnce sync.Once
-	completeRelease := func() { allowReleaseOnce.Do(func() { close(allowRelease) }) }
-	t.Cleanup(completeRelease)
-	admission := transportws.AdmissionFunc(func(context.Context, *http.Request) (session.Subject, func(), error) {
-		return session.Subject{TenantID: "tenant", UserID: "user", ExpiresAt: time.Now().Add(time.Minute)}, func() {
-			close(releaseStarted)
-			<-allowRelease
-		}, nil
-	})
-	connector := testkit.NewFakeConnector(4)
-	app, err := New(validConfig(), connector, WithIDGenerator(deterministicIDs{}), WithAdmission(admission))
-	require.NoError(t, err)
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	started := make(chan struct{})
-	app.listener = &signalingListener{Listener: listener, started: started}
-	ctx, cancelRun := context.WithCancel(t.Context())
-	done := make(chan error, 1)
-	go func() { done <- app.Run(ctx) }()
-	select {
-	case <-started:
-	case <-time.After(gatewayTestTimeout):
-		t.Fatal("gateway did not begin serving")
-	}
-	dialContext, cancelDial := context.WithTimeout(t.Context(), gatewayTestTimeout)
-	defer cancelDial()
-	client, _, err := websocket.Dial(dialContext, "ws://"+listener.Addr().String()+"/v1/realtime", nil)
-	require.NoError(t, err)
-	defer client.CloseNow()
-	gatewayClient := &gatewayClient{t: t, conn: client}
-	gatewayClient.expectType("session.created")
-	clientClosed := make(chan error, 1)
-	go func() {
-		_, _, err := client.Read(t.Context())
-		clientClosed <- err
-	}()
-	cancelRun()
-	select {
-	case err := <-clientClosed:
-		require.Error(t, err)
-	case <-time.After(gatewayTestTimeout):
-		t.Fatal("active websocket read did not unblock")
-	}
-	select {
-	case <-releaseStarted:
-	case <-time.After(gatewayTestTimeout):
-		t.Fatal("active websocket release did not start")
-	}
-	select {
-	case err := <-done:
-		t.Fatalf("Run returned before active websocket release completed: %v", err)
-	default:
-	}
-	completeRelease()
-	select {
-	case err := <-done:
-		require.NoError(t, err)
-	case <-time.After(gatewayTestTimeout):
-		t.Fatal("Run did not finish after active websocket release")
+func TestRunDrainsWebSocketsOnSignalAndAdminTrigger(t *testing.T) {
+	for _, trigger := range []string{"signal", "admin"} {
+		t.Run(trigger, func(t *testing.T) {
+			releaseStarted := make(chan struct{})
+			allowRelease := make(chan struct{})
+			var allowReleaseOnce sync.Once
+			completeRelease := func() { allowReleaseOnce.Do(func() { close(allowRelease) }) }
+			t.Cleanup(completeRelease)
+			admission := transportws.AdmissionFunc(func(context.Context, *http.Request) (session.Subject, func(), error) {
+				return session.Subject{TenantID: "tenant", UserID: "user", ExpiresAt: time.Now().Add(time.Minute)}, func() {
+					close(releaseStarted)
+					<-allowRelease
+				}, nil
+			})
+			cfg := validConfig()
+			cfg.Shutdown.GatewayDrainTimeout = 150 * time.Millisecond
+			cfg.Shutdown.CleanupTimeout = time.Second
+			connector := testkit.NewFakeConnector(4)
+			app, err := New(cfg, connector, WithIDGenerator(deterministicIDs{}), WithAdmission(admission))
+			require.NoError(t, err)
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			started := make(chan struct{})
+			app.listener = &signalingListener{Listener: listener, started: started}
+			ctx, cancelRun := context.WithCancel(t.Context())
+			defer cancelRun()
+			done := make(chan error, 1)
+			go func() { done <- app.Run(ctx) }()
+			select {
+			case <-started:
+			case <-time.After(gatewayTestTimeout):
+				t.Fatal("gateway did not begin serving")
+			}
+			dialContext, cancelDial := context.WithTimeout(t.Context(), gatewayTestTimeout)
+			defer cancelDial()
+			url := "ws://" + listener.Addr().String() + "/v1/realtime"
+			client, _, err := websocket.Dial(dialContext, url, nil)
+			require.NoError(t, err)
+			defer client.CloseNow()
+			gatewayClient := &gatewayClient{t: t, conn: client}
+			gatewayClient.expectType("session.created")
+			voice, err := connector.NextSession(dialContext)
+			require.NoError(t, err)
+
+			if trigger == "signal" {
+				cancelRun()
+			} else {
+				app.Drainer().Begin()
+			}
+			select {
+			case <-app.Drainer().Begun():
+			case <-time.After(gatewayTestTimeout):
+				t.Fatal("drain did not begin")
+			}
+			if app.Drainer().Accepting() {
+				t.Fatal("gateway still accepting after drain trigger")
+			}
+			ready := health.NewRegistry()
+			require.NoError(t, ready.RegisterDrainer(app.Drainer()))
+			response := httptest.NewRecorder()
+			ready.ReadyHandler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/health/ready", nil))
+			require.Equal(t, http.StatusServiceUnavailable, response.Code)
+
+			_, rejected, dialErr := websocket.Dial(dialContext, url, nil)
+			require.Error(t, dialErr)
+			if rejected != nil {
+				require.Equal(t, http.StatusServiceUnavailable, rejected.StatusCode)
+				rejected.Body.Close()
+			}
+			pcm := testkit.RampPCM(960)
+			gatewayClient.appendPCM(pcm)
+			command := nextCommand(t, voice)
+			require.Equal(t, realtime.CommandAppendAudio, command.Kind)
+			require.Equal(t, pcm, command.Audio, "existing websocket I/O must survive the grace period")
+
+			clientClosed := make(chan error, 1)
+			go func() {
+				_, _, err := client.Read(t.Context())
+				clientClosed <- err
+			}()
+			select {
+			case err := <-clientClosed:
+				require.Error(t, err)
+			case <-time.After(gatewayTestTimeout):
+				t.Fatal("active websocket was not force-closed at the drain deadline")
+			}
+			select {
+			case <-releaseStarted:
+			case <-time.After(gatewayTestTimeout):
+				t.Fatal("active websocket release did not start")
+			}
+			completeRelease()
+			select {
+			case runErr := <-done:
+				require.ErrorContains(t, runErr, "drain")
+			case <-time.After(gatewayTestTimeout):
+				t.Fatal("Run did not finish after forced websocket release")
+			}
+		})
 	}
 }
 

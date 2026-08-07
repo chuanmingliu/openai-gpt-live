@@ -5,23 +5,34 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/admin"
 	"github.com/chuanmingliu/openai-gpt-live/internal/admission"
 	"github.com/chuanmingliu/openai-gpt-live/internal/auth"
 	"github.com/chuanmingliu/openai-gpt-live/internal/config"
 	"github.com/chuanmingliu/openai-gpt-live/internal/gateway"
+	"github.com/chuanmingliu/openai-gpt-live/internal/health"
+	"github.com/chuanmingliu/openai-gpt-live/internal/lifecycle"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime/s2sws"
+	"github.com/chuanmingliu/openai-gpt-live/internal/session"
 	"github.com/chuanmingliu/openai-gpt-live/internal/telemetry"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const providerConnectTimeout = 10 * time.Second
+
+var commandOutput io.Writer = os.Stdout
 
 func main() {
 	slog.SetDefault(slog.New(telemetry.NewRedactingHandler(slog.Default().Handler(), nil)))
@@ -34,10 +45,17 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, lookup func(string) (string, bool)) (runErr error) {
+	if handled, err := runCommand(ctx, args, lookup); handled {
+		return err
+	}
 	flags := flag.NewFlagSet("live-gateway", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
 	configPath := flags.String("config", "", "path to gateway YAML configuration")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("extra arguments are not accepted")
 	}
 	if *configPath == "" {
 		return errors.New("-config is required")
@@ -48,6 +66,9 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 	}
 	slog.SetDefault(slog.New(telemetry.NewRedactingHandler(slog.Default().Handler(), cfg.Safety.RedactionDeniedKeys)))
 	if err := validateComposition(cfg); err != nil {
+		return err
+	}
+	if err := verifyExpectedHash(cfg, lookup); err != nil {
 		return err
 	}
 	if err := cfg.ResolveSecrets(lookup); err != nil {
@@ -80,15 +101,214 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 	if err != nil {
 		return fmt.Errorf("configure realtime connector: %w", err)
 	}
-	var appOptions []gateway.Option
+	configHash, err := config.Hash(cfg)
+	if err != nil {
+		return err
+	}
+	registry := prometheus.NewRegistry()
+	provider := cfg.Gateway.Voice.Provider
+	if provider == "" {
+		provider = "other"
+	}
+	instance := cfg.Admission.InstanceID
+	if instance == "" {
+		instance = "local"
+	}
+	metrics, err := telemetry.NewMetrics(registry, telemetry.MetricsConfig{Labels: telemetry.MetricLabels{Component: "gateway", Provider: provider, Region: "local", Instance: instance, ConfigHash: configHash}, AllowedComponents: []string{"gateway"}, AllowedProviders: []string{provider}, AllowedRegions: []string{"local"}, AllowedInstances: []string{instance}, AllowedConfigHashes: []string{configHash}, AllowedQueues: []string{"ingress", "egress", "reactor", "voice_control", "client_control", "handoff", "outbox"}, AllowedResults: []string{"ok", "error", "rejected", "dropped", "timeout", "suppressed", "replay"}})
+	if err != nil {
+		return fmt.Errorf("configure gateway metrics: %w", err)
+	}
+	traceRuntime, err := telemetry.NewRuntime(ctx, telemetry.RuntimeConfig{Endpoint: cfg.Telemetry.OTLPEndpoint, Protocol: cfg.Telemetry.Protocol, Timeout: cfg.Telemetry.ExportTimeout, ServiceName: cfg.Telemetry.ServiceName, Component: "gateway", Provider: provider, Region: "local", Instance: instance, ConfigHash: configHash, Production: cfg.Mode == "production"})
+	if err != nil {
+		return fmt.Errorf("configure gateway telemetry: %w", err)
+	}
+	defer func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		runErr = errors.Join(runErr, traceRuntime.Close(closeCtx))
+	}()
+	drainer := lifecycle.NewDrainer()
+	ready := health.NewRegistry()
+	_ = ready.RegisterDrainer(drainer)
+	_ = ready.RegisterRequired("telemetry", health.CheckFunc(func(context.Context) error { return traceRuntime.Ready() }))
 	if admissionController != nil {
+		_ = ready.RegisterRequired("admission", admissionController)
+	}
+	audioObserver := metrics.BindAudioTransit()
+	ingressQueue, egressQueue := metrics.BindQueue("ingress"), metrics.BindQueue("egress")
+	bargeObserver := metrics.BargeinSuppression.WithLabelValues("ok")
+	queueObserver := func(name string) telemetry.QueueObserver {
+		if name == "ingress" {
+			return ingressQueue
+		}
+		if name == "egress" {
+			return egressQueue
+		}
+		return telemetry.QueueObserver{}
+	}
+	var appOptions = []gateway.Option{gateway.WithDrainer(drainer), gateway.WithTracer(traceRuntime.TracerProvider().Tracer("live.gateway")), gateway.WithHandoffMetrics(gateway.HandoffMetricsHooks{Acknowledgement: func(d time.Duration, result string) { metrics.HandoffACK.WithLabelValues(result).Observe(d.Seconds()) }, Presentation: func(d time.Duration, result string) {
+		metrics.PresentationDelay.WithLabelValues(result).Observe(d.Seconds())
+	}, Duplicate: func(result string) { metrics.DuplicateDeliveries.WithLabelValues(result).Inc() }}), gateway.WithSessionMetrics(session.MetricsHooks{SessionStarted: metrics.SessionStarted, SessionEnded: metrics.SessionEnded, AudioTransit: audioObserver.ObserveDuration, QueueOverflow: func(q string) { metrics.ObserveQueueOverflow(q, "dropped") }, StaleOutputRejected: func() { metrics.StaleOutputRejected.WithLabelValues("rejected").Inc() }, ReconnectRestore: func(d time.Duration, result string) {
+		metrics.ObserveSeconds(metrics.ReconnectRestore, result, d.Seconds())
+	}, QueueState: func(name string, depth, bytes int, buffered time.Duration) {
+		queueObserver(name).Set(depth, bytes, buffered)
+	}, QueueBlocked: func(name string, d time.Duration) { queueObserver(name).ObserveBlocked(d) }, QueueOldest: func(name string, d time.Duration) { queueObserver(name).ObserveOldest(d) }, BargeinSuppression: func(d time.Duration) { bargeObserver.Observe(d.Seconds()) }})}
+	if admissionController != nil {
+		admissionController.SetMetricsObserver(metrics.ObserveAdmission)
 		appOptions = append(appOptions, gateway.WithAdmission(admissionController))
 	}
 	app, err := gateway.New(cfg, connector, appOptions...)
 	if err != nil {
 		return fmt.Errorf("configure gateway: %w", err)
 	}
-	return app.Run(ctx)
+	diagnostics, err := startGatewayDiagnostics(ctx, cfg, admissionController, app, drainer, ready, registry)
+	if err != nil {
+		return err
+	}
+	if diagnostics != nil {
+		defer diagnostics.close()
+	}
+	return runGateway(ctx, app, diagnostics)
+}
+
+type gatewayCapacity struct{ app *gateway.App }
+
+func (c gatewayCapacity) Capacity() admin.Capacity {
+	active, limit := c.app.CapacitySnapshot()
+	available := limit - active
+	if available < 0 {
+		available = 0
+	}
+	return admin.Capacity{Active: active, Limit: limit, Available: available}
+}
+
+type diagnosticsServer struct {
+	server   *http.Server
+	listener net.Listener
+	errors   chan error
+}
+
+func startGatewayDiagnostics(ctx context.Context, cfg config.Config, authenticator auth.Authenticator, app *gateway.App, drainer *lifecycle.Drainer, ready *health.Registry, registry *prometheus.Registry) (*diagnosticsServer, error) {
+	if cfg.Admin.ListenAddr == "" {
+		return nil, nil
+	}
+	if authenticator == nil {
+		return nil, errors.New("admin authentication is unavailable")
+	}
+	if err := admin.ValidateListenAddress(ctx, cfg.Admin.ListenAddr, cfg.Mode == "production"); err != nil {
+		return nil, err
+	}
+	adminHandler, err := admin.NewHandler(admin.Config{Authenticator: authenticator, Drainer: drainer, Capacity: gatewayCapacity{app}, Sessions: app})
+	if err != nil {
+		return nil, err
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/health/live", health.LiveHandler())
+	mux.Handle("/health/ready", ready.ReadyHandler())
+	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+	mux.Handle("/admin/", adminHandler)
+	server := admin.Server(cfg.Admin.ListenAddr, mux)
+	listener, err := net.Listen("tcp", cfg.Admin.ListenAddr)
+	if err != nil {
+		return nil, errors.New("listen diagnostics")
+	}
+	d := &diagnosticsServer{server: server, listener: listener, errors: make(chan error, 1)}
+	go func() {
+		err := server.Serve(listener)
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		}
+		d.errors <- err
+	}()
+	return d, nil
+}
+func (d *diagnosticsServer) close() {
+	if d == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = d.server.Shutdown(ctx)
+	_ = d.listener.Close()
+}
+func runGateway(ctx context.Context, app *gateway.App, d *diagnosticsServer) error {
+	if d == nil {
+		return app.Run(ctx)
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	appDone := make(chan error, 1)
+	go func() { appDone <- app.Run(runCtx) }()
+	select {
+	case err := <-appDone:
+		return err
+	case err := <-d.errors:
+		cancel()
+		return errors.Join(err, <-appDone)
+	}
+}
+
+func runCommand(ctx context.Context, args []string, lookup func(string) (string, bool)) (bool, error) {
+	if len(args) == 0 {
+		return false, nil
+	}
+	switch args[0] {
+	case "check-config", "config-hash":
+		flags := flag.NewFlagSet(args[0], flag.ContinueOnError)
+		flags.SetOutput(io.Discard)
+		path := flags.String("config", "", "configuration path")
+		if err := flags.Parse(args[1:]); err != nil {
+			return true, err
+		}
+		if *path == "" || flags.NArg() != 0 {
+			return true, errors.New("--config is required and extra arguments are not accepted")
+		}
+		cfg, err := config.LoadUnresolved(*path)
+		if err != nil {
+			return true, err
+		}
+		if args[0] == "config-hash" {
+			hash, err := config.Hash(cfg)
+			if err != nil {
+				return true, err
+			}
+			_, err = fmt.Fprintln(commandOutput, hash)
+			return true, err
+		}
+		return true, nil
+	case "drain":
+		flags := flag.NewFlagSet("drain", flag.ContinueOnError)
+		flags.SetOutput(io.Discard)
+		raw := flags.String("url", "", "loopback admin URL")
+		if err := flags.Parse(args[1:]); err != nil {
+			return true, err
+		}
+		if *raw == "" || flags.NArg() != 0 {
+			return true, errors.New("--url is required and extra arguments are not accepted")
+		}
+		token := ""
+		if lookup != nil {
+			token, _ = lookup("LIVE_ADMIN_BEARER_TOKEN")
+		}
+		return true, admin.DrainURL(ctx, nil, *raw, token)
+	default:
+		return false, nil
+	}
+}
+
+func verifyExpectedHash(cfg config.Config, lookup func(string) (string, bool)) error {
+	if lookup == nil {
+		return nil
+	}
+	expected, ok := lookup("LIVE_EXPECTED_CONFIG_HASH")
+	if !ok {
+		return nil
+	}
+	actual, err := config.Hash(cfg)
+	if err != nil {
+		return err
+	}
+	return config.ValidateExpected(actual, expected)
 }
 
 func finishAdmission(runErr error, closeAdmission func() error) error {

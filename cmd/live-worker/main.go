@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -21,8 +22,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/admin"
+	"github.com/chuanmingliu/openai-gpt-live/internal/auth"
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
 	"github.com/chuanmingliu/openai-gpt-live/internal/config"
+	"github.com/chuanmingliu/openai-gpt-live/internal/health"
+	"github.com/chuanmingliu/openai-gpt-live/internal/lifecycle"
 	"github.com/chuanmingliu/openai-gpt-live/internal/reasoner/deepseek"
 	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
 	"github.com/chuanmingliu/openai-gpt-live/internal/store/postgres"
@@ -30,6 +35,8 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/worker"
 	"github.com/chuanmingliu/openai-gpt-live/migrations"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type resolvedSecrets struct {
@@ -37,13 +44,14 @@ type resolvedSecrets struct {
 	ProviderAPIKey    string
 	PrivacyHMACKey    []byte
 	ToolEncryptionKey []byte
+	AdminBearer       string
 	raw               []string
 }
 
 func (s *resolvedSecrets) clear() {
 	clear(s.PrivacyHMACKey)
 	clear(s.ToolEncryptionKey)
-	s.DatabaseURL, s.ProviderAPIKey = "", ""
+	s.DatabaseURL, s.ProviderAPIKey, s.AdminBearer = "", "", ""
 	for index := range s.raw {
 		s.raw[index] = ""
 	}
@@ -55,6 +63,8 @@ type serviceRuntime interface {
 }
 
 type runtimeBuilder func(context.Context, config.Config, resolvedSecrets) (serviceRuntime, error)
+
+var commandOutput io.Writer = os.Stdout
 
 func main() {
 	slog.SetDefault(slog.New(telemetry.NewRedactingHandler(slog.Default().Handler(), nil)))
@@ -69,6 +79,9 @@ func main() {
 func runWithBuilder(ctx context.Context, args []string, lookup func(string) (string, bool), builder runtimeBuilder) error {
 	if ctx == nil {
 		return errors.New("worker context is required")
+	}
+	if handled, err := runCommand(ctx, args, lookup); handled {
+		return err
 	}
 	flags := flag.NewFlagSet("live-worker", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
@@ -85,9 +98,12 @@ func runWithBuilder(ctx context.Context, args []string, lookup func(string) (str
 	if lookup == nil {
 		lookup = os.LookupEnv
 	}
-	cfg, err := config.Load(*configPath, lookup)
+	cfg, err := config.LoadUnresolved(*configPath)
 	if err != nil {
 		return fmt.Errorf("load worker configuration: %w", err)
+	}
+	if err := verifyExpectedHash(cfg, lookup); err != nil {
+		return err
 	}
 	slog.SetDefault(slog.New(telemetry.NewRedactingHandler(slog.Default().Handler(), cfg.Safety.RedactionDeniedKeys)))
 	secrets, err := resolveSecrets(cfg, lookup)
@@ -109,6 +125,68 @@ func runWithBuilder(ctx context.Context, args []string, lookup func(string) (str
 		return nil
 	}
 	return redactError(err, redactions)
+}
+
+func runCommand(ctx context.Context, args []string, lookup func(string) (string, bool)) (bool, error) {
+	if len(args) == 0 {
+		return false, nil
+	}
+	switch args[0] {
+	case "check-config", "config-hash":
+		flags := flag.NewFlagSet(args[0], flag.ContinueOnError)
+		flags.SetOutput(io.Discard)
+		path := flags.String("config", "", "configuration path")
+		if err := flags.Parse(args[1:]); err != nil {
+			return true, err
+		}
+		if *path == "" || flags.NArg() != 0 {
+			return true, errors.New("--config is required and extra arguments are not accepted")
+		}
+		cfg, err := config.LoadUnresolved(*path)
+		if err != nil {
+			return true, err
+		}
+		if args[0] == "config-hash" {
+			hash, err := config.Hash(cfg)
+			if err != nil {
+				return true, err
+			}
+			_, err = fmt.Fprintln(commandOutput, hash)
+			return true, err
+		}
+		return true, nil
+	case "drain":
+		flags := flag.NewFlagSet("drain", flag.ContinueOnError)
+		flags.SetOutput(io.Discard)
+		raw := flags.String("url", "", "loopback admin URL")
+		if err := flags.Parse(args[1:]); err != nil {
+			return true, err
+		}
+		if *raw == "" || flags.NArg() != 0 {
+			return true, errors.New("--url is required and extra arguments are not accepted")
+		}
+		token := ""
+		if lookup != nil {
+			token, _ = lookup("LIVE_ADMIN_BEARER_TOKEN")
+		}
+		return true, admin.DrainURL(ctx, nil, *raw, token)
+	default:
+		return false, nil
+	}
+}
+func verifyExpectedHash(cfg config.Config, lookup func(string) (string, bool)) error {
+	if lookup == nil {
+		return nil
+	}
+	expected, ok := lookup("LIVE_EXPECTED_CONFIG_HASH")
+	if !ok {
+		return nil
+	}
+	actual, err := config.Hash(cfg)
+	if err != nil {
+		return err
+	}
+	return config.ValidateExpected(actual, expected)
 }
 
 func resolveSecrets(cfg config.Config, lookup func(string) (string, bool)) (resolvedSecrets, error) {
@@ -157,6 +235,13 @@ func resolveSecrets(cfg config.Config, lookup func(string) (string, bool)) (reso
 		secrets.ToolEncryptionKey = append([]byte(nil), key...)
 		clear(key)
 	}
+	if cfg.Admin.ListenAddr != "" && cfg.Mode == "local" {
+		secrets.AdminBearer, err = require(cfg.Auth.StaticBearerEnv, "admin bearer")
+		if err != nil {
+			secrets.clear()
+			return resolvedSecrets{}, err
+		}
+	}
 	return secrets, nil
 }
 
@@ -189,19 +274,24 @@ func (cryptoJitter) Duration(max time.Duration) time.Duration {
 }
 
 type productionRuntime struct {
-	pool           *pgxpool.Pool
-	runner         *worker.Runner
-	publisher      *postgres.OutboxPublisher
-	repo           *postgres.Repository
-	clock          clock.Clock
-	sweepEvery     time.Duration
-	secretKey      []byte
-	sealer         worker.ToolArgumentSealer
-	drainTimeout   time.Duration
-	components     []func(context.Context) error
-	closeOnce      sync.Once
-	drained        atomic.Bool
-	closeRequested atomic.Bool
+	pool               *pgxpool.Pool
+	runner             *worker.Runner
+	publisher          *postgres.OutboxPublisher
+	repo               *postgres.Repository
+	clock              clock.Clock
+	sweepEvery         time.Duration
+	secretKey          []byte
+	sealer             worker.ToolArgumentSealer
+	drainTimeout       time.Duration
+	components         []func(context.Context) error
+	closeOnce          sync.Once
+	drained            atomic.Bool
+	closeRequested     atomic.Bool
+	drainer            *lifecycle.Drainer
+	cleanupTimeout     time.Duration
+	telemetry          *telemetry.Runtime
+	diagnostics        *http.Server
+	diagnosticListener net.Listener
 }
 
 func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecrets) (serviceRuntime, error) {
@@ -215,8 +305,18 @@ func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecret
 	}
 	closeOnError := true
 	var argumentSealer worker.ToolArgumentSealer
+	var traceRuntime *telemetry.Runtime
+	var diagnosticListener net.Listener
 	defer func() {
 		if closeOnError {
+			if diagnosticListener != nil {
+				_ = diagnosticListener.Close()
+			}
+			if traceRuntime != nil {
+				closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_ = traceRuntime.Close(closeCtx)
+				cancel()
+			}
 			if argumentSealer != nil {
 				_ = argumentSealer.Close()
 			}
@@ -231,6 +331,24 @@ func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecret
 	}
 	realClock := clock.Real{}
 	jitter := cryptoJitter{}
+	configHash, err := config.Hash(cfg)
+	if err != nil {
+		return nil, err
+	}
+	provider := cfg.Worker.Reasoner.Provider
+	if provider == "" {
+		provider = "other"
+	}
+	instance := workerIdentity()
+	metricRegistry := prometheus.NewRegistry()
+	metrics, err := telemetry.NewMetrics(metricRegistry, telemetry.MetricsConfig{Labels: telemetry.MetricLabels{Component: "worker", Provider: provider, Region: "local", Instance: instance, ConfigHash: configHash}, AllowedComponents: []string{"worker"}, AllowedProviders: []string{provider}, AllowedRegions: []string{"local"}, AllowedInstances: []string{instance}, AllowedConfigHashes: []string{configHash}, AllowedQueues: []string{"worker", "outbox"}, AllowedResults: []string{"ok", "error", "scheduled", "expired"}})
+	if err != nil {
+		return nil, err
+	}
+	traceRuntime, err = telemetry.NewRuntime(ctx, telemetry.RuntimeConfig{Endpoint: cfg.Telemetry.OTLPEndpoint, Protocol: cfg.Telemetry.Protocol, Timeout: cfg.Telemetry.ExportTimeout, ServiceName: cfg.Telemetry.ServiceName, Component: "worker", Provider: provider, Region: "local", Instance: instance, ConfigHash: configHash, Production: cfg.Mode == "production"})
+	if err != nil {
+		return nil, err
+	}
 	registry, err := worker.NewToolRegistry(map[string][]worker.RegisteredTool{})
 	if err != nil {
 		return nil, err
@@ -249,11 +367,15 @@ func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecret
 		clear(privacyKey)
 		return nil, fmt.Errorf("configure static safety policy: %w", err)
 	}
-	runnerConfig := worker.Runner{Store: repo, Reasoner: client, Safety: staticPolicy, Tools: registry, Clock: realClock, Jitter: jitter,
+	drainer := lifecycle.NewDrainer()
+	runnerConfig := worker.Runner{Store: repo, Reasoner: client, Safety: staticPolicy, Tools: registry, Clock: realClock, Jitter: jitter, Drainer: drainer, Tracer: traceRuntime.TracerProvider().Tracer("live.worker"),
 		Retry: worker.RetryPolicy{Base: cfg.Worker.RetryBase, Maximum: cfg.Worker.RetryMax, MaxRetries: uint32(cfg.Worker.MaxRetries)}, WorkerID: workerIdentity(), LeaseDuration: cfg.Worker.LeaseDuration, Concurrency: cfg.Worker.Concurrency,
 		PollInterval: cfg.Worker.PollInterval, MaxOutputBytes: cfg.Worker.MaxOutputBytes, MaxOutputTokens: cfg.Worker.MaxOutputTokens, MaxToolRounds: cfg.Worker.MaxToolRounds, MaxToolCalls: 64,
 		MaxToolArgumentBytes: minInt(cfg.Worker.MaxOutputBytes, 256<<10), MaxToolOutputBytes: minInt(cfg.Worker.MaxOutputBytes, 256<<10),
 		ProviderSafetyID: func(tenant, user string) (string, error) { return safety.ProviderSafetyID(privacyKey, tenant, user) },
+		Metrics: worker.MetricsHooks{Queue: func(d time.Duration) { metrics.WorkerQueue.WithLabelValues("ok").Observe(d.Seconds()) }, FirstToken: func(d time.Duration) { metrics.ReasonerFirstToken.WithLabelValues("ok").Observe(d.Seconds()) }, Duration: func(d time.Duration, result string) {
+			metrics.WorkerDuration.WithLabelValues(result).Observe(d.Seconds())
+		}, Retry: func(result string) { metrics.WorkerRetries.WithLabelValues(result).Inc() }},
 	}
 	if len(secrets.ToolEncryptionKey) == 32 {
 		argumentSealer, err = worker.NewAESArgumentSealer(cfg.Features.ToolEncryptionKeyID, secrets.ToolEncryptionKey, rand.Reader)
@@ -273,38 +395,108 @@ func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecret
 		clear(privacyKey)
 		return nil, err
 	}
+	outboxLag := metrics.OutboxLag.WithLabelValues("outbox")
+	publisher.SetLagObserver(func(d time.Duration) { outboxLag.Observe(d.Seconds()) })
+	publisher.SetTracer(traceRuntime.TracerProvider().Tracer("live.store"))
+	repo.SetExpiredLeaseObserver(func(count int) { metrics.ExpiredLeases.WithLabelValues("worker").Add(float64(count)) })
 	sweepEvery := cfg.Store.Retention.SweepInterval
 	if sweepEvery <= 0 {
 		sweepEvery = time.Minute
 	}
+	ready := health.NewRegistry()
+	_ = ready.RegisterDrainer(drainer)
+	_ = ready.RegisterRequired("database", health.CheckFunc(func(checkCtx context.Context) error { return pool.Ping(checkCtx) }))
+	_ = ready.RegisterRequired("telemetry", health.CheckFunc(func(context.Context) error { return traceRuntime.Ready() }))
+	var diagnostics *http.Server
+	if cfg.Admin.ListenAddr != "" {
+		if err := admin.ValidateListenAddress(ctx, cfg.Admin.ListenAddr, cfg.Mode == "production"); err != nil {
+			return nil, err
+		}
+		authenticator, err := workerAdminAuthenticator(ctx, cfg, secrets)
+		if err != nil {
+			return nil, err
+		}
+		adminHandler, err := admin.NewHandler(admin.Config{Authenticator: authenticator, Drainer: drainer, Capacity: workerCapacity{drainer: drainer, limit: int64(cfg.Worker.Concurrency)}})
+		if err != nil {
+			return nil, err
+		}
+		mux := http.NewServeMux()
+		mux.Handle("/health/live", health.LiveHandler())
+		mux.Handle("/health/ready", ready.ReadyHandler())
+		mux.Handle("/metrics", promhttp.HandlerFor(metricRegistry, promhttp.HandlerOpts{}))
+		mux.Handle("/admin/", adminHandler)
+		diagnostics = admin.Server(cfg.Admin.ListenAddr, mux)
+		diagnosticListener, err = net.Listen("tcp", cfg.Admin.ListenAddr)
+		if err != nil {
+			return nil, errors.New("listen worker diagnostics")
+		}
+	}
 	closeOnError = false
-	return &productionRuntime{pool: pool, runner: runner, publisher: publisher, repo: repo, clock: realClock, sweepEvery: sweepEvery, secretKey: privacyKey, sealer: argumentSealer, drainTimeout: cfg.Shutdown.DrainTimeout}, nil
+	runtime := &productionRuntime{pool: pool, runner: runner, publisher: publisher, repo: repo, clock: realClock, sweepEvery: sweepEvery, secretKey: privacyKey, sealer: argumentSealer, drainer: drainer, drainTimeout: cfg.Shutdown.WorkerDrainTimeout, cleanupTimeout: cfg.Shutdown.CleanupTimeout, telemetry: traceRuntime, diagnostics: diagnostics, diagnosticListener: diagnosticListener}
+	return runtime, nil
+}
+
+type workerCapacity struct {
+	drainer *lifecycle.Drainer
+	limit   int64
+}
+
+func (c workerCapacity) Capacity() admin.Capacity {
+	active := c.drainer.Active()
+	available := c.limit - active
+	if available < 0 {
+		available = 0
+	}
+	return admin.Capacity{Active: active, Limit: c.limit, Available: available}
+}
+func workerAdminAuthenticator(ctx context.Context, cfg config.Config, secrets resolvedSecrets) (auth.Authenticator, error) {
+	if cfg.Mode == "local" {
+		scopes := make(map[string]struct{}, len(cfg.Auth.StaticScopes))
+		for _, scope := range cfg.Auth.StaticScopes {
+			scopes[scope] = struct{}{}
+		}
+		return auth.NewStatic([]byte(secrets.AdminBearer), auth.Principal{TenantID: cfg.Auth.StaticTenantID, UserID: cfg.Auth.StaticUserID, Scopes: scopes}), nil
+	}
+	return auth.NewOIDC(ctx, auth.OIDCConfig{Issuer: cfg.Auth.OIDCIssuer, Audience: cfg.Auth.OIDCAudience, TenantClaim: cfg.Auth.OIDCTenantClaim, UserClaim: cfg.Auth.OIDCUserClaim, ScopeClaim: cfg.Auth.OIDCScopeClaim, RequiredScopes: []string{admin.AdminScope}, MaxKeySetStaleness: cfg.Auth.OIDCCacheOutage, HTTPTimeout: cfg.Auth.OIDCHTTPTimeout})
 }
 
 func (r *productionRuntime) Run(ctx context.Context) error {
-	runCtx, cancel := context.WithCancel(ctx)
+	if r.drainer == nil {
+		r.drainer = lifecycle.NewDrainer()
+	}
+	return r.runProduction(ctx)
+}
+
+func (r *productionRuntime) runProduction(ctx context.Context) error {
+	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancel()
+	diagnosticErrors := make(chan error, 1)
+	if r.diagnostics != nil {
+		go func() {
+			err := r.diagnostics.Serve(r.diagnosticListener)
+			if errors.Is(err, http.ErrServerClosed) {
+				err = nil
+			}
+			diagnosticErrors <- err
+		}()
+	}
 	components := r.components
 	if len(components) == 0 {
 		components = []func(context.Context) error{r.runner.Run, r.publisher.Run, r.sweep}
 	}
 	errorsOut := make(chan error, len(components))
 	var group sync.WaitGroup
-	run := func(component func(context.Context) error) {
+	for _, component := range components {
 		group.Add(1)
-		go func() {
+		go func(run func(context.Context) error) {
 			defer group.Done()
-			if err := component(runCtx); err != nil && !errors.Is(err, context.Canceled) {
+			if err := run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
 				select {
 				case errorsOut <- err:
-					cancel()
 				default:
 				}
 			}
-		}()
-	}
-	for _, component := range components {
-		run(component)
+		}(component)
 	}
 	groupDone := make(chan struct{})
 	go func() {
@@ -315,30 +507,55 @@ func (r *productionRuntime) Run(ctx context.Context) error {
 		}
 		close(groupDone)
 	}()
-	var firstErr error
+	var terminalErr error
 	select {
+	case terminalErr = <-errorsOut:
+	case terminalErr = <-diagnosticErrors:
+		if terminalErr == nil {
+			terminalErr = errors.New("worker diagnostics stopped unexpectedly")
+		}
+	case <-groupDone:
+		terminalErr = errors.New("worker components stopped unexpectedly")
 	case <-ctx.Done():
-		cancel()
-	case firstErr = <-errorsOut:
-		cancel()
-	case <-groupDone:
+	case <-r.drainer.Begun():
 	}
-	drainTimeout := r.drainTimeout
-	if drainTimeout <= 0 {
-		drainTimeout = 10 * time.Second
+	// Every exit source takes this same path: unready first, then bounded grace,
+	// forced cancellation, bounded cleanup, and ordered resource shutdown.
+	r.drainer.Begin()
+	r.shutdownDiagnostics()
+	timeout := r.drainTimeout
+	if timeout <= 0 {
+		timeout = 120 * time.Second
 	}
-	drain := r.clock.NewTicker(drainTimeout)
-	defer drain.Stop()
+	timer := r.clock.NewTicker(timeout)
+	timedOut := false
+	select {
+	case <-r.drainer.Done():
+	case <-timer.C():
+		timedOut = true
+	}
+	timer.Stop()
+	cancel()
+	cleanup := r.cleanupTimeout
+	if cleanup <= 0 {
+		cleanup = minDuration(5*time.Second, timeout)
+	}
+	cleanupTimer := r.clock.NewTicker(cleanup)
+	defer cleanupTimer.Stop()
 	select {
 	case <-groupDone:
-	case <-drain.C():
-		return errors.New("worker drain timeout")
+	case <-cleanupTimer.C():
+		timedOut = true
+	}
+	if timedOut {
+		r.closeResources()
+		return errors.Join(terminalErr, errors.New("worker drain timeout"))
 	}
 	select {
 	case err := <-errorsOut:
-		return err
+		return errors.Join(terminalErr, err)
 	default:
-		return firstErr
+		return terminalErr
 	}
 }
 
@@ -366,6 +583,12 @@ func (r *productionRuntime) Close() {
 
 func (r *productionRuntime) closeResources() {
 	r.closeOnce.Do(func() {
+		r.shutdownDiagnostics()
+		if r.telemetry != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = r.telemetry.Close(ctx)
+			cancel()
+		}
 		clear(r.secretKey)
 		r.secretKey = nil
 		if r.sealer != nil {
@@ -375,6 +598,20 @@ func (r *productionRuntime) closeResources() {
 			r.pool.Close()
 		}
 	})
+}
+
+func (r *productionRuntime) shutdownDiagnostics() {
+	if r == nil {
+		return
+	}
+	if r.diagnostics != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = r.diagnostics.Shutdown(ctx)
+		cancel()
+	}
+	if r.diagnosticListener != nil {
+		_ = r.diagnosticListener.Close()
+	}
 }
 
 func workerIdentity() string {
@@ -397,6 +634,12 @@ func minInt(a, b int) int {
 }
 func maxDuration(a, b time.Duration) time.Duration {
 	if a > b {
+		return a
+	}
+	return b
+}
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
 		return a
 	}
 	return b

@@ -390,6 +390,8 @@ func TestCancellationAndCompletionSerializeAtEventLock(t *testing.T) {
 // lease that was extended while waiting for the row lock.
 func TestLeaseHeartbeatThenSweepAndExpiredRecovery(t *testing.T) {
 	repo, pool, manual := repositoryHarness(t)
+	observed := 0
+	repo.SetExpiredLeaseObserver(func(count int) { observed += count })
 	record, lease, now := runningLease(t, repo, "sweep-race")
 	manual.Advance(now.Sub(repositoryTestNow))
 	_, err := repo.Heartbeat(t.Context(), lease.Token, now.Add(10*time.Minute))
@@ -402,12 +404,27 @@ func TestLeaseHeartbeatThenSweepAndExpiredRecovery(t *testing.T) {
 	count, err = repo.SweepExpired(t.Context(), now, 10)
 	require.NoError(t, err)
 	assert.Equal(t, 1, count)
+	assert.Equal(t, 1, observed)
 	_, err = repo.Heartbeat(t.Context(), lease.Token, now.Add(time.Minute))
 	assert.ErrorIs(t, err, worker.ErrLeaseLost)
 	recovered, ok, err := repo.LeaseNext(t.Context(), worker.LeaseRequest{WorkerID: "recovery", LeaseDuration: time.Minute, Now: now})
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, lease.Token.Version+1, recovered.Token.Version)
+}
+
+func TestExpiredLeaseObserverExcludesDeadlineAndCancellationTransitions(t *testing.T) {
+	repo, _, _ := repositoryHarness(t)
+	observed := 0
+	repo.SetExpiredLeaseObserver(func(count int) { observed += count })
+	deadline := createRunnableHandoff(t, repo, "observer-deadline")
+	cancelled := createRunnableHandoff(t, repo, "observer-cancel")
+	_, err := repo.RequestHandoffCancel(t.Context(), cancelled.Request.Scope, cancelled.HandoffID, handoff.CancelRequest{Actor: "user", Reason: "stop", IdempotencyKey: "observer-cancel"})
+	require.NoError(t, err)
+	count, err := repo.SweepExpired(t.Context(), deadline.Request.Deadline.Add(time.Second), 10)
+	require.NoError(t, err)
+	assert.Equal(t, 2, count)
+	assert.Zero(t, observed)
 }
 
 func TestSweepHoldingRowLockFencesConcurrentHeartbeat(t *testing.T) {

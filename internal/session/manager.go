@@ -104,8 +104,17 @@ type DurableEffectDispatcher interface {
 }
 
 type MetricsHooks struct {
-	QueueOverflow func(string)
-	AudioDropped  func(int)
+	QueueOverflow       func(string)
+	AudioDropped        func(int)
+	SessionStarted      func()
+	SessionEnded        func()
+	AudioTransit        func(time.Duration)
+	ReconnectRestore    func(time.Duration, string)
+	StaleOutputRejected func()
+	QueueState          func(string, int, int, time.Duration)
+	QueueBlocked        func(string, time.Duration)
+	QueueOldest         func(string, time.Duration)
+	BargeinSuppression  func(time.Duration)
 }
 
 func normalizeMetricsHooks(hooks MetricsHooks) MetricsHooks {
@@ -114,6 +123,33 @@ func normalizeMetricsHooks(hooks MetricsHooks) MetricsHooks {
 	}
 	if hooks.AudioDropped == nil {
 		hooks.AudioDropped = func(int) {}
+	}
+	if hooks.SessionStarted == nil {
+		hooks.SessionStarted = func() {}
+	}
+	if hooks.SessionEnded == nil {
+		hooks.SessionEnded = func() {}
+	}
+	if hooks.AudioTransit == nil {
+		hooks.AudioTransit = func(time.Duration) {}
+	}
+	if hooks.ReconnectRestore == nil {
+		hooks.ReconnectRestore = func(time.Duration, string) {}
+	}
+	if hooks.StaleOutputRejected == nil {
+		hooks.StaleOutputRejected = func() {}
+	}
+	if hooks.QueueState == nil {
+		hooks.QueueState = func(string, int, int, time.Duration) {}
+	}
+	if hooks.QueueBlocked == nil {
+		hooks.QueueBlocked = func(string, time.Duration) {}
+	}
+	if hooks.QueueOldest == nil {
+		hooks.QueueOldest = func(string, time.Duration) {}
+	}
+	if hooks.BargeinSuppression == nil {
+		hooks.BargeinSuppression = func(time.Duration) {}
 	}
 	return hooks
 }
@@ -302,8 +338,9 @@ type reactorMessage struct {
 }
 
 type ingressFrame struct {
-	sequence uint64
-	audio    []byte
+	sequence   uint64
+	audio      []byte
+	enqueuedAt time.Time
 }
 
 type outputPCMFramer struct {
@@ -368,6 +405,7 @@ type egressFrame struct {
 	responseID  string
 	itemID      string
 	audio       []byte
+	enqueuedAt  time.Time
 }
 
 type voiceControl struct {
@@ -547,6 +585,17 @@ func (m *Manager) metricsSnapshot() MetricsHooks {
 	m.metricsMu.RLock()
 	defer m.metricsMu.RUnlock()
 	return m.metrics
+}
+
+// ActiveSessions returns only currently published runtimes; it never exposes
+// session identities.
+func (m *Manager) ActiveSessions() int64 {
+	if m == nil {
+		return 0
+	}
+	m.activeMu.RLock()
+	defer m.activeMu.RUnlock()
+	return int64(len(m.active))
 }
 
 func normalizeManagerConfig(cfg Config) (Config, error) {
@@ -770,7 +819,9 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	if err := m.register(runtime); err != nil {
 		return abortBeforePublication(err)
 	}
-	defer m.unregister(runtime.key, runtime)
+	hooks := m.metricsSnapshot()
+	hooks.SessionStarted()
+	defer func() { m.unregister(runtime.key, runtime); hooks.SessionEnded() }()
 
 	waitErr := group.Wait()
 	cancel()
@@ -815,6 +866,7 @@ func (m *Manager) failInitialEstablishment(sessionID identity.SessionID, logical
 // compare-and-swap. Scope is expected to come from the authenticated transport
 // and is checked against the immutable scope retained by the manager.
 func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, client ClientConn) error {
+	started := m.cfg.Clock.Now()
 	if m == nil || m.validationErr != nil {
 		if m != nil && m.validationErr != nil {
 			return m.validationErr
@@ -832,6 +884,7 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 	checkErr := m.checkReconnectLocked(request, logical)
 	m.activeMu.RUnlock()
 	if checkErr != nil {
+		m.metricsSnapshot().ReconnectRestore(m.cfg.Clock.Now().Sub(started), "rejected")
 		return checkErr
 	}
 	if isNilInterface(m.cfg.RecoveryStore) {
@@ -962,6 +1015,11 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 	m.activeMu.RLock()
 	published = logical.highWater == newIncarnation
 	m.activeMu.RUnlock()
+	result := "ok"
+	if err != nil {
+		result = "error"
+	}
+	m.metricsSnapshot().ReconnectRestore(m.cfg.Clock.Now().Sub(started), result)
 	return err
 }
 
@@ -1085,7 +1143,9 @@ func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.Canc
 	if err := m.registerReplacement(runtime, logical, expected); err != nil {
 		return abort(err)
 	}
-	defer m.unregister(runtime.key, runtime)
+	hooks := m.metricsSnapshot()
+	hooks.SessionStarted()
+	defer func() { m.unregister(runtime.key, runtime); hooks.SessionEnded() }()
 
 	waitErr := group.Wait()
 	cancel()
@@ -1559,6 +1619,7 @@ func (r *sessionRuntime) acceptClientEvent(ctx context.Context, accept func() er
 }
 
 func (s *runState) enqueueIngress(ctx context.Context, frame ingressFrame) error {
+	started := s.cfg.Clock.Now()
 	timer := time.NewTimer(s.cfg.IngressBlockTimeout)
 	defer timer.Stop()
 	select {
@@ -1566,10 +1627,14 @@ func (s *runState) enqueueIngress(ctx context.Context, frame ingressFrame) error
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-timer.C:
+		s.metrics.QueueBlocked("ingress", nonnegativeDuration(s.cfg.Clock.Now().Sub(started)))
 		s.metrics.queueOverflow("ingress")
 		return ErrIngressBackpressure
 	}
+	s.metrics.QueueBlocked("ingress", nonnegativeDuration(s.cfg.Clock.Now().Sub(started)))
+	frame.enqueuedAt = s.cfg.Clock.Now()
 	s.ingress <- frame
+	s.metrics.QueueState("ingress", len(s.ingress), len(s.ingress)*pcmFrameBytes, time.Duration(len(s.ingress))*20*time.Millisecond)
 	return nil
 }
 
@@ -1651,6 +1716,7 @@ func (s *runState) voiceWriter(ctx context.Context) error {
 		case control := <-s.voiceCtl:
 			pending = append(pending, control)
 		case frame := <-s.ingress:
+			s.metrics.QueueOldest("ingress", nonnegativeDuration(s.cfg.Clock.Now().Sub(frame.enqueuedAt)))
 			command := realtime.Command{Kind: realtime.CommandAppendAudio, Sequence: frame.sequence, Audio: append([]byte(nil), frame.audio...)}
 			err := s.voice.Send(ctx, command)
 			s.releaseIngressSlot()
@@ -1749,9 +1815,11 @@ func (s *runState) enqueueEgress(ctx context.Context, event realtime.Event, audi
 	if !s.fence.Accept(event.Epoch) {
 		s.progress.mark(sequence)
 		s.metrics.audioDropped(len(audio))
+		s.metrics.BargeinSuppression(20 * time.Millisecond)
 		return false, nil
 	}
 	timer := time.NewTimer(s.cfg.EgressBlockTimeout)
+	started := s.cfg.Clock.Now()
 	defer timer.Stop()
 	select {
 	case <-s.egressSlots:
@@ -1759,14 +1827,17 @@ func (s *runState) enqueueEgress(ctx context.Context, event realtime.Event, audi
 		s.progress.mark(sequence)
 		return false, ctx.Err()
 	case <-timer.C:
+		s.metrics.QueueBlocked("egress", nonnegativeDuration(s.cfg.Clock.Now().Sub(started)))
 		s.progress.mark(sequence)
 		s.metrics.queueOverflow("egress")
 		return false, ErrEgressBackpressure
 	}
+	s.metrics.QueueBlocked("egress", nonnegativeDuration(s.cfg.Clock.Now().Sub(started)))
 	if !s.fence.Accept(event.Epoch) {
 		s.egressSlots <- struct{}{}
 		s.progress.mark(sequence)
 		s.metrics.audioDropped(len(audio))
+		s.metrics.BargeinSuppression(20 * time.Millisecond)
 		return false, nil
 	}
 	s.outputMu.Lock()
@@ -1774,9 +1845,10 @@ func (s *runState) enqueueEgress(ctx context.Context, event realtime.Event, audi
 	frame := egressFrame{
 		order: s.outputOrder, sequence: sequence, incarnation: s.ids.Incarnation, epoch: event.Epoch,
 		eventID:    fmt.Sprintf("session-%s-audio-%06d", s.ids.SessionID, sequence),
-		responseID: event.ResponseID, itemID: event.ItemID, audio: append([]byte(nil), audio...),
+		responseID: event.ResponseID, itemID: event.ItemID, audio: append([]byte(nil), audio...), enqueuedAt: s.cfg.Clock.Now(),
 	}
 	s.egress <- frame
+	s.metrics.QueueState("egress", len(s.egress), len(s.egress)*pcmFrameBytes, time.Duration(len(s.egress))*20*time.Millisecond)
 	s.outputMu.Unlock()
 	return true, nil
 }
@@ -2035,9 +2107,11 @@ func (s *runState) clientWriter(ctx context.Context) error {
 		}
 		if pendingFrame != nil && pendingFrame.order == nextOrder {
 			frame := *pendingFrame
+			s.metrics.QueueOldest("egress", nonnegativeDuration(s.cfg.Clock.Now().Sub(frame.enqueuedAt)))
 			pendingFrame = nil
 			nextOrder++
 			if frame.incarnation != s.ids.Incarnation || !s.fence.Accept(frame.epoch) {
+				s.metrics.StaleOutputRejected()
 				s.progress.mark(frame.sequence)
 				s.metrics.audioDropped(len(frame.audio))
 				s.releaseEgressSlot()
@@ -2045,6 +2119,7 @@ func (s *runState) clientWriter(ctx context.Context) error {
 			}
 			writeCtx, finish := s.activeWrite.begin(ctx)
 			if frame.incarnation != s.ids.Incarnation || !s.fence.Accept(frame.epoch) {
+				s.metrics.StaleOutputRejected()
 				finish()
 				s.progress.mark(frame.sequence)
 				s.metrics.audioDropped(len(frame.audio))
@@ -2066,6 +2141,7 @@ func (s *runState) clientWriter(ctx context.Context) error {
 				}
 				return err
 			}
+			s.metrics.AudioTransit(s.cfg.Clock.Now().Sub(frame.enqueuedAt))
 			continue
 		}
 
@@ -2098,6 +2174,7 @@ func (s *runState) releaseVoiceSlot() {
 func (s *runState) releaseIngressSlot() {
 	if s.ingressSlots != nil {
 		s.ingressSlots <- struct{}{}
+		s.metrics.QueueState("ingress", len(s.ingress), len(s.ingress)*pcmFrameBytes, time.Duration(len(s.ingress))*20*time.Millisecond)
 	}
 }
 
@@ -2110,7 +2187,15 @@ func (s *runState) releaseClientSlot() {
 func (s *runState) releaseEgressSlot() {
 	if s.egressSlots != nil {
 		s.egressSlots <- struct{}{}
+		s.metrics.QueueState("egress", len(s.egress), len(s.egress)*pcmFrameBytes, time.Duration(len(s.egress))*20*time.Millisecond)
 	}
+}
+
+func nonnegativeDuration(d time.Duration) time.Duration {
+	if d < 0 {
+		return 0
+	}
+	return d
 }
 
 func (s *runState) closeClient(code int, reason string) {

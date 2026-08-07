@@ -18,6 +18,8 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/session"
 	"github.com/chuanmingliu/openai-gpt-live/internal/store/postgres"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type HandoffWork struct {
@@ -33,6 +35,7 @@ type HandoffWork struct {
 	Transcript   string
 	Snapshot     SessionHandoffSnapshot
 	RejectReason string
+	queuedAt     time.Time
 }
 
 type SessionHandoffSnapshot struct {
@@ -63,6 +66,9 @@ type HandoffCoordinator struct {
 	unavailable     atomic.Bool
 	health          *durabilityHealth
 	outageStarted   time.Time
+	tracer          trace.Tracer
+	metricsClock    clock.Clock
+	ackMetric       func(time.Duration, string)
 }
 
 func (c *HandoffCoordinator) configureOutage(grace time.Duration, source clock.Clock) error {
@@ -180,6 +186,9 @@ func (c *HandoffCoordinator) Enqueue(work HandoffWork) error {
 	c.retainedBytes += retained
 	c.mu.Unlock()
 	owned := cloneHandoffWork(work)
+	if !isNil(c.metricsClock) {
+		owned.queuedAt = c.metricsClock.Now()
+	}
 	c.work <- owned
 	return nil
 }
@@ -217,30 +226,50 @@ func (c *HandoffCoordinator) Run(ctx context.Context) error {
 				return err
 			}
 		case work := <-c.work:
-			err := c.retryDurability(ctx, func() error {
+			workCtx := ctx
+			var span trace.Span
+			if c.tracer != nil {
+				workCtx, span = c.tracer.Start(ctx, "gateway.handoff.ack")
+			}
+			err := c.retryDurability(workCtx, func() error {
 				if c.journal != nil && work.RejectReason == "" {
 					canonical, canonicalErr := canonicalizeHandoffWork(work)
 					if canonicalErr == nil {
-						err := c.admitJournal(ctx, canonical)
+						err := c.admitJournal(workCtx, canonical)
 						if err == nil {
-							err = c.drainJournal(ctx)
+							err = c.drainJournal(workCtx)
 						}
 						return err
 					} else {
-						completion, retryErr := c.process(ctx, work)
+						completion, retryErr := c.process(workCtx, work)
 						if retryErr != nil {
 							return retryErr
 						}
-						return c.submitCompletion(ctx, work, completion)
+						return c.submitCompletion(workCtx, work, completion)
 					}
 				} else {
-					completion, retryErr := c.process(ctx, work)
+					completion, retryErr := c.process(workCtx, work)
 					if retryErr != nil {
 						return retryErr
 					}
-					return c.submitCompletion(ctx, work, completion)
+					return c.submitCompletion(workCtx, work, completion)
 				}
 			})
+			result := "ok"
+			if err != nil {
+				result = "error"
+			}
+			if c.ackMetric != nil && !work.queuedAt.IsZero() {
+				elapsed := c.metricsClock.Now().Sub(work.queuedAt)
+				if elapsed < 0 {
+					elapsed = 0
+				}
+				c.ackMetric(elapsed, result)
+			}
+			if span != nil {
+				span.SetAttributes(attribute.String("result", result))
+				span.End()
+			}
 			c.releaseWork(work)
 			if err != nil {
 				if ctx.Err() != nil {

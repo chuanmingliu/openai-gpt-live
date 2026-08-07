@@ -22,6 +22,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
 type streamerFunc func(context.Context, reasoner.Request, func(reasoner.Chunk) error) (reasoner.Result, error)
@@ -35,6 +36,25 @@ type safetyPolicyFunc func(context.Context, safety.WorkerResultCandidate) (safet
 func (f safetyPolicyFunc) EvaluateWorkerResult(ctx context.Context, candidate safety.WorkerResultCandidate) (safety.Decision, error) {
 	return f(ctx, candidate)
 }
+
+type workerSpanCapture struct {
+	mu    sync.Mutex
+	names []string
+	attrs []string
+}
+
+func (c *workerSpanCapture) ExportSpans(_ context.Context, spans []sdktrace.ReadOnlySpan) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, span := range spans {
+		c.names = append(c.names, span.Name())
+		for _, attr := range span.Attributes() {
+			c.attrs = append(c.attrs, string(attr.Key)+"="+attr.Value.Emit())
+		}
+	}
+	return nil
+}
+func (*workerSpanCapture) Shutdown(context.Context) error { return nil }
 
 type memoryStore struct {
 	mu                 sync.Mutex
@@ -272,6 +292,30 @@ func TestRunnerNormalCompletionPersistsSanitizedResultAndSafetyDecision(t *testi
 	assert.Equal(t, "done", store.completed[0].Summary)
 	assert.JSONEq(t, `{"action":"allow","reason_code":"allowed"}`, string(store.completed[0].SafetyDecision))
 	assert.Empty(t, store.failed)
+}
+
+func TestRunnerExecutionSpanReachesExporterWithoutRawIdentityAttributes(t *testing.T) {
+	store := &memoryStore{}
+	registry, err := NewToolRegistry(map[string][]RegisteredTool{"tools-v1": {}})
+	require.NoError(t, err)
+	stream := streamerFunc(func(_ context.Context, _ reasoner.Request, onChunk func(reasoner.Chunk) error) (reasoner.Result, error) {
+		require.NoError(t, onChunk(reasoner.Chunk{Text: "done"}))
+		return reasoner.Result{Text: "done", FinishReason: "stop"}, nil
+	})
+	capture := &workerSpanCapture{}
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(capture))
+	t.Cleanup(func() { _ = provider.Shutdown(t.Context()) })
+	runner := testRunner(store, stream, allowPolicy(), clock.Real{}, fixedJitter(0), registry)
+	runner.Tracer = provider.Tracer("test")
+	lease := workerLease()
+	lease.Token.TenantID = "raw-private-tenant"
+	lease.Job.Request.Scope.TenantID = lease.Token.TenantID
+	require.NoError(t, runner.executeLease(t.Context(), lease))
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+	assert.Contains(t, capture.names, "worker.execute")
+	assert.Equal(t, []string{"result=ok"}, capture.attrs)
+	assert.NotContains(t, strings.Join(capture.attrs, " "), lease.Token.TenantID)
 }
 
 func TestRunnerDeliversDurableInputInFirstReasonerRequest(t *testing.T) {

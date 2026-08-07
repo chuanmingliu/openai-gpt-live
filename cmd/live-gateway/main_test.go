@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,4 +68,40 @@ func TestFinishAdmissionReportsStoreCloseFailure(t *testing.T) {
 	assert.ErrorIs(t, err, closeFailure)
 	assert.ErrorContains(t, err, "close admission storage")
 	assert.NoError(t, finishAdmission(nil, func() error { return nil }))
+}
+
+func TestGatewayConfigCommandsDoNotLookupSecrets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gateway.yaml")
+	require.NoError(t, os.WriteFile(path, []byte("mode: local\ngateway:\n  voice:\n    api_key_env: PROVIDER_SECRET\n"), 0600))
+	old := commandOutput
+	defer func() { commandOutput = old }()
+	var output bytes.Buffer
+	commandOutput = &output
+	lookup := func(string) (string, bool) { t.Fatal("secret lookup"); return "", false }
+	require.NoError(t, run(t.Context(), []string{"check-config", "--config", path}, lookup))
+	require.NoError(t, run(t.Context(), []string{"config-hash", "--config", path}, lookup))
+	assert.Regexp(t, `^v1:[0-9a-f]{64}\n$`, output.String())
+}
+
+func TestGatewayNormalStartupRejectsTrailingArgumentBeforeDownstreamConstruction(t *testing.T) {
+	path := filepath.Join("..", "..", "configs", "gateway.example.yaml")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	}
+	lookup := func(string) (string, bool) {
+		t.Fatal("environment lookup occurred after a positional argument")
+		return "", false
+	}
+	err := run(t.Context(), []string{"-config", path, "unexpected"}, lookup)
+	require.EqualError(t, err, "extra arguments are not accepted")
+}
+
+func TestGatewayExpectedHashMismatchIsContentFree(t *testing.T) {
+	cfg, err := config.LoadUnresolved(filepath.Join("..", "..", "configs", "gateway.example.yaml"))
+	require.NoError(t, err)
+	err = verifyExpectedHash(cfg, func(name string) (string, bool) {
+		assert.Equal(t, "LIVE_EXPECTED_CONFIG_HASH", name)
+		return "v1:" + strings.Repeat("0", 64), true
+	})
+	require.EqualError(t, err, "config hash mismatch")
 }
