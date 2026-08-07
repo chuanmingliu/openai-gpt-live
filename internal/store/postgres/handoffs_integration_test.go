@@ -15,6 +15,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
+	"github.com/chuanmingliu/openai-gpt-live/internal/worker"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -468,6 +469,46 @@ func TestSteerInputAndCancelMutationsAreDurableAndIdempotent(t *testing.T) {
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM outbox WHERE aggregate_id=$1`, record.HandoffID).Scan(&wakeupCount))
 	assert.Equal(t, int64(4), eventCount)
 	assert.Equal(t, int64(5), wakeupCount) // two create rows plus one per mutation
+}
+
+func TestSteerAndCancelOrderingPreservesLatestRevisionAndCommittedReplay(t *testing.T) {
+	t.Run("steer first then cancel terminalizes latest revision", func(t *testing.T) {
+		repo, _, _ := repositoryHarness(t)
+		record, lease, now := runningLease(t, repo, "steer-before-cancel")
+		steer := handoff.SteerRequest{Objective: "latest", ExpectedRevision: 1, Actor: "user", IdempotencyKey: "steer-before-cancel"}
+		_, err := repo.SteerHandoff(t.Context(), record.Request.Scope, record.HandoffID, steer)
+		require.NoError(t, err)
+		_, err = repo.RequestHandoffCancel(t.Context(), record.Request.Scope, record.HandoffID, handoff.CancelRequest{Actor: "user", Reason: "stop", IdempotencyKey: "cancel-after-steer"})
+		require.NoError(t, err)
+		control, err := repo.Heartbeat(t.Context(), lease.Token, now.Add(time.Minute))
+		require.NoError(t, err)
+		assert.True(t, control.CancelRequested)
+		assert.Equal(t, uint32(1), control.ObjectiveRevision)
+		require.NoError(t, repo.MarkCancelled(t.Context(), lease.Token, worker.CancelledRecord{MutationID: "cancel-latest", ExpectedObjectiveRevision: 1}))
+	})
+
+	t.Run("cancel first rejects new steer but replays prior committed steer", func(t *testing.T) {
+		repo, pool, _ := repositoryHarness(t)
+		scope := testScope("tenant-a", "conversation-cancel-steer")
+		insertConversation(t, pool, scope)
+		record := prepareCreate(t, repo, scope, "cancel-steer-replay")
+		_, _, err := repo.CreateHandoff(t.Context(), record)
+		require.NoError(t, err)
+		committed := handoff.SteerRequest{Objective: "committed", ExpectedRevision: 1, Actor: "user", IdempotencyKey: "committed-steer"}
+		_, err = repo.SteerHandoff(t.Context(), scope, record.HandoffID, committed)
+		require.NoError(t, err)
+		_, err = repo.RequestHandoffCancel(t.Context(), scope, record.HandoffID, handoff.CancelRequest{Actor: "user", Reason: "stop", IdempotencyKey: "cancel-before-new-steer"})
+		require.NoError(t, err)
+		replayed, err := repo.SteerHandoff(t.Context(), scope, record.HandoffID, committed)
+		require.NoError(t, err)
+		assert.Equal(t, uint32(1), replayed.ObjectiveRevision)
+		assert.Equal(t, "committed", replayed.Request.Objective)
+		_, err = repo.SteerHandoff(t.Context(), scope, record.HandoffID, handoff.SteerRequest{Objective: "must reject", ExpectedRevision: 2, Actor: "user", IdempotencyKey: "new-steer-after-cancel"})
+		assert.ErrorIs(t, err, handoff.ErrSteeringBlocked)
+		var revision int64
+		require.NoError(t, pool.QueryRow(t.Context(), `SELECT objective_revision FROM handoffs WHERE id=$1`, record.HandoffID).Scan(&revision))
+		assert.Equal(t, int64(1), revision)
+	})
 }
 
 func TestMutationRevisionStateConcurrencyAndTerminalProtection(t *testing.T) {

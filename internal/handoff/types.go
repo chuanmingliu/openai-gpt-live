@@ -61,6 +61,7 @@ type Snapshot struct {
 	ObjectiveRevision uint32
 	InputRevision     uint32
 	ConsumedInput     uint32
+	Input             json.RawMessage
 	Attempt           uint32
 	RetryCount        uint32
 	Result            *Result
@@ -70,10 +71,11 @@ type Snapshot struct {
 }
 
 type Result struct {
-	MutationID string
-	Summary    string
-	Structured json.RawMessage
-	Usage      json.RawMessage
+	MutationID     string
+	Summary        string
+	Structured     json.RawMessage
+	SafetyDecision json.RawMessage
+	Usage          json.RawMessage
 }
 
 type Failure struct {
@@ -133,9 +135,11 @@ type EventWakeup struct {
 func CloneSnapshot(in Snapshot) Snapshot {
 	out := in
 	out.Request = cloneRequest(in.Request)
+	out.Input = cloneBytes(in.Input)
 	if in.Result != nil {
 		result := *in.Result
 		result.Structured = cloneBytes(in.Result.Structured)
+		result.SafetyDecision = cloneBytes(in.Result.SafetyDecision)
 		result.Usage = cloneBytes(in.Result.Usage)
 		out.Result = &result
 	}

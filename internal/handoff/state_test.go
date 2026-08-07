@@ -268,18 +268,20 @@ func TestCloneSnapshot_DeepCopiesMutableValues(t *testing.T) {
 	now := time.Date(2026, 8, 7, 4, 0, 0, 0, time.UTC)
 	original := Snapshot{
 		ID: "handoff-1", Request: validCreateRequest(now), RequestHash: "hash", State: StateSucceeded,
-		Result:  &Result{MutationID: "m", Summary: "done", Structured: json.RawMessage(`{"nested":[1]}`), Usage: json.RawMessage(`{"tokens":2}`)},
+		Result:  &Result{MutationID: "m", Summary: "done", Structured: json.RawMessage(`{"nested":[1]}`), SafetyDecision: json.RawMessage(`{"action":"allow"}`), Usage: json.RawMessage(`{"tokens":2}`)},
 		Failure: &Failure{MutationID: "f", Code: "code", Message: "message"},
 	}
 	cloned := CloneSnapshot(original)
 	cloned.Request.ToolAllowlist[0] = "changed"
 	cloned.Request.ApprovalPolicy[0] = '['
 	cloned.Result.Structured[0] = '['
+	cloned.Result.SafetyDecision[0] = '['
 	cloned.Result.Usage[0] = '['
 	cloned.Failure.Message = "changed"
 	assert.Equal(t, "read", original.Request.ToolAllowlist[0])
 	assert.Equal(t, byte('{'), original.Request.ApprovalPolicy[0])
 	assert.Equal(t, byte('{'), original.Result.Structured[0])
+	assert.Equal(t, byte('{'), original.Result.SafetyDecision[0])
 	assert.Equal(t, byte('{'), original.Result.Usage[0])
 	assert.Equal(t, "message", original.Failure.Message)
 }
@@ -293,19 +295,23 @@ func TestCloneEvent_DeepCopiesPayload(t *testing.T) {
 
 func TestValidateResult_CanonicalizesPrivateCopies(t *testing.T) {
 	input := Result{
-		MutationID: "mutation-1",
-		Summary:    "completed",
-		Structured: json.RawMessage(`{ "b": [2.0, 1], "a": 0.0100 }`),
-		Usage:      json.RawMessage(`{"output":2.0,"input":1}`),
+		MutationID:     "mutation-1",
+		Summary:        "completed",
+		Structured:     json.RawMessage(`{ "b": [2.0, 1], "a": 0.0100 }`),
+		SafetyDecision: json.RawMessage(`{ "reason_code": "bounded", "action": "allow" }`),
+		Usage:          json.RawMessage(`{"output":2.0,"input":1}`),
 	}
 
 	got, err := ValidateResult(input)
 	require.NoError(t, err)
 	assert.Equal(t, json.RawMessage(`{"a":0.01,"b":[2,1]}`), got.Structured)
+	assert.Equal(t, json.RawMessage(`{"action":"allow","reason_code":"bounded"}`), got.SafetyDecision)
 	assert.Equal(t, json.RawMessage(`{"input":1,"output":2}`), got.Usage)
 	input.Structured[2] = 'x'
+	input.SafetyDecision[2] = 'x'
 	input.Usage[2] = 'x'
 	assert.Equal(t, byte('{'), got.Structured[0])
+	assert.Equal(t, byte('{'), got.SafetyDecision[0])
 	assert.Equal(t, byte('{'), got.Usage[0])
 }
 
@@ -320,6 +326,7 @@ func TestValidateResult_RequiresBoundedMetadataAndBothJSONDocuments(t *testing.T
 		{"blank summary", func(r *Result) { r.Summary = "\n" }},
 		{"summary over limit", func(r *Result) { r.Summary = strings.Repeat("s", 16*1024+1) }},
 		{"missing structured", func(r *Result) { r.Structured = nil }},
+		{"missing safety decision", func(r *Result) { r.SafetyDecision = nil }},
 		{"missing usage", func(r *Result) { r.Usage = nil }},
 	}
 	for _, tc := range tests {
@@ -352,12 +359,14 @@ func TestValidateResult_EnforcesStrictJSONForBothDocuments(t *testing.T) {
 		{"deep", deep},
 		{"extreme number", json.RawMessage(`{"x":1e999}`)},
 	}
-	for _, field := range []string{"structured", "usage"} {
+	for _, field := range []string{"structured", "safety decision", "usage"} {
 		for _, tc := range tests {
 			t.Run(field+"/"+tc.name, func(t *testing.T) {
 				candidate := validResult()
 				if field == "structured" {
 					candidate.Structured = tc.raw
+				} else if field == "safety decision" {
+					candidate.SafetyDecision = tc.raw
 				} else {
 					candidate.Usage = tc.raw
 				}
@@ -373,11 +382,17 @@ func TestValidateResult_EnforcesRawAndCanonicalJSONSizeForBothDocuments(t *testi
 	overRawLimit := json.RawMessage(`"` + strings.Repeat("x", 64*1024-1) + `"`)
 	overCanonicalLimit := json.RawMessage(`"` + strings.Repeat("<", 12*1024) + `"`)
 
-	for _, field := range []string{"structured", "usage"} {
+	for _, field := range []string{"structured", "safety decision", "usage"} {
 		t.Run(field+" at limit", func(t *testing.T) {
 			candidate := validResult()
+			fieldAtLimit := atLimit
+			if field == "safety decision" {
+				fieldAtLimit = json.RawMessage(`{"x":"` + strings.Repeat("x", 64*1024-8) + `"}`)
+			}
 			if field == "structured" {
-				candidate.Structured = atLimit
+				candidate.Structured = fieldAtLimit
+			} else if field == "safety decision" {
+				candidate.SafetyDecision = fieldAtLimit
 			} else {
 				candidate.Usage = atLimit
 			}
@@ -387,8 +402,18 @@ func TestValidateResult_EnforcesRawAndCanonicalJSONSizeForBothDocuments(t *testi
 		for name, raw := range map[string]json.RawMessage{"raw limit plus one": overRawLimit, "canonical output over limit": overCanonicalLimit} {
 			t.Run(field+"/"+name, func(t *testing.T) {
 				candidate := validResult()
+				fieldRaw := raw
+				if field == "safety decision" {
+					if name == "raw limit plus one" {
+						fieldRaw = json.RawMessage(`{"x":"` + strings.Repeat("x", 64*1024-7) + `"}`)
+					} else {
+						fieldRaw = json.RawMessage(`{"x":"` + strings.Repeat("<", 12*1024) + `"}`)
+					}
+				}
 				if field == "structured" {
-					candidate.Structured = raw
+					candidate.Structured = fieldRaw
+				} else if field == "safety decision" {
+					candidate.SafetyDecision = fieldRaw
 				} else {
 					candidate.Usage = raw
 				}
@@ -396,6 +421,15 @@ func TestValidateResult_EnforcesRawAndCanonicalJSONSizeForBothDocuments(t *testi
 				assert.ErrorIs(t, err, ErrInvalidRequest)
 			})
 		}
+	}
+}
+
+func TestValidateResult_SafetyDecisionMustBeAnObject(t *testing.T) {
+	for _, raw := range []json.RawMessage{json.RawMessage(`[]`), json.RawMessage(`"allow"`), json.RawMessage(`null`)} {
+		candidate := validResult()
+		candidate.SafetyDecision = raw
+		_, err := ValidateResult(candidate)
+		assert.ErrorIs(t, err, ErrInvalidRequest)
 	}
 }
 
@@ -428,7 +462,7 @@ func TestValidateFailure_RequiresBoundedTerminalMetadata(t *testing.T) {
 }
 
 func TestStableSentinelsSupportErrorsIs(t *testing.T) {
-	for _, target := range []error{ErrInvalidRequest, ErrNotFound, ErrUncommittedTurn, ErrIdempotencyConflict, ErrInvalidTransition, ErrTerminalState, ErrRevisionConflict} {
+	for _, target := range []error{ErrInvalidRequest, ErrNotFound, ErrUncommittedTurn, ErrIdempotencyConflict, ErrInvalidTransition, ErrTerminalState, ErrRevisionConflict, ErrSteeringBlocked} {
 		assert.True(t, errors.Is(errors.Join(errors.New("context"), target), target))
 	}
 }
@@ -460,11 +494,12 @@ func makeToolNames(n int) []string {
 }
 
 func validResult() Result {
-	return Result{MutationID: "mutation-1", Summary: "completed", Structured: json.RawMessage(`{"ok":true}`), Usage: json.RawMessage(`{"tokens":2}`)}
+	return Result{MutationID: "mutation-1", Summary: "completed", Structured: json.RawMessage(`{"ok":true}`), SafetyDecision: json.RawMessage(`{"action":"allow"}`), Usage: json.RawMessage(`{"tokens":2}`)}
 }
 
 func cloneResultForTest(in Result) Result {
 	in.Structured = append(json.RawMessage(nil), in.Structured...)
+	in.SafetyDecision = append(json.RawMessage(nil), in.SafetyDecision...)
 	in.Usage = append(json.RawMessage(nil), in.Usage...)
 	return in
 }

@@ -73,7 +73,7 @@ func TestLeaseConcurrentAcquisitionAndABAFencing(t *testing.T) {
 	assert.Equal(t, old.HandoffID, reacquired.Token.HandoffID)
 	assert.Equal(t, old.Version+1, reacquired.Token.Version)
 	assert.Equal(t, old.Attempt+1, reacquired.Token.Attempt)
-	err = repo.Complete(t.Context(), old, handoff.Result{MutationID: "stale", Summary: "bad", Structured: json.RawMessage(`{}`), Usage: json.RawMessage(`{}`)})
+	err = repo.Complete(t.Context(), old, worker.CompletionRecord{ExpectedObjectiveRevision: reacquired.Job.ObjectiveRevision, Result: handoff.Result{MutationID: "stale", Summary: "bad", Structured: json.RawMessage(`{}`), SafetyDecision: json.RawMessage(`{"action":"allow"}`), Usage: json.RawMessage(`{}`)}})
 	assert.ErrorIs(t, err, worker.ErrLeaseLost)
 }
 
@@ -138,22 +138,22 @@ func TestEveryPostLeaseMutationRejectsStaleToken(t *testing.T) {
 		"MarkRunning": func() error { return repo.MarkRunning(t.Context(), stale.Token, now) },
 		"Heartbeat":   func() error { _, err := repo.Heartbeat(t.Context(), stale.Token, now.Add(time.Minute)); return err },
 		"ScheduleRetry": func() error {
-			return repo.ScheduleRetry(t.Context(), stale.Token, worker.RetryRecord{MutationID: "stale-retry", ReadyAt: now.Add(time.Minute), RetryCount: 1, Code: "x"})
+			return repo.ScheduleRetry(t.Context(), stale.Token, worker.RetryRecord{MutationID: "stale-retry", ExpectedObjectiveRevision: stale.Job.ObjectiveRevision, ReadyAt: now.Add(time.Minute), RetryCount: 1, Code: "x"})
 		},
 		"AppendProgress": func() error {
-			return repo.AppendProgress(t.Context(), stale.Token, worker.ProgressRecord{MutationID: "stale-progress", Sequence: 1, Summary: "x"})
+			return repo.AppendProgress(t.Context(), stale.Token, worker.ProgressRecord{MutationID: "stale-progress", ExpectedObjectiveRevision: stale.Job.ObjectiveRevision, Sequence: 1, Summary: "x"})
 		},
 		"MarkNeedsInput": func() error {
-			return repo.MarkNeedsInput(t.Context(), stale.Token, worker.NeedsInputRecord{MutationID: "stale-input", Prompt: "x", Schema: json.RawMessage(`{}`)})
+			return repo.MarkNeedsInput(t.Context(), stale.Token, worker.NeedsInputRecord{MutationID: "stale-input", ExpectedObjectiveRevision: stale.Job.ObjectiveRevision, Prompt: "x", Schema: json.RawMessage(`{}`)})
 		},
 		"Complete": func() error {
-			return repo.Complete(t.Context(), stale.Token, handoff.Result{MutationID: "stale-complete", Summary: "x", Structured: json.RawMessage(`{}`), Usage: json.RawMessage(`{}`)})
+			return repo.Complete(t.Context(), stale.Token, worker.CompletionRecord{ExpectedObjectiveRevision: stale.Job.ObjectiveRevision, Result: handoff.Result{MutationID: "stale-complete", Summary: "x", Structured: json.RawMessage(`{}`), SafetyDecision: json.RawMessage(`{"action":"allow"}`), Usage: json.RawMessage(`{}`)}})
 		},
 		"Fail": func() error {
-			return repo.Fail(t.Context(), stale.Token, handoff.Failure{MutationID: "stale-fail", Code: "x", Message: "x"})
+			return repo.Fail(t.Context(), stale.Token, worker.FailureRecord{ExpectedObjectiveRevision: stale.Job.ObjectiveRevision, Failure: handoff.Failure{MutationID: "stale-fail", Code: "x", Message: "x"}})
 		},
 		"MarkCancelled": func() error {
-			return repo.MarkCancelled(t.Context(), stale.Token, worker.CancelledRecord{MutationID: "stale-cancel"})
+			return repo.MarkCancelled(t.Context(), stale.Token, worker.CancelledRecord{MutationID: "stale-cancel", ExpectedObjectiveRevision: stale.Job.ObjectiveRevision})
 		},
 		"BeginToolInvocation": func() error { _, _, err := repo.BeginToolInvocation(t.Context(), stale.Token, invocation); return err },
 		"CompleteToolInvocation": func() error {
@@ -171,18 +171,29 @@ func TestEveryPostLeaseMutationRejectsStaleToken(t *testing.T) {
 // different terminal payload under the same mutation ID is a conflict.
 func TestLeaseCompleteExactReplayAndConflict(t *testing.T) {
 	repo, _, _ := repositoryHarness(t)
-	createRunnableHandoff(t, repo, "complete")
+	record := createRunnableHandoff(t, repo, "complete")
 	now := repositoryTestNow.Add(time.Minute)
 	lease, ok, err := repo.LeaseNext(t.Context(), worker.LeaseRequest{WorkerID: "worker", LeaseDuration: time.Minute, Now: now})
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.NoError(t, repo.MarkRunning(t.Context(), lease.Token, now))
-	result := handoff.Result{MutationID: "done", Summary: "finished", Structured: json.RawMessage(`{"b":2,"a":1}`), Usage: json.RawMessage(`{"tokens":3}`)}
-	require.NoError(t, repo.Complete(t.Context(), lease.Token, result))
-	require.NoError(t, repo.Complete(t.Context(), lease.Token, result))
+	result := handoff.Result{MutationID: "done", Summary: "finished", Structured: json.RawMessage(`{"b":2,"a":1}`), SafetyDecision: json.RawMessage(`{"reason_code":"checked","action":"allow"}`), Usage: json.RawMessage(`{"tokens":3}`)}
+	completion := worker.CompletionRecord{ExpectedObjectiveRevision: lease.Job.ObjectiveRevision, Result: result}
+	require.NoError(t, repo.Complete(t.Context(), lease.Token, completion))
+	require.NoError(t, repo.Complete(t.Context(), lease.Token, completion))
+	loaded, err := repo.GetHandoff(t.Context(), record.Request.Scope, record.HandoffID)
+	require.NoError(t, err)
+	require.NotNil(t, loaded.Result)
+	assert.JSONEq(t, `{"action":"allow","reason_code":"checked"}`, string(loaded.Result.SafetyDecision))
 	result.Summary = "different"
-	err = repo.Complete(t.Context(), lease.Token, result)
+	completion.Result = result
+	err = repo.Complete(t.Context(), lease.Token, completion)
 	assert.True(t, errors.Is(err, handoff.ErrIdempotencyConflict), err)
+	result.Summary = "finished"
+	result.SafetyDecision = json.RawMessage(`{"action":"redact","reason_code":"checked"}`)
+	completion.Result = result
+	err = repo.Complete(t.Context(), lease.Token, completion)
+	assert.ErrorIs(t, err, handoff.ErrIdempotencyConflict)
 }
 
 func runningLease(t *testing.T, repo *Repository, suffix string) (handoff.CreateRecord, worker.Lease, time.Time) {
@@ -202,7 +213,7 @@ func TestLeaseRetryReadinessAndNeedsInputReclamation(t *testing.T) {
 	repo, pool, manual := repositoryHarness(t)
 	record, lease, now := runningLease(t, repo, "retry")
 	ready := now.Add(3 * time.Minute)
-	require.NoError(t, repo.ScheduleRetry(t.Context(), lease.Token, worker.RetryRecord{MutationID: "retry-1", ReadyAt: ready, RetryCount: 1, Code: "provider"}))
+	require.NoError(t, repo.ScheduleRetry(t.Context(), lease.Token, worker.RetryRecord{MutationID: "retry-1", ExpectedObjectiveRevision: lease.Job.ObjectiveRevision, ReadyAt: ready, RetryCount: 1, Code: "provider"}))
 	var state, owner string
 	var version int64
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT state,COALESCE(lease_owner,''),lease_version FROM handoffs WHERE id=$1`, record.HandoffID).Scan(&state, &owner, &version))
@@ -217,7 +228,7 @@ func TestLeaseRetryReadinessAndNeedsInputReclamation(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, lease.Token.Version+1, retry.Token.Version)
-	require.NoError(t, repo.MarkNeedsInput(t.Context(), retry.Token, worker.NeedsInputRecord{MutationID: "question", Prompt: "Which?", Schema: json.RawMessage(`{"type":"string"}`)}))
+	require.NoError(t, repo.MarkNeedsInput(t.Context(), retry.Token, worker.NeedsInputRecord{MutationID: "question", ExpectedObjectiveRevision: retry.Job.ObjectiveRevision, Prompt: "Which?", Schema: json.RawMessage(`{"type":"string"}`)}))
 	_, err = repo.ProvideHandoffInput(t.Context(), record.Request.Scope, record.HandoffID, handoff.InputRequest{Input: json.RawMessage(`{"answer":"one"}`), ExpectedRevision: 2, Actor: "user", IdempotencyKey: "out-of-order"})
 	assert.ErrorIs(t, err, handoff.ErrRevisionConflict)
 	input := handoff.InputRequest{Input: json.RawMessage(`{"answer":"one"}`), ExpectedRevision: 1, Actor: "user", IdempotencyKey: "input-1"}
@@ -229,11 +240,47 @@ func TestLeaseRetryReadinessAndNeedsInputReclamation(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, record.HandoffID, resumed.Token.HandoffID)
+	assert.JSONEq(t, `{"answer":"one"}`, string(resumed.Job.Input))
+	resumed.Job.Input[0] = '['
 	control, err := repo.Heartbeat(t.Context(), resumed.Token, ready.Add(2*time.Minute))
 	require.NoError(t, err)
 	assert.Equal(t, uint32(1), control.InputRevision)
 	assert.Equal(t, uint32(1), control.ConsumedInput)
 	assert.JSONEq(t, `{"answer":"one"}`, string(control.Input))
+	_, err = pool.Exec(t.Context(), `UPDATE handoffs SET lease_expires_at=$1 WHERE id=$2`, ready, record.HandoffID)
+	require.NoError(t, err)
+	recovered, ok, err := repo.LeaseNext(t.Context(), worker.LeaseRequest{WorkerID: "recovery-worker", LeaseDuration: time.Minute, Now: ready.Add(3 * time.Minute)})
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.JSONEq(t, `{"answer":"one"}`, string(recovered.Job.Input))
+	assert.Equal(t, uint32(1), recovered.Job.ConsumedInput)
+}
+
+func TestProgressAfterSteerAndRetryReacquireIsRevisionFencedAndReplaySafe(t *testing.T) {
+	repo, pool, manual := repositoryHarness(t)
+	record, lease, now := runningLease(t, repo, "progress-generations")
+	first := worker.ProgressRecord{MutationID: "progress-version-1-attempt-1-objective-0-input-0-sequence-1", ExpectedObjectiveRevision: lease.Job.ObjectiveRevision, Sequence: 1, Summary: "first"}
+	require.NoError(t, repo.AppendProgress(t.Context(), lease.Token, first))
+	_, err := repo.SteerHandoff(t.Context(), record.Request.Scope, record.HandoffID, handoff.SteerRequest{Objective: "revised", ExpectedRevision: 1, Actor: "user", IdempotencyKey: "steer-progress"})
+	require.NoError(t, err)
+	stale := worker.ProgressRecord{MutationID: "progress-version-1-attempt-1-objective-0-input-0-sequence-2", ExpectedObjectiveRevision: 0, Sequence: 2, Summary: "stale"}
+	err = repo.AppendProgress(t.Context(), lease.Token, stale)
+	assert.ErrorIs(t, err, worker.ErrLeaseLost)
+	steered := worker.ProgressRecord{MutationID: "progress-version-1-attempt-1-objective-1-input-0-sequence-1", ExpectedObjectiveRevision: 1, Sequence: 1, Summary: "steered"}
+	require.NoError(t, repo.AppendProgress(t.Context(), lease.Token, steered))
+	require.NoError(t, repo.AppendProgress(t.Context(), lease.Token, steered))
+	ready := now.Add(time.Minute)
+	require.NoError(t, repo.ScheduleRetry(t.Context(), lease.Token, worker.RetryRecord{MutationID: "retry-after-steer", ExpectedObjectiveRevision: 1, ReadyAt: ready, RetryCount: 1, Code: "provider"}))
+	manual.Advance(ready.Sub(repositoryTestNow))
+	reacquired, ok, err := repo.LeaseNext(t.Context(), worker.LeaseRequest{WorkerID: "retry-progress-worker", LeaseDuration: time.Minute, Now: ready})
+	require.NoError(t, err)
+	require.True(t, ok)
+	retryProgress := worker.ProgressRecord{MutationID: "progress-version-2-attempt-2-objective-1-input-0-sequence-1", ExpectedObjectiveRevision: 1, Sequence: 1, Summary: "retry"}
+	require.NoError(t, repo.AppendProgress(t.Context(), reacquired.Token, retryProgress))
+	var events, distinct int
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*),count(DISTINCT event_id) FROM handoff_events WHERE handoff_id=$1 AND kind='handoff.progress'`, record.HandoffID).Scan(&events, &distinct))
+	assert.Equal(t, 3, events)
+	assert.Equal(t, events, distinct)
 }
 
 func TestCancellationPendingAndCommittedBeforeCompletion(t *testing.T) {
@@ -257,7 +304,7 @@ func TestCancellationPendingAndCommittedBeforeCompletion(t *testing.T) {
 		control, err := repo.Heartbeat(t.Context(), lease.Token, now.Add(4*time.Minute))
 		require.NoError(t, err)
 		assert.True(t, control.CancelRequested)
-		err = repo.Complete(t.Context(), lease.Token, handoff.Result{MutationID: "late", Summary: "late", Structured: json.RawMessage(`{}`), Usage: json.RawMessage(`{}`)})
+		err = repo.Complete(t.Context(), lease.Token, worker.CompletionRecord{Result: handoff.Result{MutationID: "late", Summary: "late", Structured: json.RawMessage(`{}`), SafetyDecision: json.RawMessage(`{"action":"allow"}`), Usage: json.RawMessage(`{}`)}})
 		assert.ErrorIs(t, err, worker.ErrLeaseLost)
 		_, err = repo.SweepExpired(t.Context(), now, 10)
 		require.NoError(t, err)
@@ -293,7 +340,7 @@ func TestCancellationAndCompletionSerializeAtEventLock(t *testing.T) {
 		if completionFirst {
 			completeRepo.failpoint = barrier
 			go func() {
-				firstDone <- completeRepo.Complete(t.Context(), lease.Token, handoff.Result{MutationID: "complete-first", Summary: "done", Structured: json.RawMessage(`{}`), Usage: json.RawMessage(`{}`)})
+				firstDone <- completeRepo.Complete(t.Context(), lease.Token, worker.CompletionRecord{Result: handoff.Result{MutationID: "complete-first", Summary: "done", Structured: json.RawMessage(`{}`), SafetyDecision: json.RawMessage(`{"action":"allow"}`), Usage: json.RawMessage(`{}`)}})
 			}()
 			<-entered
 			go func() {
@@ -308,7 +355,7 @@ func TestCancellationAndCompletionSerializeAtEventLock(t *testing.T) {
 			}()
 			<-entered
 			go func() {
-				secondDone <- completeRepo.Complete(t.Context(), lease.Token, handoff.Result{MutationID: "complete-second", Summary: "done", Structured: json.RawMessage(`{}`), Usage: json.RawMessage(`{}`)})
+				secondDone <- completeRepo.Complete(t.Context(), lease.Token, worker.CompletionRecord{Result: handoff.Result{MutationID: "complete-second", Summary: "done", Structured: json.RawMessage(`{}`), SafetyDecision: json.RawMessage(`{"action":"allow"}`), Usage: json.RawMessage(`{}`)}})
 			}()
 		}
 		waitForBlockedAdvisoryLock(t, pool, "pg_advisory_xact_lock")
@@ -489,10 +536,10 @@ func TestLeaseEveryMutationStatementBoundaryRollsBack(t *testing.T) {
 			return repo.MarkNeedsInput(t.Context(), token, worker.NeedsInputRecord{MutationID: "mutation", Prompt: "question", Schema: json.RawMessage(`{}`)})
 		}},
 		{"complete", func(repo *Repository, token worker.LeaseToken, _ time.Time) error {
-			return repo.Complete(t.Context(), token, handoff.Result{MutationID: "mutation", Summary: "done", Structured: json.RawMessage(`{}`), Usage: json.RawMessage(`{}`)})
+			return repo.Complete(t.Context(), token, worker.CompletionRecord{Result: handoff.Result{MutationID: "mutation", Summary: "done", Structured: json.RawMessage(`{}`), SafetyDecision: json.RawMessage(`{"action":"allow"}`), Usage: json.RawMessage(`{}`)}})
 		}},
 		{"fail", func(repo *Repository, token worker.LeaseToken, _ time.Time) error {
-			return repo.Fail(t.Context(), token, handoff.Failure{MutationID: "mutation", Code: "provider", Retryable: false, Message: "failed"})
+			return repo.Fail(t.Context(), token, worker.FailureRecord{Failure: handoff.Failure{MutationID: "mutation", Code: "provider", Retryable: false, Message: "failed"}})
 		}},
 		{"cancel", func(repo *Repository, token worker.LeaseToken, _ time.Time) error {
 			return repo.MarkCancelled(t.Context(), token, worker.CancelledRecord{MutationID: "mutation", Reason: "stop"})
@@ -620,20 +667,64 @@ func TestRepositoryLeavesCallerAcquiredLeasesHeld(t *testing.T) {
 func TestLeaseTerminalCommitResponseLossReplaysExactly(t *testing.T) {
 	repo, pool, _ := repositoryHarness(t)
 	_, lease, _ := runningLease(t, repo, "response-loss")
-	result := handoff.Result{MutationID: "terminal", Summary: "done", Structured: json.RawMessage(`{"ok":true}`), Usage: json.RawMessage(`{}`)}
+	result := handoff.Result{MutationID: "terminal", Summary: "done", Structured: json.RawMessage(`{"ok":true}`), SafetyDecision: json.RawMessage(`{"action":"allow"}`), Usage: json.RawMessage(`{}`)}
 	repo.failpoint = func(step string) error {
 		if step == "worker_complete_commit" {
 			return errors.New("response lost")
 		}
 		return nil
 	}
-	err := repo.Complete(t.Context(), lease.Token, result)
+	completion := worker.CompletionRecord{ExpectedObjectiveRevision: lease.Job.ObjectiveRevision, Result: result}
+	err := repo.Complete(t.Context(), lease.Token, completion)
 	require.EqualError(t, err, "response lost")
 	repo.failpoint = nil
-	require.NoError(t, repo.Complete(t.Context(), lease.Token, result))
+	require.NoError(t, repo.Complete(t.Context(), lease.Token, completion))
 	var terminals int
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM handoff_events WHERE handoff_id=$1 AND kind='handoff.complete'`, lease.Token.HandoffID).Scan(&terminals))
 	assert.Equal(t, 1, terminals)
+}
+
+func TestLeaseNonterminalAndTerminalCommitResponseLossReplayExactMutation(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		action    string
+		wantState handoff.State
+		mutate    func(*Repository, worker.Lease, time.Time) error
+	}{
+		{"needs input", "needs-input", handoff.StateNeedsInput, func(repo *Repository, lease worker.Lease, _ time.Time) error {
+			return repo.MarkNeedsInput(t.Context(), lease.Token, worker.NeedsInputRecord{MutationID: "needs-input-ack", ExpectedObjectiveRevision: lease.Job.ObjectiveRevision, Prompt: "question", Schema: json.RawMessage(`{"type":"object"}`)})
+		}},
+		{"retry", "retry", handoff.StateRunning, func(repo *Repository, lease worker.Lease, now time.Time) error {
+			return repo.ScheduleRetry(t.Context(), lease.Token, worker.RetryRecord{MutationID: "retry-ack", ExpectedObjectiveRevision: lease.Job.ObjectiveRevision, ReadyAt: now.Add(time.Minute), RetryCount: 1, Code: "provider"})
+		}},
+		{"fail", "fail", handoff.StateFailed, func(repo *Repository, lease worker.Lease, _ time.Time) error {
+			return repo.Fail(t.Context(), lease.Token, worker.FailureRecord{ExpectedObjectiveRevision: lease.Job.ObjectiveRevision, Failure: handoff.Failure{MutationID: "fail-ack", Code: "provider", Message: "failed"}})
+		}},
+		{"cancel", "cancel", handoff.StateCancelled, func(repo *Repository, lease worker.Lease, _ time.Time) error {
+			return repo.MarkCancelled(t.Context(), lease.Token, worker.CancelledRecord{MutationID: "cancel-ack", ExpectedObjectiveRevision: lease.Job.ObjectiveRevision, Reason: "stop"})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, pool, _ := repositoryHarness(t)
+			record, lease, now := runningLease(t, repo, "ack-"+tc.action)
+			repo.failpoint = func(step string) error {
+				if step == "worker_"+tc.action+"_commit" {
+					return errors.New("response lost")
+				}
+				return nil
+			}
+			err := tc.mutate(repo, lease, now)
+			require.EqualError(t, err, "response lost")
+			repo.failpoint = nil
+			require.NoError(t, tc.mutate(repo, lease, now))
+			got, err := repo.GetHandoff(t.Context(), record.Request.Scope, record.HandoffID)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantState, got.State)
+			var events int
+			require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM handoff_events WHERE handoff_id=$1 AND kind=$2`, record.HandoffID, "handoff."+tc.action).Scan(&events))
+			assert.Equal(t, 1, events)
+		})
+	}
 }
 
 func TestSteeringVersusTerminalSerializes(t *testing.T) {
@@ -669,7 +760,7 @@ func TestSteeringVersusTerminalSerializes(t *testing.T) {
 				return err
 			}
 			terminal := func() error {
-				return terminalRepo.Complete(t.Context(), lease.Token, handoff.Result{MutationID: "done", Summary: "done", Structured: json.RawMessage(`{}`), Usage: json.RawMessage(`{}`)})
+				return terminalRepo.Complete(t.Context(), lease.Token, worker.CompletionRecord{ExpectedObjectiveRevision: lease.Job.ObjectiveRevision, Result: handoff.Result{MutationID: "done", Summary: "done", Structured: json.RawMessage(`{}`), SafetyDecision: json.RawMessage(`{"action":"allow"}`), Usage: json.RawMessage(`{}`)}})
 			}
 			if terminalFirst {
 				terminalRepo.failpoint = barrier
@@ -689,16 +780,24 @@ func TestSteeringVersusTerminalSerializes(t *testing.T) {
 			if terminalFirst {
 				assert.ErrorIs(t, secondErr, handoff.ErrTerminalState)
 			} else {
-				require.NoError(t, secondErr)
+				assert.ErrorIs(t, secondErr, worker.ErrLeaseLost)
 			}
 			got, err := base.GetHandoff(t.Context(), record.Request.Scope, record.HandoffID)
 			require.NoError(t, err)
-			assert.Equal(t, handoff.StateSucceeded, got.State)
+			if terminalFirst {
+				assert.Equal(t, handoff.StateSucceeded, got.State)
+			} else {
+				assert.Equal(t, handoff.StateRunning, got.State)
+			}
 			var terminals int
 			require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM handoff_events
 				WHERE tenant_id=$1 AND conversation_id=$2 AND handoff_id=$3
 				  AND kind IN ('handoff.complete','handoff.failed','handoff.cancelled')`, lease.Token.TenantID, lease.Token.ConversationID, lease.Token.HandoffID).Scan(&terminals))
-			assert.Equal(t, 1, terminals)
+			if terminalFirst {
+				assert.Equal(t, 1, terminals)
+			} else {
+				assert.Equal(t, 0, terminals)
+			}
 		})
 	}
 }
@@ -735,7 +834,7 @@ func TestLeaseSameTextIDAcrossScopesHasIndependentLifecycle(t *testing.T) {
 		_, _, err = repo.BeginToolInvocation(t.Context(), lease.Token, worker.ToolInvocationRecord{InvocationID: invocationID, ObjectiveRevision: 0, ToolOrdinal: 1, ToolName: "search", IdempotencyKey: invocationID, ArgumentsHash: hash, Ciphertext: make([]byte, 16), Nonce: make([]byte, 12), KeyID: "key"})
 		require.NoError(t, err)
 		require.NoError(t, repo.CompleteToolInvocation(t.Context(), lease.Token, worker.ToolCompletionRecord{InvocationID: invocationID, MutationID: fmt.Sprintf("tool-done-%d", i), Result: json.RawMessage(`{}`)}))
-		require.NoError(t, repo.Complete(t.Context(), lease.Token, handoff.Result{MutationID: fmt.Sprintf("done-%d", i), Summary: "done", Structured: json.RawMessage(`{}`), Usage: json.RawMessage(`{}`)}))
+		require.NoError(t, repo.Complete(t.Context(), lease.Token, worker.CompletionRecord{Result: handoff.Result{MutationID: fmt.Sprintf("done-%d", i), Summary: "done", Structured: json.RawMessage(`{}`), SafetyDecision: json.RawMessage(`{"action":"allow"}`), Usage: json.RawMessage(`{}`)}}))
 	}
 	assert.Len(t, map[string]struct{}{invocationIDs[0]: {}, invocationIDs[1]: {}, invocationIDs[2]: {}}, 3)
 }
@@ -776,10 +875,10 @@ func TestWorkerStoreMethodsRejectNilAndCancelledContexts(t *testing.T) {
 			return repo.MarkNeedsInput(ctx, token, worker.NeedsInputRecord{MutationID: "m", Prompt: "x", Schema: json.RawMessage(`{}`)})
 		},
 		"Complete": func(ctx context.Context) error {
-			return repo.Complete(ctx, token, handoff.Result{MutationID: "m", Summary: "x", Structured: json.RawMessage(`{}`), Usage: json.RawMessage(`{}`)})
+			return repo.Complete(ctx, token, worker.CompletionRecord{Result: handoff.Result{MutationID: "m", Summary: "x", Structured: json.RawMessage(`{}`), SafetyDecision: json.RawMessage(`{"action":"allow"}`), Usage: json.RawMessage(`{}`)}})
 		},
 		"Fail": func(ctx context.Context) error {
-			return repo.Fail(ctx, token, handoff.Failure{MutationID: "m", Code: "x", Message: "x"})
+			return repo.Fail(ctx, token, worker.FailureRecord{Failure: handoff.Failure{MutationID: "m", Code: "x", Message: "x"}})
 		},
 		"MarkCancelled": func(ctx context.Context) error {
 			return repo.MarkCancelled(ctx, token, worker.CancelledRecord{MutationID: "m"})

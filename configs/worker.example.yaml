@@ -13,3 +13,11 @@ store:
   database_url_env: DATABASE_URL
 safety:
   privacy_hmac_key_env: LIVE_PRIVACY_HMAC_KEY
+shutdown:
+  drain_timeout: 10s
+features:
+  side_effecting_tools: true
+  tool_encryption_key_env: LIVE_TOOL_ENCRYPTION_KEY
+  # Immutable identifier stored with ciphertext. Keep old key IDs and keys
+  # available to the separate decryptor when rotating; workers only encrypt.
+  tool_encryption_key_id: local-v1

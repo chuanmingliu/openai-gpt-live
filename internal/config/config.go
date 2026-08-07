@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
 )
@@ -171,6 +172,7 @@ type AdminConfig struct {
 type FeatureConfig struct {
 	SideEffectingTools   bool   `yaml:"side_effecting_tools"`
 	ToolEncryptionKeyEnv string `yaml:"tool_encryption_key_env"`
+	ToolEncryptionKeyID  string `yaml:"tool_encryption_key_id"`
 	Handoffs             bool   `yaml:"handoffs"`
 }
 
@@ -276,6 +278,12 @@ func (c *Config) applyDefaults() {
 	if c.Worker.MaxToolRounds == 0 {
 		c.Worker.MaxToolRounds = 8
 	}
+	if c.Shutdown.DrainTimeout == 0 {
+		c.Shutdown.DrainTimeout = 10 * time.Second
+	}
+	if c.Features.SideEffectingTools && c.Features.ToolEncryptionKeyEnv == "" {
+		c.Features.ToolEncryptionKeyEnv = "LIVE_TOOL_ENCRYPTION_KEY"
+	}
 }
 
 func (c Config) Validate() error {
@@ -324,6 +332,16 @@ func (c Config) Validate() error {
 	}
 	if c.Worker.MaxOutputBytes <= 0 || c.Worker.MaxOutputTokens <= 0 || c.Worker.MaxToolRounds <= 0 {
 		return errors.New("worker output limits must be positive")
+	}
+	if c.Shutdown.DrainTimeout < 0 || c.Shutdown.DrainTimeout > 10*time.Minute {
+		return errors.New("shutdown.drain_timeout must be positive and bounded when set")
+	}
+	if c.Features.ToolEncryptionKeyEnv != "" {
+		if !validKeyID(c.Features.ToolEncryptionKeyID) {
+			return errors.New("features.tool_encryption_key_id must be a non-empty immutable key identifier")
+		}
+	} else if c.Features.ToolEncryptionKeyID != "" {
+		return errors.New("features.tool_encryption_key_id requires tool_encryption_key_env")
 	}
 	if c.Mode == "production" {
 		if strings.Contains(c.Store.URL, "sslmode=disable") {
@@ -377,11 +395,8 @@ func (c Config) validateSecrets(lookup func(string) (string, bool)) error {
 			return errors.New("production database URL must not disable SSL")
 		}
 	}
-	if c.Features.SideEffectingTools {
+	if c.Features.ToolEncryptionKeyEnv != "" {
 		name := c.Features.ToolEncryptionKeyEnv
-		if name == "" {
-			name = "LIVE_TOOL_ENCRYPTION_KEY"
-		}
 		if !environmentName(name) {
 			return fmt.Errorf("secret environment variable name %q is invalid", name)
 		}
@@ -409,6 +424,18 @@ func environmentName(value string) bool {
 	return true
 }
 
+func validKeyID(value string) bool {
+	if value == "" || len(value) > 256 || !utf8.ValidString(value) {
+		return false
+	}
+	for _, r := range value {
+		if (r < 'A' || r > 'Z') && (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' && r != '_' && r != '.' {
+			return false
+		}
+	}
+	return true
+}
+
 func rejectPlaintextSecrets(data []byte) error {
 	var node yaml.Node
 	if err := yaml.Unmarshal(data, &node); err != nil {
@@ -420,7 +447,7 @@ func rejectPlaintextSecrets(data []byte) error {
 			for i := 0; i+1 < len(n.Content); i += 2 {
 				key, value := n.Content[i], n.Content[i+1]
 				lower := strings.ToLower(key.Value)
-				if (strings.Contains(lower, "secret") || strings.Contains(lower, "password") || strings.Contains(lower, "api_key") || strings.Contains(lower, "token") || strings.Contains(lower, "hmac_key") || strings.Contains(lower, "encryption_key")) && !strings.HasSuffix(lower, "_env") && value.Kind == yaml.ScalarNode && value.Value != "" {
+				if (strings.Contains(lower, "secret") || strings.Contains(lower, "password") || strings.Contains(lower, "api_key") || strings.Contains(lower, "token") || strings.Contains(lower, "hmac_key") || strings.Contains(lower, "encryption_key")) && !strings.HasSuffix(lower, "_env") && !strings.HasSuffix(lower, "_id") && value.Kind == yaml.ScalarNode && value.Value != "" {
 					return fmt.Errorf("plaintext secret %q is not allowed in YAML; use an environment variable name", key.Value)
 				}
 				if lower == "url" && value.Kind == yaml.ScalarNode {

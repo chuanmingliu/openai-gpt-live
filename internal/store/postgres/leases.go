@@ -24,6 +24,7 @@ type leaseRow struct {
 	state                handoff.State
 	attempt              uint32
 	retryCount           uint32
+	objectiveRevision    uint32
 	cancelRequested      bool
 }
 
@@ -218,13 +219,13 @@ func (r *Repository) ScheduleRetry(ctx context.Context, token worker.LeaseToken,
 		return fmt.Errorf("%w: retry readiness must be future", handoff.ErrInvalidRequest)
 	}
 	payload, _ := json.Marshal(record)
-	return r.mutateLease(ctx, token, "retry", record.MutationID, payload, func(ctx context.Context, tx pgx.Tx, row leaseRow) (handoff.State, error) {
+	return r.mutateLease(ctx, token, record.ExpectedObjectiveRevision, "retry", record.MutationID, payload, func(ctx context.Context, tx pgx.Tx, row leaseRow) (handoff.State, error) {
 		if row.retryCount == math.MaxUint32 || record.RetryCount != row.retryCount+1 {
 			return "", fmt.Errorf("%w: retry count must increment exactly", handoff.ErrInvalidRequest)
 		}
 		command, err := tx.Exec(ctx, `UPDATE handoffs SET state='running',lease_owner=NULL,lease_expires_at=NULL,ready_at=$1,retry_count=$2,updated_at=$3
 			WHERE tenant_id=$4 AND conversation_id=$5 AND id=$6 AND lease_owner=$7 AND lease_version=$8 AND attempt=$9
-			  AND state='running' AND lease_expires_at>$3 AND cancel_requested_at IS NULL`, record.ReadyAt, record.RetryCount, now, token.TenantID, token.ConversationID, token.HandoffID, token.WorkerID, token.Version, token.Attempt)
+			  AND state='running' AND lease_expires_at>$3 AND cancel_requested_at IS NULL AND objective_revision=$10`, record.ReadyAt, record.RetryCount, now, token.TenantID, token.ConversationID, token.HandoffID, token.WorkerID, token.Version, token.Attempt, record.ExpectedObjectiveRevision)
 		if err != nil {
 			return "", mapWriteError(err)
 		}
@@ -250,10 +251,10 @@ func (r *Repository) AppendProgress(ctx context.Context, token worker.LeaseToken
 	}
 	payload, _ := json.Marshal(record)
 	now := r.clock.Now().UTC()
-	return r.mutateLease(ctx, token, "progress", record.MutationID, payload, func(ctx context.Context, tx pgx.Tx, row leaseRow) (handoff.State, error) {
+	return r.mutateLease(ctx, token, record.ExpectedObjectiveRevision, "progress", record.MutationID, payload, func(ctx context.Context, tx pgx.Tx, row leaseRow) (handoff.State, error) {
 		command, err := tx.Exec(ctx, `UPDATE handoffs SET updated_at=$1
 			WHERE tenant_id=$2 AND conversation_id=$3 AND id=$4 AND lease_owner=$5 AND lease_version=$6 AND attempt=$7
-			  AND state='running' AND lease_expires_at>$1 AND cancel_requested_at IS NULL`, now, token.TenantID, token.ConversationID, token.HandoffID, token.WorkerID, token.Version, token.Attempt)
+			  AND state='running' AND lease_expires_at>$1 AND cancel_requested_at IS NULL AND objective_revision=$8`, now, token.TenantID, token.ConversationID, token.HandoffID, token.WorkerID, token.Version, token.Attempt, record.ExpectedObjectiveRevision)
 		if err != nil {
 			return "", mapWriteError(err)
 		}
@@ -281,10 +282,10 @@ func (r *Repository) MarkNeedsInput(ctx context.Context, token worker.LeaseToken
 	record.Schema = schema
 	payload, _ := json.Marshal(record)
 	now := r.clock.Now().UTC()
-	return r.mutateLease(ctx, token, "needs-input", record.MutationID, payload, func(ctx context.Context, tx pgx.Tx, row leaseRow) (handoff.State, error) {
+	return r.mutateLease(ctx, token, record.ExpectedObjectiveRevision, "needs-input", record.MutationID, payload, func(ctx context.Context, tx pgx.Tx, row leaseRow) (handoff.State, error) {
 		command, err := tx.Exec(ctx, `UPDATE handoffs SET state='needs_input',lease_owner=NULL,lease_expires_at=NULL,updated_at=$1
 			WHERE tenant_id=$2 AND conversation_id=$3 AND id=$4 AND lease_owner=$5 AND lease_version=$6 AND attempt=$7
-			  AND state='running' AND lease_expires_at>$1 AND cancel_requested_at IS NULL`, now, token.TenantID, token.ConversationID, token.HandoffID, token.WorkerID, token.Version, token.Attempt)
+			  AND state='running' AND lease_expires_at>$1 AND cancel_requested_at IS NULL AND objective_revision=$8`, now, token.TenantID, token.ConversationID, token.HandoffID, token.WorkerID, token.Version, token.Attempt, record.ExpectedObjectiveRevision)
 		if err != nil {
 			return "", err
 		}
@@ -295,20 +296,21 @@ func (r *Repository) MarkNeedsInput(ctx context.Context, token worker.LeaseToken
 	})
 }
 
-func (r *Repository) Complete(ctx context.Context, token worker.LeaseToken, result handoff.Result) error {
+func (r *Repository) Complete(ctx context.Context, token worker.LeaseToken, record worker.CompletionRecord) error {
 	if err := validateContext(ctx); err != nil {
 		return err
 	}
-	result, err := handoff.ValidateResult(result)
+	result, err := handoff.ValidateResult(record.Result)
 	if err != nil {
 		return err
 	}
-	payload, _ := json.Marshal(result)
+	record.Result = result
+	payload, _ := json.Marshal(record)
 	now := r.clock.Now().UTC()
-	return r.mutateLease(ctx, token, "complete", result.MutationID, payload, func(ctx context.Context, tx pgx.Tx, row leaseRow) (handoff.State, error) {
-		command, err := tx.Exec(ctx, `UPDATE handoffs SET state='succeeded',lease_owner=NULL,lease_expires_at=NULL,terminal_mutation_id=$1,result_summary=$2,structured_result=$3::json,usage=$4::json,terminal_at=$5,updated_at=$5
-			WHERE tenant_id=$6 AND conversation_id=$7 AND id=$8 AND lease_owner=$9 AND lease_version=$10 AND attempt=$11
-			  AND state='running' AND lease_expires_at>$5 AND cancel_requested_at IS NULL`, result.MutationID, result.Summary, result.Structured, result.Usage, now, token.TenantID, token.ConversationID, token.HandoffID, token.WorkerID, token.Version, token.Attempt)
+	return r.mutateLease(ctx, token, record.ExpectedObjectiveRevision, "complete", result.MutationID, payload, func(ctx context.Context, tx pgx.Tx, row leaseRow) (handoff.State, error) {
+		command, err := tx.Exec(ctx, `UPDATE handoffs SET state='succeeded',lease_owner=NULL,lease_expires_at=NULL,terminal_mutation_id=$1,result_summary=$2,structured_result=$3::json,safety_decision=$4::json,usage=$5::json,terminal_at=$6,updated_at=$6
+			WHERE tenant_id=$7 AND conversation_id=$8 AND id=$9 AND lease_owner=$10 AND lease_version=$11 AND attempt=$12
+			  AND state='running' AND lease_expires_at>$6 AND cancel_requested_at IS NULL AND objective_revision=$13`, result.MutationID, result.Summary, result.Structured, result.SafetyDecision, result.Usage, now, token.TenantID, token.ConversationID, token.HandoffID, token.WorkerID, token.Version, token.Attempt, record.ExpectedObjectiveRevision)
 		if err != nil {
 			return "", mapWriteError(err)
 		}
@@ -319,20 +321,21 @@ func (r *Repository) Complete(ctx context.Context, token worker.LeaseToken, resu
 	})
 }
 
-func (r *Repository) Fail(ctx context.Context, token worker.LeaseToken, failure handoff.Failure) error {
+func (r *Repository) Fail(ctx context.Context, token worker.LeaseToken, record worker.FailureRecord) error {
 	if err := validateContext(ctx); err != nil {
 		return err
 	}
-	failure, err := handoff.ValidateFailure(failure)
+	failure, err := handoff.ValidateFailure(record.Failure)
 	if err != nil {
 		return err
 	}
-	payload, _ := json.Marshal(failure)
+	record.Failure = failure
+	payload, _ := json.Marshal(record)
 	now := r.clock.Now().UTC()
-	return r.mutateLease(ctx, token, "fail", failure.MutationID, payload, func(ctx context.Context, tx pgx.Tx, row leaseRow) (handoff.State, error) {
+	return r.mutateLease(ctx, token, record.ExpectedObjectiveRevision, "fail", failure.MutationID, payload, func(ctx context.Context, tx pgx.Tx, row leaseRow) (handoff.State, error) {
 		command, err := tx.Exec(ctx, `UPDATE handoffs SET state='failed',lease_owner=NULL,lease_expires_at=NULL,terminal_mutation_id=$1,failure_code=$2,failure_retryable=$3,failure_message=$4,terminal_at=$5,updated_at=$5
 			WHERE tenant_id=$6 AND conversation_id=$7 AND id=$8 AND lease_owner=$9 AND lease_version=$10 AND attempt=$11
-			  AND state='running' AND lease_expires_at>$5 AND cancel_requested_at IS NULL`, failure.MutationID, failure.Code, failure.Retryable, failure.Message, now, token.TenantID, token.ConversationID, token.HandoffID, token.WorkerID, token.Version, token.Attempt)
+			  AND state='running' AND lease_expires_at>$5 AND cancel_requested_at IS NULL AND objective_revision=$12`, failure.MutationID, failure.Code, failure.Retryable, failure.Message, now, token.TenantID, token.ConversationID, token.HandoffID, token.WorkerID, token.Version, token.Attempt, record.ExpectedObjectiveRevision)
 		if err != nil {
 			return "", mapWriteError(err)
 		}
@@ -355,10 +358,10 @@ func (r *Repository) MarkCancelled(ctx context.Context, token worker.LeaseToken,
 	}
 	payload, _ := json.Marshal(record)
 	now := r.clock.Now().UTC()
-	return r.mutateLease(ctx, token, "cancel", record.MutationID, payload, func(ctx context.Context, tx pgx.Tx, row leaseRow) (handoff.State, error) {
+	return r.mutateLease(ctx, token, record.ExpectedObjectiveRevision, "cancel", record.MutationID, payload, func(ctx context.Context, tx pgx.Tx, row leaseRow) (handoff.State, error) {
 		command, err := tx.Exec(ctx, `UPDATE handoffs SET state='cancelled',lease_owner=NULL,lease_expires_at=NULL,terminal_mutation_id=$1,terminal_at=$2,updated_at=$2
 			WHERE tenant_id=$3 AND conversation_id=$4 AND id=$5 AND lease_owner=$6 AND lease_version=$7 AND attempt=$8
-			  AND state IN ('leased','running') AND lease_expires_at>$2`, record.MutationID, now, token.TenantID, token.ConversationID, token.HandoffID, token.WorkerID, token.Version, token.Attempt)
+			  AND state IN ('leased','running') AND lease_expires_at>$2 AND objective_revision=$9`, record.MutationID, now, token.TenantID, token.ConversationID, token.HandoffID, token.WorkerID, token.Version, token.Attempt, record.ExpectedObjectiveRevision)
 		if err != nil {
 			return "", mapWriteError(err)
 		}
@@ -369,7 +372,7 @@ func (r *Repository) MarkCancelled(ctx context.Context, token worker.LeaseToken,
 	})
 }
 
-func (r *Repository) mutateLease(ctx context.Context, token worker.LeaseToken, action, mutationID string, payload []byte, update func(context.Context, pgx.Tx, leaseRow) (handoff.State, error)) error {
+func (r *Repository) mutateLease(ctx context.Context, token worker.LeaseToken, expectedObjectiveRevision uint32, action, mutationID string, payload []byte, update func(context.Context, pgx.Tx, leaseRow) (handoff.State, error)) error {
 	if err := validateContext(ctx); err != nil {
 		return err
 	}
@@ -392,10 +395,7 @@ func (r *Repository) mutateLease(ctx context.Context, token worker.LeaseToken, a
 		if existingTenant != token.TenantID || existingConversation != string(token.ConversationID) || existingHandoff != string(token.HandoffID) || !bytes.Equal(existing, payload) {
 			return handoff.ErrIdempotencyConflict
 		}
-		if action == "complete" || action == "fail" || action == "cancel" {
-			return tx.Commit(ctx)
-		}
-		return worker.ErrLeaseLost
+		return tx.Commit(ctx)
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return err
@@ -405,6 +405,9 @@ func (r *Repository) mutateLease(ctx context.Context, token worker.LeaseToken, a
 		return err
 	}
 	if !expires.After(r.clock.Now().UTC()) {
+		return worker.ErrLeaseLost
+	}
+	if row.objectiveRevision != expectedObjectiveRevision {
 		return worker.ErrLeaseLost
 	}
 	if row.cancelRequested && action != "cancel" {
@@ -538,21 +541,22 @@ func validateToken(token worker.LeaseToken) error {
 
 func (r *Repository) lockLease(ctx context.Context, tx pgx.Tx, token worker.LeaseToken) (leaseRow, time.Time, error) {
 	var row leaseRow
-	var attempt, retryCount int64
+	var attempt, retryCount, objectiveRevision int64
 	var expires time.Time
-	err := tx.QueryRow(ctx, `SELECT tenant_id,conversation_id,state,attempt,retry_count,lease_expires_at,cancel_requested_at IS NOT NULL FROM handoffs
-		WHERE tenant_id=$1 AND conversation_id=$2 AND id=$3 AND lease_owner=$4 AND lease_version=$5 AND attempt=$6 FOR UPDATE`, token.TenantID, token.ConversationID, token.HandoffID, token.WorkerID, token.Version, token.Attempt).Scan(&row.tenant, &row.conversation, &row.state, &attempt, &retryCount, &expires, &row.cancelRequested)
+	err := tx.QueryRow(ctx, `SELECT tenant_id,conversation_id,state,attempt,retry_count,objective_revision,lease_expires_at,cancel_requested_at IS NOT NULL FROM handoffs
+		WHERE tenant_id=$1 AND conversation_id=$2 AND id=$3 AND lease_owner=$4 AND lease_version=$5 AND attempt=$6 FOR UPDATE`, token.TenantID, token.ConversationID, token.HandoffID, token.WorkerID, token.Version, token.Attempt).Scan(&row.tenant, &row.conversation, &row.state, &attempt, &retryCount, &objectiveRevision, &expires, &row.cancelRequested)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return row, time.Time{}, worker.ErrLeaseLost
 	}
 	if err != nil {
 		return row, time.Time{}, err
 	}
-	if attempt < 0 || attempt > math.MaxUint32 || retryCount < 0 || retryCount > math.MaxUint32 {
+	if attempt < 0 || attempt > math.MaxUint32 || retryCount < 0 || retryCount > math.MaxUint32 || objectiveRevision < 0 || objectiveRevision > math.MaxUint32 {
 		return row, time.Time{}, errors.New("postgres: lease attempt out of range")
 	}
 	row.attempt = uint32(attempt)
 	row.retryCount = uint32(retryCount)
+	row.objectiveRevision = uint32(objectiveRevision)
 	return row, expires.UTC(), nil
 }
 
@@ -583,7 +587,7 @@ func (r *Repository) appendWorkerEvent(ctx context.Context, tx pgx.Tx, eventID, 
 }
 
 func canonicalWorkerJSON(raw json.RawMessage) (json.RawMessage, error) {
-	result, err := handoff.ValidateResult(handoff.Result{MutationID: "canonical", Summary: "canonical", Structured: raw, Usage: json.RawMessage(`{}`)})
+	result, err := handoff.ValidateResult(handoff.Result{MutationID: "canonical", Summary: "canonical", Structured: raw, SafetyDecision: json.RawMessage(`{}`), Usage: json.RawMessage(`{}`)})
 	if err != nil {
 		return nil, err
 	}

@@ -1,14 +1,36 @@
 package config
 
 import (
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestToolEncryptionKeyRequiresImmutableConfiguredID(t *testing.T) {
+	key := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	lookup := func(name string) (string, bool) { return key, name == "TOOL_KEY" }
+	_, err := loadFixture(t, "features:\n  tool_encryption_key_env: TOOL_KEY\n", lookup)
+	assert.ErrorContains(t, err, "tool_encryption_key_id")
+	cfg, err := loadFixture(t, "features:\n  tool_encryption_key_env: TOOL_KEY\n  tool_encryption_key_id: rotation-2026-v2\n", lookup)
+	require.NoError(t, err)
+	assert.Equal(t, "rotation-2026-v2", cfg.Features.ToolEncryptionKeyID)
+	_, err = loadFixture(t, "features:\n  tool_encryption_key_env: TOOL_KEY\n  tool_encryption_key_id: invalid/key\n", lookup)
+	assert.ErrorContains(t, err, "tool_encryption_key_id")
+}
+
+func TestShutdownDrainTimeoutDefaultsAndIsBounded(t *testing.T) {
+	cfg, err := loadFixture(t, "mode: local\n", nil)
+	require.NoError(t, err)
+	assert.Equal(t, 10*time.Second, cfg.Shutdown.DrainTimeout)
+	_, err = loadFixture(t, "shutdown:\n  drain_timeout: -1s\n", nil)
+	assert.ErrorContains(t, err, "drain_timeout")
+}
 
 // TestLoadAppliesRealtimeDefaults catches a loader regression that leaves realtime
 // queues or PCM sample rate at zero when the operator omits optional limits.

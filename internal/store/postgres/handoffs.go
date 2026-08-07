@@ -22,8 +22,8 @@ const handoffColumns = `
 	user_request, objective, context_ref, context_hash, deadline, token_budget, priority,
 	tool_allowlist::text, approval_policy::text, model_version, prompt_version, tool_registry_version,
 	config_version, presentation_hint, idempotency_key, request_hash, state, objective_revision,
-	input_revision, consumed_input_revision, attempt, retry_count, terminal_mutation_id,
-	result_summary, structured_result::text, usage::text, failure_code, failure_retryable,
+	input_revision, consumed_input_revision, input::text, attempt, retry_count, terminal_mutation_id,
+	result_summary, structured_result::text, safety_decision::text, usage::text, failure_code, failure_retryable,
 	failure_message, created_at, updated_at`
 
 const handoffCreateLockNamespace = "openai-gpt-live/handoff-create/v1\x00"
@@ -313,6 +313,12 @@ func (r *Repository) SteerHandoff(ctx context.Context, scope handoff.Scope, id i
 	}
 	return r.mutateHandoff(ctx, scope, id, "steer", request.IdempotencyKey, "handoff.steered", payload,
 		func(ctx context.Context, tx pgx.Tx, current mutationCurrent) error {
+			if current.CancelRequested {
+				return handoff.ErrSteeringBlocked
+			}
+			if err := r.guardSteeringToolInvocations(ctx, tx, scope, id, current.ToolRegistryVersion); err != nil {
+				return err
+			}
 			if current.ObjectiveRevision+1 != request.ExpectedRevision {
 				return handoff.ErrRevisionConflict
 			}
@@ -385,11 +391,38 @@ func (r *Repository) RequestHandoffCancel(ctx context.Context, scope handoff.Sco
 }
 
 type mutationCurrent struct {
-	State             handoff.State
-	ObjectiveRevision uint32
-	InputRevision     uint32
-	Attempt           uint32
-	CancelRequested   bool
+	State               handoff.State
+	ObjectiveRevision   uint32
+	InputRevision       uint32
+	Attempt             uint32
+	CancelRequested     bool
+	ToolRegistryVersion string
+}
+
+func (r *Repository) guardSteeringToolInvocations(ctx context.Context, tx pgx.Tx, scope handoff.Scope, id identity.HandoffID, registryVersion string) error {
+	rows, err := tx.Query(ctx, `SELECT tool_name,status FROM tool_invocations
+		WHERE tenant_id=$1 AND conversation_id=$2 AND handoff_id=$3`, scope.TenantID, scope.ConversationID, id)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name, status string
+		if err := rows.Scan(&name, &status); err != nil {
+			return err
+		}
+		if nilInterface(r.toolGate) {
+			return handoff.ErrSteeringBlocked
+		}
+		metadata, registered := r.toolGate.Metadata(ctx, registryVersion, name)
+		if !registered {
+			return handoff.ErrSteeringBlocked
+		}
+		if metadata.SideEffecting && status != "pending" {
+			return handoff.ErrSteeringBlocked
+		}
+	}
+	return rows.Err()
 }
 
 type mutationUpdate func(context.Context, pgx.Tx, mutationCurrent) error
@@ -439,12 +472,12 @@ func (r *Repository) mutateHandoff(ctx context.Context, scope handoff.Scope, id 
 		return handoff.Snapshot{}, err
 	}
 
-	var state string
+	var state, toolRegistryVersion string
 	var objectiveRevision, inputRevision, attempt int64
 	var cancelRequested bool
-	err = tx.QueryRow(ctx, `SELECT state,objective_revision,input_revision,attempt,cancel_requested_at IS NOT NULL
+	err = tx.QueryRow(ctx, `SELECT state,objective_revision,input_revision,attempt,cancel_requested_at IS NOT NULL,tool_registry_version
 		FROM handoffs WHERE tenant_id=$1 AND conversation_id=$2 AND id=$3 AND user_id=$4 FOR UPDATE`,
-		scope.TenantID, scope.ConversationID, id, scope.UserID).Scan(&state, &objectiveRevision, &inputRevision, &attempt, &cancelRequested)
+		scope.TenantID, scope.ConversationID, id, scope.UserID).Scan(&state, &objectiveRevision, &inputRevision, &attempt, &cancelRequested, &toolRegistryVersion)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return handoff.Snapshot{}, handoff.ErrNotFound
 	}
@@ -477,7 +510,7 @@ func (r *Repository) mutateHandoff(ctx context.Context, scope handoff.Scope, id 
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return handoff.Snapshot{}, err
 	}
-	current := mutationCurrent{State: handoff.State(state), ObjectiveRevision: uint32(objectiveRevision), InputRevision: uint32(inputRevision), Attempt: uint32(attempt), CancelRequested: cancelRequested}
+	current := mutationCurrent{State: handoff.State(state), ObjectiveRevision: uint32(objectiveRevision), InputRevision: uint32(inputRevision), Attempt: uint32(attempt), CancelRequested: cancelRequested, ToolRegistryVersion: toolRegistryVersion}
 	if terminalHandoffState(current.State) {
 		return handoff.Snapshot{}, errors.Join(handoff.ErrInvalidTransition, handoff.ErrTerminalState)
 	}
@@ -549,16 +582,16 @@ func loadHandoffRow(row pgx.Row) (handoff.Snapshot, error) {
 	var tenant, conversation, user, session, sourceTurn string
 	var sourceRevision, objectiveRevision, inputRevision, consumedInput, attempt, retryCount int64
 	var state string
-	var allowlistRaw, approvalRaw []byte
-	var mutationID, resultSummary, structured, usage, failureCode, failureMessage sql.NullString
+	var allowlistRaw, approvalRaw, inputRaw []byte
+	var mutationID, resultSummary, structured, safetyDecision, usage, failureCode, failureMessage sql.NullString
 	var failureRetryable sql.NullBool
 	err := row.Scan(&out.ID, &tenant, &conversation, &user, &session, &sourceTurn, &sourceRevision,
 		&out.Request.UserRequest, &out.Request.Objective, &out.Request.ContextRef, &out.Request.ContextHash,
 		&out.Request.Deadline, &out.Request.TokenBudget, &out.Request.Priority, &allowlistRaw, &approvalRaw,
 		&out.Request.Versions.Model, &out.Request.Versions.Prompt, &out.Request.Versions.ToolRegistry,
 		&out.Request.Versions.Config, &out.Request.PresentationHint, &out.Request.IdempotencyKey, &out.RequestHash,
-		&state, &objectiveRevision, &inputRevision, &consumedInput, &attempt, &retryCount, &mutationID,
-		&resultSummary, &structured, &usage, &failureCode, &failureRetryable, &failureMessage, &out.CreatedAt, &out.UpdatedAt)
+		&state, &objectiveRevision, &inputRevision, &consumedInput, &inputRaw, &attempt, &retryCount, &mutationID,
+		&resultSummary, &structured, &safetyDecision, &usage, &failureCode, &failureRetryable, &failureMessage, &out.CreatedAt, &out.UpdatedAt)
 	if err != nil {
 		return handoff.Snapshot{}, err
 	}
@@ -576,10 +609,13 @@ func loadHandoffRow(row pgx.Row) (handoff.Snapshot, error) {
 	out.Request.ApprovalPolicy = append(json.RawMessage(nil), approvalRaw...)
 	out.State = handoff.State(state)
 	out.ObjectiveRevision, out.InputRevision, out.ConsumedInput = uint32(objectiveRevision), uint32(inputRevision), uint32(consumedInput)
+	out.Input = append(json.RawMessage(nil), inputRaw...)
 	out.Attempt, out.RetryCount = uint32(attempt), uint32(retryCount)
 	if state == string(handoff.StateSucceeded) {
 		out.Result = &handoff.Result{MutationID: mutationID.String, Summary: resultSummary.String,
-			Structured: append(json.RawMessage(nil), structured.String...), Usage: append(json.RawMessage(nil), usage.String...)}
+			Structured:     append(json.RawMessage(nil), structured.String...),
+			SafetyDecision: append(json.RawMessage(nil), safetyDecision.String...),
+			Usage:          append(json.RawMessage(nil), usage.String...)}
 	}
 	if state == string(handoff.StateFailed) {
 		out.Failure = &handoff.Failure{MutationID: mutationID.String, Code: failureCode.String,

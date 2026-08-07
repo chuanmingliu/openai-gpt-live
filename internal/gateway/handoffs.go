@@ -376,6 +376,7 @@ func isStableHandoffRejection(err error) bool {
 		handoff.ErrRevisionConflict,
 		handoff.ErrInvalidTransition,
 		handoff.ErrTerminalState,
+		handoff.ErrSteeringBlocked,
 	} {
 		if errors.Is(err, stable) {
 			return true

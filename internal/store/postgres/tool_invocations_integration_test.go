@@ -21,15 +21,16 @@ import (
 
 type testToolGate map[string]bool
 
-func (g testToolGate) Registered(_ context.Context, version, name string) bool {
-	return version == "tools-v3" && g[name]
+func (g testToolGate) Metadata(_ context.Context, version, name string) (worker.ToolGateMetadata, bool) {
+	sideEffecting, ok := g[name]
+	return worker.ToolGateMetadata{SideEffecting: sideEffecting}, version == "tools-v3" && ok
 }
 
 type observingToolGate struct{ seen chan string }
 
-func (g observingToolGate) Registered(_ context.Context, version, name string) bool {
+func (g observingToolGate) Metadata(_ context.Context, version, name string) (worker.ToolGateMetadata, bool) {
 	g.seen <- version
-	return version == "tools-v3" && name == "search"
+	return worker.ToolGateMetadata{}, version == "tools-v3" && name == "search"
 }
 
 // Replacing length-delimited hashing with concatenation changes this fixed
@@ -419,30 +420,132 @@ func TestToolInvocationAttemptRebindFailpointsRollbackAndRetry(t *testing.T) {
 	}
 }
 
-func TestToolLatePreSteerCompletionRejectedAndNewInvocationAttached(t *testing.T) {
-	_, pool, manual := repositoryHarness(t)
-	repo, err := NewRepository(pool, manual, WithToolGate(testToolGate{"search": true}))
-	require.NoError(t, err)
-	record, lease, _ := runningLease(t, repo, "tool-steer")
-	makeRecord := func(revision uint32, ordinal uint32) worker.ToolInvocationRecord {
-		hash := fmt.Sprintf("%064x", ordinal)
-		id := worker.StableToolInvocationID(lease.Token.TenantID, lease.Token.ConversationID, lease.Token.HandoffID, revision, ordinal, "search", hash)
-		return worker.ToolInvocationRecord{InvocationID: id, ObjectiveRevision: revision, ToolOrdinal: ordinal, ToolName: "search", IdempotencyKey: id, ArgumentsHash: hash, Ciphertext: make([]byte, 16), Nonce: make([]byte, 12), KeyID: "key"}
+func TestSteeringSerializesWithSideEffectingToolInvocation(t *testing.T) {
+	t.Run("steer first fences old begin", func(t *testing.T) {
+		_, pool, manual := repositoryHarness(t)
+		repo, err := NewRepository(pool, manual, WithToolGate(testToolGate{"search": true}))
+		require.NoError(t, err)
+		record, lease, _ := runningLease(t, repo, "steer-first")
+		invocation := testToolRecord(lease.Token, 0, 1, "search")
+		updated, release := make(chan struct{}), make(chan struct{})
+		repo.failpoint = func(step string) error {
+			if step == "mutation_update" {
+				close(updated)
+				<-release
+			}
+			return nil
+		}
+		steerDone := make(chan error, 1)
+		go func() {
+			_, err := repo.SteerHandoff(t.Context(), record.Request.Scope, record.HandoffID, handoff.SteerRequest{Objective: "new", ExpectedRevision: 1, Actor: "user", IdempotencyKey: "steer-first"})
+			steerDone <- err
+		}()
+		<-updated
+		beginDone := make(chan error, 1)
+		go func() {
+			_, _, err := repo.BeginToolInvocation(t.Context(), lease.Token, invocation)
+			beginDone <- err
+		}()
+		close(release)
+		require.NoError(t, <-steerDone)
+		assert.ErrorIs(t, <-beginDone, worker.ErrLeaseLost)
+		assert.Equal(t, int64(0), tableCount(t, pool, "tool_invocations"))
+	})
+
+	t.Run("begin first blocks steer and completion succeeds", func(t *testing.T) {
+		_, pool, manual := repositoryHarness(t)
+		repo, err := NewRepository(pool, manual, WithToolGate(testToolGate{"search": true}))
+		require.NoError(t, err)
+		record, lease, _ := runningLease(t, repo, "begin-first")
+		invocation := testToolRecord(lease.Token, 0, 1, "search")
+		inserted, release := make(chan struct{}), make(chan struct{})
+		repo.failpoint = func(step string) error {
+			if step == "tool_invocation_insert" {
+				close(inserted)
+				<-release
+			}
+			return nil
+		}
+		beginDone := make(chan error, 1)
+		go func() {
+			_, _, err := repo.BeginToolInvocation(t.Context(), lease.Token, invocation)
+			beginDone <- err
+		}()
+		<-inserted
+		steerDone := make(chan error, 1)
+		go func() {
+			_, err := repo.SteerHandoff(t.Context(), record.Request.Scope, record.HandoffID, handoff.SteerRequest{Objective: "new", ExpectedRevision: 1, Actor: "user", IdempotencyKey: "begin-first"})
+			steerDone <- err
+		}()
+		close(release)
+		require.NoError(t, <-beginDone)
+		assert.ErrorIs(t, <-steerDone, handoff.ErrSteeringBlocked)
+		repo.failpoint = nil
+		require.NoError(t, repo.CompleteToolInvocation(t.Context(), lease.Token, worker.ToolCompletionRecord{InvocationID: invocation.InvocationID, MutationID: "done", Result: json.RawMessage(`{"ok":true}`)}))
+		var revision int64
+		var status string
+		require.NoError(t, pool.QueryRow(t.Context(), `SELECT objective_revision FROM handoffs WHERE id=$1`, record.HandoffID).Scan(&revision))
+		require.NoError(t, pool.QueryRow(t.Context(), `SELECT status FROM tool_invocations WHERE invocation_id=$1`, invocation.InvocationID).Scan(&status))
+		assert.Zero(t, revision)
+		assert.Equal(t, "succeeded", status)
+	})
+}
+
+func TestSteeringToolInvocationSafetyPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		sideEffecting bool
+		approval      bool
+		complete      bool
+		missing       bool
+		wantBlocked   bool
+	}{
+		{name: "running side effect", sideEffecting: true, wantBlocked: true},
+		{name: "succeeded side effect remains blocked", sideEffecting: true, complete: true, wantBlocked: true},
+		{name: "read only running remains steerable"},
+		{name: "pending approval remains steerable", sideEffecting: true, approval: true},
+		{name: "missing immutable metadata fails closed", sideEffecting: true, missing: true, wantBlocked: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, pool, manual := repositoryHarness(t)
+			repo, err := NewRepository(pool, manual, WithToolGate(testToolGate{"search": tc.sideEffecting}))
+			require.NoError(t, err)
+			record, lease, _ := runningLease(t, repo, "steer-policy-"+tc.name)
+			if tc.approval {
+				_, err = pool.Exec(t.Context(), `UPDATE handoffs SET approval_policy='{"mode":"ask"}'::json WHERE id=$1`, record.HandoffID)
+				require.NoError(t, err)
+			}
+			invocation := testToolRecord(lease.Token, 0, 1, "search")
+			_, _, err = repo.BeginToolInvocation(t.Context(), lease.Token, invocation)
+			if tc.approval {
+				require.ErrorIs(t, err, worker.ErrApprovalRequired)
+			} else {
+				require.NoError(t, err)
+			}
+			if tc.complete {
+				require.NoError(t, repo.CompleteToolInvocation(t.Context(), lease.Token, worker.ToolCompletionRecord{InvocationID: invocation.InvocationID, MutationID: "done", Result: json.RawMessage(`{"ok":true}`)}))
+			}
+			if tc.missing {
+				repo.toolGate = testToolGate{}
+			}
+			request := handoff.SteerRequest{Objective: "new", ExpectedRevision: 1, Actor: "user", IdempotencyKey: "steer-policy"}
+			_, err = repo.SteerHandoff(t.Context(), record.Request.Scope, record.HandoffID, request)
+			if tc.wantBlocked {
+				assert.ErrorIs(t, err, handoff.ErrSteeringBlocked)
+				_, secondErr := repo.SteerHandoff(t.Context(), record.Request.Scope, record.HandoffID, request)
+				assert.ErrorIs(t, secondErr, handoff.ErrSteeringBlocked)
+				var revision int64
+				require.NoError(t, pool.QueryRow(t.Context(), `SELECT objective_revision FROM handoffs WHERE id=$1`, record.HandoffID).Scan(&revision))
+				assert.Zero(t, revision)
+				return
+			}
+			require.NoError(t, err)
+		})
 	}
-	old := makeRecord(0, 1)
-	_, _, err = repo.BeginToolInvocation(t.Context(), lease.Token, old)
-	require.NoError(t, err)
-	_, err = repo.SteerHandoff(t.Context(), record.Request.Scope, record.HandoffID, handoff.SteerRequest{Objective: "new", ExpectedRevision: 1, Actor: "user", IdempotencyKey: "steer"})
-	require.NoError(t, err)
-	err = repo.CompleteToolInvocation(t.Context(), lease.Token, worker.ToolCompletionRecord{InvocationID: old.InvocationID, MutationID: "late", Result: json.RawMessage(`{"old":true}`)})
-	assert.ErrorIs(t, err, worker.ErrLeaseLost)
-	newInvocation := makeRecord(1, 2)
-	_, _, err = repo.BeginToolInvocation(t.Context(), lease.Token, newInvocation)
-	require.NoError(t, err)
-	require.NoError(t, repo.CompleteToolInvocation(t.Context(), lease.Token, worker.ToolCompletionRecord{InvocationID: newInvocation.InvocationID, MutationID: "new", Result: json.RawMessage(`{"new":true}`)}))
-	var oldStatus, newStatus string
-	require.NoError(t, pool.QueryRow(t.Context(), `SELECT status FROM tool_invocations WHERE invocation_id=$1`, old.InvocationID).Scan(&oldStatus))
-	require.NoError(t, pool.QueryRow(t.Context(), `SELECT status FROM tool_invocations WHERE invocation_id=$1`, newInvocation.InvocationID).Scan(&newStatus))
-	assert.Equal(t, "running", oldStatus)
-	assert.Equal(t, "succeeded", newStatus)
+}
+
+func testToolRecord(token worker.LeaseToken, revision, ordinal uint32, name string) worker.ToolInvocationRecord {
+	hash := fmt.Sprintf("%064x", ordinal)
+	id := worker.StableToolInvocationID(token.TenantID, token.ConversationID, token.HandoffID, revision, ordinal, name, hash)
+	return worker.ToolInvocationRecord{InvocationID: id, ObjectiveRevision: revision, ToolOrdinal: ordinal, ToolName: name, IdempotencyKey: id, ArgumentsHash: hash, Ciphertext: make([]byte, 16), Nonce: make([]byte, 12), KeyID: "key"}
 }

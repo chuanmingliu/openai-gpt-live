@@ -585,6 +585,35 @@ func TestHandoffCoordinatorStableDomainRejectionSubmitsAndAcknowledges(t *testin
 	require.NoError(t, <-done)
 }
 
+func TestHandoffCoordinatorSteeringBlockedSubmitsGenericRejectionAndAcknowledges(t *testing.T) {
+	journal := newCoordinatorJournalFake()
+	inputs := make(chan session.Input, 1)
+	service := &handoffServiceFake{
+		getResult: handoff.Snapshot{ID: "handoff-2", ObjectiveRevision: 2, Request: handoff.CreateRequest{Objective: "old"}},
+		steers:    make(chan handoff.SteerRequest, 1),
+		steerErr:  handoff.ErrSteeringBlocked,
+	}
+	coordinator := NewHandoffCoordinator(service, &submitterFake{inputs: inputs}, 1)
+	require.NoError(t, coordinator.configureJournal(journal, "app-a", "worker-a", 100*time.Millisecond))
+	work := validHandoffWork()
+	work.ToolName = handoff.ToolSteerBackgroundTask
+	work.Arguments = json.RawMessage(`{"handoff_id":"handoff-2","objective":"new"}`)
+	require.NoError(t, coordinator.Enqueue(work))
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- coordinator.Run(ctx) }()
+	<-service.steers
+	rejected := (<-inputs).(session.HandoffAcceptedInput)
+	assert.False(t, rejected.Accepted)
+	assert.Empty(t, rejected.HandoffID)
+	assert.Equal(t, "handoff_rejected", rejected.Reason)
+	require.Eventually(t, func() bool {
+		return journal.isDelivered(handoffWorkKey(mustCanonicalHandoffWork(t, work)))
+	}, time.Second, time.Millisecond)
+	cancel()
+	require.NoError(t, <-done)
+}
+
 func TestHandoffCoordinatorRenewsLeaseThroughBlockedSubmit(t *testing.T) {
 	journal := newCoordinatorJournalFake()
 	submit := &blockingSubmitter{

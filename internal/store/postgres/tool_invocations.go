@@ -75,7 +75,7 @@ func (r *Repository) BeginToolInvocation(ctx context.Context, token worker.Lease
 	if !allowed {
 		return worker.ToolInvocation{}, false, worker.ErrToolNotAllowed
 	}
-	if !r.toolGate.Registered(ctx, registryVersion, record.ToolName) {
+	if _, registered := r.toolGate.Metadata(ctx, registryVersion, record.ToolName); !registered {
 		return worker.ToolInvocation{}, false, worker.ErrToolNotRegistered
 	}
 	requiresApproval, err := approvalRequired(policyRaw)

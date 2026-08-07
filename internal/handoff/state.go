@@ -202,11 +202,16 @@ func ValidateResult(result Result) (Result, error) {
 	if err != nil {
 		return Result{}, invalid("structured result", err)
 	}
+	safetyDecision, err := canonicalJSON(result.SafetyDecision, maxJSONBytes, maxJSONDepth)
+	if err != nil || len(safetyDecision) == 0 || safetyDecision[0] != '{' {
+		return Result{}, invalid("safety decision", err)
+	}
 	usage, err := canonicalJSON(result.Usage, maxJSONBytes, maxJSONDepth)
 	if err != nil {
 		return Result{}, invalid("result usage", err)
 	}
 	result.Structured = structured
+	result.SafetyDecision = safetyDecision
 	result.Usage = usage
 	return result, nil
 }
