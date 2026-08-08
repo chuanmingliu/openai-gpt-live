@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
+	"github.com/chuanmingliu/openai-gpt-live/internal/feature"
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/presentation"
@@ -79,6 +80,7 @@ type Config struct {
 	ReconnectRetryMax     time.Duration
 	Clock                 clock.Clock
 	Jitter                clock.JitterSource
+	FeatureGates          interface{ Enabled(string) bool }
 	reactorApplyGate      func(Input) <-chan struct{}
 	reconnectBoundaryGate func() <-chan struct{}
 	initialRegisterGate   func() <-chan struct{}
@@ -409,8 +411,9 @@ type egressFrame struct {
 }
 
 type voiceControl struct {
-	command realtime.Command
-	sent    chan error
+	command             realtime.Command
+	sent                chan error
+	handoffPresentation bool
 }
 
 type clientControl struct {
@@ -557,6 +560,7 @@ type runState struct {
 	externalAccepted atomic.Uint64
 	externalApplied  atomic.Uint64
 	pendingVoice     atomic.Int64
+	handoffEpoch     atomic.Uint64
 }
 
 func NewManager(cfg Config, connector realtime.Connector, ids IDGenerator) *Manager {
@@ -1694,6 +1698,18 @@ func (s *runState) voiceWriter(ctx context.Context) error {
 		if selected >= 0 {
 			control := pending[selected]
 			pending = append(pending[:selected], pending[selected+1:]...)
+			if (control.handoffPresentation && s.cfg.FeatureGates != nil && s.cfg.FeatureGates.Enabled(feature.ShadowMode)) || s.shadowHandoffEpoch(control.command.Epoch) {
+				s.releaseVoiceSlot()
+				if control.sent != nil {
+					control.sent <- nil
+				}
+				if err := s.enqueueReactor(reactorMessage{input: VoiceCommandCompletedInput{
+					Sequence: control.command.Sequence, Kind: control.command.Kind, Suppressed: true,
+				}}); err != nil {
+					return err
+				}
+				continue
+			}
 			err := s.voice.Send(ctx, control.command)
 			s.releaseVoiceSlot()
 			if control.sent != nil {
@@ -1753,6 +1769,12 @@ func (s *runState) voiceReader(ctx context.Context) error {
 				return errors.New("provider audio response changed before audio.done")
 			}
 			if !s.fence.Accept(event.Epoch) {
+				continue
+			}
+			if s.shadowHandoffEpoch(event.Epoch) {
+				framer.reset()
+				streamHasAudio = false
+				streamResponse, streamItem, streamEpoch = "", "", 0
 				continue
 			}
 			limit := s.cfg.EgressFrames * pcmFrameBytes
@@ -1871,6 +1893,7 @@ func (s *runState) reactorLoop(ctx context.Context) error {
 			}
 			dispatchCtx, finishDispatch := offerDispatchContext(ctx, message.offerCtx)
 			effects, err := reactor.ApplyContext(dispatchCtx, message.input)
+			markHandoffPresentationEffects(message.input, effects, s.handoffEpoch.Load())
 			policySuppressed := false
 			for index := range effects {
 				policySuppressed = policySuppressed || effects[index].PolicySuppressed
@@ -1883,7 +1906,16 @@ func (s *runState) reactorLoop(ctx context.Context) error {
 						}
 					}
 				}
-				err = s.dispatchEffects(dispatchCtx, effects, message.ingressAfter, message.egressAfter)
+				err = s.dispatchEffectsReconciled(dispatchCtx, effects, message.ingressAfter, message.egressAfter, func(completed VoiceCommandCompletedInput) error {
+					reconciled, reconcileErr := reactor.ApplyContext(dispatchCtx, completed)
+					if reconcileErr != nil {
+						return reconcileErr
+					}
+					if len(reconciled) != 0 {
+						return errors.New("suppressed voice command produced unexpected effects")
+					}
+					return nil
+				})
 			}
 			if err == nil {
 				s.boundaryMu.Lock()
@@ -1910,6 +1942,22 @@ func (s *runState) reactorLoop(ctx context.Context) error {
 	}
 }
 
+func markHandoffPresentationEffects(input Input, effects []Effect, handoffEpoch uint64) {
+	handoffPresentation := false
+	switch typed := input.(type) {
+	case HandoffEventInput, HandoffAcceptedInput:
+		handoffPresentation = true
+	case VoiceInput:
+		handoffPresentation = handoffEpoch != 0 && handoffEpoch == uint64(typed.Event.Epoch)
+	}
+	if !handoffPresentation {
+		return
+	}
+	for index := range effects {
+		effects[index].HandoffPresentation = true
+	}
+}
+
 func offerDispatchContext(sessionCtx, offerCtx context.Context) (context.Context, func()) {
 	if offerCtx == nil {
 		return sessionCtx, func() {}
@@ -1923,6 +1971,10 @@ func offerDispatchContext(sessionCtx, offerCtx context.Context) (context.Context
 }
 
 func (s *runState) dispatchEffects(ctx context.Context, effects []Effect, ingressAfter, egressAfter uint64) error {
+	return s.dispatchEffectsReconciled(ctx, effects, ingressAfter, egressAfter, nil)
+}
+
+func (s *runState) dispatchEffectsReconciled(ctx context.Context, effects []Effect, ingressAfter, egressAfter uint64, reconcile func(VoiceCommandCompletedInput) error) error {
 	requireVoiceAcks := false
 	for index := range effects {
 		requireVoiceAcks = requireVoiceAcks || effects[index].PolicySuppressed
@@ -1930,6 +1982,16 @@ func (s *runState) dispatchEffects(ctx context.Context, effects []Effect, ingres
 	for _, effect := range effects {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		// These are the final visual and speech side-effect boundaries. Each
+		// effect re-reads the gate so a transition during dispatch cannot leak.
+		if effect.HandoffPresentation && s.cfg.FeatureGates != nil && s.cfg.FeatureGates.Enabled(feature.ShadowMode) {
+			if effect.VoiceCommand != nil && effect.VoiceCommand.Kind == realtime.CommandCreateResponse && reconcile != nil {
+				if err := reconcile(VoiceCommandCompletedInput{Sequence: effect.VoiceCommand.Sequence, Kind: effect.VoiceCommand.Kind, Suppressed: true}); err != nil {
+					return err
+				}
+			}
+			continue
 		}
 		if effect.FlushBefore != 0 {
 			if err := s.activeWrite.cancelAndWait(); err != nil {
@@ -1966,6 +2028,9 @@ func (s *runState) dispatchEffects(ctx context.Context, effects []Effect, ingres
 		}
 		if effect.VoiceCommand != nil {
 			command := *effect.VoiceCommand
+			if effect.HandoffPresentation && command.Kind == realtime.CommandCreateResponse && command.Epoch != 0 {
+				s.handoffEpoch.Store(uint64(command.Epoch))
+			}
 			if command.Kind != realtime.CommandCancelResponse && command.Kind != realtime.CommandBindResponseEpoch {
 				command.AfterSeq = ingressAfter
 			}
@@ -1975,7 +2040,7 @@ func (s *runState) dispatchEffects(ctx context.Context, effects []Effect, ingres
 				s.metrics.queueOverflow("voice_control")
 				return ErrControlOverflow
 			}
-			control := voiceControl{command: command}
+			control := voiceControl{command: command, handoffPresentation: effect.HandoffPresentation}
 			if requireVoiceAcks || command.Kind == realtime.CommandCancelResponse {
 				control.sent = make(chan error, 1)
 			}
@@ -2081,6 +2146,14 @@ func (s *runState) clientWriter(ctx context.Context) error {
 					s.releaseClientSlot()
 					continue
 				}
+				if (strings.HasPrefix(control.event.EventType(), "live.handoff.") || s.shadowHandoffEpoch(control.epoch)) && s.cfg.FeatureGates != nil && s.cfg.FeatureGates.Enabled(feature.ShadowMode) {
+					finish()
+					if control.written != nil {
+						control.written <- nil
+					}
+					s.releaseClientSlot()
+					continue
+				}
 				err := s.client.Write(writeCtx, control.event)
 				finish()
 				if control.written != nil {
@@ -2110,7 +2183,7 @@ func (s *runState) clientWriter(ctx context.Context) error {
 			s.metrics.QueueOldest("egress", nonnegativeDuration(s.cfg.Clock.Now().Sub(frame.enqueuedAt)))
 			pendingFrame = nil
 			nextOrder++
-			if frame.incarnation != s.ids.Incarnation || !s.fence.Accept(frame.epoch) {
+			if frame.incarnation != s.ids.Incarnation || !s.fence.Accept(frame.epoch) || s.shadowHandoffEpoch(frame.epoch) {
 				s.metrics.StaleOutputRejected()
 				s.progress.mark(frame.sequence)
 				s.metrics.audioDropped(len(frame.audio))
@@ -2118,7 +2191,7 @@ func (s *runState) clientWriter(ctx context.Context) error {
 				continue
 			}
 			writeCtx, finish := s.activeWrite.begin(ctx)
-			if frame.incarnation != s.ids.Incarnation || !s.fence.Accept(frame.epoch) {
+			if frame.incarnation != s.ids.Incarnation || !s.fence.Accept(frame.epoch) || s.shadowHandoffEpoch(frame.epoch) {
 				s.metrics.StaleOutputRejected()
 				finish()
 				s.progress.mark(frame.sequence)
@@ -2163,6 +2236,10 @@ func (s *runState) clientWriter(ctx context.Context) error {
 		case <-s.progress.changed:
 		}
 	}
+}
+
+func (s *runState) shadowHandoffEpoch(epoch identity.ResponseEpoch) bool {
+	return s != nil && epoch != 0 && s.handoffEpoch.Load() == uint64(epoch) && s.cfg.FeatureGates != nil && s.cfg.FeatureGates.Enabled(feature.ShadowMode)
 }
 
 func (s *runState) releaseVoiceSlot() {

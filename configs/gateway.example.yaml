@@ -58,3 +58,5 @@ admin:
 shutdown:
   gateway_drain_timeout: 30s
   cleanup_timeout: 5s
+features:
+  runtime_refresh_interval: 1s

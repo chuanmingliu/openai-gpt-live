@@ -28,8 +28,9 @@ type VoiceInput struct {
 }
 
 type VoiceCommandCompletedInput struct {
-	Sequence uint64
-	Kind     realtime.CommandKind
+	Sequence   uint64
+	Kind       realtime.CommandKind
+	Suppressed bool
 }
 
 type DurableInput struct {

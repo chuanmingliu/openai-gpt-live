@@ -1563,6 +1563,49 @@ func TestTerminalFirstHandoffFailureEmitsNoDurableIDAndIgnoresWrongCorrelation(t
 	assert.Equal(t, identity.ResponseEpoch(4), effects[1].VoiceCommand.Epoch)
 }
 
+func TestDisabledHandoffAcceptanceEmitsContentFreeDegradedWithoutClosingVoice(t *testing.T) {
+	reactor, _ := testReactor(2)
+	epoch := startStreaming(t, reactor, "response-disabled")
+	turn := identity.TurnKey{ID: "turn-disabled", Revision: 1}
+	applyOK(t, reactor, TurnCommittedInput{Sequence: 1, Turn: turn, Transcript: "request"})
+	applyOK(t, reactor, currentVoice(reactor, backgroundToolEvent(epoch, "response-disabled", "call-disabled", json.RawMessage(`{"objective":"request"}`))))
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventResponseDone, Epoch: epoch, ResponseID: "response-disabled", Status: "completed"}))
+	effects := applyOK(t, reactor, HandoffAcceptedInput{
+		OriginEpoch: epoch, Turn: turn, ResponseID: "response-disabled", CallID: "call-disabled", Accepted: false, Reason: "handoffs_disabled",
+	})
+	require.Len(t, effects, 3)
+	require.NotNil(t, effects[0].VoiceCommand)
+	require.NotNil(t, effects[1].VoiceCommand)
+	degraded, ok := effects[2].ClientEvent.(protocol.LiveSessionDegradedEvent)
+	require.True(t, ok)
+	assert.Equal(t, "live.session.degraded", degraded.Type)
+	assert.JSONEq(t, `{"code":"handoffs_disabled"}`, string(degraded.Details))
+	assert.Nil(t, effects[2].Close)
+}
+
+func TestSuppressedHandoffAcceptanceCreateResponseClearsPendingAndAllowsNormalVoice(t *testing.T) {
+	reactor, _ := testReactor(2)
+	epoch := startStreaming(t, reactor, "response-shadow-acceptance")
+	turn := identity.TurnKey{ID: "turn-shadow-acceptance", Revision: 1}
+	applyOK(t, reactor, TurnCommittedInput{Sequence: 1, Turn: turn, Transcript: "request"})
+	applyOK(t, reactor, currentVoice(reactor, backgroundToolEvent(epoch, "response-shadow-acceptance", "call-shadow-acceptance", json.RawMessage(`{"objective":"request"}`))))
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventResponseDone, Epoch: epoch, ResponseID: "response-shadow-acceptance", Status: "completed"}))
+	accepted := HandoffAcceptedInput{
+		OriginEpoch: epoch, Turn: turn, ResponseID: "response-shadow-acceptance", CallID: "call-shadow-acceptance", Accepted: true, HandoffID: "handoff-shadow-acceptance",
+	}
+	effects := applyOK(t, reactor, accepted)
+	require.Len(t, effects, 2)
+	response := effects[1].VoiceCommand
+	require.NotNil(t, response)
+	assert.Equal(t, ResponsePending, reactor.Snapshot().Response)
+	assert.Empty(t, applyOK(t, reactor, VoiceCommandCompletedInput{Sequence: response.Sequence, Kind: response.Kind, Suppressed: true}))
+	assert.Equal(t, ResponseTerminal, reactor.Snapshot().Response)
+	assert.Empty(t, applyOK(t, reactor, accepted), "durable acceptance remains resolved after presentation suppression")
+	normal := applyOK(t, reactor, ClientInput{Event: protocol.ResponseCreateEvent{Type: "response.create"}})
+	require.Len(t, normal, 1)
+	assert.Equal(t, realtime.CommandCreateResponse, normal[0].VoiceCommand.Kind)
+}
+
 func TestPendingAcceptanceTerminalPathsDrainNextReadyCompletion(t *testing.T) {
 	setup := func(t *testing.T, connect bool) (*Reactor, identity.ResponseEpoch) {
 		t.Helper()

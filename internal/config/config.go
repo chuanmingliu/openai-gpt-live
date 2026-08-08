@@ -204,10 +204,11 @@ type AdminConfig struct {
 }
 
 type FeatureConfig struct {
-	SideEffectingTools   bool   `yaml:"side_effecting_tools"`
-	ToolEncryptionKeyEnv string `yaml:"tool_encryption_key_env"`
-	ToolEncryptionKeyID  string `yaml:"tool_encryption_key_id"`
-	Handoffs             bool   `yaml:"handoffs"`
+	SideEffectingTools   bool          `yaml:"side_effecting_tools"`
+	ToolEncryptionKeyEnv string        `yaml:"tool_encryption_key_env"`
+	ToolEncryptionKeyID  string        `yaml:"tool_encryption_key_id"`
+	Handoffs             bool          `yaml:"handoffs"`
+	RefreshInterval      time.Duration `yaml:"runtime_refresh_interval"`
 }
 
 // Load reads a YAML file, resolves only secret environment names, supplies
@@ -427,6 +428,9 @@ func (c *Config) applyDefaults() {
 	if c.Features.SideEffectingTools && c.Features.ToolEncryptionKeyEnv == "" {
 		c.Features.ToolEncryptionKeyEnv = "LIVE_TOOL_ENCRYPTION_KEY"
 	}
+	if c.Features.RefreshInterval == 0 {
+		c.Features.RefreshInterval = time.Second
+	}
 }
 
 func (c Config) Validate() error {
@@ -584,6 +588,9 @@ func (c Config) Validate() error {
 	} else if c.Features.ToolEncryptionKeyID != "" {
 		return errors.New("features.tool_encryption_key_id requires tool_encryption_key_env")
 	}
+	if featureRefreshInterval(c) < 10*time.Millisecond || featureRefreshInterval(c) > time.Minute {
+		return errors.New("features.runtime_refresh_interval must be bounded")
+	}
 	if c.Mode == "production" {
 		hasCert, hasKey := c.Gateway.TLS.CertFile != "", c.Gateway.TLS.KeyFile != ""
 		if hasCert != hasKey {
@@ -621,6 +628,13 @@ func (c Config) Validate() error {
 		return errors.New("static authentication requires configured tenant, user, and scopes")
 	}
 	return nil
+}
+
+func featureRefreshInterval(c Config) time.Duration {
+	if c.Features.RefreshInterval == 0 {
+		return time.Second
+	}
+	return c.Features.RefreshInterval
 }
 
 func validateHTTPURL(raw, name string, requireHTTPS bool) error {

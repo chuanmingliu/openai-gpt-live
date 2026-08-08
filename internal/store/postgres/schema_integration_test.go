@@ -79,6 +79,15 @@ var requiredColumns = map[string]map[string]string{
 		"audit_id": "text", "tenant_id": "text", "conversation_hash": "text", "actor": "text",
 		"reason_code": "text", "deleted_at": "timestamp with time zone",
 	},
+	"runtime_feature_authority": {
+		"singleton": "boolean", "version": "bigint", "updated_at": "timestamp with time zone",
+	},
+	"runtime_feature_flags": {
+		"name": "text", "enabled": "boolean", "version": "bigint", "updated_at": "timestamp with time zone",
+	},
+	"runtime_feature_audit": {
+		"version": "bigint", "name": "text", "enabled": "boolean", "actor": "text", "reason": "text", "changed_at": "timestamp with time zone",
+	},
 }
 
 var requiredDefaults = map[string]string{
@@ -117,6 +126,10 @@ var requiredDefaults = map[string]string{
 	"delivery_cursors.updated_at":               `CURRENT_TIMESTAMP`,
 	"session_admission_leases.created_at":       `CURRENT_TIMESTAMP`,
 	"deletion_audits.deleted_at":                `CURRENT_TIMESTAMP`,
+	"runtime_feature_authority.singleton":       `true`,
+	"runtime_feature_authority.updated_at":      `CURRENT_TIMESTAMP`,
+	"runtime_feature_flags.updated_at":          `CURRENT_TIMESTAMP`,
+	"runtime_feature_audit.changed_at":          `CURRENT_TIMESTAMP`,
 }
 
 var requiredNamedConstraintNames = strings.Fields(`
@@ -161,6 +174,10 @@ var requiredNamedConstraintNames = strings.Fields(`
 	session_admission_leases_tenant_id_size_check session_admission_leases_user_id_size_check
 	session_admission_leases_timestamps_check deletion_audits_audit_id_size_check deletion_audits_tenant_id_size_check
 	deletion_audits_conversation_hash_size_check deletion_audits_actor_size_check deletion_audits_reason_code_size_check
+	runtime_feature_authority_singleton_check runtime_feature_authority_version_check
+	runtime_feature_flags_name_check runtime_feature_flags_version_check
+	runtime_feature_audit_name_check runtime_feature_audit_actor_size_check
+	runtime_feature_audit_reason_size_check runtime_feature_audit_version_check
 `)
 
 // Removing the embedded migration, leaving it dirty, or reporting a stale
@@ -175,7 +192,7 @@ func TestSchemaMigrationLifecycle(t *testing.T) {
 
 	version, dirty, err := migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
-	assert.Equal(t, uint(3), version)
+	assert.Equal(t, uint(4), version)
 	assert.False(t, dirty)
 	var journalPresent bool
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
@@ -200,6 +217,13 @@ func TestSchemaMigrationLifecycle(t *testing.T) {
 	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
 	version, dirty, err = migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
+	assert.Equal(t, uint(3), version)
+	assert.False(t, dirty)
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
+	assert.True(t, journalPresent)
+	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
+	version, dirty, err = migrations.Version(t.Context(), pool)
+	require.NoError(t, err)
 	assert.Equal(t, uint(2), version)
 	assert.False(t, dirty)
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
@@ -211,9 +235,52 @@ func TestSchemaMigrationLifecycle(t *testing.T) {
 	assert.False(t, dirty)
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
 	assert.False(t, journalPresent)
-	require.NoError(t, migrations.Steps(t.Context(), pool, 2))
+	require.NoError(t, migrations.Steps(t.Context(), pool, 3))
 	require.NoError(t, migrations.Steps(t.Context(), pool, 0))
 	require.NoError(t, migrations.Check(t.Context(), pool))
+}
+
+func TestSchemaTask20RuntimeFlagsV4UpDownUpPreservesPriorDurableRowsAndTriggers(t *testing.T) {
+	pool := migratedPostgres(t)
+	insertConversation(t, pool, "tenant-v4-preserve", "conversation-v4-preserve")
+	_, err := pool.Exec(t.Context(), `
+		UPDATE runtime_feature_authority SET version=2 WHERE singleton=true;
+		UPDATE runtime_feature_flags SET enabled=false, version=2 WHERE name='handoffs_enabled';
+		INSERT INTO runtime_feature_audit(version,name,enabled,actor,reason)
+		VALUES(2,'handoffs_enabled',false,'operator','migration-cycle')`)
+	require.NoError(t, err)
+
+	assertV4Objects := func(expected bool) {
+		t.Helper()
+		for _, object := range []string{"runtime_feature_authority", "runtime_feature_flags", "runtime_feature_audit"} {
+			var present bool
+			require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass($1) IS NOT NULL`, object).Scan(&present))
+			assert.Equal(t, expected, present, object)
+		}
+		if !expected {
+			return
+		}
+		var triggers int
+		require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM pg_trigger
+			WHERE tgrelid='runtime_feature_audit'::regclass AND NOT tgisinternal
+			  AND tgname IN ('runtime_feature_audit_append_only','runtime_feature_audit_reject_truncate')`).Scan(&triggers))
+		assert.Equal(t, 2, triggers)
+	}
+	assertV4Objects(true)
+	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
+	assertV4Objects(false)
+	var preserved int
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM conversations WHERE tenant_id='tenant-v4-preserve' AND id='conversation-v4-preserve'`).Scan(&preserved))
+	assert.Equal(t, 1, preserved)
+	require.NoError(t, migrations.Steps(t.Context(), pool, 1))
+	assertV4Objects(true)
+	var authorityVersion, flags int
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT version FROM runtime_feature_authority WHERE singleton=true`).Scan(&authorityVersion))
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM runtime_feature_flags`).Scan(&flags))
+	assert.Equal(t, 1, authorityVersion)
+	assert.Equal(t, 2, flags)
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM conversations WHERE tenant_id='tenant-v4-preserve' AND id='conversation-v4-preserve'`).Scan(&preserved))
+	assert.Equal(t, 1, preserved)
 }
 
 func TestSchemaTask12ToolInvocationScopeConstraint(t *testing.T) {
@@ -240,7 +307,7 @@ func TestSchemaTask12ToolInvocationScopeSafeDownAndUp(t *testing.T) {
 	require.NoError(t, insertHandoff(t, pool, "tenant-safe", "conversation-safe", "handoff-safe", "handoff-idem-safe"))
 	require.NoError(t, insertToolInvocation(t, pool, "invocation-safe", "tenant-safe", "conversation-safe", "handoff-safe", "tool-idem-safe"))
 
-	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
+	require.NoError(t, migrations.Steps(t.Context(), pool, -2))
 	version, dirty, err := migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
 	assert.Equal(t, uint(2), version)
@@ -269,13 +336,14 @@ func TestSchemaTask12ToolInvocationScopeConflictingDownRefusalPreservesV3(t *tes
 	require.NoError(t, insertToolInvocation(t, pool, "invocation-a", "tenant-conflict", "conversation-a", "same-handoff", "tool-idem-a"))
 	require.NoError(t, insertToolInvocation(t, pool, "invocation-b", "tenant-conflict", "conversation-b", "same-handoff", "tool-idem-b"))
 
+	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
 	err := migrations.Steps(t.Context(), pool, -1)
 	require.ErrorIs(t, err, migrations.ErrToolInvocationScopeConflict)
 	version, dirty, versionErr := migrations.Version(t.Context(), pool)
 	require.NoError(t, versionErr)
 	assert.Equal(t, uint(3), version)
 	assert.False(t, dirty)
-	require.NoError(t, migrations.Check(t.Context(), pool))
+	assert.Error(t, migrations.Check(t.Context(), pool))
 	assertToolInvocationStableConstraintColumns(t, pool, []string{
 		"tenant_id", "conversation_id", "handoff_id", "objective_revision",
 		"tool_ordinal", "tool_name", "canonical_arguments_hash",
@@ -283,6 +351,8 @@ func TestSchemaTask12ToolInvocationScopeConflictingDownRefusalPreservesV3(t *tes
 	var count int
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM tool_invocations WHERE tenant_id='tenant-conflict'`).Scan(&count))
 	assert.Equal(t, 2, count)
+	require.NoError(t, migrations.Up(t.Context(), pool))
+	require.NoError(t, migrations.Check(t.Context(), pool))
 }
 
 // Replacing caller cancellation with a post-operation ctx.Err check leaves a
@@ -356,7 +426,7 @@ func TestSchemaMigrationLockTimeoutLeavesNoOrphan(t *testing.T) {
 // backend, roll back the statement, and preserve a clean schema version.
 func TestSchemaMigrationCancellationWhileExecutingSQL(t *testing.T) {
 	pool := migratedPostgres(t)
-	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
+	require.NoError(t, migrations.Steps(t.Context(), pool, -2))
 	locker, err := pool.Acquire(t.Context())
 	require.NoError(t, err)
 	defer locker.Release()
@@ -742,6 +812,14 @@ func TestSchemaEveryNamedCheckRejectsInvalidMutation(t *testing.T) {
 		"deletion_audits_conversation_hash_size_check":    `UPDATE deletion_audits SET conversation_hash='' WHERE audit_id='audit-c'`,
 		"deletion_audits_actor_size_check":                `UPDATE deletion_audits SET actor='' WHERE audit_id='audit-c'`,
 		"deletion_audits_reason_code_size_check":          `UPDATE deletion_audits SET reason_code='' WHERE audit_id='audit-c'`,
+		"runtime_feature_authority_singleton_check":       `INSERT INTO runtime_feature_authority(singleton,version) VALUES(false,1)`,
+		"runtime_feature_authority_version_check":         `UPDATE runtime_feature_authority SET version=0 WHERE singleton=true`,
+		"runtime_feature_flags_name_check":                `INSERT INTO runtime_feature_flags(name,enabled,version) VALUES('unknown',false,1)`,
+		"runtime_feature_flags_version_check":             `UPDATE runtime_feature_flags SET version=0 WHERE name='shadow_mode'`,
+		"runtime_feature_audit_name_check":                `INSERT INTO runtime_feature_audit(version,name,enabled,actor,reason) VALUES(2,'unknown',false,'actor','reason')`,
+		"runtime_feature_audit_actor_size_check":          `INSERT INTO runtime_feature_audit(version,name,enabled,actor,reason) VALUES(2,'handoffs_enabled',false,'','reason')`,
+		"runtime_feature_audit_reason_size_check":         `INSERT INTO runtime_feature_audit(version,name,enabled,actor,reason) VALUES(2,'handoffs_enabled',false,'actor','')`,
+		"runtime_feature_audit_version_check":             `INSERT INTO runtime_feature_audit(version,name,enabled,actor,reason) VALUES(1,'handoffs_enabled',false,'actor','reason')`,
 	}
 
 	rows, err := pool.Query(t.Context(), `

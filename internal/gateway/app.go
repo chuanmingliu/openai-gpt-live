@@ -64,6 +64,7 @@ type App struct {
 	eventPump       *handoff.EventPump
 	eventListener   HandoffEventListener
 	eventWakeups    chan handoff.EventWakeup
+	featureGates    interface{ Enabled(string) bool }
 }
 
 type DurableDependencies struct {
@@ -170,6 +171,16 @@ func WithTracer(tracer trace.Tracer) Option {
 	}
 }
 
+func WithFeatureGates(gates interface{ Enabled(string) bool }) Option {
+	return func(app *App) error {
+		if isNil(gates) {
+			return errors.New("gateway feature gates are required")
+		}
+		app.featureGates = gates
+		return nil
+	}
+}
+
 func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("validate gateway config: %w", err)
@@ -248,6 +259,7 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 	if isNil(app.ids) {
 		return nil, errors.New("session ID generator is required")
 	}
+	managerConfig.FeatureGates = app.featureGates
 
 	if cfg.Features.Handoffs {
 		if app.durable == nil || isNil(app.durable.Service) || isNil(app.durable.ConversationWriter) ||
@@ -276,7 +288,7 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 			Reader: app.presentation.Reader, Cursors: app.presentation.Cursors, Notifications: app.eventWakeups,
 			Clock: app.presentation.Clock, PollInterval: app.presentation.PollInterval,
 			Metrics: handoff.EventPumpMetrics{Presentation: app.handoffMetrics.Presentation, Duplicate: app.handoffMetrics.Duplicate},
-			Tracer:  app.tracer,
+			Tracer:  app.tracer, Gates: app.featureGates,
 		}
 		app.eventListener = app.presentation.Listener
 		managerConfig.HandoffConsumerID = app.presentation.ConsumerID
@@ -296,6 +308,11 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 		app.manager = session.NewManager(managerConfig, connector, app.ids)
 		app.eventPump.Sink = app.manager
 		app.handoffs = NewHandoffCoordinator(app.durable.Service, app.manager, app.durable.HandoffQueueCapacity)
+		if app.featureGates != nil {
+			if err := app.handoffs.SetFeatureGates(app.featureGates); err != nil {
+				return nil, err
+			}
+		}
 		app.handoffs.tracer = app.tracer
 		app.handoffs.metricsClock = app.presentation.Clock
 		app.handoffs.ackMetric = app.handoffMetrics.Acknowledgement

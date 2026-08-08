@@ -43,6 +43,32 @@ func (r *Repository) lockHandoffCreate(ctx context.Context, tx pgx.Tx, tenantID,
 	return r.after("create_idempotency_lock")
 }
 
+// admitNewHandoff serializes the irreversible create boundary with runtime
+// feature mutations. Set locks this same singleton row FOR UPDATE. A create
+// that takes this shared lock first is ordered before a later disable; a create
+// that reaches it after disable commits must observe disabled and reject.
+func (r *Repository) admitNewHandoff(ctx context.Context, tx pgx.Tx) error {
+	if err := r.after("before_handoff_feature_admission"); err != nil {
+		return err
+	}
+	if r.handoffAdmissionHook != nil {
+		r.handoffAdmissionHook()
+	}
+	var authorityVersion int64
+	if err := tx.QueryRow(ctx, `SELECT version FROM runtime_feature_authority WHERE singleton=true FOR SHARE`).Scan(&authorityVersion); err != nil || authorityVersion <= 0 {
+		return errors.New("runtime feature authority is corrupt")
+	}
+	var enabled bool
+	var flagVersion int64
+	if err := tx.QueryRow(ctx, `SELECT enabled, version FROM runtime_feature_flags WHERE name='handoffs_enabled'`).Scan(&enabled, &flagVersion); err != nil || flagVersion <= 0 || flagVersion > authorityVersion {
+		return errors.New("runtime feature authority is corrupt")
+	}
+	if !enabled {
+		return handoff.ErrHandoffsDisabled
+	}
+	return r.after("handoff_feature_admitted")
+}
+
 func (r *Repository) GetHandoffByIdempotencyKey(ctx context.Context, scope handoff.Scope, key string) (handoff.Snapshot, error) {
 	if err := validateContext(ctx); err != nil {
 		return handoff.Snapshot{}, err
@@ -115,6 +141,9 @@ func (r *Repository) CreateHandoff(ctx context.Context, record handoff.CreateRec
 	}
 	if !errors.Is(loadErr, pgx.ErrNoRows) {
 		return handoff.Snapshot{}, false, loadErr
+	}
+	if err := r.admitNewHandoff(ctx, tx); err != nil {
+		return handoff.Snapshot{}, false, err
 	}
 
 	normalized, err := handoff.ValidateCreateRequest(record.Request, record.CreatedAt)

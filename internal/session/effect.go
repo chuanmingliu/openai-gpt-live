@@ -9,17 +9,18 @@ import (
 )
 
 type Effect struct {
-	ClientEvent        protocol.ServerEvent
-	RequireClientWrite bool
-	PolicySuppressed   bool
-	ResponseEpoch      identity.ResponseEpoch
-	Incarnation        identity.Incarnation
-	VoiceCommand       *realtime.Command
-	Async              *AsyncEffect
-	Transcript         *TranscriptRequestedEffect
-	Handoff            *HandoffRequestedEffect
-	FlushBefore        identity.ResponseEpoch
-	Close              *CloseEffect
+	ClientEvent         protocol.ServerEvent
+	RequireClientWrite  bool
+	PolicySuppressed    bool
+	ResponseEpoch       identity.ResponseEpoch
+	Incarnation         identity.Incarnation
+	VoiceCommand        *realtime.Command
+	Async               *AsyncEffect
+	Transcript          *TranscriptRequestedEffect
+	Handoff             *HandoffRequestedEffect
+	FlushBefore         identity.ResponseEpoch
+	Close               *CloseEffect
+	HandoffPresentation bool
 }
 
 type TranscriptRequestedEffect struct {

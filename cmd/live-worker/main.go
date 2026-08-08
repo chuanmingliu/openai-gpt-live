@@ -26,6 +26,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/auth"
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
 	"github.com/chuanmingliu/openai-gpt-live/internal/config"
+	"github.com/chuanmingliu/openai-gpt-live/internal/feature"
 	"github.com/chuanmingliu/openai-gpt-live/internal/health"
 	"github.com/chuanmingliu/openai-gpt-live/internal/lifecycle"
 	"github.com/chuanmingliu/openai-gpt-live/internal/reasoner/deepseek"
@@ -292,6 +293,9 @@ type productionRuntime struct {
 	telemetry          *telemetry.Runtime
 	diagnostics        *http.Server
 	diagnosticListener net.Listener
+	gates              *feature.Gates
+	featureStore       *feature.PostgresStore
+	featureInterval    time.Duration
 }
 
 func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecrets) (serviceRuntime, error) {
@@ -341,7 +345,7 @@ func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecret
 	}
 	instance := workerIdentity()
 	metricRegistry := prometheus.NewRegistry()
-	metrics, err := telemetry.NewMetrics(metricRegistry, telemetry.MetricsConfig{Labels: telemetry.MetricLabels{Component: "worker", Provider: provider, Region: "local", Instance: instance, ConfigHash: configHash}, AllowedComponents: []string{"worker"}, AllowedProviders: []string{provider}, AllowedRegions: []string{"local"}, AllowedInstances: []string{instance}, AllowedConfigHashes: []string{configHash}, AllowedQueues: []string{"worker", "outbox"}, AllowedResults: []string{"ok", "error", "scheduled", "expired"}})
+	metrics, err := telemetry.NewMetrics(metricRegistry, telemetry.MetricsConfig{Labels: telemetry.MetricLabels{Component: "worker", Provider: provider, Region: "local", Instance: instance, ConfigHash: configHash}, AllowedComponents: []string{"worker"}, AllowedProviders: []string{provider}, AllowedRegions: []string{"local"}, AllowedInstances: []string{instance}, AllowedConfigHashes: []string{configHash}, AllowedQueues: []string{"worker", "outbox"}, AllowedResults: []string{"ok", "error", "scheduled", "expired", "shadow"}})
 	if err != nil {
 		return nil, err
 	}
@@ -357,6 +361,15 @@ func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecret
 	if err != nil {
 		return nil, err
 	}
+	featureStore, err := feature.NewPostgres(pool, realClock, time.Second, cfg.Shutdown.CleanupTimeout)
+	if err != nil {
+		return nil, err
+	}
+	gates := feature.New(nil)
+	authority, err := featureStore.Load(ctx)
+	if err != nil || !gates.Apply(authority) {
+		return nil, errors.New("runtime feature authority is unavailable")
+	}
 	client, err := deepseek.New(deepseek.Config{BaseURL: cfg.Worker.Reasoner.BaseURL, APIKey: secrets.ProviderAPIKey, MaxOutputBytes: cfg.Worker.MaxOutputBytes, MaxToolCalls: 64, MaxToolArgumentBytes: minInt(cfg.Worker.MaxOutputBytes, 256<<10)}, &http.Client{Timeout: cfg.Worker.RequestTimeout})
 	if err != nil {
 		return nil, fmt.Errorf("configure DeepSeek client: %w", err)
@@ -369,7 +382,8 @@ func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecret
 	}
 	drainer := lifecycle.NewDrainer()
 	runnerConfig := worker.Runner{Store: repo, Reasoner: client, Safety: staticPolicy, Tools: registry, Clock: realClock, Jitter: jitter, Drainer: drainer, Tracer: traceRuntime.TracerProvider().Tracer("live.worker"),
-		Retry: worker.RetryPolicy{Base: cfg.Worker.RetryBase, Maximum: cfg.Worker.RetryMax, MaxRetries: uint32(cfg.Worker.MaxRetries)}, WorkerID: workerIdentity(), LeaseDuration: cfg.Worker.LeaseDuration, Concurrency: cfg.Worker.Concurrency,
+		FeatureGates: gates,
+		Retry:        worker.RetryPolicy{Base: cfg.Worker.RetryBase, Maximum: cfg.Worker.RetryMax, MaxRetries: uint32(cfg.Worker.MaxRetries)}, WorkerID: workerIdentity(), LeaseDuration: cfg.Worker.LeaseDuration, Concurrency: cfg.Worker.Concurrency,
 		PollInterval: cfg.Worker.PollInterval, MaxOutputBytes: cfg.Worker.MaxOutputBytes, MaxOutputTokens: cfg.Worker.MaxOutputTokens, MaxToolRounds: cfg.Worker.MaxToolRounds, MaxToolCalls: 64,
 		MaxToolArgumentBytes: minInt(cfg.Worker.MaxOutputBytes, 256<<10), MaxToolOutputBytes: minInt(cfg.Worker.MaxOutputBytes, 256<<10),
 		ProviderSafetyID: func(tenant, user string) (string, error) { return safety.ProviderSafetyID(privacyKey, tenant, user) },
@@ -407,6 +421,12 @@ func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecret
 	_ = ready.RegisterDrainer(drainer)
 	_ = ready.RegisterRequired("database", health.CheckFunc(func(checkCtx context.Context) error { return pool.Ping(checkCtx) }))
 	_ = ready.RegisterRequired("telemetry", health.CheckFunc(func(context.Context) error { return traceRuntime.Ready() }))
+	_ = ready.RegisterRequired("runtime_features", health.CheckFunc(func(context.Context) error {
+		if !gates.Healthy() {
+			return errors.New("runtime feature refresh is unhealthy")
+		}
+		return nil
+	}))
 	var diagnostics *http.Server
 	if cfg.Admin.ListenAddr != "" {
 		if err := admin.ValidateListenAddress(ctx, cfg.Admin.ListenAddr, cfg.Mode == "production"); err != nil {
@@ -416,7 +436,7 @@ func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecret
 		if err != nil {
 			return nil, err
 		}
-		adminHandler, err := admin.NewHandler(admin.Config{Authenticator: authenticator, Drainer: drainer, Capacity: workerCapacity{drainer: drainer, limit: int64(cfg.Worker.Concurrency)}})
+		adminHandler, err := admin.NewHandler(admin.Config{Authenticator: authenticator, Drainer: drainer, Capacity: workerCapacity{drainer: drainer, limit: int64(cfg.Worker.Concurrency)}, FeatureStore: featureStore, FeatureGates: gates})
 		if err != nil {
 			return nil, err
 		}
@@ -432,7 +452,7 @@ func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecret
 		}
 	}
 	closeOnError = false
-	runtime := &productionRuntime{pool: pool, runner: runner, publisher: publisher, repo: repo, clock: realClock, sweepEvery: sweepEvery, secretKey: privacyKey, sealer: argumentSealer, drainer: drainer, drainTimeout: cfg.Shutdown.WorkerDrainTimeout, cleanupTimeout: cfg.Shutdown.CleanupTimeout, telemetry: traceRuntime, diagnostics: diagnostics, diagnosticListener: diagnosticListener}
+	runtime := &productionRuntime{pool: pool, runner: runner, publisher: publisher, repo: repo, clock: realClock, sweepEvery: sweepEvery, secretKey: privacyKey, sealer: argumentSealer, drainer: drainer, drainTimeout: cfg.Shutdown.WorkerDrainTimeout, cleanupTimeout: cfg.Shutdown.CleanupTimeout, telemetry: traceRuntime, diagnostics: diagnostics, diagnosticListener: diagnosticListener, gates: gates, featureStore: featureStore, featureInterval: cfg.Features.RefreshInterval}
 	return runtime, nil
 }
 
@@ -483,6 +503,11 @@ func (r *productionRuntime) runProduction(ctx context.Context) error {
 	components := r.components
 	if len(components) == 0 {
 		components = []func(context.Context) error{r.runner.Run, r.publisher.Run, r.sweep}
+		if r.gates != nil && r.featureStore != nil {
+			components = append(components, func(ctx context.Context) error {
+				return r.gates.Run(ctx, r.featureStore, r.featureInterval, r.cleanupTimeout)
+			})
+		}
 	}
 	errorsOut := make(chan error, len(components))
 	var group sync.WaitGroup

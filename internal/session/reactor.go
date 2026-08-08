@@ -3,6 +3,8 @@ package session
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -132,6 +134,7 @@ type Reactor struct {
 	activeTurn                *activeInputTurn
 	inputTurnRevision         uint32
 	pendingCancelSequence     uint64
+	pendingCreateSequence     uint64
 	synthEventSequence        uint64
 	transcriptSequence        uint64
 	committedTranscript       string
@@ -666,6 +669,7 @@ func (r *Reactor) startPresentation(event handoff.Event, summary string, structu
 			Instructions: presentationInstructions, ToolChoice: json.RawMessage(`"none"`), Input: input,
 		},
 	}
+	r.pendingCreateSequence = command.Sequence
 	r.state.Response = ResponsePending
 	r.activeResponseID = ""
 	r.activeResponseEpoch = epoch
@@ -998,6 +1002,7 @@ func (r *Reactor) emitHandoffAcceptance(call *handoffCall) ([]Effect, error) {
 	r.activeResponseEpoch = epoch
 	r.terminal = nil
 	r.pendingCancelSequence = 0
+	r.pendingCreateSequence = responseCommand.Sequence
 	call.emitted = true
 	r.handoffCallBytes -= call.bytes
 	token := handoffToken{originEpoch: call.originEpoch, turn: call.turn, responseID: call.responseID, callID: call.callID}
@@ -1025,7 +1030,17 @@ func (r *Reactor) emitHandoffAcceptance(call *handoffCall) ([]Effect, error) {
 	if !responseStillReferenced {
 		delete(r.terminalResponses, call.responseID)
 	}
-	return []Effect{{VoiceCommand: &itemCommand}, {VoiceCommand: &responseCommand}}, nil
+	effects := []Effect{{VoiceCommand: &itemCommand}, {VoiceCommand: &responseCommand}}
+	if call.completed.Reason == "handoffs_disabled" {
+		digest := sha256.Sum256([]byte(call.callID))
+		details, _ := json.Marshal(struct {
+			Code string `json:"code"`
+		}{Code: "handoffs_disabled"})
+		effects = append(effects, Effect{ClientEvent: protocol.LiveSessionDegradedEvent{
+			Type: "live.session.degraded", EventID: "feature-" + hex.EncodeToString(digest[:16]), Status: "degraded", Details: details,
+		}, RequireClientWrite: true})
+	}
+	return effects, nil
 }
 
 func (r *Reactor) applyStaleTurnCommit(sequence uint64, turn identity.TurnKey) ([]Effect, error) {
@@ -1252,6 +1267,7 @@ func (r *Reactor) applyResponseCreate(event protocol.ResponseCreateEvent) ([]Eff
 		Epoch:    epoch,
 		Response: response,
 	}
+	r.pendingCreateSequence = command.Sequence
 	return []Effect{{VoiceCommand: &command}}, nil
 }
 
@@ -1824,6 +1840,26 @@ func (r *Reactor) applyVoiceCommandCompleted(input VoiceCommandCompletedInput) (
 			Session: cloneRaw(pending.session),
 		}
 		return []Effect{{ClientEvent: updated}}, nil
+	}
+	if input.Kind == realtime.CommandCreateResponse {
+		if input.Sequence == 0 || input.Sequence != r.pendingCreateSequence {
+			return nil, nil
+		}
+		r.pendingCreateSequence = 0
+		if !input.Suppressed {
+			return nil, nil
+		}
+		// No provider response can terminalize a command deliberately dropped
+		// by shadow mode. Fence the absent response and clear all presentation
+		// state so a subsequent ordinary response.create is admissible.
+		r.activeResponseEpoch = r.fence.Advance()
+		r.activeResponseID = ""
+		r.pendingCancelSequence = 0
+		r.terminal = nil
+		r.state.Response = ResponseTerminal
+		r.stagedPresentation = nil
+		r.clearPresentationResponse()
+		return nil, nil
 	}
 	if input.Kind != realtime.CommandCancelResponse ||
 		input.Sequence == 0 ||

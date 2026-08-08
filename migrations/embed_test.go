@@ -36,6 +36,19 @@ func TestTask12MigrationEmbeddedChecksums(t *testing.T) {
 	}
 }
 
+func TestTask20MigrationEmbeddedChecksums(t *testing.T) {
+	want := map[string]string{
+		"000004_runtime_flags.up.sql":   "c6b3736ecdf0a8be66c99430383f75b8ef7236e2e345a7dd5bf48be49cb0a7ff",
+		"000004_runtime_flags.down.sql": "7434b93a436203cb4a9713df54b46bea71b47a2ca96027ac8e8b39cf446d5af7",
+	}
+	for name, checksum := range want {
+		contents, err := files.ReadFile(name)
+		require.NoError(t, err)
+		digest := sha256.Sum256(contents)
+		assert.Equal(t, checksum, hex.EncodeToString(digest[:]), name)
+	}
+}
+
 func TestCoordinatorPendingRefusalClassificationIsExact(t *testing.T) {
 	assert.True(t, isCoordinatorPendingRefusal(&pgconn.PgError{Code: "55000", Message: ErrCoordinatorPendingWork.Error()}))
 	assert.False(t, isCoordinatorPendingRefusal(&pgconn.PgError{Code: "57014", Message: ErrCoordinatorPendingWork.Error()}))

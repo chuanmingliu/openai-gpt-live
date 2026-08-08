@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
+	"github.com/chuanmingliu/openai-gpt-live/internal/feature"
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
@@ -1493,6 +1494,108 @@ func TestDispatchPolicySuppressionWaitsForAllowedSpeechSendSuccess(t *testing.T)
 	err = state.dispatchEffects(ctx, []Effect{{VoiceCommand: &command}, {PolicySuppressed: true}}, 0, 0)
 	require.ErrorIs(t, err, providerErr)
 	require.ErrorIs(t, <-voiceDone, providerErr)
+}
+
+type sessionShadowGates map[string]bool
+
+func (g sessionShadowGates) Enabled(name string) bool { return g[name] }
+
+func TestDispatchShadowRechecksVisualAndSpeechBoundariesSeparately(t *testing.T) {
+	gates := sessionShadowGates{feature.ShadowMode: true}
+	cfg, err := normalizeManagerConfig(Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second, FeatureGates: gates})
+	require.NoError(t, err)
+	state := newRunState(cfg, testIDs(), &recordingVoice{sent: make(chan realtime.Command, 1)}, newChannelClient(1), func() {})
+	visual := protocol.LiveHandoffCompletedEvent{Type: "live.handoff.completed", EventID: "event", HandoffID: "handoff", Status: "succeeded"}
+	speech := realtime.Command{Kind: realtime.CommandCreateResponse, Sequence: 1, Epoch: 2}
+	require.NoError(t, state.dispatchEffects(t.Context(), []Effect{
+		{ClientEvent: visual, RequireClientWrite: true, HandoffPresentation: true},
+		{VoiceCommand: &speech, HandoffPresentation: true},
+	}, 0, 0))
+	select {
+	case got := <-state.clientCtl:
+		t.Fatalf("shadow visual reached client boundary: %#v", got)
+	default:
+	}
+	select {
+	case got := <-state.voiceCtl:
+		t.Fatalf("shadow speech reached provider boundary: %#v", got)
+	default:
+	}
+}
+
+func handoffAcceptanceEffectsForShadowTest(t *testing.T) (*Reactor, HandoffAcceptedInput, []Effect) {
+	t.Helper()
+	reactor, _ := testReactor(2)
+	epoch := startStreaming(t, reactor, "response-manager-shadow")
+	turn := identity.TurnKey{ID: "turn-manager-shadow", Revision: 1}
+	applyOK(t, reactor, TurnCommittedInput{Sequence: 1, Turn: turn, Transcript: "request"})
+	applyOK(t, reactor, currentVoice(reactor, backgroundToolEvent(epoch, "response-manager-shadow", "call-manager-shadow", json.RawMessage(`{"objective":"request"}`))))
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventResponseDone, Epoch: epoch, ResponseID: "response-manager-shadow", Status: "completed"}))
+	input := HandoffAcceptedInput{OriginEpoch: epoch, Turn: turn, ResponseID: "response-manager-shadow", CallID: "call-manager-shadow", Accepted: true, HandoffID: "handoff-manager-shadow"}
+	effects := applyOK(t, reactor, input)
+	markHandoffPresentationEffects(input, effects, 0)
+	return reactor, input, effects
+}
+
+func TestShadowFromStartSuppressesEveryHandoffAcceptanceReinjectionAndReconcilesState(t *testing.T) {
+	gates := feature.New(map[string]bool{feature.HandoffsEnabled: true, feature.ShadowMode: true})
+	reactor, accepted, effects := handoffAcceptanceEffectsForShadowTest(t)
+	voice := &recordingVoice{sent: make(chan realtime.Command, 4)}
+	client := newChannelClient(4)
+	cfg, err := normalizeManagerConfig(Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second, FeatureGates: gates})
+	require.NoError(t, err)
+	state := newRunState(cfg, testIDs(), voice, client, func() {})
+	err = state.dispatchEffectsReconciled(t.Context(), effects, 0, 0, func(completed VoiceCommandCompletedInput) error {
+		_, applyErr := reactor.Apply(completed)
+		return applyErr
+	})
+	require.NoError(t, err)
+	require.Equal(t, ResponseTerminal, reactor.Snapshot().Response)
+	require.Empty(t, applyOK(t, reactor, accepted), "acceptance durable state must remain resolved")
+	select {
+	case command := <-state.voiceCtl:
+		t.Fatalf("handoff acceptance reached provider queue in shadow: %#v", command)
+	default:
+	}
+	select {
+	case event := <-state.clientCtl:
+		t.Fatalf("handoff acceptance reached client queue in shadow: %#v", event)
+	default:
+	}
+	normal := applyOK(t, reactor, ClientInput{Event: protocol.ResponseCreateEvent{Type: "response.create"}})
+	require.Len(t, normal, 1)
+}
+
+func TestQueuedHandoffAcceptanceSuppressionReconcilesBeforeProviderSend(t *testing.T) {
+	gates := feature.New(map[string]bool{feature.HandoffsEnabled: true, feature.ShadowMode: false})
+	reactor, _, effects := handoffAcceptanceEffectsForShadowTest(t)
+	voice := &recordingVoice{sent: make(chan realtime.Command, 4)}
+	cfg, err := normalizeManagerConfig(Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second, FeatureGates: gates})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	state := newRunState(cfg, testIDs(), voice, newChannelClient(4), cancel)
+	require.NoError(t, state.dispatchEffects(ctx, effects, 0, 0))
+	require.True(t, gates.Apply(feature.Snapshot{Version: 1, Values: map[string]bool{feature.HandoffsEnabled: true, feature.ShadowMode: true}}))
+	done := make(chan error, 1)
+	go func() { done <- state.voiceWriter(ctx) }()
+	for range 2 {
+		message := <-state.inbox
+		completed, ok := message.input.(VoiceCommandCompletedInput)
+		require.True(t, ok)
+		require.True(t, completed.Suppressed)
+		applyOK(t, reactor, completed)
+	}
+	require.Equal(t, ResponseTerminal, reactor.Snapshot().Response)
+	select {
+	case command := <-voice.sent:
+		t.Fatalf("queued handoff acceptance reached provider after shadow enable: %#v", command)
+	default:
+	}
+	normal := applyOK(t, reactor, ClientInput{Event: protocol.ResponseCreateEvent{Type: "response.create"}})
+	require.Len(t, normal, 1)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
 }
 
 func TestManagerConfigDefaultsAndBounds(t *testing.T) {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
+	"github.com/chuanmingliu/openai-gpt-live/internal/feature"
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
@@ -173,6 +174,33 @@ func TestHandoffCoordinatorRejectsAdversarialArgumentsAndOverflow(t *testing.T) 
 	select {
 	case request := <-service.creates:
 		t.Fatalf("invalid model authority reached service: %#v", request)
+	default:
+	}
+	cancel()
+	require.NoError(t, <-done)
+}
+
+type staticFeatureGates map[string]bool
+
+func (g staticFeatureGates) Enabled(name string) bool { return g[name] }
+
+func TestHandoffCoordinatorChecksDisableImmediatelyBeforeCreate(t *testing.T) {
+	service := &handoffServiceFake{creates: make(chan handoff.CreateRequest, 1), result: handoff.Snapshot{ID: "must-not-create"}}
+	inputs := make(chan session.Input, 1)
+	coordinator := NewHandoffCoordinator(service, &submitterFake{inputs: inputs}, 1)
+	gates := staticFeatureGates{feature.HandoffsEnabled: true}
+	require.NoError(t, coordinator.SetFeatureGates(gates))
+	require.NoError(t, coordinator.Enqueue(validHandoffWork()))
+	gates[feature.HandoffsEnabled] = false
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- coordinator.Run(ctx) }()
+	rejected := (<-inputs).(session.HandoffAcceptedInput)
+	assert.False(t, rejected.Accepted)
+	assert.Equal(t, "handoffs_disabled", rejected.Reason)
+	select {
+	case request := <-service.creates:
+		t.Fatalf("disabled work reached durable create: %#v", request)
 	default:
 	}
 	cancel()

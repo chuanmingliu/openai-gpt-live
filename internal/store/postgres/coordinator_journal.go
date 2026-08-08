@@ -307,6 +307,35 @@ func (r *Repository) AckCoordinatorWork(ctx context.Context, workKey, owner stri
 	return nil
 }
 
+// DiscardCoordinatorWork terminally removes a claimed item that was rejected
+// before any durable domain write. The same owner/generation/lease fence as an
+// acknowledgement prevents a stale coordinator from deleting live work.
+func (r *Repository) DiscardCoordinatorWork(ctx context.Context, workKey, owner string, generation uint64) error {
+	if err := validateContext(ctx); err != nil {
+		return err
+	}
+	if err := bounded("work key", workKey, maxIdentityBytes, true); err != nil {
+		return err
+	}
+	if err := bounded("claim owner", owner, maxIdentityBytes, true); err != nil || generation == 0 || generation > math.MaxInt64 {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("%w: invalid coordinator discard", handoff.ErrInvalidRequest)
+	}
+	command, err := r.pool.Exec(ctx, `
+		DELETE FROM coordinator_work_journal
+		WHERE work_key=$1 AND claim_owner=$2 AND claim_generation=$3 AND delivered=FALSE
+		  AND claim_until > clock_timestamp()`, workKey, owner, int64(generation))
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return handoff.ErrNotFound
+	}
+	return nil
+}
+
 func validateCoordinatorRecord(record CoordinatorJournalRecord) (CoordinatorJournalRecord, error) {
 	if err := validateScope(record.Scope); err != nil {
 		return CoordinatorJournalRecord{}, err

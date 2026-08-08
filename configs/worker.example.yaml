@@ -35,6 +35,7 @@ telemetry:
 admin:
   listen_addr: 127.0.0.1:9091
 features:
+  runtime_refresh_interval: 1s
   side_effecting_tools: true
   tool_encryption_key_env: LIVE_TOOL_ENCRYPTION_KEY
   # Immutable identifier stored with ciphertext. Keep old key IDs and keys

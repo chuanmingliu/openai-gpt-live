@@ -2,6 +2,7 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -13,8 +14,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/auth"
+	"github.com/chuanmingliu/openai-gpt-live/internal/feature"
 )
 
 const AdminScope = "live.admin"
@@ -32,6 +35,8 @@ type Config struct {
 	Drainer       Drainer
 	Capacity      CapacityProvider
 	Sessions      SessionProvider
+	FeatureStore  feature.Store
+	FeatureGates  *feature.Gates
 }
 
 func NewHandler(cfg Config) (http.Handler, error) {
@@ -50,7 +55,8 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 		return
 	}
-	if status := h.authorizationStatus(r); status != 0 {
+	principal, status := h.authorize(r)
+	if status != 0 {
 		w.WriteHeader(status)
 		return
 	}
@@ -61,24 +67,26 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.sessions(w, r)
 	case "/admin/v1/drain":
 		h.drain(w, r)
+	case "/admin/v1/features/handoffs":
+		h.handoffs(w, r, principal)
 	default:
 		http.NotFound(w, r)
 	}
 }
-func (h *handler) authorizationStatus(r *http.Request) int {
+func (h *handler) authorize(r *http.Request) (auth.Principal, int) {
 	token, err := auth.Bearer(r.Header)
 	if err != nil {
-		return http.StatusUnauthorized
+		return auth.Principal{}, http.StatusUnauthorized
 	}
 	principal, err := h.cfg.Authenticator.Authenticate(r.Context(), token)
 	if err != nil {
-		return http.StatusUnauthorized
+		return auth.Principal{}, http.StatusUnauthorized
 	}
 	_, ok := principal.Scopes[AdminScope]
 	if !ok {
-		return http.StatusForbidden
+		return auth.Principal{}, http.StatusForbidden
 	}
-	return 0
+	return principal, 0
 }
 func (h *handler) capacity(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -129,6 +137,110 @@ func (h *handler) drain(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, r, http.StatusAccepted, struct {
 		Status string `json:"status"`
 	}{"draining"})
+}
+
+type handoffFeatureMutation struct {
+	Enabled bool
+	Reason  string
+}
+
+func (h *handler) handoffs(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
+	if r.Method != http.MethodPut {
+		method(w, "PUT")
+		return
+	}
+	if r.Header.Get("Content-Type") != "application/json" {
+		w.WriteHeader(http.StatusUnsupportedMediaType)
+		return
+	}
+	if r.ContentLength > 2048 {
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		return
+	}
+	if h.cfg.FeatureStore == nil || h.cfg.FeatureGates == nil || strings.TrimSpace(principal.UserID) == "" || len(principal.UserID) > 256 || !utf8.ValidString(principal.UserID) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 2049))
+	if err != nil || len(body) > 2048 {
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		return
+	}
+	mutation, err := decodeHandoffFeatureMutation(body)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	snapshot, err := h.cfg.FeatureStore.Set(ctx, feature.HandoffsEnabled, mutation.Enabled, principal.UserID, mutation.Reason)
+	if err != nil || !acceptCommittedFeatureSnapshot(h.cfg.FeatureGates, snapshot) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, r, http.StatusOK, struct {
+		Name    string `json:"name"`
+		Enabled bool   `json:"enabled"`
+		Version uint64 `json:"version"`
+	}{feature.HandoffsEnabled, snapshot.Values[feature.HandoffsEnabled], snapshot.Version})
+}
+
+func acceptCommittedFeatureSnapshot(gates *feature.Gates, committed feature.Snapshot) bool {
+	if gates == nil || !committed.Valid() {
+		return false
+	}
+	if gates.Apply(committed) {
+		return true
+	}
+	current := gates.Snapshot()
+	if !current.Valid() {
+		return false
+	}
+	if current.Version > committed.Version {
+		// Store.Set has already committed or reconciled the exact immutable
+		// audit. A newer local authority supersedes publication, not the truth
+		// of this operation's acknowledgement.
+		return true
+	}
+	return current.Version == committed.Version && current.Equal(committed)
+}
+
+func decodeHandoffFeatureMutation(body []byte) (handoffFeatureMutation, error) {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	start, err := decoder.Token()
+	if err != nil || start != json.Delim('{') {
+		return handoffFeatureMutation{}, errors.New("invalid feature mutation")
+	}
+	var mutation handoffFeatureMutation
+	seen := map[string]bool{}
+	for decoder.More() {
+		token, err := decoder.Token()
+		key, ok := token.(string)
+		if err != nil || !ok || seen[key] {
+			return handoffFeatureMutation{}, errors.New("invalid feature mutation")
+		}
+		seen[key] = true
+		switch key {
+		case "enabled":
+			if err := decoder.Decode(&mutation.Enabled); err != nil {
+				return handoffFeatureMutation{}, errors.New("invalid feature mutation")
+			}
+		case "reason":
+			if err := decoder.Decode(&mutation.Reason); err != nil {
+				return handoffFeatureMutation{}, errors.New("invalid feature mutation")
+			}
+		default:
+			return handoffFeatureMutation{}, errors.New("invalid feature mutation")
+		}
+	}
+	end, err := decoder.Token()
+	if err != nil || end != json.Delim('}') || !seen["enabled"] || !seen["reason"] || strings.TrimSpace(mutation.Reason) == "" || len(mutation.Reason) > 256 || !utf8.ValidString(mutation.Reason) {
+		return handoffFeatureMutation{}, errors.New("invalid feature mutation")
+	}
+	if decoder.Decode(new(any)) != io.EOF {
+		return handoffFeatureMutation{}, errors.New("invalid feature mutation")
+	}
+	return mutation, nil
 }
 func method(w http.ResponseWriter, allow string) {
 	w.Header().Set("Allow", allow)

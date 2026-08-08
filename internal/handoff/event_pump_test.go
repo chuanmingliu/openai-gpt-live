@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
+	"github.com/chuanmingliu/openai-gpt-live/internal/feature"
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/stretchr/testify/assert"
@@ -162,6 +163,35 @@ func TestEventPumpExplicitSafetySuppressionAdvancesCursor(t *testing.T) {
 	}, time.Second, time.Millisecond)
 	cancel()
 	assert.ErrorIs(t, <-done, context.Canceled)
+}
+
+type pumpGates map[string]bool
+
+func (g pumpGates) Enabled(name string) bool { return g[name] }
+
+func TestEventPumpShadowSuppressesSinkButAdvancesCursorAndRecordsShadow(t *testing.T) {
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "conversation"}
+	store := newPumpStore()
+	store.events[scope] = []handoff.Event{pumpEvent(scope, 1, "handoff.completed", handoff.StateSucceeded)}
+	metric := make(chan string, 1)
+	pump := &handoff.EventPump{
+		Reader: store, Cursors: store, Sink: store, Clock: clock.NewManual(time.Unix(0, 0)), PollInterval: time.Second,
+		Gates:   pumpGates{feature.ShadowMode: true},
+		Metrics: handoff.EventPumpMetrics{Presentation: func(_ time.Duration, stringResult string) { metric <- stringResult }},
+	}
+	require.NoError(t, pump.Register(handoff.EventSubscription{ConsumerID: "consumer", Scope: scope}))
+	runPump(t, pump)
+	assert.Equal(t, "shadow", <-metric)
+	require.Eventually(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return store.cursors[pumpKey("consumer", scope)] == 1
+	}, time.Second, time.Millisecond)
+	select {
+	case event := <-store.offerCalls:
+		t.Fatalf("shadow event reached sink: %#v", event)
+	default:
+	}
 }
 
 func TestEventPumpRecordsPresentationDelayAndReplayDuplicateAtDeliveryBoundary(t *testing.T) {

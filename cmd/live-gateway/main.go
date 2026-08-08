@@ -18,13 +18,16 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/admin"
 	"github.com/chuanmingliu/openai-gpt-live/internal/admission"
 	"github.com/chuanmingliu/openai-gpt-live/internal/auth"
+	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
 	"github.com/chuanmingliu/openai-gpt-live/internal/config"
+	"github.com/chuanmingliu/openai-gpt-live/internal/feature"
 	"github.com/chuanmingliu/openai-gpt-live/internal/gateway"
 	"github.com/chuanmingliu/openai-gpt-live/internal/health"
 	"github.com/chuanmingliu/openai-gpt-live/internal/lifecycle"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime/s2sws"
 	"github.com/chuanmingliu/openai-gpt-live/internal/session"
 	"github.com/chuanmingliu/openai-gpt-live/internal/telemetry"
+	"github.com/chuanmingliu/openai-gpt-live/migrations"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -83,6 +86,13 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 			runErr = finishAdmission(runErr, closeAdmission)
 		}()
 	}
+	featureRuntime, err := composeGatewayFeatures(ctx, cfg, lookup)
+	if err != nil {
+		return err
+	}
+	if featureRuntime != nil {
+		defer featureRuntime.close()
+	}
 	apiKey := ""
 	if cfg.Gateway.Voice.APIKeyEnv != "" {
 		value, ok := lookup(cfg.Gateway.Voice.APIKeyEnv)
@@ -114,7 +124,7 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 	if instance == "" {
 		instance = "local"
 	}
-	metrics, err := telemetry.NewMetrics(registry, telemetry.MetricsConfig{Labels: telemetry.MetricLabels{Component: "gateway", Provider: provider, Region: "local", Instance: instance, ConfigHash: configHash}, AllowedComponents: []string{"gateway"}, AllowedProviders: []string{provider}, AllowedRegions: []string{"local"}, AllowedInstances: []string{instance}, AllowedConfigHashes: []string{configHash}, AllowedQueues: []string{"ingress", "egress", "reactor", "voice_control", "client_control", "handoff", "outbox"}, AllowedResults: []string{"ok", "error", "rejected", "dropped", "timeout", "suppressed", "replay"}})
+	metrics, err := telemetry.NewMetrics(registry, telemetry.MetricsConfig{Labels: telemetry.MetricLabels{Component: "gateway", Provider: provider, Region: "local", Instance: instance, ConfigHash: configHash}, AllowedComponents: []string{"gateway"}, AllowedProviders: []string{provider}, AllowedRegions: []string{"local"}, AllowedInstances: []string{instance}, AllowedConfigHashes: []string{configHash}, AllowedQueues: []string{"ingress", "egress", "reactor", "voice_control", "client_control", "handoff", "outbox"}, AllowedResults: []string{"ok", "error", "rejected", "dropped", "timeout", "suppressed", "replay", "shadow"}})
 	if err != nil {
 		return fmt.Errorf("configure gateway metrics: %w", err)
 	}
@@ -133,6 +143,14 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 	_ = ready.RegisterRequired("telemetry", health.CheckFunc(func(context.Context) error { return traceRuntime.Ready() }))
 	if admissionController != nil {
 		_ = ready.RegisterRequired("admission", admissionController)
+	}
+	if featureRuntime != nil {
+		_ = ready.RegisterRequired("runtime_features", health.CheckFunc(func(context.Context) error {
+			if !featureRuntime.gates.Healthy() {
+				return errors.New("runtime feature refresh is unhealthy")
+			}
+			return nil
+		}))
 	}
 	audioObserver := metrics.BindAudioTransit()
 	ingressQueue, egressQueue := metrics.BindQueue("ingress"), metrics.BindQueue("egress")
@@ -153,6 +171,9 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 	}, QueueState: func(name string, depth, bytes int, buffered time.Duration) {
 		queueObserver(name).Set(depth, bytes, buffered)
 	}, QueueBlocked: func(name string, d time.Duration) { queueObserver(name).ObserveBlocked(d) }, QueueOldest: func(name string, d time.Duration) { queueObserver(name).ObserveOldest(d) }, BargeinSuppression: func(d time.Duration) { bargeObserver.Observe(d.Seconds()) }})}
+	if featureRuntime != nil {
+		appOptions = append(appOptions, gateway.WithFeatureGates(featureRuntime.gates))
+	}
 	if admissionController != nil {
 		admissionController.SetMetricsObserver(metrics.ObserveAdmission)
 		appOptions = append(appOptions, gateway.WithAdmission(admissionController))
@@ -161,7 +182,7 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 	if err != nil {
 		return fmt.Errorf("configure gateway: %w", err)
 	}
-	diagnostics, err := startGatewayDiagnostics(ctx, cfg, admissionController, app, drainer, ready, registry)
+	diagnostics, err := startGatewayDiagnostics(ctx, cfg, admissionController, app, drainer, ready, registry, featureRuntime)
 	if err != nil {
 		return err
 	}
@@ -169,6 +190,70 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 		defer diagnostics.close()
 	}
 	return runGateway(ctx, app, diagnostics)
+}
+
+type gatewayFeatureRuntime struct {
+	pool            *pgxpool.Pool
+	store           *feature.PostgresStore
+	gates           *feature.Gates
+	cancel          context.CancelFunc
+	done            chan error
+	shutdownTimeout time.Duration
+}
+
+func composeGatewayFeatures(ctx context.Context, cfg config.Config, lookup func(string) (string, bool)) (*gatewayFeatureRuntime, error) {
+	if cfg.Mode != "production" {
+		return nil, nil
+	}
+	databaseURL := cfg.Store.URL
+	if cfg.Store.DatabaseURLEnv != "" {
+		value, ok := lookup(cfg.Store.DatabaseURLEnv)
+		if !ok || value == "" {
+			return nil, errors.New("configured database credential is unavailable")
+		}
+		databaseURL = value
+	}
+	pool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		return nil, errors.New("configure runtime feature storage")
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, errors.New("runtime feature storage is unavailable")
+	}
+	if err := migrations.Check(ctx, pool); err != nil {
+		pool.Close()
+		return nil, errors.New("runtime feature schema is unavailable")
+	}
+	store, err := feature.NewPostgres(pool, clock.Real{}, time.Second, cfg.Shutdown.CleanupTimeout)
+	if err != nil {
+		pool.Close()
+		return nil, err
+	}
+	gates := feature.New(nil)
+	snapshot, err := store.Load(ctx)
+	if err != nil || !gates.Apply(snapshot) {
+		pool.Close()
+		return nil, errors.New("runtime feature authority is unavailable")
+	}
+	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	runtime := &gatewayFeatureRuntime{pool: pool, store: store, gates: gates, cancel: cancel, done: make(chan error, 1), shutdownTimeout: cfg.Shutdown.CleanupTimeout}
+	go func() {
+		runtime.done <- gates.Run(runCtx, store, cfg.Features.RefreshInterval, cfg.Shutdown.CleanupTimeout)
+	}()
+	return runtime, nil
+}
+
+func (r *gatewayFeatureRuntime) close() {
+	if r == nil {
+		return
+	}
+	r.cancel()
+	select {
+	case <-r.done:
+	case <-time.After(r.shutdownTimeout):
+	}
+	r.pool.Close()
 }
 
 type gatewayCapacity struct{ app *gateway.App }
@@ -188,7 +273,7 @@ type diagnosticsServer struct {
 	errors   chan error
 }
 
-func startGatewayDiagnostics(ctx context.Context, cfg config.Config, authenticator auth.Authenticator, app *gateway.App, drainer *lifecycle.Drainer, ready *health.Registry, registry *prometheus.Registry) (*diagnosticsServer, error) {
+func startGatewayDiagnostics(ctx context.Context, cfg config.Config, authenticator auth.Authenticator, app *gateway.App, drainer *lifecycle.Drainer, ready *health.Registry, registry *prometheus.Registry, features *gatewayFeatureRuntime) (*diagnosticsServer, error) {
 	if cfg.Admin.ListenAddr == "" {
 		return nil, nil
 	}
@@ -198,7 +283,11 @@ func startGatewayDiagnostics(ctx context.Context, cfg config.Config, authenticat
 	if err := admin.ValidateListenAddress(ctx, cfg.Admin.ListenAddr, cfg.Mode == "production"); err != nil {
 		return nil, err
 	}
-	adminHandler, err := admin.NewHandler(admin.Config{Authenticator: authenticator, Drainer: drainer, Capacity: gatewayCapacity{app}, Sessions: app})
+	adminConfig := admin.Config{Authenticator: authenticator, Drainer: drainer, Capacity: gatewayCapacity{app}, Sessions: app}
+	if features != nil {
+		adminConfig.FeatureStore, adminConfig.FeatureGates = features.store, features.gates
+	}
+	adminHandler, err := admin.NewHandler(adminConfig)
 	if err != nil {
 		return nil, err
 	}

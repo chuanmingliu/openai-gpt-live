@@ -367,7 +367,7 @@ func TestCoordinatorJournalDownWaitsForConcurrentAdmissionThenRefuses(t *testing
 
 func requireCoordinatorMigrationVersion2(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
-	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
+	require.NoError(t, migrations.Steps(t.Context(), pool, -2))
 	version, dirty, err := migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
 	assert.Equal(t, uint(2), version)

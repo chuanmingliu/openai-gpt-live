@@ -32,6 +32,16 @@ func TestShutdownDrainTimeoutDefaultsAndIsBounded(t *testing.T) {
 	assert.ErrorContains(t, err, "drain_timeout")
 }
 
+func TestRuntimeFeatureRefreshDefaultsAndIsBounded(t *testing.T) {
+	cfg, err := loadFixture(t, "mode: local\n", nil)
+	require.NoError(t, err)
+	assert.Equal(t, time.Second, cfg.Features.RefreshInterval)
+	_, err = loadFixture(t, "features:\n  runtime_refresh_interval: 1ms\n", nil)
+	assert.ErrorContains(t, err, "runtime_refresh_interval")
+	_, err = loadFixture(t, "features:\n  runtime_refresh_interval: 2m\n", nil)
+	assert.ErrorContains(t, err, "runtime_refresh_interval")
+}
+
 // TestLoadAppliesRealtimeDefaults catches a loader regression that leaves realtime
 // queues or PCM sample rate at zero when the operator omits optional limits.
 func TestLoadAppliesRealtimeDefaults(t *testing.T) {

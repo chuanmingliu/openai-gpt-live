@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
+	"github.com/chuanmingliu/openai-gpt-live/internal/feature"
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/reasoner"
@@ -292,6 +293,69 @@ func TestRunnerNormalCompletionPersistsSanitizedResultAndSafetyDecision(t *testi
 	assert.Equal(t, "done", store.completed[0].Summary)
 	assert.JSONEq(t, `{"action":"allow","reason_code":"allowed"}`, string(store.completed[0].SafetyDecision))
 	assert.Empty(t, store.failed)
+}
+
+type mutableShadowGate struct{ shadow atomic.Bool }
+
+func (g *mutableShadowGate) Enabled(name string) bool {
+	return name == feature.ShadowMode && g.shadow.Load()
+}
+
+func TestRunnerShadowExcludesSideEffectsButKeepsReadOnlyDefinitions(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	lease := workerLease()
+	lease.Job.Request.ToolAllowlist = []string{"lookup", "charge"}
+	store := &memoryStore{leases: []Lease{lease}, onComplete: cancel}
+	registry, err := NewToolRegistry(map[string][]RegisteredTool{"tools-v1": {
+		{Definition: reasoner.ToolDefinition{Name: "lookup", Parameters: json.RawMessage(`{"type":"object"}`)}, ReadOnly: true, Executor: toolExecutorFunc(func(context.Context, ToolExecutionRequest) (json.RawMessage, error) {
+			return json.RawMessage(`{}`), nil
+		})},
+		{Definition: reasoner.ToolDefinition{Name: "charge", Parameters: json.RawMessage(`{"type":"object"}`)}, SideEffecting: true, StableIdempotency: true, Executor: toolExecutorFunc(func(context.Context, ToolExecutionRequest) (json.RawMessage, error) {
+			t.Fatal("side effect executed")
+			return nil, nil
+		})},
+	}})
+	require.NoError(t, err)
+	stream := streamerFunc(func(_ context.Context, request reasoner.Request, _ func(reasoner.Chunk) error) (reasoner.Result, error) {
+		require.Len(t, request.Tools, 1)
+		assert.Equal(t, "lookup", request.Tools[0].Name)
+		return reasoner.Result{Text: "done"}, nil
+	})
+	gates := &mutableShadowGate{}
+	gates.shadow.Store(true)
+	runner := testRunner(store, stream, allowPolicy(), clock.Real{}, fixedJitter(0), registry)
+	runner.FeatureGates = gates
+	require.NoError(t, runner.Run(ctx))
+	require.Len(t, store.completed, 1)
+}
+
+func TestRunnerRechecksShadowImmediatelyBeforeSideEffectInvocation(t *testing.T) {
+	lease := workerLease()
+	lease.Job.Request.ToolAllowlist = []string{"charge"}
+	var executions atomic.Int32
+	registry, err := NewToolRegistry(map[string][]RegisteredTool{"tools-v1": {{
+		Definition: reasoner.ToolDefinition{Name: "charge", Parameters: json.RawMessage(`{"type":"object"}`)}, SideEffecting: true, StableIdempotency: true,
+		Executor: toolExecutorFunc(func(context.Context, ToolExecutionRequest) (json.RawMessage, error) {
+			executions.Add(1)
+			return json.RawMessage(`{"charged":true}`), nil
+		}),
+	}}})
+	require.NoError(t, err)
+	gates := &mutableShadowGate{}
+	store := &memoryStore{}
+	store.beginTool = func(record ToolInvocationRecord) (ToolInvocation, bool, error) {
+		gates.shadow.Store(true)
+		return canonicalInvocation(record, "running", nil, false, ApprovalNotRequired), true, nil
+	}
+	stream := streamerFunc(func(_ context.Context, _ reasoner.Request, _ func(reasoner.Chunk) error) (reasoner.Result, error) {
+		return reasoner.Result{ToolCalls: []reasoner.ToolCall{{ID: "call", Name: "charge", Arguments: json.RawMessage(`{}`)}}}, nil
+	})
+	runner := testRunner(store, stream, allowPolicy(), clock.Real{}, fixedJitter(0), registry)
+	runner.FeatureGates = gates
+	runner.ArgumentSealer, _ = NewAESArgumentSealer("test-key", bytes.Repeat([]byte{5}, 32), bytes.NewReader(bytes.Repeat([]byte{1}, 12)))
+	require.NoError(t, runner.executeLease(t.Context(), lease))
+	assert.Zero(t, executions.Load())
+	require.Len(t, store.failed, 1)
 }
 
 func TestRunnerExecutionSpanReachesExporterWithoutRawIdentityAttributes(t *testing.T) {

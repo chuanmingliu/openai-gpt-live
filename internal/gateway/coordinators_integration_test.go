@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
+	"github.com/chuanmingliu/openai-gpt-live/internal/feature"
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
@@ -121,6 +122,87 @@ func TestTwoAppsSharingPostgresCannotConsumeForeignAffinity(t *testing.T) {
 		return pool.QueryRow(t.Context(), `SELECT delivered FROM coordinator_work_journal WHERE work_key=$1`, transcriptWorkKey(work)).Scan(&delivered) == nil && delivered
 	}, time.Second, time.Millisecond)
 	hostCancel()
+	require.NoError(t, <-done)
+}
+
+func TestDisabledQueuedCreationWritesNoHandoffEventOutboxOrJournalRows(t *testing.T) {
+	repository, pool, manual := gatewayRepositoryHarness(t)
+	service, err := handoff.NewService(repository, manual, coordinatorIDs{handoffID: "must-not-create", eventID: "must-not-create"})
+	require.NoError(t, err)
+	inputs := make(chan session.Input, 1)
+	coordinator := NewHandoffCoordinator(service, &submitterFake{inputs: inputs}, 1)
+	require.NoError(t, coordinator.SetFeatureGates(staticFeatureGates{feature.HandoffsEnabled: false}))
+	require.NoError(t, coordinator.configureJournal(repository, "disabled-affinity", "disabled-owner", 100*time.Millisecond))
+	work := validHandoffWork()
+	require.NoError(t, coordinator.Enqueue(work))
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- coordinator.Run(ctx) }()
+	rejected := (<-inputs).(session.HandoffAcceptedInput)
+	assert.False(t, rejected.Accepted)
+	assert.Equal(t, "handoffs_disabled", rejected.Reason)
+	for _, table := range []string{"handoffs", "handoff_events", "outbox", "coordinator_work_journal"} {
+		var count int
+		require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM `+table).Scan(&count))
+		assert.Zero(t, count, table)
+	}
+	cancel()
+	require.NoError(t, <-done)
+}
+
+func TestHandoffAdmissionRaceDisableCommittedBeforeCreateWritesNothing(t *testing.T) {
+	pool := testkit.Postgres(t)
+	require.NoError(t, migrations.Up(t.Context(), pool))
+	manual := clock.NewManual(time.Now().UTC())
+	admissionReached := make(chan struct{})
+	resumeAdmission := make(chan struct{})
+	var once sync.Once
+	repository, err := postgres.NewRepository(pool, manual, postgres.WithHandoffAdmissionHook(func() {
+		once.Do(func() { close(admissionReached) })
+		<-resumeAdmission
+	}))
+	require.NoError(t, err)
+	work := validHandoffWork()
+	work.Scope = handoff.Scope{TenantID: "tenant-admission-race", UserID: "user-admission-race", ConversationID: "conversation-admission-race"}
+	work.SessionID = "session-admission-race"
+	work.Turn = identity.TurnKey{ID: "turn-admission-race", Revision: 1}
+	work.Snapshot.Deadline = manual.Now().Add(time.Hour)
+	insertGatewayConversation(t, pool, work.Scope, manual.Now())
+	_, err = repository.AppendCommittedItem(t.Context(), work.Scope, postgres.ConversationItem{
+		SessionID: work.SessionID, Turn: work.Turn, Sequence: 1, Role: "user",
+		Content: work.Transcript, ContentHash: "hash-admission-race", CreatedAt: manual.Now(),
+	})
+	require.NoError(t, err)
+	service, err := handoff.NewService(repository, manual, coordinatorIDs{handoffID: "must-not-create-race", eventID: "must-not-create-race"})
+	require.NoError(t, err)
+	inputs := make(chan session.Input, 1)
+	coordinator := NewHandoffCoordinator(service, &submitterFake{inputs: inputs}, 1)
+	require.NoError(t, coordinator.SetFeatureGates(staticFeatureGates{feature.HandoffsEnabled: true}))
+	require.NoError(t, coordinator.configureJournal(repository, "admission-race-affinity", "admission-race-owner", time.Second))
+	require.NoError(t, coordinator.Enqueue(work))
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- coordinator.Run(ctx) }()
+	select {
+	case <-admissionReached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("create did not pause at transaction-coupled feature admission")
+	}
+	store, err := feature.NewPostgres(pool, clock.Real{}, 10*time.Millisecond)
+	require.NoError(t, err)
+	disabled, err := store.Set(t.Context(), feature.HandoffsEnabled, false, "operator", "admission-race")
+	require.NoError(t, err)
+	assert.False(t, disabled.Values[feature.HandoffsEnabled])
+	close(resumeAdmission)
+	rejected := (<-inputs).(session.HandoffAcceptedInput)
+	assert.False(t, rejected.Accepted)
+	assert.Equal(t, "handoffs_disabled", rejected.Reason)
+	for _, table := range []string{"handoffs", "handoff_events", "outbox", "coordinator_work_journal"} {
+		var count int
+		require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM `+table).Scan(&count))
+		assert.Zero(t, count, table)
+	}
+	cancel()
 	require.NoError(t, <-done)
 }
 

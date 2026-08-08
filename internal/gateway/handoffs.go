@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
+	"github.com/chuanmingliu/openai-gpt-live/internal/feature"
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/session"
@@ -69,6 +70,7 @@ type HandoffCoordinator struct {
 	tracer          trace.Tracer
 	metricsClock    clock.Clock
 	ackMetric       func(time.Duration, string)
+	gates           interface{ Enabled(string) bool }
 }
 
 func (c *HandoffCoordinator) configureOutage(grace time.Duration, source clock.Clock) error {
@@ -161,6 +163,16 @@ func NewHandoffCoordinator(service handoff.Service, submit SessionSubmitter, cap
 	}
 }
 
+// SetFeatureGates installs the process-local immutable authority view. New
+// creation is checked after queueing/replay, immediately before durable Create.
+func (c *HandoffCoordinator) SetFeatureGates(gates interface{ Enabled(string) bool }) error {
+	if c == nil || isNil(gates) {
+		return errors.New("handoff feature gates are required")
+	}
+	c.gates = gates
+	return nil
+}
+
 func (c *HandoffCoordinator) Enqueue(work HandoffWork) error {
 	if c == nil || c.work == nil {
 		return errors.New("handoff coordinator is not configured")
@@ -232,6 +244,15 @@ func (c *HandoffCoordinator) Run(ctx context.Context) error {
 				workCtx, span = c.tracer.Start(ctx, "gateway.handoff.ack")
 			}
 			err := c.retryDurability(workCtx, func() error {
+				// A request disabled while queued must not create even a coordinator
+				// journal row. process repeats this check at the Create boundary.
+				if c.creationDisabled(work) {
+					completion, retryErr := c.process(workCtx, work)
+					if retryErr != nil {
+						return retryErr
+					}
+					return c.submitCompletion(workCtx, work, completion)
+				}
 				if c.journal != nil && work.RejectReason == "" {
 					canonical, canonicalErr := canonicalizeHandoffWork(work)
 					if canonicalErr == nil {
@@ -279,6 +300,10 @@ func (c *HandoffCoordinator) Run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+func (c *HandoffCoordinator) creationDisabled(work HandoffWork) bool {
+	return c != nil && c.gates != nil && work.RejectReason == "" && work.ToolName == handoff.ToolStartBackgroundTask && !c.gates.Enabled(feature.HandoffsEnabled)
 }
 
 func (c *HandoffCoordinator) submitCompletion(ctx context.Context, work HandoffWork, completion session.HandoffAcceptedInput) error {
@@ -358,6 +383,16 @@ func (c *HandoffCoordinator) drainJournal(ctx context.Context) error {
 		if leaseErr != nil {
 			return fmt.Errorf("handoff coordinator lease lost: %w", leaseErr)
 		}
+		if completion.Reason == "handoffs_disabled" {
+			if discarder, ok := c.journal.(interface {
+				DiscardCoordinatorWork(context.Context, string, string, uint64) error
+			}); ok {
+				if err := discarder.DiscardCoordinatorWork(ctx, record.WorkKey, c.journalOwner, record.ClaimGeneration); err != nil {
+					return err
+				}
+				continue
+			}
+		}
 		if errors.Is(err, session.ErrSessionNotActive) {
 			// Incarnations are immutable and cannot become active again. The
 			// durable handoff event remains the reconnect recovery source, so a
@@ -418,6 +453,10 @@ func (c *HandoffCoordinator) process(appCtx context.Context, work HandoffWork) (
 	var snapshot handoff.Snapshot
 	switch args := parsed.(type) {
 	case handoff.StartBackgroundTaskArgs:
+		if c.gates != nil && !c.gates.Enabled(feature.HandoffsEnabled) {
+			completion.Reason = "handoffs_disabled"
+			return completion, nil
+		}
 		canonical, marshalErr := json.Marshal(args)
 		if marshalErr != nil {
 			completion.Reason = "invalid_reserved_tool"
@@ -458,6 +497,10 @@ func (c *HandoffCoordinator) process(appCtx context.Context, work HandoffWork) (
 		err = handoff.ErrInvalidRequest
 	}
 	if err != nil {
+		if errors.Is(err, handoff.ErrHandoffsDisabled) {
+			completion.Reason = "handoffs_disabled"
+			return completion, nil
+		}
 		if !isStableHandoffRejection(err) {
 			return session.HandoffAcceptedInput{}, fmt.Errorf("process handoff work: %w", err)
 		}
@@ -482,6 +525,7 @@ func isStableHandoffRejection(err error) bool {
 		handoff.ErrInvalidTransition,
 		handoff.ErrTerminalState,
 		handoff.ErrSteeringBlocked,
+		handoff.ErrHandoffsDisabled,
 	} {
 		if errors.Is(err, stable) {
 			return true

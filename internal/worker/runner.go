@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
+	"github.com/chuanmingliu/openai-gpt-live/internal/feature"
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/lifecycle"
 	"github.com/chuanmingliu/openai-gpt-live/internal/reasoner"
@@ -81,6 +82,7 @@ type Runner struct {
 	Drainer              *lifecycle.Drainer
 	Metrics              MetricsHooks
 	Tracer               trace.Tracer
+	FeatureGates         interface{ Enabled(string) bool }
 }
 
 func NewRunner(config Runner) (*Runner, error) {
@@ -222,7 +224,9 @@ func (r *Runner) executeLease(parent context.Context, lease Lease) (runErr error
 	parent, span := tracer.Start(parent, "worker.execute")
 	defer func() {
 		result := "ok"
-		if runErr != nil {
+		if r.shadowMode() {
+			result = "shadow"
+		} else if runErr != nil {
 			result = "error"
 		}
 		span.SetAttributes(attribute.String("result", result))
@@ -231,7 +235,9 @@ func (r *Runner) executeLease(parent context.Context, lease Lease) (runErr error
 	started := r.Clock.Now()
 	defer func() {
 		result := "ok"
-		if runErr != nil {
+		if r.shadowMode() {
+			result = "shadow"
+		} else if runErr != nil {
 			result = "error"
 		}
 		metrics.Duration(nonnegative(r.Clock.Now().Sub(started)), result)
@@ -429,7 +435,25 @@ func (e *jobExecution) consumeTools(calls, maxCalls, maxRounds int) error {
 }
 
 func (r *Runner) generate(ctx context.Context, lease Lease, control Control, execution *jobExecution, generation uint64) (generatedResult, error) {
-	definitions, err := r.Tools.Definitions(lease.Job.Request.Versions.ToolRegistry, lease.Job.Request.ToolAllowlist)
+	allowlist := lease.Job.Request.ToolAllowlist
+	if r.shadowMode() {
+		allowlist = make([]string, 0, len(lease.Job.Request.ToolAllowlist))
+		seen := make(map[string]struct{}, len(lease.Job.Request.ToolAllowlist))
+		for _, name := range lease.Job.Request.ToolAllowlist {
+			if _, duplicate := seen[name]; duplicate {
+				return generatedResult{}, ErrToolNotAllowed
+			}
+			seen[name] = struct{}{}
+			tool, ok := r.Tools.Lookup(lease.Job.Request.Versions.ToolRegistry, name)
+			if !ok {
+				return generatedResult{}, ErrToolNotRegistered
+			}
+			if !tool.SideEffecting {
+				allowlist = append(allowlist, name)
+			}
+		}
+	}
+	definitions, err := r.Tools.Definitions(lease.Job.Request.Versions.ToolRegistry, allowlist)
 	if err != nil {
 		return generatedResult{}, err
 	}
@@ -625,6 +649,9 @@ func (r *Runner) executeToolCalls(ctx context.Context, lease Lease, revision, st
 		if !ok || !containsString(lease.Job.Request.ToolAllowlist, call.Name) {
 			return nil, startOrdinal, ErrToolNotAllowed
 		}
+		if tool.SideEffecting && r.shadowMode() {
+			return nil, startOrdinal, ErrToolNotAllowed
+		}
 		arguments, err := canonicalToolArguments(call.Arguments, r.MaxToolArgumentBytes)
 		if err != nil {
 			return nil, startOrdinal, err
@@ -733,6 +760,11 @@ func (r *Runner) executeOneTool(ctx context.Context, lease Lease, revision, ordi
 		}
 		return output, nil
 	}
+	// This is the final side-effect boundary. Metadata came from the immutable
+	// registry, never model arguments, and a mid-job transition is honored.
+	if tool.SideEffecting && r.shadowMode() {
+		return nil, ErrToolNotAllowed
+	}
 	output, err := tool.Executor.Execute(ctx, ToolExecutionRequest{InvocationID: invocationID, IdempotencyKey: invocationID, Arguments: append(json.RawMessage(nil), arguments...)})
 	if err != nil {
 		return nil, fmt.Errorf("%w", errToolFailure)
@@ -749,6 +781,10 @@ func (r *Runner) executeOneTool(ctx context.Context, lease Lease, revision, ordi
 		return nil, err
 	}
 	return output, nil
+}
+
+func (r *Runner) shadowMode() bool {
+	return r != nil && r.FeatureGates != nil && r.FeatureGates.Enabled(feature.ShadowMode)
 }
 
 func boundedToolOutput(raw json.RawMessage, limit int) (json.RawMessage, error) {

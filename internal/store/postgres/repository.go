@@ -55,6 +55,7 @@ type Repository struct {
 	toolGate             worker.ToolGate
 	failpoint            func(string) error
 	expiredLeaseObserver func(int)
+	handoffAdmissionHook func()
 }
 
 // SetExpiredLeaseObserver installs a process-local observer for successfully
@@ -76,6 +77,19 @@ func WithToolGate(gate worker.ToolGate) RepositoryOption {
 			return errors.New("postgres repository tool gate is required")
 		}
 		repository.toolGate = gate
+		return nil
+	}
+}
+
+// WithHandoffAdmissionHook installs an observation point immediately before a
+// new create serializes with runtime feature authority. It is intended for
+// deterministic lifecycle/race verification and must not perform database work.
+func WithHandoffAdmissionHook(hook func()) RepositoryOption {
+	return func(repository *Repository) error {
+		if hook == nil {
+			return errors.New("postgres handoff admission hook is required")
+		}
+		repository.handoffAdmissionHook = hook
 		return nil
 	}
 }

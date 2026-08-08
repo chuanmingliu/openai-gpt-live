@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
+	"github.com/chuanmingliu/openai-gpt-live/internal/feature"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -59,6 +60,7 @@ type EventPump struct {
 	PollInterval  time.Duration
 	Metrics       EventPumpMetrics
 	Tracer        trace.Tracer
+	Gates         interface{ Enabled(string) bool }
 
 	mu            sync.Mutex
 	subscriptions map[EventSubscription]struct{}
@@ -263,9 +265,19 @@ func (p *EventPump) deliverSubscription(ctx context.Context, subscription EventS
 			if p.Tracer != nil {
 				offerCtx, span = p.Tracer.Start(ctx, "gateway.presentation.offer")
 			}
-			offerErr := p.Sink.OfferHandoffEvent(offerCtx, subscription.Scope, CloneEvent(event))
+			var offerErr error
+			shadow := p.Gates != nil && p.Gates.Enabled(feature.ShadowMode)
+			if !shadow {
+				offerErr = p.Sink.OfferHandoffEvent(offerCtx, subscription.Scope, CloneEvent(event))
+				// Re-check at the completed presentation boundary so a concurrent
+				// transition is recorded as shadow even when the session's final
+				// visual/speech checks performed the actual suppression.
+				shadow = p.Gates != nil && p.Gates.Enabled(feature.ShadowMode)
+			}
 			result := "ok"
-			if offerErr == ErrPresentationSuppressed {
+			if shadow {
+				result = "shadow"
+			} else if offerErr == ErrPresentationSuppressed {
 				result = "suppressed"
 			} else if offerErr != nil {
 				result = "error"

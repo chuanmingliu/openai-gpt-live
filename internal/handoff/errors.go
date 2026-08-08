@@ -11,4 +11,5 @@ var (
 	ErrTerminalState       = errors.New("handoff is terminal")
 	ErrRevisionConflict    = errors.New("handoff revision conflict")
 	ErrSteeringBlocked     = errors.New("handoff steering is blocked")
+	ErrHandoffsDisabled    = errors.New("handoff creation is disabled")
 )
