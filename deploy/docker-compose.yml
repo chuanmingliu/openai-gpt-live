@@ -1,0 +1,122 @@
+name: gpt-live
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_DB=live
+      - POSTGRES_USER=live
+      - POSTGRES_PASSWORD
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U live -d live"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks: [backend]
+
+  speech-to-speech:
+    image: ${S2S_IMAGE:-speech-to-speech:local}
+    volumes:
+      - type: bind
+        source: ${S2S_CONFIG_PATH:-./config/s2s.yaml}
+        target: /app/config.yaml
+        read_only: true
+    expose: ["8000"]
+    networks: [backend]
+
+  migrate:
+    build:
+      context: ..
+      target: migrate
+    image: gpt-live-migrate:local
+    environment:
+      - DATABASE_URL
+    command: ["-direction", "up"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [backend]
+    restart: "no"
+
+  gateway:
+    build:
+      context: ..
+      target: gateway
+    image: gpt-live-gateway:local
+    command: ["-config", "/etc/live/config.yaml"]
+    environment:
+      - DATABASE_URL
+      - S2S_API_KEY
+      - DEEPSEEK_API_KEY
+      - LIVE_STATIC_BEARER_TOKEN
+      - LIVE_ADMIN_BEARER_TOKEN
+      - LIVE_PRIVACY_HMAC_KEY
+      - LIVE_RETENTION_HMAC_KEY
+      - LIVE_TOOL_ENCRYPTION_KEY
+      - LIVE_EXPECTED_CONFIG_HASH
+    volumes:
+      - ./config/local.yaml:/etc/live/config.yaml:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      speech-to-speech:
+        condition: service_started
+    ports:
+      - "127.0.0.1:${GATEWAY_PORT:-18080}:8080"
+      - "127.0.0.1:${GATEWAY_HEALTH_PORT:-19090}:9090"
+    healthcheck:
+      test: ["CMD", "/bin/busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/health/ready"]
+      interval: 3s
+      timeout: 2s
+      retries: 30
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 45s
+    networks: [frontend, backend]
+
+  worker:
+    build:
+      context: ..
+      target: worker
+    image: gpt-live-worker:local
+    command: ["-config", "/etc/live/config.yaml"]
+    environment:
+      - DATABASE_URL
+      - DEEPSEEK_API_KEY
+      - LIVE_STATIC_BEARER_TOKEN
+      - LIVE_ADMIN_BEARER_TOKEN
+      - LIVE_PRIVACY_HMAC_KEY
+      - LIVE_RETENTION_HMAC_KEY
+      - LIVE_TOOL_ENCRYPTION_KEY
+      - LIVE_EXPECTED_CONFIG_HASH
+    volumes:
+      - ./config/local.yaml:/etc/live/config.yaml:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:${WORKER_HEALTH_PORT:-19091}:9090"
+    healthcheck:
+      test: ["CMD", "/bin/busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/health/ready"]
+      interval: 3s
+      timeout: 2s
+      retries: 30
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 135s
+    networks: [backend]
+
+volumes:
+  postgres-data: {}
+networks:
+  frontend: {}
+  backend:
+    internal: false

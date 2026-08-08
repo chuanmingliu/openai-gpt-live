@@ -1,0 +1,64 @@
+# Non-secret local deployment configuration. Fields ending in _env are names,
+# not values; Compose/Kubernetes inject those names at runtime.
+mode: local
+gateway:
+  advertised_model: gpt-live-simulator
+  listen_addr: :8080
+  voice:
+    role: realtime_voice
+    provider: speech_to_speech
+    url: ws://speech-to-speech:8000/v1/realtime
+    model: s2s-realtime
+    api_key_env: S2S_API_KEY
+  audio:
+    sample_rate: 24000
+    channels: 1
+    bytes_per_sample: 2
+  storage_grace: 30s
+  behind_ingress: false
+store:
+  database_url_env: DATABASE_URL
+  retention:
+    conversation_ttl: 720h
+    sweep_interval: 1m
+    deletion_batch: 100
+    approval_ttl: 5m
+    hmac_key_env: LIVE_RETENTION_HMAC_KEY
+    hmac_key_id: local-retention-v1
+auth:
+  static_bearer_env: LIVE_STATIC_BEARER_TOKEN
+  static_tenant_id: development
+  static_user_id: local-simulator
+  static_scopes: [realtime, live.admin]
+  allowed_origins: [http://127.0.0.1:3000]
+admission:
+  max_sessions: 250
+  max_sessions_per_tenant: 100
+  max_sessions_per_user: 10
+safety:
+  policy_version: static-v1
+  mode: enforce
+  privacy_hmac_key_env: LIVE_PRIVACY_HMAC_KEY
+telemetry:
+  service_name: gpt-live
+  protocol: http/protobuf
+admin:
+  listen_addr: 127.0.0.1:9090
+shutdown:
+  gateway_drain_timeout: 30s
+  worker_drain_timeout: 120s
+  cleanup_timeout: 5s
+worker:
+  concurrency: 4
+  reasoner:
+    role: async_gpt_5_5
+    provider: deepseek
+    base_url: https://api.deepseek.com
+    model: deepseek-chat
+    api_key_env: DEEPSEEK_API_KEY
+features:
+  side_effecting_tools: true
+  tool_encryption_key_env: LIVE_TOOL_ENCRYPTION_KEY
+  tool_encryption_key_id: local-tools-v1
+  runtime_refresh_interval: 1s
+

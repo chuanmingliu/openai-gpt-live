@@ -1,0 +1,59 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-ingress
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: live-gateway}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+      - namespaceSelector:
+          matchLabels: {kubernetes.io/metadata.name: ingress-nginx}
+        podSelector:
+          matchLabels: {app.kubernetes.io/name: ingress-nginx}
+      ports: [{protocol: TCP, port: 8080}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: application-egress
+spec:
+  podSelector:
+    matchExpressions:
+      - {key: app.kubernetes.io/component, operator: In, values: [gateway, worker]}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: kube-system}
+      ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: gpt-live}
+          podSelector:
+            matchLabels: {app.kubernetes.io/name: postgres}
+      ports: [{protocol: TCP, port: 5432}]
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: identity}
+          podSelector:
+            matchLabels: {app.kubernetes.io/name: oidc}
+      ports: [{protocol: TCP, port: 443}]
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: observability}
+          podSelector:
+            matchLabels: {app.kubernetes.io/name: otel-collector}
+      ports: [{protocol: TCP, port: 4318}]
+    # External speech/DeepSeek traffic is forced through this stable platform
+    # proxy range. Native NetworkPolicy cannot filter external FQDNs.
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: platform}
+          podSelector:
+            matchLabels: {app.kubernetes.io/name: egress-proxy}
+      ports: [{protocol: TCP, port: 3128}]
+    - to:
+        - ipBlock: {cidr: LIVE_PRODUCTION_EGRESS_PROXY_CIDR}
+      ports: [{protocol: TCP, port: 3128}]

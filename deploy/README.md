@@ -1,0 +1,113 @@
+# Deployment guide
+
+`make verify-deploy-static` validates the two Compose renders, the local
+Kustomize render, an explicitly marked non-deployable production fixture,
+canonical configuration hashes, structured per-workload hardening policies, and
+the complete Kubernetes resource graph (selectors, ports, scaling, disruption,
+Ingress, ConfigMap projection, hashes, and environment wiring), plus repository
+secret policy without contacting a cluster. Fixture success is not
+production readiness: an unrendered production overlay and a production render
+without operator inputs are both required to fail. `make verify-deploy` is the release
+gate: it additionally requires Docker, kubeconform, and kind, builds all four
+image targets, runs the service config commands with a read-only root filesystem
+and no capabilities, performs strict schema validation, and uses server-side
+dry-run of an actual deploy-ready production render in a disposable kind cluster.
+It therefore requires the reviewed production inputs listed below; fixture mode
+is never used by the full gate. Missing tools or inputs are failures, never skips.
+
+## Configuration and secrets
+
+`deploy/config/local.yaml` is canonical local configuration. Production config
+is a non-secret template whose reviewed values are supplied only to
+`render-kustomize.sh`; the script runs the shipped binary to validate the final
+config and compute its hash. The matching Kubernetes copies are checked for
+drift. The same generated hash is placed in the pod annotation and
+`LIVE_EXPECTED_CONFIG_HASH`; the binaries independently reject drift and use the
+same bounded value in telemetry. Secret values are not part of the hash.
+
+Create the preexisting `gpt-live/live-secrets` Kubernetes Secret out of band
+using the exact keys in `k8s/secrets.example.env`; never commit a generated
+Secret. The apply preflight checks presence and required keys without printing
+values. Local `LIVE_STATIC_BEARER_TOKEN` is sourced only through
+`secretKeyRef{name: live-secrets, key: LIVE_STATIC_BEARER_TOKEN}`. Compose passes those
+same environment names from the invoking process and explicitly disables `.env`
+loading in repository scripts. `S2S_IMAGE` and `S2S_CONFIG_PATH` select the
+external simulator image and its non-secret configuration. Admin/health ports
+are loopback-published only; the public Realtime port defaults to 18080.
+For local static authentication, `LIVE_ADMIN_BEARER_TOKEN` and
+`LIVE_STATIC_BEARER_TOKEN` must reference the same scoped value because preStop
+uses the former while the local admin handler validates the latter.
+
+Production rendering fails closed unless all of these non-secret environment
+inputs are present and reviewed:
+
+- `LIVE_PRODUCTION_HOST`, `LIVE_PRODUCTION_TLS_SECRET`
+- `LIVE_PRODUCTION_TRUSTED_PROXY_CIDR`, `LIVE_PRODUCTION_EGRESS_PROXY_CIDR`
+- `LIVE_PRODUCTION_VOICE_URL`, `LIVE_PRODUCTION_OIDC_ISSUER`
+- `LIVE_PRODUCTION_GATEWAY_IMAGE`, `LIVE_PRODUCTION_WORKER_IMAGE`, and
+  `LIVE_PRODUCTION_MIGRATE_IMAGE`, each in canonical
+  `registry/repository-path@sha256:<64 lowercase hex>` form (no URL scheme,
+  whitespace, or tag; repository name at most 255 bytes)
+
+Example/test/reserved hosts and networks, the old generic host/TLS/CIDR values,
+repeated or duplicate digests, mutable images, and unresolved tokens are
+rejected. `LIVE_PRODUCTION_RENDER_MODE=fixture` is reserved to repository tests;
+its rendered metadata says `fixture`, and `deploy-k8s.sh` never enables it.
+Native NetworkPolicy cannot filter external FQDNs: external speech and DeepSeek
+requests use `http://egress-proxy.platform.svc:3128`, and the production policy
+admits exactly TCP/3128 to the reviewed stable egress-proxy CIDR—not generic
+TCP/443 to that CIDR.
+
+## Apply and drain order
+
+The checked-in `gpt-live` Namespace is applied first and has explicit repository
+ownership. `deploy/scripts/deploy-k8s.sh production` refuses to run until the operator
+attests that Prometheus Adapter exposes `custom.metrics.k8s.io`. It validates the
+deploy-ready render, checks external Secrets, then applies default-deny and the
+migration-specific allow policy before starting the Job. Migration egress is
+exactly kube-system DNS TCP/UDP 53 plus labeled in-cluster PostgreSQL TCP/5432;
+the PostgreSQL peer is bound to the `gpt-live` namespace identity. Application
+OIDC and OTLP peers are likewise bound to `identity` and `observability`; the
+ingress controller and egress proxy remain bound to `ingress-nginx` and
+`platform`.
+
+There is no migration identity, telemetry, provider, or Internet path. The script waits up
+to ten minutes for completion, then applies workloads. Run down/up migration
+checks only on a disposable database. Production gateway scaling combines CPU with
+`live_sessions_active`; worker scaling combines CPU with queue age and never
+uses active sessions.
+
+Before apply, the same Go YAML parser validates unique decoded object identities,
+rejects duplicate keys, aliases/merge ambiguity, and any missing or extra graph
+edge. Its `--split job|workloads` mode then emits each validated object exactly
+once; no line-oriented YAML splitter is used.
+
+Gateway pods have 45 seconds and workers 135 seconds to terminate. The preStop
+hook invokes a fixed image helper, which reads no secret argument: the helper
+resolves `LIVE_ADMIN_BEARER_TOKEN` from its environment and sends it only
+in the loopback Authorization header. The request and readiness polls have hard
+deadlines, the helper waits until readiness falls, and a single monotonic
+35/125-second context budget includes both drain and every poll. This leaves
+shutdown margin inside the pod grace periods. In production,
+`LIVE_ADMIN_BEARER_TOKEN` must be a narrowly scoped token
+accepted by the configured OIDC policy; rotate it through the external secret
+manager.
+
+## Local smoke
+
+After exporting every name listed by `smoke-compose.sh` and selecting the S2S
+image/config, run `make smoke-deploy`. The bounded check migrates the disposable
+database, waits for readiness, establishes one authenticated WebSocket session,
+sends and stores no audio/transcript content, then verifies graceful drain. The
+script removes only its own Compose volumes. The fuller simulator audio check is
+currently subject to the Task 22 implicit-VAD event-order limitation; it is not
+reported as a deployment-readiness failure.
+
+The `load` Docker target is intentionally only a hardened capability marker in
+Task 23 and exits with a content-free message. Task 24 replaces it with
+`cmd/live-load`; it must not be used as a load generator before then.
+
+The Go 1.26 and Alpine runtime bases are pinned by immutable digest. Runtime
+package installation was eliminated: CA data is copied from the pinned Go base,
+and the runtime user/shell come from the pinned Alpine bytes. Rebuilding does not
+resolve a mutable base tag or live package repository.

@@ -1,0 +1,13 @@
+# Task 24 adds Toxiproxy services and rewires endpoint URLs. Keeping this as a
+# pure override today guarantees that the standard topology remains renderable.
+services:
+  postgres:
+    labels:
+      live.chaos.extension: "task-24"
+  gateway:
+    environment:
+      CHAOS_MODE: "extension-ready"
+  worker:
+    environment:
+      CHAOS_MODE: "extension-ready"
+

@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: live-gateway
+spec:
+  template:
+    spec:
+      containers:
+        - name: live-gateway
+          image: LIVE_PRODUCTION_GATEWAY_IMAGE
+          env:
+            - name: HTTPS_PROXY
+              value: http://egress-proxy.platform.svc:3128
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: live-worker
+spec:
+  template:
+    spec:
+      containers:
+        - name: live-worker
+          image: LIVE_PRODUCTION_WORKER_IMAGE
+          env:
+            - name: HTTPS_PROXY
+              value: http://egress-proxy.platform.svc:3128
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: live-migrate
+spec:
+  template:
+    spec:
+      containers:
+        - name: live-migrate
+          image: LIVE_PRODUCTION_MIGRATE_IMAGE
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: live-gateway
+spec:
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 65}
+    - type: Pods
+      pods:
+        metric: {name: live_sessions_active}
+        target: {type: AverageValue, averageValue: "50"}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: live-worker
+spec:
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: {type: Utilization, averageUtilization: 70}
+    - type: External
+      external:
+        metric: {name: live_handoff_queue_oldest_age_seconds}
+        target: {type: AverageValue, averageValue: "5"}

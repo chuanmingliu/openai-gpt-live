@@ -1,0 +1,33 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: gpt-live
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - gateway-deployment.yaml
+  - gateway-service.yaml
+  - worker-deployment.yaml
+  - migrate-job.yaml
+  - pdb.yaml
+  - hpa.yaml
+  - ingress.yaml
+  - default-deny.yaml
+  - network-policy.yaml
+  - migrate-network-policy.yaml
+configMapGenerator:
+  - name: live-config
+    files:
+      - config.yaml=production.yaml
+generatorOptions:
+  disableNameSuffixHash: true
+replacements:
+  - source:
+      kind: ConfigMap
+      name: live-deploy-metadata
+      fieldPath: data.config-hash
+    targets:
+      - select:
+          kind: Deployment
+        fieldPaths:
+          - spec.template.metadata.annotations.[live.openai.com/config-hash]
+          - spec.template.spec.containers.*.env.[name=LIVE_EXPECTED_CONFIG_HASH].value

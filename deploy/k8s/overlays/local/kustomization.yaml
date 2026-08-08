@@ -1,0 +1,34 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+configMapGenerator:
+  - name: live-config
+    behavior: replace
+    files:
+      - config.yaml=local.yaml
+generatorOptions:
+  disableNameSuffixHash: true
+images:
+  - name: live-gateway
+    newName: live-gateway
+    newTag: dev
+  - name: live-worker
+    newName: live-worker
+    newTag: dev
+  - name: live-migrate
+    newName: live-migrate
+    newTag: dev
+patches:
+  - path: patch.yaml
+replacements:
+  - source:
+      kind: ConfigMap
+      name: live-deploy-metadata
+      fieldPath: data.config-hash
+    targets:
+      - select:
+          kind: Deployment
+        fieldPaths:
+          - spec.template.metadata.annotations.[live.openai.com/config-hash]
+          - spec.template.spec.containers.*.env.[name=LIVE_EXPECTED_CONFIG_HASH].value

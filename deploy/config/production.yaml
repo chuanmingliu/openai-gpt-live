@@ -1,0 +1,64 @@
+# Canonical non-secret production template. Environment-specific endpoints are
+# explicit and must be reviewed with the rendered Ingress and NetworkPolicy.
+mode: production
+gateway:
+  advertised_model: gpt-live-simulator
+  listen_addr: :8080
+  behind_ingress: true
+  trusted_proxies: [LIVE_PRODUCTION_TRUSTED_PROXY_CIDR]
+  voice:
+    role: realtime_voice
+    provider: speech_to_speech
+    url: LIVE_PRODUCTION_VOICE_URL
+    model: s2s-realtime
+    api_key_env: S2S_API_KEY
+  audio:
+    sample_rate: 24000
+    channels: 1
+    bytes_per_sample: 2
+  storage_grace: 30s
+store:
+  database_url_env: DATABASE_URL
+  retention:
+    conversation_ttl: 720h
+    sweep_interval: 1m
+    deletion_batch: 100
+    approval_ttl: 5m
+    hmac_key_env: LIVE_RETENTION_HMAC_KEY
+    hmac_key_id: production-retention-v1
+auth:
+  oidc_issuer: LIVE_PRODUCTION_OIDC_ISSUER
+  oidc_audience: gpt-live
+  oidc_required_scopes: [realtime]
+  allowed_origins: [https://LIVE_PRODUCTION_HOST]
+admission:
+  max_sessions: 1000
+  max_sessions_per_tenant: 100
+  max_sessions_per_user: 10
+safety:
+  policy_version: static-v1
+  mode: enforce
+  privacy_hmac_key_env: LIVE_PRIVACY_HMAC_KEY
+telemetry:
+  service_name: gpt-live
+  protocol: http/protobuf
+  otlp_endpoint: https://otel-collector.observability.svc:4318
+admin:
+  listen_addr: 127.0.0.1:9090
+shutdown:
+  gateway_drain_timeout: 30s
+  worker_drain_timeout: 120s
+  cleanup_timeout: 5s
+worker:
+  concurrency: 16
+  reasoner:
+    role: async_gpt_5_5
+    provider: deepseek
+    base_url: https://api.deepseek.com
+    model: deepseek-chat
+    api_key_env: DEEPSEEK_API_KEY
+features:
+  side_effecting_tools: true
+  tool_encryption_key_env: LIVE_TOOL_ENCRYPTION_KEY
+  tool_encryption_key_id: production-tools-v1
+  runtime_refresh_interval: 1s

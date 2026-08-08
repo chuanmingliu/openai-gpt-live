@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: live-deploy-metadata
+  labels:
+    app.kubernetes.io/part-of: gpt-live
+data:
+  # render-kustomize.sh computes this after all reviewed production inputs.
+  config-hash: PRODUCTION_CONFIG_HASH
+  render-readiness: PRODUCTION_RENDER_READINESS
+  production-host: LIVE_PRODUCTION_HOST
+  tls-secret: LIVE_PRODUCTION_TLS_SECRET
+  egress-proxy-cidr: LIVE_PRODUCTION_EGRESS_PROXY_CIDR
+  trusted-proxy-cidr: LIVE_PRODUCTION_TRUSTED_PROXY_CIDR
+  https-proxy: http://egress-proxy.platform.svc:3128
