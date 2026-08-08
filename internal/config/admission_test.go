@@ -1,6 +1,8 @@
 package config
 
 import (
+	"bytes"
+	"encoding/base64"
 	"fmt"
 	"testing"
 	"time"
@@ -28,6 +30,9 @@ func TestProductionTransportModeIsExplicitAndUnambiguous(t *testing.T) {
 %s
 store:
   database_url_env: DATABASE_URL
+  retention:
+    hmac_key_env: RETENTION_HMAC_KEY
+    hmac_key_id: retention-v1
 auth:
   oidc_issuer: https://issuer.example
   oidc_audience: live
@@ -35,7 +40,10 @@ auth:
   allowed_origins: [https://app.example]
 `
 	lookup := func(name string) (string, bool) {
-		return "postgres://db.example/live?sslmode=require", name == "DATABASE_URL"
+		if name == "DATABASE_URL" {
+			return "postgres://db.example/live?sslmode=require", true
+		}
+		return "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", name == "RETENTION_HMAC_KEY"
 	}
 	tests := []struct {
 		name, transport string
@@ -72,6 +80,9 @@ gateway:
     key_file: server.key
 store:
   database_url_env: DATABASE_URL
+  retention:
+    hmac_key_env: RETENTION_HMAC_KEY
+    hmac_key_id: retention-v1
 auth:
   oidc_issuer: https://issuer.example
   oidc_audience: live
@@ -79,10 +90,60 @@ auth:
   allowed_origins: [https://app.example]
 `
 	cfg, err := loadFixture(t, yaml, func(name string) (string, bool) {
-		return "postgres://db.example/live?sslmode=require", name == "DATABASE_URL"
+		if name == "DATABASE_URL" {
+			return "postgres://db.example/live?sslmode=require", true
+		}
+		return "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", name == "RETENTION_HMAC_KEY"
 	})
 	require.NoError(t, err)
 	assert.Equal(t, "tenant_id", cfg.Auth.OIDCTenantClaim)
+}
+
+func TestProductionRetentionHMACRequiresBothReferenceAndValidResolvedKey(t *testing.T) {
+	base := `mode: production
+gateway:
+  tls:
+    cert_file: server.crt
+    key_file: server.key
+store:
+  database_url_env: DATABASE_URL
+%s
+auth:
+  oidc_issuer: https://issuer.example
+  oidc_audience: live
+  oidc_required_scopes: [realtime]
+  allowed_origins: [https://app.example]
+`
+	lookup := func(name string) (string, bool) {
+		switch name {
+		case "DATABASE_URL":
+			return "postgres://db.example/live?sslmode=require", true
+		case "RETENTION_HMAC_KEY":
+			return "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", true
+		default:
+			return "", false
+		}
+	}
+	_, err := loadFixture(t, fmt.Sprintf(base, ""), lookup)
+	assert.ErrorContains(t, err, "retention HMAC")
+	_, err = loadFixture(t, fmt.Sprintf(base, "  retention:\n    hmac_key_env: RETENTION_HMAC_KEY"), lookup)
+	assert.ErrorContains(t, err, "configured together")
+	_, err = loadFixture(t, fmt.Sprintf(base, "  retention:\n    hmac_key_env: RETENTION_HMAC_KEY\n    hmac_key_id: retention-v1"), func(name string) (string, bool) {
+		if name == "RETENTION_HMAC_KEY" {
+			return "not-base64", true
+		}
+		return lookup(name)
+	})
+	assert.ErrorContains(t, err, "base64-encoded HMAC key")
+	_, err = loadFixture(t, fmt.Sprintf(base, "  retention:\n    hmac_key_env: RETENTION_HMAC_KEY\n    hmac_key_id: retention-v1"), func(name string) (string, bool) {
+		if name == "RETENTION_HMAC_KEY" {
+			return base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 31)), true
+		}
+		return lookup(name)
+	})
+	assert.ErrorContains(t, err, "base64-encoded HMAC key")
+	_, err = loadFixture(t, fmt.Sprintf(base, "  retention:\n    hmac_key_env: RETENTION_HMAC_KEY\n    hmac_key_id: retention-v1"), lookup)
+	require.NoError(t, err)
 }
 
 func TestStaticAuthenticationIsDevelopmentOnlyAndRequiresIdentity(t *testing.T) {

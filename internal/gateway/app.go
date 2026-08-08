@@ -65,6 +65,7 @@ type App struct {
 	eventListener   HandoffEventListener
 	eventWakeups    chan handoff.EventWakeup
 	featureGates    interface{ Enabled(string) bool }
+	approvalStore   handoff.ApprovalStore
 }
 
 type DurableDependencies struct {
@@ -181,6 +182,16 @@ func WithFeatureGates(gates interface{ Enabled(string) bool }) Option {
 	}
 }
 
+func WithApprovalStore(store handoff.ApprovalStore) Option {
+	return func(app *App) error {
+		if isNil(store) {
+			return errors.New("gateway approval store is required")
+		}
+		app.approvalStore = store
+		return nil
+	}
+}
+
 func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("validate gateway config: %w", err)
@@ -260,6 +271,7 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 		return nil, errors.New("session ID generator is required")
 	}
 	managerConfig.FeatureGates = app.featureGates
+	managerConfig.ApprovalStore = app.approvalStore
 
 	if cfg.Features.Handoffs {
 		if app.durable == nil || isNil(app.durable.Service) || isNil(app.durable.ConversationWriter) ||

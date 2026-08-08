@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
@@ -19,6 +21,54 @@ func testIDs() IDs {
 		SessionID:      identity.SessionID("session-1"),
 		ConversationID: identity.ConversationID("conversation-1"),
 		Incarnation:    identity.Incarnation(7),
+	}
+}
+
+func TestReactorPresentsDurableApprovalRequiredWithoutArguments(t *testing.T) {
+	reactor := NewReactor(IDs{SessionID: "session", ConversationID: "conversation", Incarnation: 1}, NewEpochFence(0))
+	expires := time.Now().UTC().Add(time.Minute)
+	payload, err := json.Marshal(map[string]any{"invocation_id": "inv-1", "handoff_id": "handoff-1", "action_summary": "Approve side-effecting tool action: notify", "expires_at": expires, "risk_class": "side_effecting"})
+	require.NoError(t, err)
+	effects, err := reactor.Apply(HandoffEventInput{Scope: handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "conversation"}, Event: handoff.Event{Seq: 4, EventID: "event-4", HandoffID: "handoff-1", TenantID: "tenant", ConversationID: "conversation", Kind: "tool.approval_required", State: handoff.StateNeedsInput, Payload: payload}})
+	require.NoError(t, err)
+	require.Len(t, effects, 1)
+	required, ok := effects[0].ClientEvent.(protocol.LiveToolApprovalRequiredEvent)
+	require.True(t, ok)
+	assert.Equal(t, "inv-1", required.InvocationID)
+	encoded, err := protocol.Encode(required)
+	require.NoError(t, err)
+	assert.NotContains(t, string(encoded), "arguments")
+}
+
+func TestReactorPresentsApprovalResolutionWithoutSessionDegradation(t *testing.T) {
+	tests := []struct {
+		kind, outcome string
+		state         handoff.State
+		want          any
+	}{
+		{"tool.approval_approved", "approved", handoff.StatePending, protocol.LiveHandoffProgressEvent{}},
+		{"tool.approval_denied", "denied", handoff.StateFailed, protocol.LiveHandoffFailedEvent{}},
+		{"tool.approval_expired", "expired", handoff.StateFailed, protocol.LiveHandoffFailedEvent{}},
+	}
+	for _, test := range tests {
+		t.Run(test.kind, func(t *testing.T) {
+			reactor := presentationReactor(&presentationSafety{})
+			payload := json.RawMessage(`{"invocation_id":"inv-1","outcome":"` + test.outcome + `"}`)
+			effects, err := reactor.Apply(HandoffEventInput{Scope: handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "conversation"}, Event: handoff.Event{
+				Seq: 5, EventID: "approval-outcome", HandoffID: "handoff-1", TenantID: "tenant", ConversationID: "conversation",
+				Kind: test.kind, State: test.state, Payload: payload,
+			}})
+			require.NoError(t, err)
+			var visual protocol.ServerEvent
+			for _, effect := range effects {
+				if effect.ClientEvent != nil {
+					require.NotEqual(t, "live.session.degraded", effect.ClientEvent.EventType())
+					visual = effect.ClientEvent
+				}
+			}
+			require.NotNil(t, visual)
+			assert.IsType(t, test.want, visual)
+		})
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
@@ -260,6 +261,30 @@ func (r *Reactor) applyHandoffEvent(ctx context.Context, input HandoffEventInput
 	event := handoff.CloneEvent(input.Event)
 	if err := validateHandoffPresentationInput(r.ids, input.Scope, event); err != nil {
 		return nil, err
+	}
+	if event.Kind == "tool.approval_required" {
+		var payload struct {
+			InvocationID  string    `json:"invocation_id"`
+			HandoffID     string    `json:"handoff_id"`
+			ActionSummary string    `json:"action_summary"`
+			ExpiresAt     time.Time `json:"expires_at"`
+			RiskClass     string    `json:"risk_class"`
+		}
+		decoder := json.NewDecoder(bytes.NewReader(event.Payload))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&payload); err != nil || decoder.Decode(new(any)) != io.EOF || payload.HandoffID != string(event.HandoffID) {
+			return []Effect{{ClientEvent: handoffDegradedEvent(event, "invalid_approval_event"), RequireClientWrite: true}}, nil
+		}
+		required := protocol.LiveToolApprovalRequiredEvent{Type: "live.tool.approval.required", EventID: event.EventID, SequenceID: event.Seq,
+			InvocationID: payload.InvocationID, HandoffID: payload.HandoffID, ActionSummary: payload.ActionSummary, ExpiresAt: payload.ExpiresAt, RiskClass: payload.RiskClass}
+		raw, err := protocol.Encode(required)
+		if err != nil {
+			return []Effect{{ClientEvent: handoffDegradedEvent(event, "invalid_approval_event"), RequireClientWrite: true}}, nil
+		}
+		if _, err := protocol.DecodeServer(raw, protocol.Limits{MaxFrameBytes: 4096, MaxJSONDepth: 4, MaxAudioBytes: 1}); err != nil {
+			return []Effect{{ClientEvent: handoffDegradedEvent(event, "invalid_approval_event"), RequireClientWrite: true}}, nil
+		}
+		return []Effect{{ClientEvent: required, RequireClientWrite: true}}, nil
 	}
 	public, err := presentation.SanitizeEvent(event)
 	if err != nil {
@@ -587,13 +612,13 @@ func handoffVisualEvent(event handoff.Event, details json.RawMessage) (protocol.
 		return protocol.LiveHandoffNeedsInputEvent{Type: "live.handoff.needs_input", EventID: event.EventID, SequenceID: event.Seq, HandoffID: string(event.HandoffID), Status: status, Details: details}, true
 	case "handoff.complete":
 		return protocol.LiveHandoffCompletedEvent{Type: "live.handoff.completed", EventID: event.EventID, SequenceID: event.Seq, HandoffID: string(event.HandoffID), Status: status, Details: details}, true
-	case "handoff.fail":
+	case "handoff.fail", "tool.approval_denied", "tool.approval_expired":
 		return protocol.LiveHandoffFailedEvent{Type: "live.handoff.failed", EventID: event.EventID, SequenceID: event.Seq, HandoffID: string(event.HandoffID), Status: status, Details: details}, true
 	case "handoff.cancel", "handoff.cancelled", "handoff.expired":
 		return protocol.LiveHandoffCancelledEvent{Type: "live.handoff.cancelled", EventID: event.EventID, SequenceID: event.Seq, HandoffID: string(event.HandoffID), Status: status, Details: details}, true
 	case "handoff.created":
 		return protocol.LiveHandoffCreatedEvent{Type: "live.handoff.created", EventID: event.EventID, SequenceID: event.Seq, HandoffID: string(event.HandoffID), Status: status, Details: details}, true
-	case "handoff.leased", "handoff.running", "handoff.steered", "handoff.input_provided", "handoff.cancel_requested", "handoff.retry", "handoff.progress", "handoff.lease_expired":
+	case "handoff.leased", "handoff.running", "handoff.steered", "handoff.input_provided", "handoff.cancel_requested", "handoff.retry", "handoff.progress", "handoff.lease_expired", "tool.approval_approved":
 		return protocol.LiveHandoffProgressEvent{Type: "live.handoff.progress", EventID: event.EventID, SequenceID: event.Seq, HandoffID: string(event.HandoffID), Status: status, Details: details}, true
 	}
 	return nil, false

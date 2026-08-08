@@ -81,6 +81,7 @@ type Config struct {
 	Clock                 clock.Clock
 	Jitter                clock.JitterSource
 	FeatureGates          interface{ Enabled(string) bool }
+	ApprovalStore         handoff.ApprovalStore
 	reactorApplyGate      func(Input) <-chan struct{}
 	reconnectBoundaryGate func() <-chan struct{}
 	initialRegisterGate   func() <-chan struct{}
@@ -534,6 +535,7 @@ type runState struct {
 	metrics            MetricsHooks
 	subject            Subject
 	dispatcher         DurableEffectDispatcher
+	approvals          chan protocol.LiveToolApprovalResolveEvent
 
 	ingressSequence uint64
 	egressSequence  uint64
@@ -776,6 +778,7 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	group.Go(runLoop("voice reader", state.voiceReader))
 	group.Go(runLoop("client writer", state.clientWriter))
 	group.Go(runLoop("reactor", state.reactorLoop))
+	group.Go(runLoop("approval resolver", state.approvalLoop))
 	abortBeforePublication := func(cause error) error {
 		cancel()
 		_ = group.Wait()
@@ -1015,7 +1018,7 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 	}
 
 	ids := IDs{SessionID: request.SessionID, ConversationID: request.Scope.ConversationID, Incarnation: newIncarnation}
-	err = m.runReplacement(sessionCtx, cancel, subject, ids, client, voice, initialEpoch, logical, request.LastIncarnation, request.LastEventSeq)
+	err = m.runReplacement(sessionCtx, cancel, subject, ids, client, voice, initialEpoch, logical, request.LastIncarnation, request.LastEventSeq, snapshot.PendingApprovals)
 	m.activeMu.RLock()
 	published = logical.highWater == newIncarnation
 	m.activeMu.RUnlock()
@@ -1083,7 +1086,7 @@ func (m *Manager) connectReplacement(ctx context.Context, request realtime.OpenR
 }
 
 func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.CancelFunc, subject Subject, ids IDs, client ClientConn,
-	voice realtime.Session, initialEpoch identity.ResponseEpoch, logical *logicalSession, expected identity.Incarnation, replayAfter int64,
+	voice realtime.Session, initialEpoch identity.ResponseEpoch, logical *logicalSession, expected identity.Incarnation, replayAfter int64, pendingApprovals []RecoveryApproval,
 ) error {
 	group, groupCtx := errgroup.WithContext(sessionCtx)
 	quiesced := make(chan struct{})
@@ -1119,6 +1122,7 @@ func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.Canc
 	group.Go(runLoop("voice reader", state.voiceReader))
 	group.Go(runLoop("client writer", state.clientWriter))
 	group.Go(runLoop("reactor", state.reactorLoop))
+	group.Go(runLoop("approval resolver", state.approvalLoop))
 	abort := func(cause error) error {
 		cancel()
 		_ = group.Wait()
@@ -1143,6 +1147,17 @@ func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.Canc
 		}
 	case <-groupCtx.Done():
 		return abort(groupCtx.Err())
+	}
+	for _, pending := range pendingApprovals {
+		if pending.Sequence > replayAfter {
+			continue
+		}
+		approval := pending.Approval
+		event := protocol.LiveToolApprovalRequiredEvent{Type: "live.tool.approval.required", EventID: pending.EventID, SequenceID: pending.Sequence,
+			InvocationID: approval.InvocationID, HandoffID: string(approval.HandoffID), ActionSummary: approval.ActionSummary, ExpiresAt: approval.ExpiresAt, RiskClass: approval.RiskClass}
+		if err := state.enqueueClientControl(clientControl{event: event}); err != nil {
+			return abort(err)
+		}
 	}
 	if err := m.registerReplacement(runtime, logical, expected); err != nil {
 		return abort(err)
@@ -1219,6 +1234,7 @@ func newRunState(cfg Config, ids IDs, voice realtime.Session, client ClientConn,
 		voiceCtl:           make(chan voiceControl, cfg.WriterControlEvents),
 		egress:             make(chan egressFrame, cfg.EgressFrames),
 		clientCtl:          make(chan clientControl, cfg.WriterControlEvents),
+		approvals:          make(chan protocol.LiveToolApprovalResolveEvent, cfg.ControlEvents),
 		inboxSlots:         make(chan struct{}, cfg.ControlEvents),
 		voiceSlots:         make(chan struct{}, cfg.WriterControlEvents),
 		clientSlots:        make(chan struct{}, cfg.WriterControlEvents),
@@ -1547,6 +1563,13 @@ func (s *runState) clientReader(ctx context.Context) error {
 		}
 		err = s.runtime.acceptClientEvent(ctx, func() error {
 			switch typed := event.(type) {
+			case protocol.LiveToolApprovalResolveEvent:
+				select {
+				case s.approvals <- typed:
+					return nil
+				default:
+					return s.enqueueClientControl(clientControl{event: s.approvalProtocolError("approval_backpressure")})
+				}
 			case protocol.InputAudioBufferAppendEvent:
 				pcm, decodeErr := protocol.DecodePCM24k(typed, s.cfg.IngressFrames*pcmFrameBytes)
 				if decodeErr != nil {
@@ -1595,6 +1618,41 @@ func (s *runState) clientReader(ctx context.Context) error {
 			return err
 		}
 	}
+}
+
+func (s *runState) approvalLoop(ctx context.Context) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case event := <-s.approvals:
+			if isNilInterface(s.cfg.ApprovalStore) {
+				if err := s.enqueueClientControl(clientControl{event: s.approvalProtocolError("approval_unavailable")}); err != nil {
+					return err
+				}
+				continue
+			}
+			decision := handoff.ApprovalDecision(event.Decision)
+			resolution := handoff.ApprovalResolution{
+				InvocationID: event.InvocationID, Decision: decision,
+				ActorTenantID: s.subject.TenantID, ActorUserID: s.subject.UserID,
+				Reason: event.Reason, IdempotencyKey: event.IdempotencyKey,
+				ResolvedAt: s.cfg.Clock.Now().UTC(),
+			}
+			scope := handoff.Scope{TenantID: s.subject.TenantID, UserID: s.subject.UserID, ConversationID: s.ids.ConversationID}
+			if err := s.cfg.ApprovalStore.ResolveApproval(ctx, scope, resolution); err != nil {
+				if enqueueErr := s.enqueueClientControl(clientControl{event: s.approvalProtocolError("approval_rejected")}); enqueueErr != nil {
+					return enqueueErr
+				}
+			}
+		}
+	}
+}
+
+func (s *runState) approvalProtocolError(code string) protocol.ErrorEvent {
+	return protocol.ErrorEvent{Type: "error", EventID: s.nextManagerEventID(), Error: protocol.ProtocolError{
+		Type: "invalid_request_error", Code: code, Message: "approval resolution was not accepted",
+	}}
 }
 
 func (r *sessionRuntime) acceptClientEvent(ctx context.Context, accept func() error) error {

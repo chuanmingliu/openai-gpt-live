@@ -30,6 +30,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/health"
 	"github.com/chuanmingliu/openai-gpt-live/internal/lifecycle"
 	"github.com/chuanmingliu/openai-gpt-live/internal/reasoner/deepseek"
+	retentioncontrol "github.com/chuanmingliu/openai-gpt-live/internal/retention"
 	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
 	"github.com/chuanmingliu/openai-gpt-live/internal/store/postgres"
 	"github.com/chuanmingliu/openai-gpt-live/internal/telemetry"
@@ -45,6 +46,7 @@ type resolvedSecrets struct {
 	ProviderAPIKey    string
 	PrivacyHMACKey    []byte
 	ToolEncryptionKey []byte
+	RetentionHMACKey  []byte
 	AdminBearer       string
 	raw               []string
 }
@@ -52,6 +54,7 @@ type resolvedSecrets struct {
 func (s *resolvedSecrets) clear() {
 	clear(s.PrivacyHMACKey)
 	clear(s.ToolEncryptionKey)
+	clear(s.RetentionHMACKey)
 	s.DatabaseURL, s.ProviderAPIKey, s.AdminBearer = "", "", ""
 	for index := range s.raw {
 		s.raw[index] = ""
@@ -64,6 +67,8 @@ type serviceRuntime interface {
 }
 
 type runtimeBuilder func(context.Context, config.Config, resolvedSecrets) (serviceRuntime, error)
+
+var buildRuntimeRepositoryHook func(*postgres.Repository) error
 
 var commandOutput io.Writer = os.Stdout
 
@@ -114,6 +119,9 @@ func runWithBuilder(ctx context.Context, args []string, lookup func(string) (str
 	redactions := append([]string(nil), secrets.raw...)
 	defer secrets.clear()
 	runtime, err := builder(ctx, cfg, secrets)
+	// Builders own any copies needed by the runtime. Clear the resolver-owned
+	// byte buffers before Run begins, on both success and error paths.
+	secrets.clear()
 	if err != nil {
 		return redactError(err, redactions)
 	}
@@ -243,6 +251,21 @@ func resolveSecrets(cfg config.Config, lookup func(string) (string, bool)) (reso
 			return resolvedSecrets{}, err
 		}
 	}
+	if cfg.Store.Retention.HMACKeyEnv != "" {
+		encoded, err := require(cfg.Store.Retention.HMACKeyEnv, "retention HMAC key")
+		if err != nil {
+			secrets.clear()
+			return resolvedSecrets{}, err
+		}
+		key, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil || len(key) < 32 || len(key) > 4096 {
+			clear(key)
+			secrets.clear()
+			return resolvedSecrets{}, errors.New("configured retention HMAC key is invalid")
+		}
+		secrets.RetentionHMACKey = append([]byte(nil), key...)
+		clear(key)
+	}
 	return secrets, nil
 }
 
@@ -280,7 +303,7 @@ type productionRuntime struct {
 	publisher          *postgres.OutboxPublisher
 	repo               *postgres.Repository
 	clock              clock.Clock
-	sweepEvery         time.Duration
+	sweeper            *retentioncontrol.Sweeper
 	secretKey          []byte
 	sealer             worker.ToolArgumentSealer
 	drainTimeout       time.Duration
@@ -299,6 +322,7 @@ type productionRuntime struct {
 }
 
 func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecrets) (serviceRuntime, error) {
+	defer secrets.clear()
 	poolConfig, err := pgxpool.ParseConfig(secrets.DatabaseURL)
 	if err != nil {
 		return nil, errors.New("database URL is invalid")
@@ -309,6 +333,7 @@ func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecret
 	}
 	closeOnError := true
 	var argumentSealer worker.ToolArgumentSealer
+	var repo *postgres.Repository
 	var traceRuntime *telemetry.Runtime
 	var diagnosticListener net.Listener
 	defer func() {
@@ -323,6 +348,9 @@ func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecret
 			}
 			if argumentSealer != nil {
 				_ = argumentSealer.Close()
+			}
+			if repo != nil {
+				repo.CloseSensitive()
 			}
 			pool.Close()
 		}
@@ -357,9 +385,18 @@ func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecret
 	if err != nil {
 		return nil, err
 	}
-	repo, err := postgres.NewRepository(pool, realClock, postgres.WithToolGate(registry))
+	repositoryOptions := []postgres.RepositoryOption{postgres.WithToolGate(registry), postgres.WithApprovalTTL(cfg.Store.Retention.ApprovalTTL)}
+	if len(secrets.RetentionHMACKey) != 0 {
+		repositoryOptions = append(repositoryOptions, postgres.WithRetentionHMAC(cfg.Store.Retention.HMACKeyID, secrets.RetentionHMACKey))
+	}
+	repo, err = postgres.NewRepository(pool, realClock, repositoryOptions...)
 	if err != nil {
 		return nil, err
+	}
+	if buildRuntimeRepositoryHook != nil {
+		if err := buildRuntimeRepositoryHook(repo); err != nil {
+			return nil, err
+		}
 	}
 	featureStore, err := feature.NewPostgres(pool, realClock, time.Second, cfg.Shutdown.CleanupTimeout)
 	if err != nil {
@@ -413,14 +450,24 @@ func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecret
 	publisher.SetLagObserver(func(d time.Duration) { outboxLag.Observe(d.Seconds()) })
 	publisher.SetTracer(traceRuntime.TracerProvider().Tracer("live.store"))
 	repo.SetExpiredLeaseObserver(func(count int) { metrics.ExpiredLeases.WithLabelValues("worker").Add(float64(count)) })
-	sweepEvery := cfg.Store.Retention.SweepInterval
-	if sweepEvery <= 0 {
-		sweepEvery = time.Minute
+	var deletionStore retentioncontrol.Store
+	if len(secrets.RetentionHMACKey) >= 32 {
+		deletionStore = repo
+	}
+	sweeper, err := retentioncontrol.NewSweeper(retentioncontrol.Config{
+		Store: deletionStore, Leases: repo, Approvals: repo, Clock: realClock, Drainer: drainer,
+		Interval: cfg.Store.Retention.SweepInterval, BatchSize: cfg.Store.Retention.DeletionBatch,
+		RetryBase: cfg.Worker.RetryBase, RetryMax: cfg.Worker.RetryMax, MaxRetries: cfg.Worker.MaxRetries,
+		FailureThreshold: 3, OperationTimeout: cfg.Worker.RequestTimeout, Transient: postgres.IsTransientDurabilityError,
+	})
+	if err != nil {
+		return nil, err
 	}
 	ready := health.NewRegistry()
 	_ = ready.RegisterDrainer(drainer)
 	_ = ready.RegisterRequired("database", health.CheckFunc(func(checkCtx context.Context) error { return pool.Ping(checkCtx) }))
 	_ = ready.RegisterRequired("telemetry", health.CheckFunc(func(context.Context) error { return traceRuntime.Ready() }))
+	_ = ready.RegisterRequired("retention", sweeper)
 	_ = ready.RegisterRequired("runtime_features", health.CheckFunc(func(context.Context) error {
 		if !gates.Healthy() {
 			return errors.New("runtime feature refresh is unhealthy")
@@ -436,7 +483,11 @@ func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecret
 		if err != nil {
 			return nil, err
 		}
-		adminHandler, err := admin.NewHandler(admin.Config{Authenticator: authenticator, Drainer: drainer, Capacity: workerCapacity{drainer: drainer, limit: int64(cfg.Worker.Concurrency)}, FeatureStore: featureStore, FeatureGates: gates})
+		adminConfig := admin.Config{Authenticator: authenticator, Drainer: drainer, Capacity: workerCapacity{drainer: drainer, limit: int64(cfg.Worker.Concurrency)}, FeatureStore: featureStore, FeatureGates: gates}
+		if len(secrets.RetentionHMACKey) >= 32 {
+			adminConfig.Deletions = repo
+		}
+		adminHandler, err := admin.NewHandler(adminConfig)
 		if err != nil {
 			return nil, err
 		}
@@ -452,7 +503,10 @@ func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecret
 		}
 	}
 	closeOnError = false
-	runtime := &productionRuntime{pool: pool, runner: runner, publisher: publisher, repo: repo, clock: realClock, sweepEvery: sweepEvery, secretKey: privacyKey, sealer: argumentSealer, drainer: drainer, drainTimeout: cfg.Shutdown.WorkerDrainTimeout, cleanupTimeout: cfg.Shutdown.CleanupTimeout, telemetry: traceRuntime, diagnostics: diagnostics, diagnosticListener: diagnosticListener, gates: gates, featureStore: featureStore, featureInterval: cfg.Features.RefreshInterval}
+	runtime := &productionRuntime{pool: pool, runner: runner, publisher: publisher, repo: repo, clock: realClock,
+		sweeper: sweeper, secretKey: privacyKey, sealer: argumentSealer, drainer: drainer, drainTimeout: cfg.Shutdown.WorkerDrainTimeout,
+		cleanupTimeout: cfg.Shutdown.CleanupTimeout, telemetry: traceRuntime, diagnostics: diagnostics,
+		diagnosticListener: diagnosticListener, gates: gates, featureStore: featureStore, featureInterval: cfg.Features.RefreshInterval}
 	return runtime, nil
 }
 
@@ -502,7 +556,7 @@ func (r *productionRuntime) runProduction(ctx context.Context) error {
 	}
 	components := r.components
 	if len(components) == 0 {
-		components = []func(context.Context) error{r.runner.Run, r.publisher.Run, r.sweep}
+		components = []func(context.Context) error{r.runner.Run, r.publisher.Run, r.sweeper.Run}
 		if r.gates != nil && r.featureStore != nil {
 			components = append(components, func(ctx context.Context) error {
 				return r.gates.Run(ctx, r.featureStore, r.featureInterval, r.cleanupTimeout)
@@ -584,21 +638,6 @@ func (r *productionRuntime) runProduction(ctx context.Context) error {
 	}
 }
 
-func (r *productionRuntime) sweep(ctx context.Context) error {
-	ticker := r.clock.NewTicker(r.sweepEvery)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case now := <-ticker.C():
-			if _, err := r.repo.SweepExpired(ctx, now.UTC(), 256); err != nil {
-				return err
-			}
-		}
-	}
-}
-
 func (r *productionRuntime) Close() {
 	r.closeRequested.Store(true)
 	if r.drained.Load() {
@@ -618,6 +657,9 @@ func (r *productionRuntime) closeResources() {
 		r.secretKey = nil
 		if r.sealer != nil {
 			_ = r.sealer.Close()
+		}
+		if r.repo != nil {
+			r.repo.CloseSensitive()
 		}
 		if r.pool != nil {
 			r.pool.Close()

@@ -27,6 +27,7 @@ var clientEventTypes = [...]string{
 	"conversation.item.create",
 	"response.create",
 	"response.cancel",
+	"live.tool.approval.resolve",
 }
 
 var serverEventTypes = [...]string{
@@ -55,6 +56,7 @@ var extensionEventTypes = [...]string{
 	"live.handoff.cancelled",
 	"live.session.degraded",
 	"live.session.resumed",
+	"live.tool.approval.required",
 }
 
 func Capabilities(limits Limits) CapabilityDocument {

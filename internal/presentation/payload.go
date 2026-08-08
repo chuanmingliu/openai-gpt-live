@@ -49,6 +49,11 @@ type publicCancel struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+type approvalOutcomeRecord struct {
+	InvocationID string `json:"invocation_id"`
+	Outcome      string `json:"outcome"`
+}
+
 // SanitizeEvent validates the exact kind/state pairs emitted by the postgres
 // repository and decodes the concrete producer record before constructing a
 // bounded public payload.
@@ -112,6 +117,30 @@ func SanitizeEvent(event handoff.Event) (PublicEvent, error) {
 		}
 		out.Summary = record.Summary
 		details = publicSummary{Summary: record.Summary}
+	case "tool.approval_approved":
+		if event.State != handoff.StatePending {
+			return PublicEvent{}, unsupported(event)
+		}
+		var record approvalOutcomeRecord
+		if err := decodeRecord(event.Payload, &record); err != nil || !publicString(record.InvocationID, 256, true) || record.Outcome != "approved" {
+			return PublicEvent{}, malformed(event, err)
+		}
+		out.Summary = "Tool approval accepted."
+		details = publicSummary{Summary: out.Summary}
+	case "tool.approval_denied", "tool.approval_expired":
+		if event.State != handoff.StateFailed {
+			return PublicEvent{}, unsupported(event)
+		}
+		want, code, message := "denied", "approval_denied", "Tool approval was denied."
+		if event.Kind == "tool.approval_expired" {
+			want, code, message = "expired", "approval_expired", "Tool approval expired."
+		}
+		var record approvalOutcomeRecord
+		if err := decodeRecord(event.Payload, &record); err != nil || !publicString(record.InvocationID, 256, true) || record.Outcome != want {
+			return PublicEvent{}, malformed(event, err)
+		}
+		out.Summary = message
+		details = publicFailure{Code: code, Retryable: false, Message: message}
 	case "handoff.needs-input":
 		if event.State != handoff.StateNeedsInput {
 			return PublicEvent{}, unsupported(event)

@@ -5,6 +5,7 @@ package worker_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"runtime"
@@ -46,6 +47,16 @@ type acquiredLeaseStore struct {
 	worker.Store
 	lease     worker.Lease
 	delivered atomic.Bool
+}
+
+type observedLeaseStore struct {
+	worker.Store
+	calls atomic.Int32
+}
+
+func (s *observedLeaseStore) LeaseNext(ctx context.Context, request worker.LeaseRequest) (worker.Lease, bool, error) {
+	s.calls.Add(1)
+	return s.Store.LeaseNext(ctx, request)
 }
 
 type terminalBoundaryStore struct {
@@ -159,6 +170,176 @@ func insertIntegrationJobs(t *testing.T, now time.Time, count int) *postgres.Rep
 		require.NoError(t, err)
 	}
 	return repo
+}
+
+func TestRunnerPostgresResumesExactApprovedInvocationBeforeDivergentModelCall(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	pool := testkit.Postgres(t)
+	require.NoError(t, migrations.Up(t.Context(), pool))
+	manual := clock.NewManual(now)
+	var executions atomic.Int32
+	var executedArguments atomic.Value
+	tool := worker.RegisteredTool{Definition: reasoner.ToolDefinition{Name: "charge", Parameters: json.RawMessage(`{"type":"object"}`)}, SideEffecting: true, StableIdempotency: true, Executor: integrationToolExecutor(func(_ context.Context, request worker.ToolExecutionRequest) (json.RawMessage, error) {
+		executions.Add(1)
+		executedArguments.Store(string(request.Arguments))
+		return json.RawMessage(`{"charged":true}`), nil
+	})}
+	registry, err := worker.NewToolRegistry(map[string][]worker.RegisteredTool{"tools": {tool}})
+	require.NoError(t, err)
+	repo, err := postgres.NewRepository(pool, manual, postgres.WithToolGate(registry), postgres.WithApprovalTTL(5*time.Second))
+	require.NoError(t, err)
+	conversation, handoffID := "conversation-approved-resume", "handoff-approved-resume"
+	_, err = pool.Exec(t.Context(), `INSERT INTO conversations(tenant_id,id,user_id,retention_until,created_at,updated_at)
+		VALUES('tenant-integration',$1,'user-integration',$2,$3,$3)`, conversation, now.Add(24*time.Hour), now)
+	require.NoError(t, err)
+	_, err = pool.Exec(t.Context(), `INSERT INTO handoffs(tenant_id,conversation_id,id,user_id,session_id,source_turn_id,source_turn_revision,user_request,objective,context_ref,context_hash,deadline,token_budget,tool_allowlist,approval_policy,model_version,prompt_version,tool_registry_version,config_version,idempotency_key,request_hash,ready_at,created_at,updated_at)
+		VALUES('tenant-integration',$1,$2,'user-integration','session','turn',1,'request','objective','context','hash',$3,1024,'["charge"]'::json,'{"mode":"ask"}'::json,'model','prompt','tools','config','key-approved-resume','hash',$4,$4,$4)`, conversation, handoffID, now.Add(time.Hour), now)
+	require.NoError(t, err)
+
+	firstLease, ok, err := repo.LeaseNext(t.Context(), worker.LeaseRequest{WorkerID: "approval-runner-1", LeaseDuration: 9 * time.Second, Now: manual.Now()})
+	require.NoError(t, err)
+	require.True(t, ok)
+	firstStore := &acquiredLeaseStore{Store: repo, lease: firstLease}
+	firstRunner := integrationRunner(t, repo, manual, registry, "approval-runner-1", integrationStreamer(func(context.Context, reasoner.Request, func(reasoner.Chunk) error) (reasoner.Result, error) {
+		return reasoner.Result{ToolCalls: []reasoner.ToolCall{{ID: "original-model-call", Name: "charge", Arguments: json.RawMessage(`{"amount":1}`)}}}, nil
+	}), 1)
+	firstRunner.Store = firstStore
+	firstRunner.ArgumentSealer, err = worker.NewAESArgumentSealer("integration-key", bytes.Repeat([]byte{5}, 32), bytes.NewReader(bytes.Repeat([]byte{1}, 12)))
+	require.NoError(t, err)
+	firstCtx, stopFirst := context.WithCancel(t.Context())
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- firstRunner.Run(firstCtx) }()
+	require.Eventually(t, func() bool {
+		var state string
+		return pool.QueryRow(t.Context(), `SELECT state FROM handoffs WHERE id=$1`, handoffID).Scan(&state) == nil && state == string(handoff.StateNeedsInput)
+	}, time.Second, time.Millisecond)
+	stopFirst()
+	require.NoError(t, <-firstDone)
+
+	var invocationID string
+	var expires time.Time
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT invocation_id,approval_expires_at FROM tool_invocations WHERE handoff_id=$1`, handoffID).Scan(&invocationID, &expires))
+	scope := handoff.Scope{TenantID: "tenant-integration", UserID: "user-integration", ConversationID: identity.ConversationID(conversation)}
+	require.NoError(t, repo.ResolveApproval(t.Context(), scope, handoff.ApprovalResolution{
+		InvocationID: invocationID, Decision: handoff.ApprovalApproved,
+		ActorTenantID: scope.TenantID, ActorUserID: scope.UserID, Reason: "approved",
+		IdempotencyKey: "approved-before-expiry", ResolvedAt: expires.Add(-time.Nanosecond),
+	}))
+	manual.Advance(6 * time.Second)
+	require.True(t, manual.Now().After(expires), "worker claim occurs after the decision deadline")
+	secondLease, ok, err := repo.LeaseNext(t.Context(), worker.LeaseRequest{WorkerID: "approval-runner-2", LeaseDuration: 9 * time.Second, Now: manual.Now()})
+	require.NoError(t, err)
+	require.True(t, ok)
+	secondStore := &acquiredLeaseStore{Store: repo, lease: secondLease}
+	var providerCalls atomic.Int32
+	secondRunner := integrationRunner(t, repo, manual, registry, "approval-runner-2", integrationStreamer(func(_ context.Context, request reasoner.Request, _ func(reasoner.Chunk) error) (reasoner.Result, error) {
+		providerCalls.Add(1)
+		assert.Equal(t, int32(1), executions.Load(), "approved invocation executes before model continuation")
+		require.GreaterOrEqual(t, len(request.Messages), 4)
+		assert.Equal(t, invocationID, request.Messages[len(request.Messages)-1].ToolCallID)
+		return reasoner.Result{ToolCalls: []reasoner.ToolCall{{ID: "divergent-model-call", Name: "charge", Arguments: json.RawMessage(`{"amount":999}`)}}}, nil
+	}), 1)
+	secondRunner.Store = secondStore
+	secondRunner.ArgumentSealer, err = worker.NewAESArgumentSealer("integration-key", bytes.Repeat([]byte{5}, 32), bytes.NewReader(bytes.Repeat([]byte{2}, 24)))
+	require.NoError(t, err)
+	secondCtx, stopSecond := context.WithCancel(t.Context())
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- secondRunner.Run(secondCtx) }()
+	require.Eventually(t, func() bool {
+		var pending int
+		return pool.QueryRow(t.Context(), `SELECT count(*) FROM tool_invocations WHERE handoff_id=$1 AND approval_state='pending'`, handoffID).Scan(&pending) == nil && pending == 1
+	}, time.Second, time.Millisecond)
+	stopSecond()
+	require.NoError(t, <-secondDone)
+	assert.Equal(t, int32(1), executions.Load())
+	assert.Equal(t, int32(1), providerCalls.Load())
+	assert.Equal(t, `{"amount":1}`, executedArguments.Load())
+	var approvedSucceeded, divergentPending, genericFailures int
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM tool_invocations WHERE handoff_id=$1 AND invocation_id=$2 AND approval_state='approved' AND status='succeeded'`, handoffID, invocationID).Scan(&approvedSucceeded))
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM tool_invocations WHERE handoff_id=$1 AND invocation_id<>$2 AND approval_state='pending' AND status='pending'`, handoffID, invocationID).Scan(&divergentPending))
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM handoffs WHERE id=$1 AND failure_code='worker_failed'`, handoffID).Scan(&genericFailures))
+	assert.Equal(t, 1, approvedSucceeded)
+	assert.Equal(t, 1, divergentPending, "divergent call requires its own approval and inherits no authorization")
+	assert.Zero(t, genericFailures)
+}
+
+func TestRunnerPostgresDeniedAndExpiredApprovalsNeverReachExecutor(t *testing.T) {
+	for _, outcome := range []string{"denied", "expired"} {
+		t.Run(outcome, func(t *testing.T) {
+			now := time.Now().UTC().Truncate(time.Microsecond)
+			pool := testkit.Postgres(t)
+			require.NoError(t, migrations.Up(t.Context(), pool))
+			manual := clock.NewManual(now)
+			var executions atomic.Int32
+			tool := worker.RegisteredTool{Definition: reasoner.ToolDefinition{Name: "charge", Parameters: json.RawMessage(`{"type":"object"}`)}, SideEffecting: true, StableIdempotency: true, Executor: integrationToolExecutor(func(context.Context, worker.ToolExecutionRequest) (json.RawMessage, error) {
+				executions.Add(1)
+				return json.RawMessage(`{"unexpected":true}`), nil
+			})}
+			registry, err := worker.NewToolRegistry(map[string][]worker.RegisteredTool{"tools": {tool}})
+			require.NoError(t, err)
+			repo, err := postgres.NewRepository(pool, manual, postgres.WithToolGate(registry), postgres.WithApprovalTTL(5*time.Second))
+			require.NoError(t, err)
+			conversation, handoffID := "conversation-approval-"+outcome, "handoff-approval-"+outcome
+			_, err = pool.Exec(t.Context(), `INSERT INTO conversations(tenant_id,id,user_id,retention_until,created_at,updated_at)
+				VALUES('tenant-integration',$1,'user-integration',$2,$3,$3)`, conversation, now.Add(24*time.Hour), now)
+			require.NoError(t, err)
+			_, err = pool.Exec(t.Context(), `INSERT INTO handoffs(tenant_id,conversation_id,id,user_id,session_id,source_turn_id,source_turn_revision,user_request,objective,context_ref,context_hash,deadline,token_budget,tool_allowlist,approval_policy,model_version,prompt_version,tool_registry_version,config_version,idempotency_key,request_hash,ready_at,created_at,updated_at)
+				VALUES('tenant-integration',$1,$2,'user-integration','session','turn',1,'request','objective','context','hash',$3,1024,'["charge"]'::json,'{"mode":"ask"}'::json,'model','prompt','tools','config',$4,'hash',$5,$5,$5)`, conversation, handoffID, now.Add(time.Hour), "key-approval-"+outcome, now)
+			require.NoError(t, err)
+			lease, ok, err := repo.LeaseNext(t.Context(), worker.LeaseRequest{WorkerID: "setup-" + outcome, LeaseDuration: time.Minute, Now: now})
+			require.NoError(t, err)
+			require.True(t, ok)
+			require.NoError(t, repo.MarkRunning(t.Context(), lease.Token, now))
+			arguments := json.RawMessage(`{"amount":1}`)
+			hash := fmt.Sprintf("%x", sha256.Sum256(arguments))
+			invocationID := worker.StableToolInvocationID(lease.Token.TenantID, lease.Token.ConversationID, lease.Token.HandoffID, 0, 1, "charge", hash)
+			sealer, err := worker.NewAESArgumentSealer("integration-key", bytes.Repeat([]byte{5}, 32), bytes.NewReader(bytes.Repeat([]byte{3}, 12)))
+			require.NoError(t, err)
+			sealed, err := sealer.Seal(arguments)
+			require.NoError(t, err)
+			_, _, err = repo.BeginToolInvocation(t.Context(), lease.Token, worker.ToolInvocationRecord{
+				InvocationID: invocationID, ObjectiveRevision: 0, ToolOrdinal: 1, ToolName: "charge", IdempotencyKey: invocationID,
+				ArgumentsHash: hash, Ciphertext: sealed.Ciphertext, Nonce: sealed.Nonce, KeyID: sealed.KeyID,
+			})
+			require.ErrorIs(t, err, worker.ErrApprovalRequired)
+			scope := handoff.Scope{TenantID: "tenant-integration", UserID: "user-integration", ConversationID: identity.ConversationID(conversation)}
+			if outcome == "denied" {
+				require.NoError(t, repo.ResolveApproval(t.Context(), scope, handoff.ApprovalResolution{
+					InvocationID: invocationID, Decision: handoff.ApprovalDenied,
+					ActorTenantID: scope.TenantID, ActorUserID: scope.UserID, Reason: "denied",
+					IdempotencyKey: "deny-terminal", ResolvedAt: now.Add(time.Second),
+				}))
+			} else {
+				expired, expireErr := repo.ExpireApprovals(t.Context(), now.Add(5*time.Second), 10)
+				require.NoError(t, expireErr)
+				require.Equal(t, 1, expired)
+			}
+
+			observed := &observedLeaseStore{Store: repo}
+			runner := integrationRunner(t, repo, manual, registry, "terminal-runner-"+outcome, integrationStreamer(func(context.Context, reasoner.Request, func(reasoner.Chunk) error) (reasoner.Result, error) {
+				t.Fatal("reasoner called for terminal approval outcome")
+				return reasoner.Result{}, nil
+			}), 1)
+			runner.Store = observed
+			runner.ArgumentSealer = sealer
+			ctx, cancel := context.WithCancel(t.Context())
+			done := make(chan error, 1)
+			go func() { done <- runner.Run(ctx) }()
+			require.Eventually(t, func() bool { return observed.calls.Load() > 0 }, time.Second, time.Millisecond)
+			cancel()
+			require.NoError(t, <-done)
+			assert.Zero(t, executions.Load())
+			var state, failureCode string
+			require.NoError(t, pool.QueryRow(t.Context(), `SELECT state,failure_code FROM handoffs WHERE id=$1`, handoffID).Scan(&state, &failureCode))
+			assert.Equal(t, string(handoff.StateFailed), state)
+			assert.Equal(t, "approval_"+outcome, failureCode)
+			var leases, outcomeEvents int
+			require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM handoffs WHERE id=$1 AND lease_owner IS NOT NULL`, handoffID).Scan(&leases))
+			require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM handoff_events WHERE handoff_id=$1 AND kind=$2`, handoffID, "tool.approval_"+outcome).Scan(&outcomeEvents))
+			assert.Zero(t, leases)
+			assert.Equal(t, 1, outcomeEvents)
+		})
+	}
 }
 
 func TestTwoRunnersBoundLeasesFenceStaleCompletionAndRecoverAfterExpiry(t *testing.T) {

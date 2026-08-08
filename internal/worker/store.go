@@ -107,13 +107,23 @@ type ToolInvocationRecord struct {
 }
 
 type ToolInvocation struct {
-	Record           ToolInvocationRecord
-	Status           string
-	Result           json.RawMessage
-	RequiresApproval bool
-	ApprovalState    ApprovalState
-	ApprovalProof    string
+	Record            ToolInvocationRecord
+	Status            string
+	Result            json.RawMessage
+	RequiresApproval  bool
+	ApprovalState     ApprovalState
+	ApprovalProof     string
+	ResumeDisposition ApprovalResumeDisposition
 }
+
+type ApprovalResumeDisposition string
+
+const (
+	ApprovalResumeNone      ApprovalResumeDisposition = ""
+	ApprovalResumeFresh     ApprovalResumeDisposition = "fresh"
+	ApprovalResumeUncertain ApprovalResumeDisposition = "uncertain"
+	ApprovalResumeSucceeded ApprovalResumeDisposition = "succeeded"
+)
 
 type ApprovalState string
 
@@ -141,6 +151,7 @@ type Store interface {
 	Complete(context.Context, LeaseToken, CompletionRecord) error
 	Fail(context.Context, LeaseToken, FailureRecord) error
 	MarkCancelled(context.Context, LeaseToken, CancelledRecord) error
+	ClaimApprovedToolInvocation(context.Context, LeaseToken, uint32) (ToolInvocation, bool, error)
 	BeginToolInvocation(context.Context, LeaseToken, ToolInvocationRecord) (ToolInvocation, bool, error)
 	CompleteToolInvocation(context.Context, LeaseToken, ToolCompletionRecord) error
 	SweepExpired(context.Context, time.Time, int) (int, error)

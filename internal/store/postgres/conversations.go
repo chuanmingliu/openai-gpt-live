@@ -135,6 +135,41 @@ func (r *Repository) LoadRecovery(ctx context.Context, scope handoff.Scope, item
 	}
 	handoffRows.Close()
 
+	approvalRows, err := tx.Query(ctx, `SELECT i.invocation_id,i.handoff_id,i.approval_state,i.approval_expires_at,i.tool_name,e.event_id,e.seq
+		FROM tool_invocations i
+		JOIN handoffs h ON h.tenant_id=i.tenant_id AND h.conversation_id=i.conversation_id AND h.id=i.handoff_id
+		JOIN LATERAL (SELECT event_id,seq FROM handoff_events e WHERE e.tenant_id=i.tenant_id AND e.conversation_id=i.conversation_id
+		  AND e.handoff_id=i.handoff_id AND e.kind='tool.approval_required' AND e.payload->>'invocation_id'=i.invocation_id
+		  ORDER BY e.seq DESC LIMIT 1) e ON true
+		WHERE i.tenant_id=$1 AND i.conversation_id=$2 AND h.user_id=$3 AND i.approval_state='pending' AND i.status='pending'
+		ORDER BY e.seq,i.invocation_id LIMIT $4`, scope.TenantID, scope.ConversationID, scope.UserID, maximumRecoveryHandoffs+1)
+	if err != nil {
+		return session.RecoverySnapshot{}, err
+	}
+	pendingApprovals := make([]session.RecoveryApproval, 0)
+	for approvalRows.Next() {
+		if len(pendingApprovals) == maximumRecoveryHandoffs {
+			approvalRows.Close()
+			return session.RecoverySnapshot{}, session.ErrRecoveryExhausted
+		}
+		var recovery session.RecoveryApproval
+		var toolName string
+		if err := approvalRows.Scan(&recovery.Approval.InvocationID, &recovery.Approval.HandoffID, &recovery.Approval.ApprovalState,
+			&recovery.Approval.ExpiresAt, &toolName, &recovery.EventID, &recovery.Sequence); err != nil {
+			approvalRows.Close()
+			return session.RecoverySnapshot{}, err
+		}
+		recovery.Approval.ExpiresAt = recovery.Approval.ExpiresAt.UTC()
+		recovery.Approval.ActionSummary = approvalActionSummary(toolName)
+		recovery.Approval.RiskClass = handoff.ApprovalRiskSideEffecting
+		pendingApprovals = append(pendingApprovals, recovery)
+	}
+	if err := approvalRows.Err(); err != nil {
+		approvalRows.Close()
+		return session.RecoverySnapshot{}, err
+	}
+	approvalRows.Close()
+
 	var lastEventSeq int64
 	if err := tx.QueryRow(ctx, `SELECT COALESCE(max(seq),0) FROM handoff_events
 		WHERE tenant_id=$1 AND conversation_id=$2`, scope.TenantID, scope.ConversationID).Scan(&lastEventSeq); err != nil {
@@ -148,7 +183,7 @@ func (r *Repository) LoadRecovery(ctx context.Context, scope handoff.Scope, item
 	}
 	return session.RecoverySnapshot{
 		ConversationID: scope.ConversationID, CommittedItems: items,
-		ActiveHandoffs: active, LastEventSeq: lastEventSeq,
+		ActiveHandoffs: active, PendingApprovals: pendingApprovals, LastEventSeq: lastEventSeq,
 	}, nil
 }
 
@@ -200,15 +235,18 @@ func (r *Repository) AppendCommittedItem(ctx context.Context, scope handoff.Scop
 		return ConversationItem{}, err
 	}
 	defer rollback(tx)
-	var owner bool
-	err = tx.QueryRow(ctx, `SELECT EXISTS (
-		SELECT 1 FROM conversations WHERE tenant_id=$1 AND id=$2 AND user_id=$3 AND status <> 'deleted'
-	)`, scope.TenantID, scope.ConversationID, scope.UserID).Scan(&owner)
+	var status string
+	err = tx.QueryRow(ctx, `SELECT status FROM conversations
+		WHERE tenant_id=$1 AND id=$2 AND user_id=$3 FOR UPDATE`,
+		scope.TenantID, scope.ConversationID, scope.UserID).Scan(&status)
+	if errors.Is(err, pgx.ErrNoRows) || status == "deleted" {
+		return ConversationItem{}, handoff.ErrNotFound
+	}
 	if err != nil {
 		return ConversationItem{}, err
 	}
-	if !owner {
-		return ConversationItem{}, handoff.ErrNotFound
+	if err := r.after("conversation_append_after_lock"); err != nil {
+		return ConversationItem{}, err
 	}
 
 	var inserted ConversationItem

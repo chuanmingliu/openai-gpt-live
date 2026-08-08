@@ -101,7 +101,18 @@ func containerPostgres(t testing.TB) *pgxpool.Pool {
 		defer cleanupCancel()
 		_ = container.Terminate(cleanupCtx)
 	})
-	databaseURL, err := container.ConnectionString(startupCtx, "sslmode=disable")
+	var databaseURL string
+	for attempt := 0; attempt < 3; attempt++ {
+		databaseURL, err = container.ConnectionString(startupCtx, "sslmode=disable")
+		if err == nil {
+			break
+		}
+		select {
+		case <-startupCtx.Done():
+			break
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 	if err != nil {
 		t.Fatal("PostgreSQL 16 test container address is unavailable")
 	}

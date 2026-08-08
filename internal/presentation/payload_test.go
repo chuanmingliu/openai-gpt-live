@@ -37,6 +37,27 @@ func TestSanitizeActualWorkerRecordsStripsInternalMetadata(t *testing.T) {
 	}
 }
 
+func TestSanitizeApprovalOutcomesAreContentFreeAndPresentationSafe(t *testing.T) {
+	tests := []struct {
+		kind, outcome, want string
+		state               handoff.State
+	}{
+		{"tool.approval_approved", "approved", `{"summary":"Tool approval accepted."}`, handoff.StatePending},
+		{"tool.approval_denied", "denied", `{"code":"approval_denied","retryable":false,"message":"Tool approval was denied."}`, handoff.StateFailed},
+		{"tool.approval_expired", "expired", `{"code":"approval_expired","retryable":false,"message":"Tool approval expired."}`, handoff.StateFailed},
+	}
+	for _, test := range tests {
+		t.Run(test.kind, func(t *testing.T) {
+			payload := json.RawMessage(`{"invocation_id":"inv-1","outcome":"` + test.outcome + `","reason_hash":"hash","arguments":{"secret":"never-forward"}}`)
+			public, err := SanitizeEvent(handoff.Event{Kind: test.kind, State: test.state, Payload: payload})
+			require.NoError(t, err)
+			assert.JSONEq(t, test.want, string(public.Details))
+			assert.NotContains(t, string(public.Details), "secret")
+			assert.NotContains(t, string(public.Details), "arguments")
+		})
+	}
+}
+
 func TestSanitizeRejectsUnknownAndContradictoryTerminalEvents(t *testing.T) {
 	for _, event := range []handoff.Event{
 		{Kind: "handoff.future", State: handoff.StateSucceeded, Payload: json.RawMessage(`{}`)},

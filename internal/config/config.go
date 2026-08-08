@@ -14,6 +14,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/secretbuf"
 	"gopkg.in/yaml.v3"
 )
 
@@ -139,6 +140,10 @@ type StoreConfig struct {
 type RetentionConfig struct {
 	ConversationTTL time.Duration `yaml:"conversation_ttl"`
 	SweepInterval   time.Duration `yaml:"sweep_interval"`
+	DeletionBatch   int           `yaml:"deletion_batch"`
+	ApprovalTTL     time.Duration `yaml:"approval_ttl"`
+	HMACKeyEnv      string        `yaml:"hmac_key_env"`
+	HMACKeyID       string        `yaml:"hmac_key_id"`
 }
 
 type AuthConfig struct {
@@ -431,6 +436,18 @@ func (c *Config) applyDefaults() {
 	if c.Features.RefreshInterval == 0 {
 		c.Features.RefreshInterval = time.Second
 	}
+	if c.Store.Retention.ConversationTTL == 0 {
+		c.Store.Retention.ConversationTTL = 30 * 24 * time.Hour
+	}
+	if c.Store.Retention.SweepInterval == 0 {
+		c.Store.Retention.SweepInterval = time.Minute
+	}
+	if c.Store.Retention.DeletionBatch == 0 {
+		c.Store.Retention.DeletionBatch = 100
+	}
+	if c.Store.Retention.ApprovalTTL == 0 {
+		c.Store.Retention.ApprovalTTL = 5 * time.Minute
+	}
 }
 
 func (c Config) Validate() error {
@@ -591,6 +608,18 @@ func (c Config) Validate() error {
 	if featureRefreshInterval(c) < 10*time.Millisecond || featureRefreshInterval(c) > time.Minute {
 		return errors.New("features.runtime_refresh_interval must be bounded")
 	}
+	retention := effectiveRetention(c.Store.Retention)
+	if retention.ConversationTTL < time.Hour || retention.ConversationTTL > 10*365*24*time.Hour ||
+		retention.SweepInterval < time.Second || retention.SweepInterval > 24*time.Hour ||
+		retention.DeletionBatch < 1 || retention.DeletionBatch > 1000 ||
+		retention.ApprovalTTL < time.Second || retention.ApprovalTTL > 24*time.Hour {
+		return errors.New("store.retention configuration is invalid")
+	}
+	if retention.HMACKeyEnv != "" || retention.HMACKeyID != "" {
+		if !environmentName(retention.HMACKeyEnv) || !validKeyID(retention.HMACKeyID) {
+			return errors.New("store.retention HMAC environment and key ID must be configured together")
+		}
+	}
 	if c.Mode == "production" {
 		hasCert, hasKey := c.Gateway.TLS.CertFile != "", c.Gateway.TLS.KeyFile != ""
 		if hasCert != hasKey {
@@ -615,6 +644,9 @@ func (c Config) Validate() error {
 		if len(c.Auth.AllowedOrigins) == 0 && !c.Auth.AllowNonBrowser {
 			return errors.New("production origin or non-browser policy is required")
 		}
+		if retention.HMACKeyEnv == "" || retention.HMACKeyID == "" {
+			return errors.New("production retention HMAC environment and key ID are required")
+		}
 		if c.Store.URL == "" && c.Store.DatabaseURLEnv == "" {
 			return errors.New("production admission requires PostgreSQL storage")
 		}
@@ -635,6 +667,22 @@ func featureRefreshInterval(c Config) time.Duration {
 		return time.Second
 	}
 	return c.Features.RefreshInterval
+}
+
+func effectiveRetention(value RetentionConfig) RetentionConfig {
+	if value.ConversationTTL == 0 {
+		value.ConversationTTL = 30 * 24 * time.Hour
+	}
+	if value.SweepInterval == 0 {
+		value.SweepInterval = time.Minute
+	}
+	if value.DeletionBatch == 0 {
+		value.DeletionBatch = 100
+	}
+	if value.ApprovalTTL == 0 {
+		value.ApprovalTTL = 5 * time.Minute
+	}
+	return value
 }
 
 func validateHTTPURL(raw, name string, requireHTTPS bool) error {
@@ -670,6 +718,21 @@ func (c Config) validateSecrets(lookup func(string) (string, bool)) error {
 			return errors.New("production database URL must not disable SSL")
 		}
 	}
+	if name := c.Store.Retention.HMACKeyEnv; name != "" {
+		value, ok := lookup(name)
+		if !ok {
+			return fmt.Errorf("required secret environment variable %q is not set", name)
+		}
+		err := secretbuf.WithDecodedBase64(value, func(key []byte) error {
+			if len(key) < 32 || len(key) > 4096 {
+				return errors.New("retention HMAC key length is invalid")
+			}
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("%s must contain a base64-encoded HMAC key", name)
+		}
+	}
 	if c.Features.ToolEncryptionKeyEnv != "" {
 		name := c.Features.ToolEncryptionKeyEnv
 		value, ok := lookup(name)
@@ -685,7 +748,7 @@ func (c Config) validateSecrets(lookup func(string) (string, bool)) error {
 }
 
 func (c Config) validateSecretReferences() error {
-	for _, name := range []string{c.Gateway.Voice.APIKeyEnv, c.Worker.Reasoner.APIKeyEnv, c.Store.DatabaseURLEnv, c.Auth.StaticBearerEnv, c.Safety.PrivacyHMACKeyEnv, c.Features.ToolEncryptionKeyEnv} {
+	for _, name := range []string{c.Gateway.Voice.APIKeyEnv, c.Worker.Reasoner.APIKeyEnv, c.Store.DatabaseURLEnv, c.Auth.StaticBearerEnv, c.Safety.PrivacyHMACKeyEnv, c.Features.ToolEncryptionKeyEnv, c.Store.Retention.HMACKeyEnv} {
 		if name != "" && !environmentName(name) {
 			return fmt.Errorf("secret environment variable name %q is invalid", name)
 		}

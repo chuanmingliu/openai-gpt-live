@@ -473,6 +473,28 @@ func (r *Runner) generate(ctx context.Context, lease Lease, control Control, exe
 	builder := execution.builder
 	builder.beginGeneration(ctx, control.ObjectiveRevision, control.InputRevision)
 	toolOrdinal := uint32(0)
+	type claimOutcome struct {
+		invocation ToolInvocation
+		found      bool
+	}
+	claimed, err := retryExactValue(ctx, func() (claimOutcome, error) {
+		invocation, found, claimErr := r.Store.ClaimApprovedToolInvocation(ctx, lease.Token, control.ObjectiveRevision)
+		return claimOutcome{invocation: invocation, found: found}, claimErr
+	})
+	if err != nil {
+		return generatedResult{}, err
+	}
+	if claimed.found {
+		call, output, resumeErr := r.executeClaimedApprovedTool(ctx, lease, control.ObjectiveRevision, claimed.invocation, builder, execution, generation)
+		if resumeErr != nil {
+			return generatedResult{}, resumeErr
+		}
+		toolOrdinal = claimed.invocation.Record.ToolOrdinal
+		request.Messages = append(request.Messages,
+			reasoner.Message{Role: reasoner.RoleAssistant, ToolCalls: []reasoner.ToolCall{call}},
+			reasoner.Message{Role: reasoner.RoleTool, ToolCallID: call.ID, Content: string(output)},
+		)
+	}
 	for {
 		builder.beginStream()
 		result, streamErr := r.Reasoner.Stream(ctx, request.Clone(), builder.onChunk)
@@ -520,6 +542,90 @@ func (r *Runner) generate(ctx context.Context, lease Lease, control Control, exe
 		request.Messages = append(request.Messages, reasoner.Message{Role: reasoner.RoleAssistant, Content: result.Text, ToolCalls: cloneReasonerCalls(result.ToolCalls)})
 		request.Messages = append(request.Messages, toolMessages...)
 	}
+}
+
+func (r *Runner) executeClaimedApprovedTool(ctx context.Context, lease Lease, revision uint32, invocation ToolInvocation, builder *resultBuilder, execution *jobExecution, generation uint64) (reasoner.ToolCall, json.RawMessage, error) {
+	record := invocation.Record
+	if err := ValidateCanonicalToolApproval(invocation); err != nil || !invocation.RequiresApproval || invocation.ApprovalState != ApprovalApproved {
+		return reasoner.ToolCall{}, nil, errors.New("worker resumed tool invocation approval is invalid")
+	}
+	if record.ObjectiveRevision != revision || record.ToolOrdinal == 0 || int(record.ToolOrdinal) > r.MaxToolCalls {
+		return reasoner.ToolCall{}, nil, ErrLeaseLost
+	}
+	tool, ok := r.Tools.Lookup(lease.Job.Request.Versions.ToolRegistry, record.ToolName)
+	if !ok || !containsString(lease.Job.Request.ToolAllowlist, record.ToolName) {
+		return reasoner.ToolCall{}, nil, ErrToolNotAllowed
+	}
+	if tool.SideEffecting && r.shadowMode() {
+		return reasoner.ToolCall{}, nil, ErrToolNotAllowed
+	}
+	if r.ArgumentSealer == nil {
+		return reasoner.ToolCall{}, nil, errors.New("worker argument sealer is required for approved tool replay")
+	}
+	plaintext, err := r.ArgumentSealer.Open(SealedArguments{Ciphertext: record.Ciphertext, Nonce: record.Nonce, KeyID: record.KeyID})
+	if err != nil {
+		return reasoner.ToolCall{}, nil, err
+	}
+	arguments, err := canonicalToolArguments(json.RawMessage(plaintext), r.MaxToolArgumentBytes)
+	clear(plaintext)
+	if err != nil {
+		return reasoner.ToolCall{}, nil, err
+	}
+	hash := sha256.Sum256(arguments)
+	hashText := hex.EncodeToString(hash[:])
+	expectedID := StableToolInvocationID(lease.Token.TenantID, lease.Token.ConversationID, lease.Token.HandoffID, revision, record.ToolOrdinal, record.ToolName, hashText)
+	if hashText != record.ArgumentsHash || expectedID != record.InvocationID || record.IdempotencyKey != expectedID {
+		clear(arguments)
+		return reasoner.ToolCall{}, nil, handoff.ErrIdempotencyConflict
+	}
+	if err := execution.consumeTools(1, r.MaxToolCalls, r.MaxToolRounds); err != nil {
+		clear(arguments)
+		return reasoner.ToolCall{}, nil, err
+	}
+	if err := builder.reserve(len(arguments)); err != nil {
+		clear(arguments)
+		return reasoner.ToolCall{}, nil, err
+	}
+	execution.markApproved(revision, generation)
+	var output json.RawMessage
+	switch invocation.ResumeDisposition {
+	case ApprovalResumeSucceeded:
+		if invocation.Status != "succeeded" {
+			clear(arguments)
+			return reasoner.ToolCall{}, nil, errors.New("worker durable tool result state is invalid")
+		}
+		output, err = boundedToolOutput(invocation.Result, r.MaxToolOutputBytes)
+		if err == nil {
+			err = builder.reserve(len(output))
+		}
+	case ApprovalResumeFresh, ApprovalResumeUncertain:
+		if invocation.Status != "running" {
+			clear(arguments)
+			return reasoner.ToolCall{}, nil, errors.New("worker durable tool execution state is invalid")
+		}
+		output, err = tool.Executor.Execute(ctx, ToolExecutionRequest{InvocationID: expectedID, IdempotencyKey: expectedID, Arguments: append(json.RawMessage(nil), arguments...)})
+		if err != nil {
+			err = fmt.Errorf("%w", errToolFailure)
+			break
+		}
+		output, err = boundedToolOutput(output, r.MaxToolOutputBytes)
+		if err != nil {
+			break
+		}
+		if err = builder.reserve(len(output)); err != nil {
+			break
+		}
+		completion := ToolCompletionRecord{InvocationID: expectedID, MutationID: stableMutationID(lease, revision, "tool-"+expectedID), Result: output}
+		err = retryExactMutation(ctx, func() error { return r.Store.CompleteToolInvocation(ctx, lease.Token, completion) })
+	default:
+		err = errors.New("worker approved invocation resume disposition is invalid")
+	}
+	if err != nil {
+		clear(arguments)
+		return reasoner.ToolCall{}, nil, err
+	}
+	call := reasoner.ToolCall{ID: expectedID, Name: record.ToolName, Arguments: arguments}
+	return call, output, nil
 }
 
 func initialMessages(job handoff.Snapshot, control Control) ([]reasoner.Message, error) {
@@ -732,11 +838,6 @@ func (r *Runner) executeOneTool(ctx context.Context, lease Lease, revision, ordi
 	invocation := outcome.invocation
 	if err != nil {
 		if errors.Is(err, ErrApprovalRequired) {
-			needsInput := NeedsInputRecord{MutationID: stableMutationID(lease, revision, "approval-"+invocationID), ExpectedObjectiveRevision: revision, Prompt: "Approval is required for a requested tool action.", Schema: json.RawMessage(`{"type":"object","properties":{"approved":{"type":"boolean"}},"required":["approved"]}`)}
-			markErr := retryExactMutation(ctx, func() error { return r.Store.MarkNeedsInput(ctx, lease.Token, needsInput) })
-			if markErr != nil {
-				return nil, markErr
-			}
 			return nil, errNeedsInput
 		}
 		return nil, err

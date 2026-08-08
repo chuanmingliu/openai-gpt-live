@@ -8,6 +8,8 @@ import (
 	"net"
 	"reflect"
 	"strings"
+	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
@@ -56,6 +58,33 @@ type Repository struct {
 	failpoint            func(string) error
 	expiredLeaseObserver func(int)
 	handoffAdmissionHook func()
+	approvalTTL          time.Duration
+	sensitiveMu          sync.RWMutex
+	retentionHMACKeyID   string
+	retentionHMACKey     []byte
+}
+
+// CloseSensitive clears repository-owned secret material. It is idempotent
+// and excludes concurrent keyed audit operations while the owned copy is
+// being zeroized.
+func (r *Repository) CloseSensitive() {
+	if r == nil {
+		return
+	}
+	r.sensitiveMu.Lock()
+	defer r.sensitiveMu.Unlock()
+	clear(r.retentionHMACKey)
+	r.retentionHMACKey = nil
+	r.retentionHMACKeyID = ""
+}
+
+func (r *Repository) RetentionConfigured() bool {
+	if r == nil {
+		return false
+	}
+	r.sensitiveMu.RLock()
+	defer r.sensitiveMu.RUnlock()
+	return len(r.retentionHMACKey) >= 32 && strings.TrimSpace(r.retentionHMACKeyID) != ""
 }
 
 // SetExpiredLeaseObserver installs a process-local observer for successfully
@@ -81,6 +110,27 @@ func WithToolGate(gate worker.ToolGate) RepositoryOption {
 	}
 }
 
+func WithApprovalTTL(ttl time.Duration) RepositoryOption {
+	return func(repository *Repository) error {
+		if ttl < time.Second || ttl > 24*time.Hour {
+			return errors.New("postgres repository approval TTL is invalid")
+		}
+		repository.approvalTTL = ttl
+		return nil
+	}
+}
+
+func WithRetentionHMAC(keyID string, key []byte) RepositoryOption {
+	return func(repository *Repository) error {
+		if err := bounded("retention HMAC key ID", keyID, maxIdentityBytes, true); err != nil || len(key) < 32 || len(key) > 4096 {
+			return errors.New("postgres repository retention HMAC configuration is invalid")
+		}
+		repository.retentionHMACKeyID = keyID
+		repository.retentionHMACKey = append([]byte(nil), key...)
+		return nil
+	}
+}
+
 // WithHandoffAdmissionHook installs an observation point immediately before a
 // new create serializes with runtime feature authority. It is intended for
 // deterministic lifecycle/race verification and must not perform database work.
@@ -101,12 +151,14 @@ func NewRepository(pool *pgxpool.Pool, repositoryClock clock.Clock, options ...R
 	if nilInterface(repositoryClock) {
 		return nil, errors.New("postgres repository clock is required")
 	}
-	repository := &Repository{pool: pool, clock: repositoryClock}
+	repository := &Repository{pool: pool, clock: repositoryClock, approvalTTL: 5 * time.Minute}
 	for _, option := range options {
 		if option == nil {
+			repository.CloseSensitive()
 			return nil, errors.New("postgres repository option is required")
 		}
 		if err := option(repository); err != nil {
+			repository.CloseSensitive()
 			return nil, err
 		}
 	}

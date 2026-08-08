@@ -25,7 +25,8 @@ import (
 var requiredColumns = map[string]map[string]string{
 	"conversations": {
 		"tenant_id": "text", "id": "text", "user_id": "text", "status": "text",
-		"retention_until": "timestamp with time zone", "created_at": "timestamp with time zone", "updated_at": "timestamp with time zone",
+		"retention_until": "timestamp with time zone", "deletion_actor": "text", "deletion_reason_code": "text",
+		"deletion_requested_at": "timestamp with time zone", "created_at": "timestamp with time zone", "updated_at": "timestamp with time zone",
 	},
 	"conversation_items": {
 		"tenant_id": "text", "conversation_id": "text", "session_id": "text", "turn_id": "text",
@@ -135,6 +136,7 @@ var requiredDefaults = map[string]string{
 var requiredNamedConstraintNames = strings.Fields(`
 	conversations_tenant_id_size_check conversations_id_size_check conversations_user_id_size_check
 	conversations_status_check conversations_retention_check conversations_timestamps_check
+	conversations_deletion_actor_size_check conversations_deletion_reason_size_check conversations_deletion_tuple_check
 	conversation_items_sequence_uniq conversation_items_turn_role_uniq
 	conversation_items_tenant_id_size_check conversation_items_conversation_id_size_check
 	conversation_items_session_id_size_check conversation_items_turn_id_size_check
@@ -192,7 +194,7 @@ func TestSchemaMigrationLifecycle(t *testing.T) {
 
 	version, dirty, err := migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
-	assert.Equal(t, uint(4), version)
+	assert.Equal(t, uint(5), version)
 	assert.False(t, dirty)
 	var journalPresent bool
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
@@ -217,6 +219,13 @@ func TestSchemaMigrationLifecycle(t *testing.T) {
 	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
 	version, dirty, err = migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
+	assert.Equal(t, uint(4), version)
+	assert.False(t, dirty)
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
+	assert.True(t, journalPresent)
+	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
+	version, dirty, err = migrations.Version(t.Context(), pool)
+	require.NoError(t, err)
 	assert.Equal(t, uint(3), version)
 	assert.False(t, dirty)
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
@@ -235,7 +244,7 @@ func TestSchemaMigrationLifecycle(t *testing.T) {
 	assert.False(t, dirty)
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
 	assert.False(t, journalPresent)
-	require.NoError(t, migrations.Steps(t.Context(), pool, 3))
+	require.NoError(t, migrations.Steps(t.Context(), pool, 4))
 	require.NoError(t, migrations.Steps(t.Context(), pool, 0))
 	require.NoError(t, migrations.Check(t.Context(), pool))
 }
@@ -267,12 +276,12 @@ func TestSchemaTask20RuntimeFlagsV4UpDownUpPreservesPriorDurableRowsAndTriggers(
 		assert.Equal(t, 2, triggers)
 	}
 	assertV4Objects(true)
-	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
+	require.NoError(t, migrations.Steps(t.Context(), pool, -2))
 	assertV4Objects(false)
 	var preserved int
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM conversations WHERE tenant_id='tenant-v4-preserve' AND id='conversation-v4-preserve'`).Scan(&preserved))
 	assert.Equal(t, 1, preserved)
-	require.NoError(t, migrations.Steps(t.Context(), pool, 1))
+	require.NoError(t, migrations.Steps(t.Context(), pool, 2))
 	assertV4Objects(true)
 	var authorityVersion, flags int
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT version FROM runtime_feature_authority WHERE singleton=true`).Scan(&authorityVersion))
@@ -281,6 +290,42 @@ func TestSchemaTask20RuntimeFlagsV4UpDownUpPreservesPriorDurableRowsAndTriggers(
 	assert.Equal(t, 2, flags)
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM conversations WHERE tenant_id='tenant-v4-preserve' AND id='conversation-v4-preserve'`).Scan(&preserved))
 	assert.Equal(t, 1, preserved)
+}
+
+func TestSchemaTask21DeletionProvenanceV5DownUpPreservesPriorDurableRows(t *testing.T) {
+	pool := migratedPostgres(t)
+	insertConversation(t, pool, "tenant-v5-preserve", "conversation-v5-preserve")
+	_, err := pool.Exec(t.Context(), `UPDATE conversations
+		SET status='deleted',deletion_actor='operator',deletion_reason_code='user_request',
+			deletion_requested_at=CURRENT_TIMESTAMP
+		WHERE tenant_id='tenant-v5-preserve' AND id='conversation-v5-preserve'`)
+	require.NoError(t, err)
+
+	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
+	version, dirty, err := migrations.Version(t.Context(), pool)
+	require.NoError(t, err)
+	assert.Equal(t, uint(4), version)
+	assert.False(t, dirty)
+	var preserved int
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM conversations
+		WHERE tenant_id='tenant-v5-preserve' AND id='conversation-v5-preserve' AND status='deleted'`).Scan(&preserved))
+	assert.Equal(t, 1, preserved)
+	var provenanceColumnPresent bool
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT EXISTS (
+		SELECT 1 FROM information_schema.columns
+		WHERE table_schema=current_schema() AND table_name='conversations' AND column_name='deletion_actor'
+	)`).Scan(&provenanceColumnPresent))
+	assert.False(t, provenanceColumnPresent)
+
+	require.NoError(t, migrations.Steps(t.Context(), pool, 1))
+	require.NoError(t, migrations.Check(t.Context(), pool))
+	var actor, reason *string
+	var requestedAt *time.Time
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT deletion_actor,deletion_reason_code,deletion_requested_at
+		FROM conversations WHERE tenant_id='tenant-v5-preserve' AND id='conversation-v5-preserve'`).Scan(&actor, &reason, &requestedAt))
+	assert.Nil(t, actor)
+	assert.Nil(t, reason)
+	assert.Nil(t, requestedAt)
 }
 
 func TestSchemaTask12ToolInvocationScopeConstraint(t *testing.T) {
@@ -307,7 +352,7 @@ func TestSchemaTask12ToolInvocationScopeSafeDownAndUp(t *testing.T) {
 	require.NoError(t, insertHandoff(t, pool, "tenant-safe", "conversation-safe", "handoff-safe", "handoff-idem-safe"))
 	require.NoError(t, insertToolInvocation(t, pool, "invocation-safe", "tenant-safe", "conversation-safe", "handoff-safe", "tool-idem-safe"))
 
-	require.NoError(t, migrations.Steps(t.Context(), pool, -2))
+	require.NoError(t, migrations.Steps(t.Context(), pool, -3))
 	version, dirty, err := migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
 	assert.Equal(t, uint(2), version)
@@ -336,7 +381,7 @@ func TestSchemaTask12ToolInvocationScopeConflictingDownRefusalPreservesV3(t *tes
 	require.NoError(t, insertToolInvocation(t, pool, "invocation-a", "tenant-conflict", "conversation-a", "same-handoff", "tool-idem-a"))
 	require.NoError(t, insertToolInvocation(t, pool, "invocation-b", "tenant-conflict", "conversation-b", "same-handoff", "tool-idem-b"))
 
-	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
+	require.NoError(t, migrations.Steps(t.Context(), pool, -2))
 	err := migrations.Steps(t.Context(), pool, -1)
 	require.ErrorIs(t, err, migrations.ErrToolInvocationScopeConflict)
 	version, dirty, versionErr := migrations.Version(t.Context(), pool)
@@ -426,7 +471,7 @@ func TestSchemaMigrationLockTimeoutLeavesNoOrphan(t *testing.T) {
 // backend, roll back the statement, and preserve a clean schema version.
 func TestSchemaMigrationCancellationWhileExecutingSQL(t *testing.T) {
 	pool := migratedPostgres(t)
-	require.NoError(t, migrations.Steps(t.Context(), pool, -2))
+	require.NoError(t, migrations.Steps(t.Context(), pool, -3))
 	locker, err := pool.Acquire(t.Context())
 	require.NoError(t, err)
 	defer locker.Release()
@@ -705,6 +750,9 @@ func TestSchemaEveryNamedCheckRejectsInvalidMutation(t *testing.T) {
 		"conversations_status_check":                      `UPDATE conversations SET status='unknown' WHERE tenant_id='tenant-free'`,
 		"conversations_retention_check":                   `UPDATE conversations SET retention_until=created_at-interval '1 second' WHERE tenant_id='tenant-free'`,
 		"conversations_timestamps_check":                  `UPDATE conversations SET updated_at=created_at-interval '1 second' WHERE tenant_id='tenant-free'`,
+		"conversations_deletion_actor_size_check":         `UPDATE conversations SET deletion_actor='',deletion_reason_code='reason',deletion_requested_at=CURRENT_TIMESTAMP WHERE tenant_id='tenant-free'`,
+		"conversations_deletion_reason_size_check":        `UPDATE conversations SET deletion_actor='actor',deletion_reason_code='',deletion_requested_at=CURRENT_TIMESTAMP WHERE tenant_id='tenant-free'`,
+		"conversations_deletion_tuple_check":              `UPDATE conversations SET deletion_actor='actor' WHERE tenant_id='tenant-free'`,
 		"conversation_items_tenant_id_size_check":         `UPDATE conversation_items SET tenant_id='' WHERE session_id='session-c'`,
 		"conversation_items_conversation_id_size_check":   `UPDATE conversation_items SET conversation_id='' WHERE session_id='session-c'`,
 		"conversation_items_session_id_size_check":        `UPDATE conversation_items SET session_id='' WHERE session_id='session-c'`,
@@ -1482,7 +1530,9 @@ func assertPromptCancellation(t *testing.T, done <-chan error, unblock func()) {
 func allowedNullableColumn(table, column string) bool {
 	key := table + "." + column
 	allowed := map[string]bool{
-		"handoffs.input": true, "handoffs.lease_owner": true, "handoffs.lease_expires_at": true,
+		"conversations.deletion_actor": true, "conversations.deletion_reason_code": true,
+		"conversations.deletion_requested_at": true,
+		"handoffs.input":                      true, "handoffs.lease_owner": true, "handoffs.lease_expires_at": true,
 		"handoffs.cancel_requested_at": true, "handoffs.cancel_actor": true, "handoffs.cancel_reason": true,
 		"handoffs.terminal_mutation_id": true, "handoffs.result_summary": true, "handoffs.structured_result": true,
 		"handoffs.failure_code": true, "handoffs.failure_retryable": true, "handoffs.failure_message": true,

@@ -116,3 +116,16 @@ type ResponseCancelEvent struct {
 
 func (e ResponseCancelEvent) EventType() string { return e.Type }
 func (ResponseCancelEvent) isClientEvent()      {}
+
+// LiveToolApprovalResolveEvent contains no identity claims. The gateway binds
+// it to the authenticated subject and current conversation/incarnation.
+type LiveToolApprovalResolveEvent struct {
+	Type           string `json:"type"`
+	InvocationID   string `json:"invocation_id"`
+	Decision       string `json:"decision"`
+	Reason         string `json:"reason"`
+	IdempotencyKey string `json:"idempotency_key"`
+}
+
+func (e LiveToolApprovalResolveEvent) EventType() string { return e.Type }
+func (LiveToolApprovalResolveEvent) isClientEvent()      {}

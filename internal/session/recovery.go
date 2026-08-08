@@ -45,10 +45,17 @@ type CommittedItem struct {
 }
 
 type RecoverySnapshot struct {
-	ConversationID identity.ConversationID
-	CommittedItems []CommittedItem
-	ActiveHandoffs []handoff.Snapshot
-	LastEventSeq   int64
+	ConversationID   identity.ConversationID
+	CommittedItems   []CommittedItem
+	ActiveHandoffs   []handoff.Snapshot
+	PendingApprovals []RecoveryApproval
+	LastEventSeq     int64
+}
+
+type RecoveryApproval struct {
+	EventID  string
+	Sequence int64
+	Approval handoff.ToolApproval
 }
 
 type RecoveryStore interface {
@@ -114,6 +121,7 @@ func cloneRecoverySnapshot(snapshot RecoverySnapshot) RecoverySnapshot {
 	for index := range snapshot.ActiveHandoffs {
 		out.ActiveHandoffs[index] = handoff.CloneSnapshot(snapshot.ActiveHandoffs[index])
 	}
+	out.PendingApprovals = append([]RecoveryApproval(nil), snapshot.PendingApprovals...)
 	return out
 }
 
@@ -127,6 +135,12 @@ func validateRecoverySnapshot(scope handoff.Scope, snapshot RecoverySnapshot, it
 	}
 	for _, active := range snapshot.ActiveHandoffs {
 		if active.Request.Scope != scope || terminalRecoveryState(active.State) {
+			return RecoverySnapshot{}, ErrRecoveryUnavailable
+		}
+	}
+	for _, pending := range snapshot.PendingApprovals {
+		if pending.Sequence <= 0 || pending.Sequence > snapshot.LastEventSeq || strings.TrimSpace(pending.EventID) == "" ||
+			pending.Approval.InvocationID == "" || pending.Approval.HandoffID == "" || pending.Approval.ApprovalState != "pending" || pending.Approval.ExpiresAt.IsZero() {
 			return RecoverySnapshot{}, ErrRecoveryUnavailable
 		}
 	}

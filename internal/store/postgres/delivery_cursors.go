@@ -41,12 +41,24 @@ func (r *Repository) AdvanceDeliveryCursor(ctx context.Context, consumerID strin
 	}
 	defer rollback(tx)
 	now := r.clock.Now().UTC()
+	var status string
+	err = tx.QueryRow(ctx, `SELECT status FROM conversations
+		WHERE tenant_id=$1 AND id=$2 AND user_id=$3 FOR UPDATE`,
+		scope.TenantID, scope.ConversationID, scope.UserID).Scan(&status)
+	if errors.Is(err, pgx.ErrNoRows) || status == "deleted" {
+		return handoff.ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if err := r.after("delivery_cursor_after_conversation_lock"); err != nil {
+		return err
+	}
 	_, err = tx.Exec(ctx, `
 		INSERT INTO delivery_cursors (consumer_id,tenant_id,conversation_id,last_sequence,created_at,updated_at)
-		SELECT $1,$2,$3,$4,$5,$5 FROM conversations
-		WHERE tenant_id=$2 AND id=$3 AND user_id=$6 AND status <> 'deleted'
+		VALUES ($1,$2,$3,$4,$5,$5)
 		ON CONFLICT (consumer_id,tenant_id,conversation_id) DO NOTHING`,
-		consumerID, scope.TenantID, scope.ConversationID, 0, now, scope.UserID)
+		consumerID, scope.TenantID, scope.ConversationID, 0, now)
 	if err != nil {
 		return mapWriteError(err)
 	}

@@ -475,6 +475,16 @@ func (r *Repository) mutateHandoff(ctx context.Context, scope handoff.Scope, id 
 	if err := r.lockEventAppend(ctx, tx); err != nil {
 		return handoff.Snapshot{}, err
 	}
+	var conversationStatus string
+	err = tx.QueryRow(ctx, `SELECT status FROM conversations
+		WHERE tenant_id=$1 AND id=$2 AND user_id=$3 FOR UPDATE`,
+		scope.TenantID, scope.ConversationID, scope.UserID).Scan(&conversationStatus)
+	if errors.Is(err, pgx.ErrNoRows) || conversationStatus == "deleted" {
+		return handoff.Snapshot{}, handoff.ErrNotFound
+	}
+	if err != nil {
+		return handoff.Snapshot{}, err
+	}
 
 	var existingPayload []byte
 	var existingTenant, existingConversation, existingHandoff string

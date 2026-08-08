@@ -192,7 +192,15 @@ func TestManagerReconnectCASRestoresBeforePublishingAndRejectsReplay(t *testing.
 	store := &recoveryStoreFake{snapshot: RecoverySnapshot{
 		ConversationID: scope.ConversationID,
 		CommittedItems: []CommittedItem{{Sequence: 1, Role: "user", Content: "durable history"}},
-		LastEventSeq:   7,
+		PendingApprovals: []RecoveryApproval{{
+			EventID: "approval-required-event", Sequence: 7,
+			Approval: handoff.ToolApproval{
+				InvocationID: "invocation-reconnect", HandoffID: "handoff-reconnect", ApprovalState: "pending",
+				ActionSummary: "Confirm external action", RiskClass: handoff.ApprovalRiskSideEffecting,
+				ExpiresAt: time.Now().Add(5 * time.Minute),
+			},
+		}},
+		LastEventSeq: 7,
 	}}
 	manager := NewManager(Config{
 		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
@@ -229,6 +237,11 @@ func TestManagerReconnectCASRestoresBeforePublishingAndRejectsReplay(t *testing.
 	require.Equal(t, realtime.CommandCreateItem, restored.Kind)
 	require.Contains(t, string(restored.Item), "durable history")
 	require.Equal(t, "session.created", (<-newClient.writes).EventType())
+	replayedApproval, ok := (<-newClient.writes).(protocol.LiveToolApprovalRequiredEvent)
+	require.True(t, ok)
+	require.Equal(t, "approval-required-event", replayedApproval.EventID)
+	require.Equal(t, int64(7), replayedApproval.SequenceID)
+	require.Equal(t, "invocation-reconnect", replayedApproval.InvocationID)
 	require.Eventually(t, func() bool {
 		manager.activeMu.RLock()
 		defer manager.activeMu.RUnlock()

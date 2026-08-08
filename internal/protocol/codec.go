@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"unicode/utf8"
 )
 
 const pcmFrameBytes = 960
@@ -38,6 +39,8 @@ func DecodeClient(raw []byte, limits Limits) (ClientEvent, error) {
 		target = &ResponseCreateEvent{}
 	case "response.cancel":
 		target = &ResponseCancelEvent{}
+	case "live.tool.approval.resolve":
+		target = &LiveToolApprovalResolveEvent{}
 	default:
 		return nil, fmt.Errorf("unsupported client event type %q", eventType)
 	}
@@ -104,6 +107,8 @@ func DecodeServer(raw []byte, limits Limits) (ServerEvent, error) {
 		target = &LiveSessionDegradedEvent{}
 	case "live.session.resumed":
 		target = &LiveSessionResumedEvent{}
+	case "live.tool.approval.required":
+		target = &LiveToolApprovalRequiredEvent{}
 	default:
 		return nil, fmt.Errorf("unsupported server event type %q", eventType)
 	}
@@ -242,6 +247,20 @@ func validateClient(event ClientEvent, raw []byte, limits Limits) error {
 		}
 	case InputAudioBufferCommitEvent, ResponseCreateEvent, ResponseCancelEvent:
 		return nil
+	case LiveToolApprovalResolveEvent:
+		if err := exactFields(fields, "type", "invocation_id", "decision", "reason", "idempotency_key"); err != nil {
+			return err
+		}
+		if err := requireBoundedString(fields, "invocation_id", 256, true); err != nil {
+			return err
+		}
+		if typed.Decision != "approved" && typed.Decision != "denied" {
+			return errors.New("approval decision is invalid")
+		}
+		if err := requireBoundedString(fields, "reason", 2048, false); err != nil {
+			return err
+		}
+		return requireBoundedString(fields, "idempotency_key", 256, true)
 	default:
 		return fmt.Errorf("unsupported client event %T", event)
 	}
@@ -417,6 +436,28 @@ func validateServer(event ServerEvent, raw []byte, limits Limits) error {
 			return err
 		}
 		return requireString(fields, "status", true)
+	case LiveToolApprovalRequiredEvent:
+		if err := exactFields(fields, "type", "event_id", "sequence_id", "invocation_id", "handoff_id", "action_summary", "expires_at", "risk_class"); err != nil {
+			return err
+		}
+		if err := requireNonNegativeInt(fields, "sequence_id"); err != nil || typed.SequenceID <= 0 {
+			return errors.New("approval sequence is invalid")
+		}
+		for _, field := range []string{"event_id", "invocation_id", "handoff_id"} {
+			if err := requireBoundedString(fields, field, 256, true); err != nil {
+				return err
+			}
+		}
+		if err := requireBoundedString(fields, "action_summary", 512, true); err != nil {
+			return err
+		}
+		if typed.ExpiresAt.IsZero() || typed.ExpiresAt.Year() < 1970 || typed.ExpiresAt.Year() > 9999 {
+			return errors.New("approval expiry is invalid")
+		}
+		if typed.RiskClass != "side_effecting" {
+			return errors.New("approval risk class is invalid")
+		}
+		return nil
 	default:
 		return fmt.Errorf("unsupported server event %T", event)
 	}
@@ -460,6 +501,30 @@ func requireString(fields map[string]json.RawMessage, name string, nonEmpty bool
 	return nil
 }
 
+func requireBoundedString(fields map[string]json.RawMessage, name string, limit int, nonEmpty bool) error {
+	if err := requireString(fields, name, nonEmpty); err != nil {
+		return err
+	}
+	var value string
+	_ = json.Unmarshal(fields[name], &value)
+	if len(value) > limit {
+		return fmt.Errorf("%s exceeds its byte limit", name)
+	}
+	return nil
+}
+
+func exactFields(fields map[string]json.RawMessage, names ...string) error {
+	if len(fields) != len(names) {
+		return errors.New("event fields are invalid")
+	}
+	for _, name := range names {
+		if _, ok := fields[name]; !ok {
+			return errors.New("event fields are invalid")
+		}
+	}
+	return nil
+}
+
 func requireNonNegativeInt(fields map[string]json.RawMessage, name string) error {
 	raw, ok := fields[name]
 	if !ok {
@@ -484,6 +549,9 @@ func inspectEnvelope(raw []byte, limits Limits) (string, error) {
 	}
 	if len(raw) > limits.MaxFrameBytes {
 		return "", fmt.Errorf("event size %d exceeds limit %d", len(raw), limits.MaxFrameBytes)
+	}
+	if !utf8.Valid(raw) {
+		return "", errors.New("event is not valid UTF-8")
 	}
 	if err := scanJSONDepth(raw, limits.MaxJSONDepth); err != nil {
 		return "", err

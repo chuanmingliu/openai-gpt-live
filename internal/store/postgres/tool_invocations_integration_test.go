@@ -77,8 +77,11 @@ func TestToolInvocationRequiresRegistryAllowlistAndDurableApproval(t *testing.T)
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM information_schema.columns WHERE table_name='tool_invocations' AND column_name IN ('arguments','plaintext')`).Scan(&plaintextColumns))
 	assert.Zero(t, plaintextColumns)
 
-	_, err = pool.Exec(t.Context(), `UPDATE tool_invocations SET approval_state='approved',approval_expires_at=$1 WHERE invocation_id=$2`, now.Add(time.Minute), id)
+	require.NoError(t, repo.ResolveApproval(t.Context(), record.Request.Scope, handoff.ApprovalResolution{InvocationID: id, Decision: handoff.ApprovalApproved, ActorTenantID: record.Request.Scope.TenantID, ActorUserID: record.Request.Scope.UserID, Reason: "approved in test", IdempotencyKey: "approve-search", ResolvedAt: now}))
+	lease, ok, err = repo.LeaseNext(t.Context(), worker.LeaseRequest{WorkerID: "worker-approved", LeaseDuration: 5 * time.Minute, Now: now})
 	require.NoError(t, err)
+	require.True(t, ok)
+	require.NoError(t, repo.MarkRunning(t.Context(), lease.Token, now))
 	invocation, created, err = repo.BeginToolInvocation(t.Context(), lease.Token, invocationRecord)
 	require.NoError(t, err)
 	assert.False(t, created)
@@ -149,8 +152,21 @@ func TestToolInvocationRegistryAllowlistApprovalDenialAndExpiry(t *testing.T) {
 			if tc.approval != "" {
 				_, _, err = repo.BeginToolInvocation(t.Context(), lease.Token, rec)
 				require.ErrorIs(t, err, worker.ErrApprovalRequired)
-				_, err = pool.Exec(t.Context(), `UPDATE tool_invocations SET approval_state=$1,approval_expires_at=$2 WHERE invocation_id=$3`, tc.approval, repositoryTestNow.Add(-time.Second), id)
-				require.NoError(t, err)
+				decision := handoff.ApprovalDenied
+				resolvedAt := repositoryTestNow.Add(time.Minute)
+				if tc.name == "expired" {
+					decision = handoff.ApprovalApproved
+					resolvedAt = repositoryTestNow.Add(5 * time.Minute)
+				}
+				require.NoError(t, repo.ResolveApproval(t.Context(), record.Request.Scope, handoff.ApprovalResolution{InvocationID: id, Decision: decision, ActorTenantID: record.Request.Scope.TenantID, ActorUserID: record.Request.Scope.UserID, Reason: "terminal test", IdempotencyKey: "terminal-" + tc.name, ResolvedAt: resolvedAt}))
+				approval, loadErr := repo.LoadApproval(t.Context(), record.Request.Scope, id)
+				require.NoError(t, loadErr)
+				wantState := tc.approval
+				if tc.name == "expired" {
+					wantState = "expired"
+				}
+				assert.Equal(t, wantState, approval.ApprovalState)
+				return
 			}
 			invocation, _, err := repo.BeginToolInvocation(t.Context(), lease.Token, rec)
 			assert.ErrorIs(t, err, tc.want)
@@ -296,13 +312,11 @@ func TestToolApprovalPendingRebindsToReacquiredAttempt(t *testing.T) {
 	recordInvocation := worker.ToolInvocationRecord{InvocationID: id, ObjectiveRevision: 0, ToolOrdinal: 1, ToolName: "search", IdempotencyKey: id, ArgumentsHash: hash, Ciphertext: make([]byte, 16), Nonce: make([]byte, 12), KeyID: "key"}
 	_, _, err = repo.BeginToolInvocation(t.Context(), first.Token, recordInvocation)
 	require.ErrorIs(t, err, worker.ErrApprovalRequired)
-	_, err = pool.Exec(t.Context(), `UPDATE handoffs SET lease_expires_at=$1 WHERE tenant_id=$2 AND conversation_id=$3 AND id=$4`, now.Add(-time.Second), first.Token.TenantID, first.Token.ConversationID, first.Token.HandoffID)
-	require.NoError(t, err)
+	require.NoError(t, repo.ResolveApproval(t.Context(), record.Request.Scope, handoff.ApprovalResolution{InvocationID: id, Decision: handoff.ApprovalApproved, ActorTenantID: record.Request.Scope.TenantID, ActorUserID: record.Request.Scope.UserID, Reason: "approved", IdempotencyKey: "approve-reacquire", ResolvedAt: now}))
 	second, ok, err := repo.LeaseNext(t.Context(), worker.LeaseRequest{WorkerID: "second", LeaseDuration: time.Minute, Now: now})
 	require.NoError(t, err)
 	require.True(t, ok)
-	_, err = pool.Exec(t.Context(), `UPDATE tool_invocations SET approval_state='approved',approval_expires_at=$1 WHERE invocation_id=$2`, now.Add(time.Minute), id)
-	require.NoError(t, err)
+	require.NoError(t, repo.MarkRunning(t.Context(), second.Token, now))
 	_, _, err = repo.BeginToolInvocation(t.Context(), first.Token, recordInvocation)
 	assert.ErrorIs(t, err, worker.ErrLeaseLost)
 	invocation, created, err := repo.BeginToolInvocation(t.Context(), second.Token, recordInvocation)
@@ -398,16 +412,22 @@ func TestToolInvocationAttemptRebindFailpointsRollbackAndRetry(t *testing.T) {
 			_, _, err = repo.BeginToolInvocation(t.Context(), first.Token, record)
 			if tc.approvalRequired {
 				require.ErrorIs(t, err, worker.ErrApprovalRequired)
-				_, err = pool.Exec(t.Context(), `UPDATE tool_invocations SET approval_state='approved',approval_expires_at=$1 WHERE invocation_id=$2`, now.Add(time.Minute), id)
-				require.NoError(t, err)
+				require.NoError(t, repo.ResolveApproval(t.Context(), created.Request.Scope, handoff.ApprovalResolution{
+					InvocationID: id, Decision: handoff.ApprovalApproved,
+					ActorTenantID: created.Request.Scope.TenantID, ActorUserID: created.Request.Scope.UserID,
+					Reason: "approved", IdempotencyKey: "rebind-approved", ResolvedAt: now,
+				}))
 			} else {
 				require.NoError(t, err)
+				_, err = pool.Exec(t.Context(), `UPDATE handoffs SET lease_expires_at=$1 WHERE tenant_id=$2 AND conversation_id=$3 AND id=$4`, now.Add(-time.Second), first.Token.TenantID, first.Token.ConversationID, first.Token.HandoffID)
+				require.NoError(t, err)
 			}
-			_, err = pool.Exec(t.Context(), `UPDATE handoffs SET lease_expires_at=$1 WHERE tenant_id=$2 AND conversation_id=$3 AND id=$4`, now.Add(-time.Second), first.Token.TenantID, first.Token.ConversationID, first.Token.HandoffID)
-			require.NoError(t, err)
 			second, ok, err := repo.LeaseNext(t.Context(), worker.LeaseRequest{WorkerID: "second", LeaseDuration: time.Minute, Now: now})
 			require.NoError(t, err)
 			require.True(t, ok)
+			if tc.approvalRequired {
+				require.NoError(t, repo.MarkRunning(t.Context(), second.Token, now))
+			}
 
 			repo.failpoint = func(step string) error {
 				if step == tc.failpoint {

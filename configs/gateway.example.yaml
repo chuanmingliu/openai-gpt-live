@@ -21,6 +21,13 @@ gateway:
     retry_max: 1s
 store:
   database_url_env: DATABASE_URL
+  retention:
+    conversation_ttl: 720h
+    sweep_interval: 1m
+    deletion_batch: 100
+    approval_ttl: 5m
+    hmac_key_env: LIVE_RETENTION_HMAC_KEY
+    hmac_key_id: retention-v1
 auth:
   static_bearer_env: LIVE_STATIC_BEARER_TOKEN
   static_tenant_id: development

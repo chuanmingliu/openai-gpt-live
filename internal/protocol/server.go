@@ -1,6 +1,9 @@
 package protocol
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"time"
+)
 
 type ServerEvent interface {
 	EventType() string
@@ -280,6 +283,20 @@ func (LiveHandoffNeedsInputEvent) isServerEvent()      {}
 func (LiveHandoffCompletedEvent) isServerEvent()       {}
 func (LiveHandoffFailedEvent) isServerEvent()          {}
 func (LiveHandoffCancelledEvent) isServerEvent()       {}
+
+type LiveToolApprovalRequiredEvent struct {
+	Type          string    `json:"type"`
+	EventID       string    `json:"event_id"`
+	SequenceID    int64     `json:"sequence_id"`
+	InvocationID  string    `json:"invocation_id"`
+	HandoffID     string    `json:"handoff_id"`
+	ActionSummary string    `json:"action_summary"`
+	ExpiresAt     time.Time `json:"expires_at"`
+	RiskClass     string    `json:"risk_class"`
+}
+
+func (e LiveToolApprovalRequiredEvent) EventType() string { return e.Type }
+func (LiveToolApprovalRequiredEvent) isServerEvent()      {}
 
 type LiveSessionDegradedEvent struct {
 	Type       string          `json:"type"`

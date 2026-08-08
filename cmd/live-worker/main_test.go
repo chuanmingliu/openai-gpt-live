@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"net"
 	"net/http"
@@ -24,6 +25,11 @@ type fakeRuntime struct {
 	started chan resolvedSecrets
 	drained chan struct{}
 }
+
+type functionRuntime struct{ run func(context.Context) error }
+
+func (r *functionRuntime) Run(ctx context.Context) error { return r.run(ctx) }
+func (*functionRuntime) Close()                          {}
 
 func TestProductionRuntimeGracefullyDrainsComponents(t *testing.T) {
 	manual := clock.NewManual(time.Now().UTC())
@@ -184,6 +190,9 @@ worker:
     api_key_env: TEST_DEEPSEEK_KEY
 store:
   database_url_env: TEST_DATABASE_URL
+  retention:
+    hmac_key_env: TEST_RETENTION_KEY
+    hmac_key_id: retention-key-v1
 safety:
   privacy_hmac_key_env: TEST_PRIVACY_KEY
 features:
@@ -196,10 +205,11 @@ features:
 
 func dummySecrets() map[string]string {
 	return map[string]string{
-		"TEST_DEEPSEEK_KEY": "sentinel-provider-secret",
-		"TEST_DATABASE_URL": "postgres://worker:sentinel-db-secret@db.invalid/live?sslmode=require",
-		"TEST_PRIVACY_KEY":  strings.Repeat("p", 32),
-		"TEST_TOOL_KEY":     "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU=",
+		"TEST_DEEPSEEK_KEY":  "sentinel-provider-secret",
+		"TEST_DATABASE_URL":  "postgres://worker:sentinel-db-secret@db.invalid/live?sslmode=require",
+		"TEST_PRIVACY_KEY":   strings.Repeat("p", 32),
+		"TEST_TOOL_KEY":      "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU=",
+		"TEST_RETENTION_KEY": base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("r"), 32)),
 	}
 }
 
@@ -239,6 +249,34 @@ func TestRunResolvesSecretsAndDrainsOnCancellation(t *testing.T) {
 	cancel()
 	require.NoError(t, <-done)
 	<-runtime.drained
+}
+
+func TestRunClearsResolvedRetentionSourceBeforeRuntimeRun(t *testing.T) {
+	path := writeWorkerConfig(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	started := make(chan struct{})
+	builder := func(_ context.Context, _ config.Config, secrets resolvedSecrets) (serviceRuntime, error) {
+		require.NotEmpty(t, secrets.RetentionHMACKey)
+		ownedView := secrets.RetentionHMACKey
+		return &functionRuntime{run: func(runCtx context.Context) error {
+			for _, value := range ownedView {
+				assert.Zero(t, value, "resolver-owned retention key remains live when Run begins")
+			}
+			close(started)
+			<-runCtx.Done()
+			return runCtx.Err()
+		}}, nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- runWithBuilder(ctx, []string{"-config", path}, lookupFrom(dummySecrets()), builder) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("runtime did not start")
+	}
+	cancel()
+	require.NoError(t, <-done)
 }
 
 func TestRunRedactsEveryResolvedSecretFromStartupErrors(t *testing.T) {

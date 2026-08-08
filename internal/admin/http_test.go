@@ -16,6 +16,7 @@ import (
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/auth"
 	"github.com/chuanmingliu/openai-gpt-live/internal/feature"
+	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/lifecycle"
 )
 
@@ -36,6 +37,113 @@ type noScopeAuth struct{}
 
 func (noScopeAuth) Authenticate(context.Context, string) (auth.Principal, error) {
 	return auth.Principal{Scopes: map[string]struct{}{}}, nil
+}
+
+type ownerAuth struct{ admin bool }
+
+func (a ownerAuth) Authenticate(context.Context, string) (auth.Principal, error) {
+	scopes := map[string]struct{}{}
+	if a.admin {
+		scopes[AdminScope] = struct{}{}
+	}
+	return auth.Principal{TenantID: "tenant-1", UserID: "user-1", Scopes: scopes}, nil
+}
+
+type deletionStoreFake struct {
+	mu                                  sync.Mutex
+	scope                               handoff.Scope
+	tenant, conversation, actor, reason string
+	admin                               bool
+	err                                 error
+}
+
+func (s *deletionStoreFake) MarkConversationDeleting(_ context.Context, scope handoff.Scope, actor, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.scope, s.actor, s.reason, s.admin = scope, actor, reason, false
+	return s.err
+}
+func (s *deletionStoreFake) MarkConversationDeletingAsAdmin(_ context.Context, tenant, conversation, actor, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tenant, s.conversation, s.actor, s.reason, s.admin = tenant, conversation, actor, reason, true
+	return s.err
+}
+
+func TestDeleteConversationUsesAuthenticatedOwnerAndIsExistenceBlind(t *testing.T) {
+	for _, storeErr := range []error{nil, handoff.ErrNotFound, handoff.ErrIdempotencyConflict} {
+		store := &deletionStoreFake{err: storeErr}
+		h, err := NewHandler(Config{Authenticator: ownerAuth{}, Drainer: lifecycle.NewDrainer(), Deletions: store})
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := request(http.MethodDelete, "/admin/v1/conversations/conversation-7")
+		r.Body = ioNop(`{"reason":"user_requested"}`)
+		r.ContentLength = int64(len(`{"reason":"user_requested"}`))
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if w.Code != http.StatusAccepted || w.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("code=%d body=%q", w.Code, w.Body.String())
+		}
+		if store.scope.TenantID != "tenant-1" || store.scope.UserID != "user-1" || store.scope.ConversationID != "conversation-7" || store.actor != "user-1" || store.reason != "user_requested" || store.admin {
+			t.Fatalf("unexpected mark: %+v", store)
+		}
+	}
+}
+
+func TestDeleteConversationIsUnavailableWithoutRetentionStore(t *testing.T) {
+	h, err := NewHandler(Config{Authenticator: ownerAuth{}, Drainer: lifecycle.NewDrainer()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := request(http.MethodDelete, "/admin/v1/conversations/conversation-7")
+	r.Body = ioNop(`{"reason":"user_requested"}`)
+	r.ContentLength = int64(len(`{"reason":"user_requested"}`))
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusServiceUnavailable || w.Body.Len() != 0 {
+		t.Fatalf("code=%d body=%q", w.Code, w.Body.String())
+	}
+}
+
+func TestDeleteConversationAdminIsTenantScopedAndMalformedRequestsDoNotCallStore(t *testing.T) {
+	store := &deletionStoreFake{}
+	h, err := NewHandler(Config{Authenticator: ownerAuth{admin: true}, Drainer: lifecycle.NewDrainer(), Deletions: store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := request(http.MethodDelete, "/admin/v1/conversations/conversation-9")
+	r.Body = ioNop(`{"reason":"admin_requested"}`)
+	r.ContentLength = int64(len(`{"reason":"admin_requested"}`))
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusAccepted || !store.admin || store.tenant != "tenant-1" || store.conversation != "conversation-9" {
+		t.Fatalf("code=%d store=%+v", w.Code, store)
+	}
+	r = request(http.MethodDelete, "/admin/v1/conversations/conversation-9")
+	r.Body = ioNop(`{"reason":"password=secret transcript text"}`)
+	r.ContentLength = int64(len(`{"reason":"password=secret transcript text"}`))
+	r.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusBadRequest || store.reason != handoff.DeletionReasonAdminRequested {
+		t.Fatalf("free-form reason reached store: code=%d store=%+v", w.Code, store)
+	}
+
+	for _, path := range []string{"/admin/v1/conversations/", "/admin/v1/conversations/a/b", "/admin/v1/conversations/a%2Fb", "/admin/v1/conversations/a?tenant=other"} {
+		r = request(http.MethodDelete, path)
+		r.Body = ioNop(`{"reason":"x"}`)
+		r.ContentLength = int64(len(`{"reason":"x"}`))
+		r.Header.Set("Content-Type", "application/json")
+		w = httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if w.Code != http.StatusBadRequest && w.Code != http.StatusNotFound {
+			t.Fatalf("path=%q code=%d", path, w.Code)
+		}
+	}
 }
 func request(method, path string) *http.Request {
 	r := httptest.NewRequest(method, path, nil)

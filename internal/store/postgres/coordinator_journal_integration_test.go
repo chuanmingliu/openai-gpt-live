@@ -337,6 +337,7 @@ func TestCoordinatorJournalDownWaitsForConcurrentAdmissionThenRefuses(t *testing
 	hash := sha256.Sum256(record.Payload)
 	tx, err := pool.Begin(t.Context())
 	require.NoError(t, err)
+	defer func() { _ = tx.Rollback(context.Background()) }()
 	_, err = tx.Exec(t.Context(), `INSERT INTO coordinator_work_journal (
 		work_key,kind,tenant_id,user_id,conversation_id,session_id,delivery_affinity,
 		incarnation,local_sequence,payload,payload_hash,storage_sequence
@@ -367,7 +368,7 @@ func TestCoordinatorJournalDownWaitsForConcurrentAdmissionThenRefuses(t *testing
 
 func requireCoordinatorMigrationVersion2(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
-	require.NoError(t, migrations.Steps(t.Context(), pool, -2))
+	require.NoError(t, migrations.Steps(t.Context(), pool, -3))
 	version, dirty, err := migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
 	assert.Equal(t, uint(2), version)

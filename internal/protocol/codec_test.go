@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/testkit"
 	"github.com/stretchr/testify/assert"
@@ -27,6 +28,7 @@ func TestDecodeClientDispatchesEverySupportedType(t *testing.T) {
 		{"conversation item wrong branch", `{"type":"conversation.item.create","event_id":"evt-4","previous_item_id":"item-0","item":{"id":"item-1","type":"function_call_output","call_id":"call-1","output":"ok"}}`, ConversationItemCreateEvent{}},
 		{"response create wrong branch", `{"type":"response.create","event_id":"evt-5","response":{"instructions":"brief","tool_choice":"auto"}}`, ResponseCreateEvent{}},
 		{"response cancel wrong branch", `{"type":"response.cancel","event_id":"evt-6","response_id":"resp-1"}`, ResponseCancelEvent{}},
+		{"approval resolve", `{"type":"live.tool.approval.resolve","invocation_id":"inv-1","decision":"approved","reason":"confirmed","idempotency_key":"decision-1"}`, LiveToolApprovalResolveEvent{}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -34,6 +36,42 @@ func TestDecodeClientDispatchesEverySupportedType(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, reflect.TypeOf(tt.want), reflect.TypeOf(got))
 		})
+	}
+}
+
+func TestApprovalProtocolIsExactAndContentFree(t *testing.T) {
+	valid := `{"type":"live.tool.approval.resolve","invocation_id":"inv-1","decision":"denied","reason":"not expected","idempotency_key":"decision-1"}`
+	event, err := DecodeClient([]byte(valid), testLimits)
+	require.NoError(t, err)
+	assert.Equal(t, "inv-1", event.(LiveToolApprovalResolveEvent).InvocationID)
+
+	for _, raw := range []string{
+		`{"type":"live.tool.approval.resolve","invocation_id":"inv-1","decision":"allow","reason":"x","idempotency_key":"k"}`,
+		`{"type":"live.tool.approval.resolve","invocation_id":"inv-1","decision":"approved","reason":"x","idempotency_key":"k","tenant_id":"spoof"}`,
+		`{"type":"live.tool.approval.resolve","invocation_id":"inv-1","decision":"approved","reason":"x","idempotency_key":"k","arguments":{"secret":true}}`,
+		`{"type":"live.tool.approval.resolve","invocation_id":"inv-1","invocation_id":"inv-2","decision":"approved","reason":"x","idempotency_key":"k"}`,
+	} {
+		_, err := DecodeClient([]byte(raw), testLimits)
+		assert.Error(t, err)
+	}
+
+	required := LiveToolApprovalRequiredEvent{Type: "live.tool.approval.required", EventID: "evt-1", SequenceID: 7, InvocationID: "inv-1", HandoffID: "handoff-1", ActionSummary: "Run side-effecting action notify", ExpiresAt: time.Now().UTC().Add(time.Minute), RiskClass: "side_effecting"}
+	raw, err := Encode(required)
+	require.NoError(t, err)
+	_, err = DecodeServer(raw, testLimits)
+	require.NoError(t, err)
+	assert.NotContains(t, string(raw), "arguments")
+	assert.NotContains(t, string(raw), "tenant")
+}
+
+func TestDecodeClientRejectsInvalidUTF8BeforeApprovalJSONNormalization(t *testing.T) {
+	for _, raw := range [][]byte{
+		append([]byte(`{"type":"live.tool.approval.resolve","invocation_id":"inv-`), append([]byte{0xff}, []byte(`","decision":"approved","reason":"x","idempotency_key":"key"}`)...)...),
+		append([]byte(`{"type":"live.tool.approval.resolve","invocation_id":"inv","decision":"approved","reason":"x","idempotency_key":"key-`), append([]byte{0xfe}, []byte(`"}`)...)...),
+		append([]byte(`{"type":"live.tool.approval.resolve"}`), 0xff),
+	} {
+		_, err := DecodeClient(raw, testLimits)
+		require.ErrorContains(t, err, "valid UTF-8")
 	}
 }
 

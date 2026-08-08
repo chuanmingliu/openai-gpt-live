@@ -21,6 +21,7 @@ func TestCapabilitiesPublishesPinnedFirstReleaseContract(t *testing.T) {
 		"conversation.item.create",
 		"response.create",
 		"response.cancel",
+		"live.tool.approval.resolve",
 	}, got.ClientEvents)
 	assert.Equal(t, []string{
 		"session.created",
@@ -47,6 +48,7 @@ func TestCapabilitiesPublishesPinnedFirstReleaseContract(t *testing.T) {
 		"live.handoff.cancelled",
 		"live.session.degraded",
 		"live.session.resumed",
+		"live.tool.approval.required",
 	}, got.Extensions)
 	assert.Equal(t, PCMContract{
 		Encoding:        "pcm_s16le",

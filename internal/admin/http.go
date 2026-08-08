@@ -18,6 +18,8 @@ import (
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/auth"
 	"github.com/chuanmingliu/openai-gpt-live/internal/feature"
+	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
+	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 )
 
 const AdminScope = "live.admin"
@@ -29,6 +31,12 @@ type Drainer interface {
 type Capacity struct{ Active, Limit, Available int64 }
 type CapacityProvider interface{ Capacity() Capacity }
 type SessionProvider interface{ ActiveSessions() int64 }
+type ConversationDeletionStore interface {
+	MarkConversationDeleting(context.Context, handoff.Scope, string, string) error
+}
+type AdminConversationDeletionStore interface {
+	MarkConversationDeletingAsAdmin(context.Context, string, string, string, string) error
+}
 
 type Config struct {
 	Authenticator auth.Authenticator
@@ -37,6 +45,7 @@ type Config struct {
 	Sessions      SessionProvider
 	FeatureStore  feature.Store
 	FeatureGates  *feature.Gates
+	Deletions     ConversationDeletionStore
 }
 
 func NewHandler(cfg Config) (http.Handler, error) {
@@ -51,13 +60,21 @@ type handler struct{ cfg Config }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
+	principal, status := h.authenticate(r)
+	if status != 0 {
+		w.WriteHeader(status)
+		return
+	}
 	if !requestLoopback(r) {
 		w.WriteHeader(http.StatusForbidden)
 		return
 	}
-	principal, status := h.authorize(r)
-	if status != 0 {
-		w.WriteHeader(status)
+	if strings.HasPrefix(r.URL.Path, "/admin/v1/conversations/") {
+		h.deleteConversation(w, r, principal)
+		return
+	}
+	if _, ok := principal.Scopes[AdminScope]; !ok {
+		w.WriteHeader(http.StatusForbidden)
 		return
 	}
 	switch r.URL.Path {
@@ -73,7 +90,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 	}
 }
-func (h *handler) authorize(r *http.Request) (auth.Principal, int) {
+func (h *handler) authenticate(r *http.Request) (auth.Principal, int) {
 	token, err := auth.Bearer(r.Header)
 	if err != nil {
 		return auth.Principal{}, http.StatusUnauthorized
@@ -82,11 +99,95 @@ func (h *handler) authorize(r *http.Request) (auth.Principal, int) {
 	if err != nil {
 		return auth.Principal{}, http.StatusUnauthorized
 	}
-	_, ok := principal.Scopes[AdminScope]
-	if !ok {
-		return auth.Principal{}, http.StatusForbidden
-	}
 	return principal, 0
+}
+
+type conversationDeletionRequest struct{ Reason string }
+
+func (h *handler) deleteConversation(w http.ResponseWriter, r *http.Request, principal auth.Principal) {
+	if r.Method != http.MethodDelete {
+		method(w, "DELETE")
+		return
+	}
+	const prefix = "/admin/v1/conversations/"
+	id := strings.TrimPrefix(r.URL.Path, prefix)
+	rawPath := strings.ToLower(r.URL.EscapedPath())
+	if id == "" || strings.Contains(id, "/") || len(id) > 256 || !utf8.ValidString(id) || strings.Contains(rawPath, "%2f") || r.URL.RawQuery != "" || r.URL.Fragment != "" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if r.Header.Get("Content-Type") != "application/json" {
+		w.WriteHeader(http.StatusUnsupportedMediaType)
+		return
+	}
+	if r.ContentLength > 2048 {
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 2049))
+	if err != nil || len(body) > 2048 {
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		return
+	}
+	mutation, err := decodeConversationDeletion(body)
+	if err != nil || strings.TrimSpace(principal.TenantID) == "" || strings.TrimSpace(principal.UserID) == "" || len(principal.TenantID) > 256 || len(principal.UserID) > 256 || !utf8.ValidString(principal.TenantID) || !utf8.ValidString(principal.UserID) {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if h.cfg.Deletions == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	_, admin := principal.Scopes[AdminScope]
+	if admin {
+		store, ok := h.cfg.Deletions.(AdminConversationDeletionStore)
+		if !ok {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		err = store.MarkConversationDeletingAsAdmin(ctx, principal.TenantID, id, principal.UserID, mutation.Reason)
+	} else {
+		scope := handoff.Scope{TenantID: principal.TenantID, UserID: principal.UserID, ConversationID: identity.ConversationID(id)}
+		err = h.cfg.Deletions.MarkConversationDeleting(ctx, scope, principal.UserID, mutation.Reason)
+	}
+	if err != nil && !errors.Is(err, handoff.ErrNotFound) && !errors.Is(err, handoff.ErrIdempotencyConflict) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, r, http.StatusAccepted, struct {
+		Status string `json:"status"`
+	}{"deleting"})
+}
+
+func decodeConversationDeletion(body []byte) (conversationDeletionRequest, error) {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	start, err := decoder.Token()
+	if err != nil || start != json.Delim('{') {
+		return conversationDeletionRequest{}, errors.New("invalid deletion request")
+	}
+	var result conversationDeletionRequest
+	seen := false
+	for decoder.More() {
+		token, err := decoder.Token()
+		name, ok := token.(string)
+		if err != nil || !ok || seen || name != "reason" {
+			return conversationDeletionRequest{}, errors.New("invalid deletion request")
+		}
+		seen = true
+		if err := decoder.Decode(&result.Reason); err != nil {
+			return conversationDeletionRequest{}, errors.New("invalid deletion request")
+		}
+	}
+	end, err := decoder.Token()
+	if err != nil || end != json.Delim('}') || !seen || strings.TrimSpace(result.Reason) == "" || len(result.Reason) > 256 || !utf8.ValidString(result.Reason) || handoff.ValidateExternalDeletionReason(result.Reason) != nil {
+		return conversationDeletionRequest{}, errors.New("invalid deletion request")
+	}
+	if decoder.Decode(new(any)) != io.EOF {
+		return conversationDeletionRequest{}, errors.New("invalid deletion request")
+	}
+	return result, nil
 }
 func (h *handler) capacity(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {

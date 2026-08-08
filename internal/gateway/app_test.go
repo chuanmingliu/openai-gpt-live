@@ -378,6 +378,8 @@ func TestProductionFailsClosedWithoutExplicitAdmission(t *testing.T) {
 	cfg.Auth.OIDCRequiredScopes = []string{"realtime"}
 	cfg.Auth.AllowedOrigins = []string{"https://app.example"}
 	cfg.Store.DatabaseURLEnv = "DATABASE_URL"
+	cfg.Store.Retention.HMACKeyEnv = "RETENTION_HMAC_KEY"
+	cfg.Store.Retention.HMACKeyID = "retention-key-1"
 	_, err := New(cfg, testkit.NewFakeConnector(4), WithIDGenerator(deterministicIDs{}))
 	require.ErrorContains(t, err, "admission")
 

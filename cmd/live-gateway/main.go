@@ -25,7 +25,9 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/health"
 	"github.com/chuanmingliu/openai-gpt-live/internal/lifecycle"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime/s2sws"
+	"github.com/chuanmingliu/openai-gpt-live/internal/secretbuf"
 	"github.com/chuanmingliu/openai-gpt-live/internal/session"
+	"github.com/chuanmingliu/openai-gpt-live/internal/store/postgres"
 	"github.com/chuanmingliu/openai-gpt-live/internal/telemetry"
 	"github.com/chuanmingliu/openai-gpt-live/migrations"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -173,6 +175,7 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 	}, QueueBlocked: func(name string, d time.Duration) { queueObserver(name).ObserveBlocked(d) }, QueueOldest: func(name string, d time.Duration) { queueObserver(name).ObserveOldest(d) }, BargeinSuppression: func(d time.Duration) { bargeObserver.Observe(d.Seconds()) }})}
 	if featureRuntime != nil {
 		appOptions = append(appOptions, gateway.WithFeatureGates(featureRuntime.gates))
+		appOptions = append(appOptions, gateway.WithApprovalStore(featureRuntime.repo))
 	}
 	if admissionController != nil {
 		admissionController.SetMetricsObserver(metrics.ObserveAdmission)
@@ -195,11 +198,14 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 type gatewayFeatureRuntime struct {
 	pool            *pgxpool.Pool
 	store           *feature.PostgresStore
+	repo            *postgres.Repository
 	gates           *feature.Gates
 	cancel          context.CancelFunc
 	done            chan error
 	shutdownTimeout time.Duration
 }
+
+var composeGatewayRepositoryHook func(*postgres.Repository) error
 
 func composeGatewayFeatures(ctx context.Context, cfg config.Config, lookup func(string) (string, bool)) (*gatewayFeatureRuntime, error) {
 	if cfg.Mode != "production" {
@@ -230,14 +236,49 @@ func composeGatewayFeatures(ctx context.Context, cfg config.Config, lookup func(
 		pool.Close()
 		return nil, err
 	}
+	repositoryOptions := []postgres.RepositoryOption{postgres.WithApprovalTTL(cfg.Store.Retention.ApprovalTTL)}
+	var retentionKey []byte
+	defer clear(retentionKey)
+	if cfg.Store.Retention.HMACKeyEnv != "" {
+		encoded, ok := lookup(cfg.Store.Retention.HMACKeyEnv)
+		if !ok {
+			pool.Close()
+			return nil, errors.New("retention HMAC key is unavailable")
+		}
+		decodeErr := secretbuf.WithDecodedBase64(encoded, func(key []byte) error {
+			if len(key) < 32 || len(key) > 4096 {
+				return errors.New("retention HMAC key length is invalid")
+			}
+			retentionKey = append([]byte(nil), key...)
+			return nil
+		})
+		if decodeErr != nil {
+			pool.Close()
+			return nil, errors.New("retention HMAC key is invalid")
+		}
+		repositoryOptions = append(repositoryOptions, postgres.WithRetentionHMAC(cfg.Store.Retention.HMACKeyID, retentionKey))
+	}
+	repo, err := postgres.NewRepository(pool, clock.Real{}, repositoryOptions...)
+	if err != nil {
+		pool.Close()
+		return nil, err
+	}
+	if composeGatewayRepositoryHook != nil {
+		if err := composeGatewayRepositoryHook(repo); err != nil {
+			repo.CloseSensitive()
+			pool.Close()
+			return nil, err
+		}
+	}
 	gates := feature.New(nil)
 	snapshot, err := store.Load(ctx)
 	if err != nil || !gates.Apply(snapshot) {
+		repo.CloseSensitive()
 		pool.Close()
 		return nil, errors.New("runtime feature authority is unavailable")
 	}
 	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	runtime := &gatewayFeatureRuntime{pool: pool, store: store, gates: gates, cancel: cancel, done: make(chan error, 1), shutdownTimeout: cfg.Shutdown.CleanupTimeout}
+	runtime := &gatewayFeatureRuntime{pool: pool, store: store, repo: repo, gates: gates, cancel: cancel, done: make(chan error, 1), shutdownTimeout: cfg.Shutdown.CleanupTimeout}
 	go func() {
 		runtime.done <- gates.Run(runCtx, store, cfg.Features.RefreshInterval, cfg.Shutdown.CleanupTimeout)
 	}()
@@ -252,6 +293,9 @@ func (r *gatewayFeatureRuntime) close() {
 	select {
 	case <-r.done:
 	case <-time.After(r.shutdownTimeout):
+	}
+	if r.repo != nil {
+		r.repo.CloseSensitive()
 	}
 	r.pool.Close()
 }
@@ -286,6 +330,7 @@ func startGatewayDiagnostics(ctx context.Context, cfg config.Config, authenticat
 	adminConfig := admin.Config{Authenticator: authenticator, Drainer: drainer, Capacity: gatewayCapacity{app}, Sessions: app}
 	if features != nil {
 		adminConfig.FeatureStore, adminConfig.FeatureGates = features.store, features.gates
+		adminConfig.Deletions = features.repo
 	}
 	adminHandler, err := admin.NewHandler(adminConfig)
 	if err != nil {

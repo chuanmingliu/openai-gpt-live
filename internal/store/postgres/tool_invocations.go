@@ -16,6 +16,135 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// ClaimApprovedToolInvocation resumes the exact durable invocation selected by
+// the user. Pending is the only fresh execution state; running is an uncertain
+// same-idempotency replay, and succeeded returns its durable result without an
+// executor call.
+func (r *Repository) ClaimApprovedToolInvocation(ctx context.Context, token worker.LeaseToken, expectedRevision uint32) (worker.ToolInvocation, bool, error) {
+	if err := validateContext(ctx); err != nil {
+		return worker.ToolInvocation{}, false, err
+	}
+	if err := validateToken(token); err != nil {
+		return worker.ToolInvocation{}, false, err
+	}
+	if r.toolGate == nil {
+		return worker.ToolInvocation{}, false, worker.ErrToolNotRegistered
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return worker.ToolInvocation{}, false, err
+	}
+	defer rollback(tx)
+	if err := r.lockEventAppend(ctx, tx); err != nil {
+		return worker.ToolInvocation{}, false, err
+	}
+	lease, expires, err := r.lockLease(ctx, tx, token)
+	now := r.clock.Now().UTC()
+	if err != nil || !expires.After(now) {
+		if err == nil {
+			err = worker.ErrLeaseLost
+		}
+		return worker.ToolInvocation{}, false, err
+	}
+	if lease.state != handoff.StateRunning || lease.cancelRequested {
+		return worker.ToolInvocation{}, false, worker.ErrLeaseLost
+	}
+	var allowlistRaw []byte
+	var registryVersion string
+	var objectiveRevision int64
+	if err := tx.QueryRow(ctx, `SELECT tool_allowlist::text,tool_registry_version,objective_revision
+		FROM handoffs WHERE tenant_id=$1 AND conversation_id=$2 AND id=$3`, token.TenantID, token.ConversationID, token.HandoffID).
+		Scan(&allowlistRaw, &registryVersion, &objectiveRevision); err != nil {
+		return worker.ToolInvocation{}, false, err
+	}
+	if objectiveRevision < 0 || objectiveRevision > math.MaxUint32 || uint32(objectiveRevision) != expectedRevision {
+		return worker.ToolInvocation{}, false, worker.ErrLeaseLost
+	}
+
+	var invocation worker.ToolInvocation
+	var invocationAttempt, invocationObjective, ordinal int64
+	var result []byte
+	err = tx.QueryRow(ctx, `SELECT invocation_id,objective_revision,tool_ordinal,tool_name,idempotency_key,
+		canonical_arguments_hash,arguments_ciphertext,arguments_nonce,arguments_key_id,status,
+		COALESCE(result::text,''),attempt
+		FROM tool_invocations
+		WHERE tenant_id=$1 AND conversation_id=$2 AND handoff_id=$3 AND objective_revision=$4
+		  AND approval_state='approved' AND status IN ('pending','running','succeeded')
+		ORDER BY CASE WHEN status='succeeded' THEN 1 ELSE 0 END,tool_ordinal DESC,invocation_id
+		LIMIT 1 FOR UPDATE`, token.TenantID, token.ConversationID, token.HandoffID, expectedRevision).
+		Scan(&invocation.Record.InvocationID, &invocationObjective, &ordinal, &invocation.Record.ToolName,
+			&invocation.Record.IdempotencyKey, &invocation.Record.ArgumentsHash, &invocation.Record.Ciphertext,
+			&invocation.Record.Nonce, &invocation.Record.KeyID, &invocation.Status, &result, &invocationAttempt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if err := tx.Commit(ctx); err != nil {
+			return worker.ToolInvocation{}, false, err
+		}
+		return worker.ToolInvocation{}, false, nil
+	}
+	if err != nil {
+		return worker.ToolInvocation{}, false, err
+	}
+	if invocationObjective < 0 || invocationObjective > math.MaxUint32 || ordinal < 1 || ordinal > math.MaxInt32 || invocationAttempt < 0 || invocationAttempt > math.MaxUint32 {
+		return worker.ToolInvocation{}, false, errors.New("postgres: approved invocation identity is invalid")
+	}
+	invocation.Record.ObjectiveRevision = uint32(invocationObjective)
+	invocation.Record.ToolOrdinal = uint32(ordinal)
+	invocation.Result = append(json.RawMessage(nil), result...)
+	if err := validateToolRecord(token, invocation.Record); err != nil {
+		return worker.ToolInvocation{}, false, err
+	}
+	var allowlist []string
+	if err := json.Unmarshal(allowlistRaw, &allowlist); err != nil {
+		return worker.ToolInvocation{}, false, err
+	}
+	if !containsToolName(allowlist, invocation.Record.ToolName) {
+		return worker.ToolInvocation{}, false, worker.ErrToolNotAllowed
+	}
+	if _, registered := r.toolGate.Metadata(ctx, registryVersion, invocation.Record.ToolName); !registered {
+		return worker.ToolInvocation{}, false, worker.ErrToolNotRegistered
+	}
+	worker.SetCanonicalToolApproval(&invocation, true, worker.ApprovalApproved)
+	switch invocation.Status {
+	case "pending":
+		invocation.ResumeDisposition = worker.ApprovalResumeFresh
+	case "running":
+		invocation.ResumeDisposition = worker.ApprovalResumeUncertain
+	case "succeeded":
+		invocation.ResumeDisposition = worker.ApprovalResumeSucceeded
+	}
+	if invocation.Status == "pending" || invocation.Status == "running" {
+		command, updateErr := tx.Exec(ctx, `UPDATE tool_invocations i SET status='running',attempt=$1,updated_at=$2
+			WHERE i.tenant_id=$3 AND i.conversation_id=$4 AND i.handoff_id=$5 AND i.invocation_id=$6
+			  AND i.objective_revision=$7 AND i.approval_state='approved' AND i.status=$8 AND i.attempt=$9
+			  AND i.result IS NULL AND i.mutation_id IS NULL
+			  AND EXISTS (SELECT 1 FROM handoffs h WHERE h.tenant_id=$3 AND h.conversation_id=$4 AND h.id=$5
+			    AND h.lease_owner=$10 AND h.lease_version=$11 AND h.attempt=$1 AND h.state='running'
+			    AND h.lease_expires_at>$2 AND h.cancel_requested_at IS NULL AND h.objective_revision=$7)`,
+			token.Attempt, now, token.TenantID, token.ConversationID, token.HandoffID, invocation.Record.InvocationID,
+			expectedRevision, invocation.Status, invocationAttempt, token.WorkerID, token.Version)
+		if updateErr != nil {
+			return worker.ToolInvocation{}, false, mapWriteError(updateErr)
+		}
+		if command.RowsAffected() != 1 {
+			return worker.ToolInvocation{}, false, worker.ErrLeaseLost
+		}
+		invocation.Status = "running"
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return worker.ToolInvocation{}, false, err
+	}
+	return worker.CloneToolInvocation(invocation), true, nil
+}
+
+func containsToolName(values []string, name string) bool {
+	for _, value := range values {
+		if value == name {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *Repository) BeginToolInvocation(ctx context.Context, token worker.LeaseToken, record worker.ToolInvocationRecord) (worker.ToolInvocation, bool, error) {
 	if err := validateContext(ctx); err != nil {
 		return worker.ToolInvocation{}, false, err
@@ -35,6 +164,9 @@ func (r *Repository) BeginToolInvocation(ctx context.Context, token worker.Lease
 		return worker.ToolInvocation{}, false, err
 	}
 	defer rollback(tx)
+	if err := r.lockEventAppend(ctx, tx); err != nil {
+		return worker.ToolInvocation{}, false, err
+	}
 	lease, expires, err := r.lockLease(ctx, tx, token)
 	now := r.clock.Now().UTC()
 	if err != nil || !expires.After(now) {
@@ -107,9 +239,6 @@ func (r *Repository) BeginToolInvocation(ctx context.Context, token worker.Lease
 			}
 			switch approvalState {
 			case "approved":
-				if approvalExpires == nil || !approvalExpires.After(now) {
-					return worker.ErrApprovalExpired
-				}
 			case "denied":
 				return worker.ErrApprovalDenied
 			case "expired":
@@ -129,7 +258,7 @@ func (r *Repository) BeginToolInvocation(ctx context.Context, token worker.Lease
 			}
 			command, updateErr := tx.Exec(ctx, `UPDATE tool_invocations i SET status='running',attempt=$1,updated_at=$2
 				WHERE i.tenant_id=$3 AND i.conversation_id=$4 AND i.handoff_id=$5 AND i.invocation_id=$6 AND i.status='pending'
-				  AND i.attempt=$10 AND i.objective_revision=$9 AND i.approval_state='approved' AND i.approval_expires_at>$2
+				  AND i.attempt=$10 AND i.objective_revision=$9 AND i.approval_state='approved'
 				  AND i.result IS NULL AND i.mutation_id IS NULL
 				  AND EXISTS (SELECT 1 FROM handoffs h WHERE h.tenant_id=$3 AND h.conversation_id=$4 AND h.id=$5
 				    AND h.lease_owner=$7 AND h.lease_version=$8 AND h.attempt=$1 AND h.state='running'
@@ -151,8 +280,7 @@ func (r *Repository) BeginToolInvocation(ctx context.Context, token worker.Lease
 					WHERE i.tenant_id=$3 AND i.conversation_id=$4 AND i.handoff_id=$5 AND i.invocation_id=$6
 					  AND i.attempt=$10 AND i.objective_revision=$9 AND i.status='running' AND i.approval_state=$11
 					  AND i.result IS NULL AND i.mutation_id IS NULL
-					  AND ($11='not_required' OR i.approval_expires_at>$2)
-					  AND EXISTS (SELECT 1 FROM handoffs h WHERE h.tenant_id=$3 AND h.conversation_id=$4 AND h.id=$5
+				  AND EXISTS (SELECT 1 FROM handoffs h WHERE h.tenant_id=$3 AND h.conversation_id=$4 AND h.id=$5
 					    AND h.lease_owner=$7 AND h.lease_version=$8 AND h.attempt=$1 AND h.state='running'
 					    AND h.lease_expires_at>$2 AND h.cancel_requested_at IS NULL AND h.objective_revision=$9)`, token.Attempt, now, token.TenantID, token.ConversationID, token.HandoffID, record.InvocationID, token.WorkerID, token.Version, record.ObjectiveRevision, existingAttempt, approvalState)
 				err = updateErr
@@ -176,14 +304,17 @@ func (r *Repository) BeginToolInvocation(ctx context.Context, token worker.Lease
 	}
 	approvalState = "not_required"
 	status := "running"
+	approvalExpires = nil
 	if requiresApproval {
 		approvalState = "pending"
 		status = "pending"
+		value := now.Add(r.approvalTTL)
+		approvalExpires = &value
 	}
-	command, err := tx.Exec(ctx, `INSERT INTO tool_invocations(invocation_id,tenant_id,conversation_id,handoff_id,attempt,objective_revision,tool_ordinal,tool_name,approval_state,idempotency_key,canonical_arguments_hash,arguments_ciphertext,arguments_nonce,arguments_key_id,status,created_at,updated_at)
-		SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$16 FROM handoffs h
-		WHERE h.tenant_id=$2 AND h.conversation_id=$3 AND h.id=$4 AND h.lease_owner=$17 AND h.lease_version=$18 AND h.attempt=$5
-		  AND h.state='running' AND h.lease_expires_at>$16 AND h.cancel_requested_at IS NULL AND h.objective_revision=$6`, record.InvocationID, lease.tenant, lease.conversation, token.HandoffID, token.Attempt, record.ObjectiveRevision, record.ToolOrdinal, record.ToolName, approvalState, record.IdempotencyKey, record.ArgumentsHash, record.Ciphertext, record.Nonce, record.KeyID, status, now, token.WorkerID, token.Version)
+	command, err := tx.Exec(ctx, `INSERT INTO tool_invocations(invocation_id,tenant_id,conversation_id,handoff_id,attempt,objective_revision,tool_ordinal,tool_name,approval_state,approval_expires_at,idempotency_key,canonical_arguments_hash,arguments_ciphertext,arguments_nonce,arguments_key_id,status,created_at,updated_at)
+		SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$17 FROM handoffs h
+		WHERE h.tenant_id=$2 AND h.conversation_id=$3 AND h.id=$4 AND h.lease_owner=$18 AND h.lease_version=$19 AND h.attempt=$5
+		  AND h.state='running' AND h.lease_expires_at>$17 AND h.cancel_requested_at IS NULL AND h.objective_revision=$6`, record.InvocationID, lease.tenant, lease.conversation, token.HandoffID, token.Attempt, record.ObjectiveRevision, record.ToolOrdinal, record.ToolName, approvalState, approvalExpires, record.IdempotencyKey, record.ArgumentsHash, record.Ciphertext, record.Nonce, record.KeyID, status, now, token.WorkerID, token.Version)
 	if err != nil {
 		return worker.ToolInvocation{}, false, mapWriteError(err)
 	}
@@ -195,6 +326,28 @@ func (r *Repository) BeginToolInvocation(ctx context.Context, token worker.Lease
 	}
 	invocation := worker.ToolInvocation{Record: cloneToolRecord(record), Status: status}
 	worker.SetCanonicalToolApproval(&invocation, requiresApproval, worker.ApprovalState(approvalState))
+	if requiresApproval {
+		command, err = tx.Exec(ctx, `UPDATE handoffs SET state='needs_input',lease_owner=NULL,lease_expires_at=NULL,updated_at=$7
+			WHERE tenant_id=$1 AND conversation_id=$2 AND id=$3 AND lease_owner=$4 AND lease_version=$5 AND attempt=$6
+			  AND state='running' AND cancel_requested_at IS NULL`, lease.tenant, lease.conversation, token.HandoffID, token.WorkerID, token.Version, token.Attempt, now)
+		if err != nil {
+			return worker.ToolInvocation{}, false, mapWriteError(err)
+		}
+		if command.RowsAffected() != 1 {
+			return worker.ToolInvocation{}, false, worker.ErrLeaseLost
+		}
+		payload, _ := json.Marshal(struct {
+			InvocationID  string    `json:"invocation_id"`
+			HandoffID     string    `json:"handoff_id"`
+			ActionSummary string    `json:"action_summary"`
+			ExpiresAt     time.Time `json:"expires_at"`
+			RiskClass     string    `json:"risk_class"`
+		}{record.InvocationID, string(token.HandoffID), approvalActionSummary(record.ToolName), *approvalExpires, handoff.ApprovalRiskSideEffecting})
+		eventID := workerEventID(lease.tenant, token.ConversationID, token.HandoffID, "approval_required", record.InvocationID)
+		if err := r.appendWorkerEvent(ctx, tx, eventID, lease.tenant, lease.conversation, token.HandoffID, "tool.approval_required", handoff.StateNeedsInput, token.Attempt, payload, now, "approval_required"); err != nil {
+			return worker.ToolInvocation{}, false, err
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return worker.ToolInvocation{}, false, err
 	}
@@ -204,12 +357,12 @@ func (r *Repository) BeginToolInvocation(ctx context.Context, token worker.Lease
 	return invocation, true, nil
 }
 
-func setInvocationApproval(invocation *worker.ToolInvocation, required bool, state string, expires *time.Time, now time.Time, completed bool) {
-	effective := worker.ApprovalState(state)
-	if required && state == string(worker.ApprovalApproved) && !completed && (expires == nil || !expires.After(now)) {
-		effective = worker.ApprovalExpired
-	}
-	worker.SetCanonicalToolApproval(invocation, required, effective)
+func approvalActionSummary(toolName string) string {
+	return "Approve side-effecting tool action: " + toolName
+}
+
+func setInvocationApproval(invocation *worker.ToolInvocation, required bool, state string, _ *time.Time, _ time.Time, _ bool) {
+	worker.SetCanonicalToolApproval(invocation, required, worker.ApprovalState(state))
 }
 
 func (r *Repository) CompleteToolInvocation(ctx context.Context, token worker.LeaseToken, completion worker.ToolCompletionRecord) error {

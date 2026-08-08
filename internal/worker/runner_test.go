@@ -71,6 +71,7 @@ type memoryStore struct {
 	cancelled          []CancelledRecord
 	invocations        map[string]ToolInvocation
 	onComplete         func()
+	claimTool          func(LeaseToken, uint32) (ToolInvocation, bool, error)
 	beginTool          func(ToolInvocationRecord) (ToolInvocation, bool, error)
 	completeResult     func(handoff.Result) error
 	progressResult     func(ProgressRecord) error
@@ -209,6 +210,14 @@ func (s *memoryStore) MarkCancelled(_ context.Context, _ LeaseToken, record Canc
 	}
 	return nil
 }
+
+func (s *memoryStore) ClaimApprovedToolInvocation(_ context.Context, token LeaseToken, revision uint32) (ToolInvocation, bool, error) {
+	if s.claimTool != nil {
+		return s.claimTool(token, revision)
+	}
+	return ToolInvocation{}, false, nil
+}
+
 func (s *memoryStore) BeginToolInvocation(_ context.Context, _ LeaseToken, record ToolInvocationRecord) (ToolInvocation, bool, error) {
 	if s.beginTool != nil {
 		return s.beginTool(record)
@@ -1070,56 +1079,42 @@ func TestRunnerApprovalMovesDurablyToNeedsInput(t *testing.T) {
 	stream := streamerFunc(func(context.Context, reasoner.Request, func(reasoner.Chunk) error) (reasoner.Result, error) {
 		return reasoner.Result{FinishReason: "tool_calls", ToolCalls: []reasoner.ToolCall{{ID: "call", Name: "charge", Arguments: json.RawMessage(`{"amount":1}`)}}}, nil
 	})
-	ctx, _, store, runner := toolRunnerFixture(t, []RegisteredTool{tool}, stream)
+	ctx, cancel, store, runner := toolRunnerFixture(t, []RegisteredTool{tool}, stream)
+	defer cancel()
 	store.beginTool = func(record ToolInvocationRecord) (ToolInvocation, bool, error) {
+		cancel()
 		return canonicalInvocation(record, "pending", nil, true, ApprovalPending), true, ErrApprovalRequired
 	}
 	require.NoError(t, runner.Run(ctx))
-	require.Len(t, store.needsInput, 1)
+	assert.Empty(t, store.needsInput, "the invocation store owns the atomic handoff transition")
 	assert.Empty(t, store.completed)
 	assert.Empty(t, store.failed)
 }
 
-func TestRunnerNeedsInputCommitResponseLossReplaysExactAndUncertaintyNeverFailsBusiness(t *testing.T) {
-	for _, tc := range []struct {
-		name       string
-		unresolved bool
-	}{{"response loss", false}, {"unresolved", true}} {
-		t.Run(tc.name, func(t *testing.T) {
-			lease := workerLease()
-			lease.Job.Request.ToolAllowlist = []string{"charge"}
-			tool := RegisteredTool{Definition: reasoner.ToolDefinition{Name: "charge", Parameters: json.RawMessage(`{"type":"object"}`)}, SideEffecting: true, StableIdempotency: true, Executor: toolExecutorFunc(func(context.Context, ToolExecutionRequest) (json.RawMessage, error) {
-				t.Fatal("approval-pending tool executed")
-				return nil, nil
-			})}
-			registry, _ := NewToolRegistry(map[string][]RegisteredTool{"tools-v1": {tool}})
-			store := &memoryStore{beginTool: func(record ToolInvocationRecord) (ToolInvocation, bool, error) {
-				return canonicalInvocation(record, "pending", nil, true, ApprovalPending), true, ErrApprovalRequired
-			}}
-			var attempts atomic.Int32
-			store.needsInputResult = func(NeedsInputRecord) error {
-				if attempts.Add(1) == 1 || tc.unresolved {
-					return errors.New("needs-input ACK unavailable")
-				}
-				return nil
-			}
-			stream := streamerFunc(func(context.Context, reasoner.Request, func(reasoner.Chunk) error) (reasoner.Result, error) {
-				return reasoner.Result{ToolCalls: []reasoner.ToolCall{{ID: "call", Name: "charge", Arguments: json.RawMessage(`{}`)}}}, nil
-			})
-			runner := testRunner(store, stream, allowPolicy(), clock.Real{}, fixedJitter(0), registry)
-			runner.ArgumentSealer, _ = NewAESArgumentSealer("test-key", bytes.Repeat([]byte{5}, 32), bytes.NewReader(bytes.Repeat([]byte{1}, 12)))
-			err := runner.executeLease(t.Context(), lease)
-			if tc.unresolved {
-				assert.ErrorIs(t, err, ErrInfrastructureUncertain)
-			} else {
-				require.NoError(t, err)
-			}
-			require.Len(t, store.needsInput, 2)
-			assert.Equal(t, store.needsInput[0], store.needsInput[1])
-			assert.Empty(t, store.failed)
-			assert.Empty(t, store.completed)
-		})
+func TestRunnerApprovalRequiredUsesSingleAtomicStoreTransition(t *testing.T) {
+	lease := workerLease()
+	lease.Job.Request.ToolAllowlist = []string{"charge"}
+	tool := RegisteredTool{Definition: reasoner.ToolDefinition{Name: "charge", Parameters: json.RawMessage(`{"type":"object"}`)}, SideEffecting: true, StableIdempotency: true, Executor: toolExecutorFunc(func(context.Context, ToolExecutionRequest) (json.RawMessage, error) {
+		t.Fatal("approval-pending tool executed")
+		return nil, nil
+	})}
+	registry, _ := NewToolRegistry(map[string][]RegisteredTool{"tools-v1": {tool}})
+	store := &memoryStore{}
+	var attempts atomic.Int32
+	store.beginTool = func(record ToolInvocationRecord) (ToolInvocation, bool, error) {
+		attempts.Add(1)
+		return canonicalInvocation(record, "pending", nil, true, ApprovalPending), true, ErrApprovalRequired
 	}
+	stream := streamerFunc(func(context.Context, reasoner.Request, func(reasoner.Chunk) error) (reasoner.Result, error) {
+		return reasoner.Result{ToolCalls: []reasoner.ToolCall{{ID: "call", Name: "charge", Arguments: json.RawMessage(`{}`)}}}, nil
+	})
+	runner := testRunner(store, stream, allowPolicy(), clock.Real{}, fixedJitter(0), registry)
+	runner.ArgumentSealer, _ = NewAESArgumentSealer("test-key", bytes.Repeat([]byte{5}, 32), bytes.NewReader(bytes.Repeat([]byte{1}, 12)))
+	require.NoError(t, runner.executeLease(t.Context(), lease))
+	assert.Equal(t, int32(1), attempts.Load())
+	assert.Empty(t, store.needsInput, "a second handoff mutation would split the repository transaction")
+	assert.Empty(t, store.failed)
+	assert.Empty(t, store.completed)
 }
 
 func TestRunnerRetryFailAndCancelCommitResponseLossReplayExactMutation(t *testing.T) {
@@ -1927,6 +1922,18 @@ func TestAESArgumentSealerRoundTripCopiesKeyAndRejectsNonceReuse(t *testing.T) {
 	decoded, err := gcm.Open(nil, sealed.Nonce, sealed.Ciphertext, nil)
 	require.NoError(t, err)
 	assert.Equal(t, plaintext, decoded)
+	opened, err := sealer.Open(sealed)
+	require.NoError(t, err)
+	assert.Equal(t, plaintext, opened)
+	tampered := sealed
+	tampered.Ciphertext = append([]byte(nil), sealed.Ciphertext...)
+	tampered.Ciphertext[0] ^= 1
+	_, err = sealer.Open(tampered)
+	assert.Error(t, err)
+	wrongKey := sealed
+	wrongKey.KeyID = "other-key"
+	_, err = sealer.Open(wrongKey)
+	assert.Error(t, err)
 	_, err = sealer.Seal([]byte(`{"next":true}`))
 	assert.ErrorIs(t, err, ErrNonceReuse)
 }
@@ -1940,6 +1947,8 @@ func TestAESArgumentSealerCloseZeroizesAndRejectsFurtherUse(t *testing.T) {
 	assert.Nil(t, concrete.used)
 	_, err = sealer.Seal([]byte(`{}`))
 	assert.ErrorContains(t, err, "closed")
+	_, err = sealer.Open(SealedArguments{KeyID: "rotation-v2", Nonce: make([]byte, 12), Ciphertext: make([]byte, 16)})
+	assert.ErrorContains(t, err, "unavailable")
 	require.NoError(t, sealer.Close())
 }
 

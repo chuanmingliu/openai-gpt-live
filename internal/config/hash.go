@@ -27,7 +27,7 @@ type canonicalConfig struct {
 	Shutdown  ShutdownConfig     `json:"shutdown"`
 	Admin     AdminConfig        `json:"admin"`
 	Features  canonicalFeatures  `json:"features"`
-	Retention RetentionConfig    `json:"retention"`
+	Retention canonicalRetention `json:"retention"`
 	StoreURL  string             `json:"store_url"`
 }
 
@@ -108,11 +108,19 @@ type canonicalFeatures struct {
 	Handoffs            bool          `json:"handoffs"`
 	RefreshInterval     time.Duration `json:"runtime_refresh_interval"`
 }
+type canonicalRetention struct {
+	ConversationTTL time.Duration `json:"conversation_ttl"`
+	SweepInterval   time.Duration `json:"sweep_interval"`
+	DeletionBatch   int           `json:"deletion_batch"`
+	ApprovalTTL     time.Duration `json:"approval_ttl"`
+	HMACKeyID       string        `json:"hmac_key_id"`
+}
 
 func Canonical(cfg Config) ([]byte, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	retention := effectiveRetention(cfg.Store.Retention)
 	c := canonicalConfig{
 		Version: HashVersion, Mode: cfg.Mode,
 		Gateway:   canonicalGateway{AdvertisedModel: cfg.Gateway.AdvertisedModel, ListenAddr: cfg.Gateway.ListenAddr, BehindIngress: cfg.Gateway.BehindIngress, TrustedProxies: sorted(cfg.Gateway.TrustedProxies), VoiceProvider: cfg.Gateway.Voice.Provider, VoiceURL: safeURL(cfg.Gateway.Voice.URL), VoiceModel: cfg.Gateway.Voice.Model, Audio: cfg.Gateway.Audio, Session: cfg.Gateway.Session, WebSocket: cfg.Gateway.WebSocket, ProviderRetry: cfg.Gateway.ProviderRetry, StorageGrace: cfg.Gateway.StorageGrace, Reconnect: cfg.Gateway.Reconnect},
@@ -121,7 +129,7 @@ func Canonical(cfg Config) ([]byte, error) {
 		Admission: canonicalAdmission{MaxSessions: cfg.Admission.MaxSessions, MaxSessionsPerTenant: cfg.Admission.MaxSessionsPerTenant, MaxSessionsPerUser: cfg.Admission.MaxSessionsPerUser, LeaseDuration: cfg.Admission.LeaseDuration, HeartbeatInterval: cfg.Admission.HeartbeatInterval, GlobalRate: cfg.Admission.GlobalRate, GlobalBurst: cfg.Admission.GlobalBurst, IPRate: cfg.Admission.IPRate, IPBurst: cfg.Admission.IPBurst, IPKeyTTL: cfg.Admission.IPKeyTTL, MaxIPKeys: cfg.Admission.MaxIPKeys, InstanceID: cfg.Admission.InstanceID},
 		Safety:    canonicalSafety{PolicyVersion: cfg.Safety.PolicyVersion, Mode: cfg.Safety.Mode, MaxInputBytes: cfg.Safety.MaxInputBytes, MaxSummaryBytes: cfg.Safety.MaxSummaryBytes, MaxStructuredBytes: cfg.Safety.MaxStructuredBytes, RedactedSummary: cfg.Safety.RedactedSummary, ClarificationPrompt: cfg.Safety.ClarificationPrompt, RedactionDeniedKeys: sorted(cfg.Safety.RedactionDeniedKeys)},
 		Telemetry: canonicalTelemetry{OTLPEndpoint: safeURL(cfg.Telemetry.OTLPEndpoint), ServiceName: cfg.Telemetry.ServiceName, Protocol: cfg.Telemetry.Protocol, ExportTimeout: cfg.Telemetry.ExportTimeout}, Shutdown: cfg.Shutdown, Admin: cfg.Admin,
-		Features: canonicalFeatures{SideEffectingTools: cfg.Features.SideEffectingTools, ToolEncryptionKeyID: cfg.Features.ToolEncryptionKeyID, Handoffs: cfg.Features.Handoffs, RefreshInterval: featureRefreshInterval(cfg)}, Retention: cfg.Store.Retention, StoreURL: safeStoreURL(cfg.Store.URL),
+		Features: canonicalFeatures{SideEffectingTools: cfg.Features.SideEffectingTools, ToolEncryptionKeyID: cfg.Features.ToolEncryptionKeyID, Handoffs: cfg.Features.Handoffs, RefreshInterval: featureRefreshInterval(cfg)}, Retention: canonicalRetention{ConversationTTL: retention.ConversationTTL, SweepInterval: retention.SweepInterval, DeletionBatch: retention.DeletionBatch, ApprovalTTL: retention.ApprovalTTL, HMACKeyID: retention.HMACKeyID}, StoreURL: safeStoreURL(cfg.Store.URL),
 	}
 	return json.Marshal(c)
 }

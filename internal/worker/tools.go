@@ -140,6 +140,7 @@ type SealedArguments struct {
 
 type ToolArgumentSealer interface {
 	Seal([]byte) (SealedArguments, error)
+	Open(SealedArguments) ([]byte, error)
 	Close() error
 }
 
@@ -193,6 +194,31 @@ func (s *aesArgumentSealer) Seal(plaintext []byte) (SealedArguments, error) {
 	}
 	ciphertext := gcm.Seal(nil, nonce, plaintext, nil)
 	return SealedArguments{Ciphertext: ciphertext, Nonce: nonce, KeyID: s.keyID}, nil
+}
+
+func (s *aesArgumentSealer) Open(sealed SealedArguments) ([]byte, error) {
+	if s == nil || strings.TrimSpace(sealed.KeyID) == "" || len(sealed.Ciphertext) < 16 || len(sealed.Ciphertext) > 65552 || len(sealed.Nonce) != 12 {
+		return nil, errors.New("worker sealed tool arguments are invalid")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || sealed.KeyID != s.keyID {
+		return nil, errors.New("worker argument key is unavailable")
+	}
+	block, err := aes.NewCipher(s.key)
+	if err != nil {
+		return nil, errors.New("worker argument cipher failed")
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, errors.New("worker argument cipher failed")
+	}
+	plaintext, err := gcm.Open(nil, sealed.Nonce, sealed.Ciphertext, nil)
+	if err != nil || len(plaintext) == 0 || len(plaintext) > 1<<20 {
+		clear(plaintext)
+		return nil, errors.New("worker sealed tool arguments could not be opened")
+	}
+	return plaintext, nil
 }
 
 func (s *aesArgumentSealer) Close() error {
