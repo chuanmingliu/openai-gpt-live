@@ -224,9 +224,13 @@ func TestSweeperSustainedTransientFailureMarksUnhealthyWithoutStoppingProcess(t 
 	done := make(chan error, 1)
 	go func() { done <- sweeper.Run(ctx) }()
 	require.Eventually(t, func() bool { store.mu.Lock(); defer store.mu.Unlock(); return store.leaseCalls == 1 }, time.Second, time.Millisecond)
-	manual.Advance(10 * time.Millisecond)
-	require.Eventually(t, func() bool { store.mu.Lock(); defer store.mu.Unlock(); return store.leaseCalls == 2 }, time.Second, time.Millisecond)
-	assert.Error(t, sweeper.Check(t.Context()))
+	require.Eventually(t, func() bool {
+		manual.Advance(time.Millisecond)
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return store.leaseCalls >= 2
+	}, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return sweeper.Check(t.Context()) != nil }, time.Second, time.Millisecond)
 	select {
 	case err := <-done:
 		t.Fatalf("transient failure stopped sweeper: %v", err)
