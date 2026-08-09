@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"reflect"
 	"sort"
 	"strings"
@@ -46,6 +47,15 @@ func NewRedactingHandler(next slog.Handler, deniedKeys []string) slog.Handler {
 		}
 	}
 	return &redactingHandler{next: next, denied: denied}
+}
+
+// InstallDefaultRedactingLogger installs the process-wide content-safe logger.
+func InstallDefaultRedactingLogger(deniedKeys []string) {
+	// Do not wrap slog.Default's initial defaultHandler. SetDefault bridges the
+	// standard log package back into the installed slog logger; retaining that
+	// handler as the sink would form log -> slog -> log recursion.
+	sink := slog.NewTextHandler(os.Stderr, nil)
+	slog.SetDefault(slog.New(NewRedactingHandler(sink, deniedKeys)))
 }
 
 func (h *redactingHandler) Enabled(ctx context.Context, level slog.Level) bool {

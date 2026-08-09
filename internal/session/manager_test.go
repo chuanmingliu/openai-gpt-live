@@ -28,6 +28,27 @@ type recoveryStoreFake struct {
 	calls    atomic.Int32
 }
 
+type conversationProvisionerFake struct {
+	mu     sync.Mutex
+	scopes []handoff.Scope
+	ttls   []time.Duration
+	err    error
+}
+
+func (p *conversationProvisionerFake) ProvisionConversation(_ context.Context, scope handoff.Scope, ttl time.Duration) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.scopes = append(p.scopes, scope)
+	p.ttls = append(p.ttls, ttl)
+	return p.err
+}
+
+func (p *conversationProvisionerFake) snapshot() ([]handoff.Scope, []time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]handoff.Scope(nil), p.scopes...), append([]time.Duration(nil), p.ttls...)
+}
+
 type blockingRecoveryStore struct {
 	snapshot RecoverySnapshot
 	started  chan struct{}
@@ -202,9 +223,11 @@ func TestManagerReconnectCASRestoresBeforePublishingAndRejectsReplay(t *testing.
 		}},
 		LastEventSeq: 7,
 	}}
+	provisioner := &conversationProvisionerFake{}
 	manager := NewManager(Config{
 		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
 		RecoveryStore: store, RecoveryItemLimit: 8, RecoveryByteLimit: 1024,
+		ConversationProvisioner: provisioner, ConversationTTL: 24 * time.Hour,
 	}, connector, managerIDs{session: "logical-session", conversation: scope.ConversationID})
 
 	oldCtx, oldCancel := context.WithCancel(context.Background())
@@ -252,6 +275,8 @@ func TestManagerReconnectCASRestoresBeforePublishingAndRejectsReplay(t *testing.
 		Scope: scope, SessionID: "logical-session", LastIncarnation: 1, LastEventSeq: 7,
 	}, newChannelClient(1)), ErrStaleReconnect)
 	require.Error(t, oldVoice.Emit(t.Context(), realtime.Event{Kind: realtime.EventResponseDone, Epoch: 1}), "old provider is closed before replacement publication")
+	scopes, _ := provisioner.snapshot()
+	require.Equal(t, []handoff.Scope{scope}, scopes, "reconnect reuses the already-provisioned exact owner conversation")
 
 	newCancel()
 	select {
@@ -918,6 +943,38 @@ func waitForActiveRuntime(t *testing.T, manager *Manager, sessionID identity.Ses
 
 func (i managerIDs) NewSessionID() identity.SessionID           { return i.session }
 func (i managerIDs) NewConversationID() identity.ConversationID { return i.conversation }
+
+func TestManagerProvisionsAuthenticatedConversationBeforeProviderConnectAndFailsClosed(t *testing.T) {
+	sentinel := errors.New("database unavailable")
+	provisioner := &conversationProvisionerFake{err: sentinel}
+	connector := testkit.NewFakeConnector(1)
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		ConversationProvisioner: provisioner, ConversationTTL: 24 * time.Hour,
+	}, connector, managerIDs{session: "session-provision", conversation: "conversation-provision"})
+
+	err := manager.Run(t.Context(), OpenRequest{Subject: Subject{
+		TenantID: "tenant-provision", UserID: "user-provision", ExpiresAt: time.Now().Add(time.Hour),
+	}}, newChannelClient(1))
+	require.ErrorIs(t, err, sentinel)
+	scopes, ttls := provisioner.snapshot()
+	require.Equal(t, []handoff.Scope{{
+		TenantID: "tenant-provision", UserID: "user-provision", ConversationID: "conversation-provision",
+	}}, scopes)
+	require.Equal(t, []time.Duration{24 * time.Hour}, ttls)
+
+	providerCtx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+	defer cancel()
+	_, connectErr := connector.NextSession(providerCtx)
+	require.ErrorIs(t, connectErr, context.DeadlineExceeded, "provider connection must not begin after provisioning failure")
+	manager.activeMu.RLock()
+	defer manager.activeMu.RUnlock()
+	require.Empty(t, manager.active)
+	failed := manager.logical["session-provision"]
+	require.NotNil(t, failed)
+	require.Equal(t, logicalEstablishmentFailed, failed.state)
+	require.Nil(t, failed.runtime)
+}
 
 type channelClient struct {
 	reads  chan protocol.ClientEvent

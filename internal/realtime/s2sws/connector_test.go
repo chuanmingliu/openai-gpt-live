@@ -477,6 +477,7 @@ func TestSendMapsEveryCommandToGoldenJSON(t *testing.T) {
 	}))
 	require.NoError(t, session.Send(t.Context(), realtime.Command{
 		Kind:       realtime.CommandCancelResponse,
+		Epoch:      identity.ResponseEpoch(43),
 		ResponseID: "response-to-cancel",
 	}))
 
@@ -485,7 +486,7 @@ func TestSendMapsEveryCommandToGoldenJSON(t *testing.T) {
 		string(server.nextClientFrame(t)),
 	)
 	assert.JSONEq(t,
-		`{"type":"response.cancel","response_id":"response-to-cancel"}`,
+		`{"type":"response.cancel","event_id":"live-response-cancel-43","response_id":"response-to-cancel"}`,
 		string(server.nextClientFrame(t)),
 	)
 }
@@ -497,6 +498,79 @@ func TestCancelOmitsAnEmptyResponseID(t *testing.T) {
 	session := connectTestSession(t, server.URL, nil, realtime.OpenRequest{Model: "model"})
 	require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCancelResponse}))
 	assert.JSONEq(t, `{"type":"response.cancel"}`, string(server.nextClientFrame(t)))
+}
+
+// TestCancelAdvancesOnlyTerminalCorrelation proves that the provider's
+// response.done acknowledgment crosses the cancel fence while stale media
+// remains on the response's pre-cancel epoch for the reactor to suppress.
+func TestCancelAdvancesOnlyTerminalCorrelation(t *testing.T) {
+	server := newTestVoiceServer(t)
+	session := connectTestSession(t, server.URL, nil, realtime.OpenRequest{Model: "model"})
+
+	require.NoError(t, session.Send(t.Context(), realtime.Command{
+		Kind: realtime.CommandCreateResponse, Epoch: identity.ResponseEpoch(7),
+	}))
+	server.nextClientFrame(t)
+	created := sendAndReceiveEvent(t, server, session, map[string]any{
+		"type": "response.created", "event_id": "cancel-created",
+		"response": map[string]any{"id": "cancelled-response", "status": "in_progress", "metadata": map[string]any{"live_epoch": "7"}},
+	})
+	assert.Equal(t, identity.ResponseEpoch(7), created.Epoch)
+
+	require.NoError(t, session.Send(t.Context(), realtime.Command{
+		Kind: realtime.CommandCancelResponse, Epoch: identity.ResponseEpoch(8), ResponseID: "cancelled-response",
+	}))
+	assert.JSONEq(t,
+		`{"type":"response.cancel","event_id":"live-response-cancel-8","response_id":"cancelled-response"}`,
+		string(server.nextClientFrame(t)),
+	)
+
+	staleAudio := sendAndReceiveEvent(t, server, session, map[string]any{
+		"type": "response.output_audio.delta", "event_id": "stale-after-cancel",
+		"response_id": "cancelled-response", "item_id": "old-item", "delta": "AAE=",
+	})
+	assert.Equal(t, realtime.EventAudioDelta, staleAudio.Kind)
+	assert.Equal(t, identity.ResponseEpoch(7), staleAudio.Epoch)
+
+	doneWire := map[string]any{
+		"type": "response.done", "event_id": "cancel-done",
+		"response": map[string]any{"id": "cancelled-response", "status": "cancelled"},
+	}
+	done := sendAndReceiveEvent(t, server, session, doneWire)
+	assert.Equal(t, realtime.EventResponseDone, done.Kind)
+	assert.Equal(t, identity.ResponseEpoch(8), done.Epoch)
+
+	doneWire["event_id"] = "cancel-done-duplicate"
+	duplicate := sendAndReceiveEvent(t, server, session, doneWire)
+	assert.Equal(t, identity.ResponseEpoch(8), duplicate.Epoch)
+
+	errorEvent := sendAndReceiveEvent(t, server, session, map[string]any{
+		"type": "error", "event_id": "cancel-error",
+		"error": map[string]any{"type": "invalid_request_error", "event_id": "live-response-cancel-8", "message": "private provider detail"},
+	})
+	assert.Equal(t, realtime.EventError, errorEvent.Kind)
+	assert.Equal(t, identity.ResponseEpoch(8), errorEvent.Epoch)
+}
+
+func TestProviderDisconnectAfterCancelRemainsTerminal(t *testing.T) {
+	server := newTestVoiceServer(t)
+	session := connectTestSession(t, server.URL, nil, realtime.OpenRequest{Model: "model"})
+
+	require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCreateResponse, Epoch: 11}))
+	server.nextClientFrame(t)
+	sendAndReceiveEvent(t, server, session, map[string]any{
+		"type":     "response.created",
+		"response": map[string]any{"id": "disconnect-response", "status": "in_progress", "metadata": map[string]any{"live_epoch": "11"}},
+	})
+	require.NoError(t, session.Send(t.Context(), realtime.Command{
+		Kind: realtime.CommandCancelResponse, Epoch: 12, ResponseID: "disconnect-response",
+	}))
+	server.nextClientFrame(t)
+	server.closePeer(t, websocket.StatusGoingAway, "provider restart")
+
+	_, err := session.Receive(t.Context())
+	require.Error(t, err)
+	assert.Equal(t, websocket.StatusGoingAway, websocket.CloseStatus(err))
 }
 
 func sendAndReceiveEvent(t *testing.T, server *testVoiceServer, session realtime.Session, wire map[string]any) realtime.Event {

@@ -216,7 +216,7 @@ func TestAppsHoldExclusiveCoordinatorAffinityUntilTeardown(t *testing.T) {
 		cfg := validConfig()
 		cfg.Features.Handoffs = true
 		app, appErr := New(cfg, testkit.NewFakeConnector(1), WithIDGenerator(deterministicIDs{}), WithDurableHandoffs(DurableDependencies{
-			Service: service, ConversationWriter: repository, Journal: journal,
+			Service: service, ConversationWriter: repository, ConversationProvisioner: repository, ConversationTTL: 24 * time.Hour, Journal: journal,
 			DeliveryAffinity: affinity, JournalOwner: owner, JournalClaimLease: 100 * time.Millisecond,
 			HandoffQueueCapacity: 1, TranscriptQueueCapacity: 1, Snapshot: validHandoffWork().Snapshot,
 		}), testHandoffPresentationOption())

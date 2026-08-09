@@ -11,6 +11,7 @@ COPY cmd ./cmd
 COPY internal ./internal
 COPY migrations ./migrations
 COPY deploy/prestop ./deploy/prestop
+COPY test/internal/chaosprovider ./test/internal/chaosprovider
 ARG TARGETOS=linux
 ARG TARGETARCH
 RUN --mount=type=cache,target=/go/pkg/mod \
@@ -18,6 +19,8 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags='-s -w' -o /out/live-gateway ./cmd/live-gateway && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags='-s -w' -o /out/live-worker ./cmd/live-worker && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags='-s -w' -o /out/live-migrate ./cmd/live-migrate && \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags='-s -w' -o /out/live-load ./cmd/live-load && \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags='-s -w' -o /out/live-chaos-provider ./test/internal/chaosprovider && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags='-s -w' -o /out/live-prestop ./deploy/prestop
 
 FROM ${RUNTIME_IMAGE} AS runtime
@@ -46,8 +49,7 @@ COPY --from=build --chown=65532:65532 /out/live-migrate /usr/local/bin/live-migr
 ENTRYPOINT ["/usr/local/bin/live-migrate"]
 CMD ["-direction", "up"]
 
-# Task 24 introduces cmd/live-load. Until then this target is intentionally a
-# hardened, non-production capability marker; it never aliases a service binary.
 FROM runtime AS load
-COPY --chown=65532:65532 deploy/scripts/live-load-placeholder.sh /usr/local/bin/live-load
+COPY --from=build --chown=65532:65532 /out/live-load /usr/local/bin/live-load
+COPY --from=build --chown=65532:65532 /out/live-chaos-provider /usr/local/bin/live-chaos-provider
 ENTRYPOINT ["/usr/local/bin/live-load"]

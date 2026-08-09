@@ -12,6 +12,19 @@ only by an explicit build tag and environment configuration.
 | Deterministic integration | Pull request when PostgreSQL 16 is available | PostgreSQL 16 only | `TEST_DATABASE_URL=postgres://live:live@127.0.0.1:5432/live?sslmode=disable go test -race -count=1 -tags=integration ./test/integration/...` |
 | Local simulator contract | Nightly/manual | Configured speech-to-speech service | `S2S_REALTIME_URL=ws://127.0.0.1:8765/v1/realtime go test -count=1 -tags=contract ./test/contract/...` |
 | DeepSeek live provider | Manual only; never a pull-request gate | Configured DeepSeek endpoint | `go test -count=1 -tags=liveprovider ./test/liveprovider/...` |
+| 250-session capacity | Nightly/manual | Disposable in-process gateway/provider | `go test -count=1 -tags=load -run '^TestGateway250Sessions$' -timeout=20m ./test/load/...` |
+| Soak | Manual release (2h) | Disposable in-process gateway/provider | `LIVE_SOAK_DURATION=2h go test -count=1 -tags=soak -run '^TestGatewaySoak$' -timeout=150m ./test/load/...` |
+| Chaos | Nightly/manual | Explicit disposable Compose/Toxiproxy topology | `go test -count=1 -tags=chaos -timeout=30m ./test/chaos/...` |
+
+`make load-smoke` and `make load-evidence` are deliberately different gates.
+Both require an absolute `LIVE_EVIDENCE_DIR` and emit a new JSONL bundle with a
+SHA-256 for every command artifact. Smoke runs the two-second capacity harness,
+the exact 20-sample barge test, and the ten-second soak harness. Formal evidence
+runs the race/unit gate, exact ten-minute capacity with the checked-in host
+profile and SLO enforcement, the exact barge selector, all six application-path
+chaos cases, and the exact two-hour soak. A profile mismatch, absent chaos
+topology, shortened duration, skipped scenario, or failed SLO prevents a passed
+formal manifest.
 
 The tagged packages are absent from `go test ./...` by design. Confirm discovery
 without running a service:
@@ -20,6 +33,9 @@ without running a service:
 go test -tags=integration ./test/integration/... -list .
 go test -tags=contract ./test/contract/... -list .
 go test -tags=liveprovider ./test/liveprovider/... -list .
+go test -tags=load ./test/load/... -list .
+go test -tags=soak ./test/load/... -list .
+go test -tags=chaos ./test/chaos/... -list .
 ```
 
 Current exact tagged discovery (Task 22 Round 3):
@@ -72,6 +88,33 @@ Every test operation has a deadline. Normal deterministic cases should finish
 within seconds. A simulator VAD/STT/LLM/TTS turn is allowed up to 90 seconds,
 and a live-provider request up to 45 seconds. A timeout is a failure after a
 connection or provider request has started.
+
+Task 24 chaos tests require all fifteen explicit names before any connection:
+`CHAOS_DATABASE_URL`, `CHAOS_TOXIPROXY_URL`, `CHAOS_POSTGRES_PROXY`, `CHAOS_VOICE_PROXY`,
+`CHAOS_DEEPSEEK_PROXY`, `CHAOS_VOICE_CONTROL_URL`,
+`CHAOS_DEEPSEEK_CONTROL_URL`, `CHAOS_GATEWAY_URL`,
+`CHAOS_GATEWAY_HEALTH_URL`, `CHAOS_WORKER_HEALTH_URL`, `CHAOS_BEARER_TOKEN`,
+`CHAOS_OIDC_CONTROL_URL`,
+`CHAOS_COMPOSE_PROJECT`, `CHAOS_COMPOSE_BASE`, and
+`CHAOS_COMPOSE_OVERRIDE`. `CHAOS_DATABASE_URL` is the in-network disposable
+PostgreSQL TLS route through `chaos-edge:15433`; there is no database URL alias. For
+the default disposable Compose ports the other URLs
+are `http://127.0.0.1:18474`, the proxy names are `postgres`, `voice`, and
+`deepseek`, provider controls are `http://127.0.0.1:18101` and
+`http://127.0.0.1:18102`, the WebSocket is
+`ws://127.0.0.1:18080/v1/realtime`, and gateway/worker admin bases are
+`http://127.0.0.1:19092` and `http://127.0.0.1:19093`. Compose file names must
+be absolute; use a unique disposable project and the repository's
+`deploy/docker-compose.yml` plus `deploy/compose.chaos.yml`. Missing names skip
+cleanly before connection; `make chaos` and formal evidence fail prerequisite
+checks instead of reporting a skipped suite as evidence. Every fault has a
+unique toxic or provider control and bounded cleanup.
+
+The chaos override selects PostgreSQL trust authentication only inside the
+disposable Compose network, avoiding a materialized test credential, and uses
+the required `CHAOS_DATABASE_URL`. Its deterministic voice and DeepSeek peers expose only
+bounded fault controls and timing/count statistics. The standard deployment
+does not inherit this override.
 
 ## Deterministic integration
 

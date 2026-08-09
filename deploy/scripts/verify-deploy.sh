@@ -28,13 +28,13 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 if docker run --rm --read-only --cap-drop=ALL --security-opt=no-new-privileges gpt-live-load:verify >"$scratch/load.out" 2>&1; then
-  echo "Task 23 load capability marker unexpectedly succeeded" >&2
+  echo "live-load unexpectedly accepted absent explicit arguments" >&2
   exit 1
 else
   code=$?
-  [ "$code" -eq 78 ] || { echo "Task 23 load capability marker returned $code, expected 78" >&2; exit 1; }
+  [ "$code" -eq 64 ] || { echo "live-load returned $code, expected configuration exit 64" >&2; exit 1; }
 fi
-grep -qx 'live-load is introduced in Task 24' "$scratch/load.out" || { echo "Task 23 load marker message drifted" >&2; exit 1; }
+grep -qx 'load configuration failed' "$scratch/load.out" || { echo "live-load content-free configuration message drifted" >&2; exit 1; }
 "$root/deploy/scripts/render-kustomize.sh" local >"$scratch/local.yaml"
 "$root/deploy/scripts/render-kustomize.sh" production >"$scratch/production.yaml"
 "$root/deploy/scripts/validate-render.sh" local local "$scratch/local.yaml"

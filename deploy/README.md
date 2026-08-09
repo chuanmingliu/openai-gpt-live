@@ -103,9 +103,19 @@ script removes only its own Compose volumes. The fuller simulator audio check is
 currently subject to the Task 22 implicit-VAD event-order limitation; it is not
 reported as a deployment-readiness failure.
 
-The `load` Docker target is intentionally only a hardened capability marker in
-Task 23 and exits with a content-free message. Task 24 replaces it with
-`cmd/live-load`; it must not be used as a load generator before then.
+The `load` Docker target contains the statically linked, non-root `live-load`
+binary. It requires a `capacity` or `soak` subcommand and an explicit local or
+private `-gateway-url`; an absent or public endpoint fails closed with exit 64
+and a content-free message. Bearer values are accepted only through a named
+environment variable and are never included in reports or logs.
+
+For Task 24, `make load-smoke` creates a short harness bundle while
+`make load-evidence` creates the exact formal bundle. Set
+`LIVE_EVIDENCE_DIR` to an absolute operator-owned artifact directory. Each
+bundle is JSONL with explicit selectors, SHA-256 artifact digests, and a final
+status. Formal evidence cannot silently substitute smoke durations: it requires
+the exact ten-minute pinned-profile capacity/SLO gate, 20-sample barge gate,
+six-case disposable application chaos gate, and two-hour soak gate.
 
 The Go 1.26 and Alpine runtime bases are pinned by immutable digest. Runtime
 package installation was eliminated: CA data is copied from the pinned Go base,

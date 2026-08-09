@@ -71,6 +71,8 @@ type App struct {
 type DurableDependencies struct {
 	Service                 handoff.Service
 	ConversationWriter      ConversationWriter
+	ConversationProvisioner session.ConversationProvisioner
+	ConversationTTL         time.Duration
 	RecoveryStore           session.RecoveryStore
 	Journal                 CoordinatorJournal
 	DeliveryAffinity        string
@@ -275,6 +277,7 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 
 	if cfg.Features.Handoffs {
 		if app.durable == nil || isNil(app.durable.Service) || isNil(app.durable.ConversationWriter) ||
+			isNil(app.durable.ConversationProvisioner) || app.durable.ConversationTTL < time.Hour || app.durable.ConversationTTL > 10*365*24*time.Hour ||
 			isNil(app.durable.Journal) || app.durable.DeliveryAffinity == "" || app.durable.JournalOwner == "" || app.durable.JournalClaimLease <= 0 ||
 			app.durable.HandoffQueueCapacity <= 0 || app.durable.TranscriptQueueCapacity <= 0 ||
 			validateHandoffSnapshot(app.durable.Snapshot) != nil {
@@ -304,6 +307,8 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 		}
 		app.eventListener = app.presentation.Listener
 		managerConfig.HandoffConsumerID = app.presentation.ConsumerID
+		managerConfig.ConversationProvisioner = app.durable.ConversationProvisioner
+		managerConfig.ConversationTTL = app.durable.ConversationTTL
 		managerConfig.HandoffSubscriptions = app.eventPump
 		managerConfig.PresentationPolicy = app.presentation.Policy
 		managerConfig.SafetyPolicy = app.presentation.Safety

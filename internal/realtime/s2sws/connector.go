@@ -137,6 +137,7 @@ type correlationKind uint8
 const (
 	correlationRegister correlationKind = iota + 1
 	correlationBind
+	correlationCancel
 )
 
 type correlationRequest struct {
@@ -154,6 +155,7 @@ type bufferedResponseEvent struct {
 
 type responseCorrelation struct {
 	epoch         identity.ResponseEpoch
+	cancelEpoch   identity.ResponseEpoch
 	bound         bool
 	terminal      bool
 	buffered      []bufferedResponseEvent
@@ -366,6 +368,11 @@ func (s *voiceSession) writeLoop() {
 			if err == nil && request.command.Kind == realtime.CommandCreateResponse {
 				err = s.correlate(request.ctx, correlationRequest{kind: correlationRegister, epoch: request.command.Epoch})
 			}
+			if err == nil && request.command.Kind == realtime.CommandCancelResponse && request.command.ResponseID != "" {
+				err = s.correlate(request.ctx, correlationRequest{
+					kind: correlationCancel, epoch: request.command.Epoch, responseID: request.command.ResponseID,
+				})
+			}
 			attemptedWrite := false
 			if err == nil {
 				writeContext, finishWrite, ok := s.beginWrite(request.ctx)
@@ -537,6 +544,8 @@ func (s *voiceSession) mappingLoop() {
 				err = s.registerExplicit(request.epoch)
 			case correlationBind:
 				err = s.bindImplicit(request)
+			case correlationCancel:
+				err = s.markCancelled(request)
 			default:
 				err = errors.New("unknown correlation request")
 			}
@@ -597,6 +606,9 @@ func (s *voiceSession) handleMapped(mapped mappedServerEvent) error {
 	if correlation.bound {
 		mapped.event.Epoch = correlation.epoch
 		if mapped.event.Kind == realtime.EventResponseDone {
+			if correlation.cancelEpoch != 0 {
+				mapped.event.Epoch = correlation.cancelEpoch
+			}
 			correlation.terminal = true
 		}
 		return s.deliver(s.ctx, mapped.event)
@@ -606,6 +618,26 @@ func (s *voiceSession) handleMapped(mapped mappedServerEvent) error {
 	}
 	correlation.buffered = append(correlation.buffered, bufferedResponseEvent{event: cloneEvent(mapped.event), bytes: mapped.frameBytes})
 	correlation.bufferedBytes += mapped.frameBytes
+	return nil
+}
+
+func (s *voiceSession) markCancelled(request correlationRequest) error {
+	if request.responseID == "" || request.epoch == 0 {
+		return errors.New("response ID and epoch are required for cancellation")
+	}
+	correlation, exists := s.responses[request.responseID]
+	if !exists {
+		// Preserve the provider's response.cancel behavior for callers which
+		// name an unknown response. There is no local stream to re-fence.
+		return nil
+	}
+	if !correlation.bound {
+		return fmt.Errorf("response %q is not bound to an epoch", request.responseID)
+	}
+	if correlation.cancelEpoch != 0 && correlation.cancelEpoch != request.epoch {
+		return fmt.Errorf("response %q cancellation is already bound to epoch %d", request.responseID, correlation.cancelEpoch)
+	}
+	correlation.cancelEpoch = request.epoch
 	return nil
 }
 

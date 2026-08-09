@@ -4,14 +4,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"log"
 	"log/slog"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/telemetry"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+const defaultLoggerHelperEnv = "LIVE_TEST_DEFAULT_REDACTING_LOGGER_HELPER"
 
 type secretValue struct{ Value string }
 
@@ -86,4 +92,23 @@ func TestRedactingHandlerBoundsRecursiveLogValuerResolution(t *testing.T) {
 	logger.Info("event", "recursive", recursiveLogValuer{calls: &calls})
 	assert.LessOrEqual(t, calls, 8)
 	assert.Contains(t, output.String(), telemetry.RedactedValue)
+}
+
+func TestInstallDefaultRedactingLoggerDoesNotRecurseThroughStandardLog(t *testing.T) {
+	if os.Getenv(defaultLoggerHelperEnv) == "1" {
+		telemetry.InstallDefaultRedactingLogger(nil)
+		slog.Info("safe event", "transcript", "transcript-sentinel")
+		log.Print("startup returned error")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestInstallDefaultRedactingLoggerDoesNotRecurseThroughStandardLog$")
+	command.Env = append(os.Environ(), defaultLoggerHelperEnv+"=1")
+	output, err := command.CombinedOutput()
+	require.NoError(t, err, "default logger helper did not return before timeout: %s", output)
+	assert.NotContains(t, string(output), "transcript-sentinel")
+	assert.Contains(t, string(output), telemetry.RedactedValue)
+	assert.Contains(t, string(output), "startup returned error")
 }

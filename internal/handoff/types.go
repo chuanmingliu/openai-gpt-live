@@ -169,7 +169,9 @@ func cloneSnapshots(in []Snapshot) []Snapshot {
 
 func cloneRequest(in CreateRequest) CreateRequest {
 	out := in
-	out.ToolAllowlist = append([]string(nil), in.ToolAllowlist...)
+	if in.ToolAllowlist != nil {
+		out.ToolAllowlist = append([]string{}, in.ToolAllowlist...)
+	}
 	out.ApprovalPolicy = cloneBytes(in.ApprovalPolicy)
 	return out
 }

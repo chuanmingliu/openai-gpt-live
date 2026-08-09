@@ -467,7 +467,7 @@ func (c *HandoffCoordinator) process(appCtx context.Context, work HandoffWork) (
 			UserRequest: work.Transcript, Objective: args.Objective,
 			ContextRef: work.Snapshot.ContextRef, ContextHash: work.Snapshot.ContextHash,
 			Deadline: work.Snapshot.Deadline.UTC(), TokenBudget: work.Snapshot.TokenBudget,
-			Priority: work.Snapshot.Priority, ToolAllowlist: append([]string(nil), work.Snapshot.ToolAllowlist...),
+			Priority: work.Snapshot.Priority, ToolAllowlist: cloneStringSlice(work.Snapshot.ToolAllowlist),
 			ApprovalPolicy: append(json.RawMessage(nil), work.Snapshot.ApprovalPolicy...),
 			Versions:       work.Snapshot.Versions, PresentationHint: work.Snapshot.PresentationHint,
 			IdempotencyKey: handoffIdempotencyKey(work, canonical),
@@ -549,13 +549,20 @@ func handoffIdempotencyKey(work HandoffWork, canonical []byte) string {
 
 func cloneHandoffWork(work HandoffWork) HandoffWork {
 	work.Arguments = append(json.RawMessage(nil), work.Arguments...)
-	work.Snapshot.ToolAllowlist = append([]string(nil), work.Snapshot.ToolAllowlist...)
+	work.Snapshot.ToolAllowlist = cloneStringSlice(work.Snapshot.ToolAllowlist)
 	work.Snapshot.ApprovalPolicy = append(json.RawMessage(nil), work.Snapshot.ApprovalPolicy...)
 	return work
 }
 
+func cloneStringSlice(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	return append([]string{}, values...)
+}
+
 func cloneHandoffSnapshot(snapshot SessionHandoffSnapshot) SessionHandoffSnapshot {
-	snapshot.ToolAllowlist = append([]string(nil), snapshot.ToolAllowlist...)
+	snapshot.ToolAllowlist = cloneStringSlice(snapshot.ToolAllowlist)
 	snapshot.ApprovalPolicy = append(json.RawMessage(nil), snapshot.ApprovalPolicy...)
 	return snapshot
 }

@@ -128,6 +128,13 @@ func TestValidateCreateRequest_NormalizesPrivateCopies(t *testing.T) {
 	req.ApprovalPolicy[2] = 'x'
 	assert.Equal(t, []string{"alpha", "zeta"}, got.ToolAllowlist)
 	assert.JSONEq(t, `{"a":1,"b":2}`, string(got.ApprovalPolicy))
+
+	empty := validCreateRequest(now)
+	empty.ToolAllowlist = []string{}
+	got, err = ValidateCreateRequest(empty, now)
+	require.NoError(t, err)
+	require.NotNil(t, got.ToolAllowlist, "an explicit empty allowlist must remain a JSON array at the repository boundary")
+	assert.Empty(t, got.ToolAllowlist)
 }
 
 func TestValidateCreateRequest_AllSecondaryByteBoundaries(t *testing.T) {

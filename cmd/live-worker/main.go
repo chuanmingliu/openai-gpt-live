@@ -9,7 +9,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -73,11 +72,11 @@ var buildRuntimeRepositoryHook func(*postgres.Repository) error
 var commandOutput io.Writer = os.Stdout
 
 func main() {
-	slog.SetDefault(slog.New(telemetry.NewRedactingHandler(slog.Default().Handler(), nil)))
+	telemetry.InstallDefaultRedactingLogger(nil)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	if err := runWithBuilder(ctx, os.Args[1:], os.LookupEnv, buildRuntime); err != nil {
-		log.Printf("live worker stopped: %v", err)
+		slog.Error("live worker stopped", "error", err)
 		os.Exit(1)
 	}
 }
@@ -111,7 +110,7 @@ func runWithBuilder(ctx context.Context, args []string, lookup func(string) (str
 	if err := verifyExpectedHash(cfg, lookup); err != nil {
 		return err
 	}
-	slog.SetDefault(slog.New(telemetry.NewRedactingHandler(slog.Default().Handler(), cfg.Safety.RedactionDeniedKeys)))
+	telemetry.InstallDefaultRedactingLogger(cfg.Safety.RedactionDeniedKeys)
 	secrets, err := resolveSecrets(cfg, lookup)
 	if err != nil {
 		return err

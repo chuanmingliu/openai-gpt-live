@@ -115,6 +115,38 @@ func testScope(tenant, conversation string) handoff.Scope {
 	return handoff.Scope{TenantID: tenant, UserID: "user-1", ConversationID: identity.ConversationID(conversation)}
 }
 
+func TestProvisionConversationIsOwnerExactIdempotentAndRaceSafe(t *testing.T) {
+	repo, pool, _ := repositoryHarness(t)
+	scope := testScope("tenant-provision", "conversation-provision")
+
+	const racers = 16
+	errs := make(chan error, racers)
+	for index := 0; index < racers; index++ {
+		go func() { errs <- repo.ProvisionConversation(t.Context(), scope, 24*time.Hour) }()
+	}
+	for index := 0; index < racers; index++ {
+		require.NoError(t, <-errs)
+	}
+
+	var owner string
+	var createdAt, retentionUntil time.Time
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT user_id,created_at,retention_until FROM conversations WHERE tenant_id=$1 AND id=$2`,
+		scope.TenantID, scope.ConversationID).Scan(&owner, &createdAt, &retentionUntil))
+	require.Equal(t, scope.UserID, owner)
+	require.Equal(t, repositoryTestNow, createdAt.UTC())
+	require.Equal(t, repositoryTestNow.Add(24*time.Hour), retentionUntil.UTC())
+
+	require.NoError(t, repo.ProvisionConversation(t.Context(), scope, 48*time.Hour), "duplicate retry must not mutate the original retention contract")
+	var duplicateRetention time.Time
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT retention_until FROM conversations WHERE tenant_id=$1 AND id=$2`,
+		scope.TenantID, scope.ConversationID).Scan(&duplicateRetention))
+	require.Equal(t, retentionUntil.UTC(), duplicateRetention.UTC())
+
+	wrongOwner := scope
+	wrongOwner.UserID = "other-user"
+	require.ErrorIs(t, repo.ProvisionConversation(t.Context(), wrongOwner, 24*time.Hour), handoff.ErrNotFound)
+}
+
 func TestAppendCommittedItemIsIdempotentAndScopeExact(t *testing.T) {
 	repo, pool, _ := repositoryHarness(t)
 	scope := testScope("tenant-a", "conversation-1")

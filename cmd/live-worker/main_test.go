@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -20,6 +21,36 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+const workerFatalLogHelperEnv = "LIVE_TEST_WORKER_FATAL_LOG_HELPER"
+
+func TestWorkerFatalErrorIsStructuredRedactedAndExitsOne(t *testing.T) {
+	const sentinel = "W0RKS3C"
+	path := filepath.Join(t.TempDir(), "worker.yaml")
+	require.NoError(t, os.WriteFile(path, []byte("worker:\n  concurrency: "+sentinel+"\n"), 0o600))
+	_, fixtureErr := config.LoadUnresolved(path)
+	require.ErrorContains(t, fixtureErr, sentinel, "fixture must prove the underlying error contains the sensitive sentinel")
+
+	if os.Getenv(workerFatalLogHelperEnv) == "1" {
+		os.Args = []string{"live-worker", "-config", path}
+		main()
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestWorkerFatalErrorIsStructuredRedactedAndExitsOne$")
+	command.Env = append(os.Environ(), workerFatalLogHelperEnv+"=1")
+	output, err := command.CombinedOutput()
+	require.Error(t, err, "fatal helper unexpectedly exited successfully: %s", output)
+	var exitErr *exec.ExitError
+	require.ErrorAs(t, err, &exitErr)
+	assert.Equal(t, 1, exitErr.ExitCode(), "fatal helper output: %s", output)
+	assert.NotContains(t, string(output), sentinel)
+	assert.Contains(t, string(output), "level=ERROR")
+	assert.Contains(t, string(output), `msg="live worker stopped"`)
+	assert.Contains(t, string(output), "error=[REDACTED]")
+}
 
 type fakeRuntime struct {
 	started chan resolvedSecrets

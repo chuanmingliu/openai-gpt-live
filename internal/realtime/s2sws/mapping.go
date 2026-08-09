@@ -154,8 +154,9 @@ func marshalCommand(command realtime.Command) ([]byte, error) {
 	case realtime.CommandCancelResponse:
 		return json.Marshal(struct {
 			Type       string `json:"type"`
+			EventID    string `json:"event_id,omitempty"`
 			ResponseID string `json:"response_id,omitempty"`
-		}{Type: "response.cancel", ResponseID: command.ResponseID})
+		}{Type: "response.cancel", EventID: responseCancelEventID(command.Epoch), ResponseID: command.ResponseID})
 	case realtime.CommandBindResponseEpoch:
 		return nil, errors.New("bind response epoch is internal")
 	default:
@@ -169,11 +170,35 @@ func responseCreateEventID(epoch identity.ResponseEpoch) string {
 	return responseCreateEventPrefix + strconv.FormatUint(uint64(epoch), 10)
 }
 
+const responseCancelEventPrefix = "live-response-cancel-"
+
+func responseCancelEventID(epoch identity.ResponseEpoch) string {
+	if epoch == 0 {
+		return ""
+	}
+	return responseCancelEventPrefix + strconv.FormatUint(uint64(epoch), 10)
+}
+
 func responseCreateEpoch(eventID string) identity.ResponseEpoch {
 	if !strings.HasPrefix(eventID, responseCreateEventPrefix) {
 		return 0
 	}
 	raw := strings.TrimPrefix(eventID, responseCreateEventPrefix)
+	value, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil || value == 0 || strconv.FormatUint(value, 10) != raw {
+		return 0
+	}
+	return identity.ResponseEpoch(value)
+}
+
+func responseCommandEpoch(eventID string) identity.ResponseEpoch {
+	if epoch := responseCreateEpoch(eventID); epoch != 0 {
+		return epoch
+	}
+	if !strings.HasPrefix(eventID, responseCancelEventPrefix) {
+		return 0
+	}
+	raw := strings.TrimPrefix(eventID, responseCancelEventPrefix)
 	value, err := strconv.ParseUint(raw, 10, 64)
 	if err != nil || value == 0 || strconv.FormatUint(value, 10) != raw {
 		return 0
@@ -444,7 +469,7 @@ func mapServerEvent(raw []byte, maxFrameBytes int64) (mappedServerEvent, error) 
 			return mappedServerEvent{}, fmt.Errorf("decode provider error: %w", err)
 		}
 		mapped.event.Kind, mapped.event.Reason = realtime.EventError, event.Error.Message
-		mapped.event.Epoch = responseCreateEpoch(event.Error.EventID)
+		mapped.event.Epoch = responseCommandEpoch(event.Error.EventID)
 	default:
 		return mappedServerEvent{}, fmt.Errorf("unsupported provider event type %q", envelope.Type)
 	}

@@ -61,30 +61,36 @@ type ClientConn interface {
 }
 
 type Config struct {
-	IngressFrames         int
-	EgressFrames          int
-	ControlEvents         int
-	WriterControlEvents   int
-	IngressBlockTimeout   time.Duration
-	EgressBlockTimeout    time.Duration
-	DurableDispatcher     DurableEffectDispatcher
-	HandoffConsumerID     string
-	HandoffSubscriptions  HandoffSubscriptionRegistrar
-	PresentationPolicy    presentation.Policy
-	SafetyPolicy          safety.Policy
-	RecoveryStore         RecoveryStore
-	RecoveryItemLimit     int
-	RecoveryByteLimit     int
-	ReconnectMaxRetries   int
-	ReconnectRetryBase    time.Duration
-	ReconnectRetryMax     time.Duration
-	Clock                 clock.Clock
-	Jitter                clock.JitterSource
-	FeatureGates          interface{ Enabled(string) bool }
-	ApprovalStore         handoff.ApprovalStore
-	reactorApplyGate      func(Input) <-chan struct{}
-	reconnectBoundaryGate func() <-chan struct{}
-	initialRegisterGate   func() <-chan struct{}
+	IngressFrames           int
+	EgressFrames            int
+	ControlEvents           int
+	WriterControlEvents     int
+	IngressBlockTimeout     time.Duration
+	EgressBlockTimeout      time.Duration
+	DurableDispatcher       DurableEffectDispatcher
+	HandoffConsumerID       string
+	HandoffSubscriptions    HandoffSubscriptionRegistrar
+	PresentationPolicy      presentation.Policy
+	SafetyPolicy            safety.Policy
+	RecoveryStore           RecoveryStore
+	RecoveryItemLimit       int
+	RecoveryByteLimit       int
+	ReconnectMaxRetries     int
+	ReconnectRetryBase      time.Duration
+	ReconnectRetryMax       time.Duration
+	Clock                   clock.Clock
+	Jitter                  clock.JitterSource
+	FeatureGates            interface{ Enabled(string) bool }
+	ApprovalStore           handoff.ApprovalStore
+	ConversationProvisioner ConversationProvisioner
+	ConversationTTL         time.Duration
+	reactorApplyGate        func(Input) <-chan struct{}
+	reconnectBoundaryGate   func() <-chan struct{}
+	initialRegisterGate     func() <-chan struct{}
+}
+
+type ConversationProvisioner interface {
+	ProvisionConversation(context.Context, handoff.Scope, time.Duration) error
 }
 
 type HandoffSubscriptionRegistrar interface {
@@ -660,6 +666,10 @@ func normalizeManagerConfig(cfg Config) (Config, error) {
 	if isNilInterface(cfg.Jitter) {
 		cfg.Jitter = managerJitter{}
 	}
+	provisioningConfigured := !isNilInterface(cfg.ConversationProvisioner) || cfg.ConversationTTL != 0
+	if provisioningConfigured && (isNilInterface(cfg.ConversationProvisioner) || cfg.ConversationTTL < time.Hour || cfg.ConversationTTL > 10*365*24*time.Hour) {
+		return cfg, fmt.Errorf("%w: conversation provisioning dependencies are incomplete", ErrInvalidManagerConfig)
+	}
 	presentationConfigured := cfg.HandoffConsumerID != "" || !isNilInterface(cfg.HandoffSubscriptions) ||
 		!isNilInterface(cfg.PresentationPolicy) || !isNilInterface(cfg.SafetyPolicy)
 	if presentationConfigured {
@@ -729,6 +739,11 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	defer cancel()
 	if err := sessionCtx.Err(); err != nil {
 		return fmt.Errorf("subject expired: %w", err)
+	}
+	if !isNilInterface(m.cfg.ConversationProvisioner) {
+		if err := m.cfg.ConversationProvisioner.ProvisionConversation(sessionCtx, scope, m.cfg.ConversationTTL); err != nil {
+			return fmt.Errorf("provision conversation: %w", err)
+		}
 	}
 	voice, err := m.connector.Connect(sessionCtx, realtime.OpenRequest{
 		SessionID: sessionID, Incarnation: ids.Incarnation, Model: request.RequestedModel,

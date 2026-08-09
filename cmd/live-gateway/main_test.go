@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -17,11 +18,40 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestGatewayHandoffsFailClosedUntilAdmissionAndConfiguredSafetyComposition(t *testing.T) {
-	err := validateComposition(config.Config{Features: config.FeatureConfig{Handoffs: true}})
-	assert.ErrorContains(t, err, "handoff delivery is unavailable")
-	assert.NotContains(t, err.Error(), "DATABASE_URL")
+const gatewayFatalLogHelperEnv = "LIVE_TEST_GATEWAY_FATAL_LOG_HELPER"
 
+func TestGatewayFatalErrorIsStructuredRedactedAndExitsOne(t *testing.T) {
+	const sentinel = "G4TES3C"
+	path := filepath.Join(t.TempDir(), "gateway.yaml")
+	require.NoError(t, os.WriteFile(path, []byte("gateway:\n  audio:\n    sample_rate: "+sentinel+"\n"), 0o600))
+	_, fixtureErr := config.LoadUnresolved(path)
+	require.ErrorContains(t, fixtureErr, sentinel, "fixture must prove the underlying error contains the sensitive sentinel")
+
+	if os.Getenv(gatewayFatalLogHelperEnv) == "1" {
+		os.Args = []string{"live-gateway", "-config", path}
+		main()
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestGatewayFatalErrorIsStructuredRedactedAndExitsOne$")
+	command.Env = append(os.Environ(), gatewayFatalLogHelperEnv+"=1")
+	output, err := command.CombinedOutput()
+	require.Error(t, err, "fatal helper unexpectedly exited successfully: %s", output)
+	var exitErr *exec.ExitError
+	require.ErrorAs(t, err, &exitErr)
+	assert.Equal(t, 1, exitErr.ExitCode(), "fatal helper output: %s", output)
+	assert.NotContains(t, string(output), sentinel)
+	assert.Contains(t, string(output), "level=ERROR")
+	assert.Contains(t, string(output), `msg="live gateway stopped"`)
+	assert.Contains(t, string(output), "error=[REDACTED]")
+}
+
+func TestGatewayHandoffsRequireProductionDurabilityComposition(t *testing.T) {
+	assert.NoError(t, validateComposition(config.Config{Mode: "production", Features: config.FeatureConfig{Handoffs: true}}))
+	err := validateComposition(config.Config{Mode: "local", Features: config.FeatureConfig{Handoffs: true}})
+	assert.ErrorContains(t, err, "production durability composition")
 	assert.NoError(t, validateComposition(config.Config{}), "non-handoff local startup stays compatible")
 }
 
@@ -39,7 +69,7 @@ gateway:
 		lookups++
 		return "secret", true
 	})
-	assert.ErrorContains(t, err, "handoff delivery is unavailable")
+	assert.ErrorContains(t, err, "production durability composition")
 	assert.Zero(t, lookups)
 }
 

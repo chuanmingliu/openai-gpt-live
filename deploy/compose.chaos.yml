@@ -1,13 +1,139 @@
-# Task 24 adds Toxiproxy services and rewires endpoint URLs. Keeping this as a
-# pure override today guarantees that the standard topology remains renderable.
 services:
   postgres:
-    labels:
-      live.chaos.extension: "task-24"
+    # Disposable loopback-only chaos database. This override deliberately uses
+    # trust auth so test automation never needs to materialize a credential.
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0@sha256:9378ed52a28bc50edc1350f936f518f31fa95f0d15917d6eb40b8e376d1a214e
+    ports:
+      - "127.0.0.1:${CHAOS_TOXIPROXY_PORT:-18474}:8474"
+      - "127.0.0.1:${CHAOS_POSTGRES_PORT:-15432}:15432"
+      - "127.0.0.1:${CHAOS_VOICE_PORT:-18001}:18001"
+      - "127.0.0.1:${CHAOS_DEEPSEEK_PORT:-18002}:18002"
+    networks: [backend]
+
+  toxiproxy-init:
+    build: {context: .., target: load}
+    image: gpt-live-load:local
+    entrypoint: ["/usr/local/bin/live-chaos-provider"]
+    command: ["-mode", "toxiproxy-init", "-toxiproxy-url", "http://toxiproxy:8474"]
+    depends_on:
+      toxiproxy: {condition: service_started}
+      postgres: {condition: service_healthy}
+      speech-to-speech: {condition: service_started}
+      fake-deepseek: {condition: service_started}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [backend]
+    restart: "no"
+
+  speech-to-speech:
+    build: {context: .., target: load}
+    image: gpt-live-load:local
+    entrypoint: ["/usr/local/bin/live-chaos-provider"]
+    command: ["-mode", "voice", "-listen", ":8000"]
+    volumes: ["./config/chaos.yaml:/app/config.yaml:ro"]
+    ports: ["127.0.0.1:${CHAOS_VOICE_CONTROL_PORT:-18101}:8000"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [backend]
+
+  fake-deepseek:
+    build: {context: .., target: load}
+    image: gpt-live-load:local
+    entrypoint: ["/usr/local/bin/live-chaos-provider"]
+    command: ["-mode", "deepseek", "-listen", ":8001"]
+    ports: ["127.0.0.1:${CHAOS_DEEPSEEK_CONTROL_PORT:-18102}:8001"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [backend]
+
+  chaos-edge:
+    build: {context: .., target: load}
+    image: gpt-live-load:local
+    entrypoint: ["/usr/local/bin/live-chaos-provider"]
+    command: ["-mode", "edge", "-listen", ":8443", "-control-listen", ":8081", "-ca-path", "/chaos-ca/ca.pem", "-voice-upstream", "http://toxiproxy:18001", "-deepseek-upstream", "http://toxiproxy:18002", "-issuer", "https://chaos-edge:8443/oidc"]
+    user: "0:0"
+    volumes: ["chaos-ca:/chaos-ca"]
+    ports: ["127.0.0.1:${CHAOS_OIDC_CONTROL_PORT:-18103}:8081"]
+    healthcheck:
+      test: ["CMD", "/bin/busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8081/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      toxiproxy: {condition: service_started}
+      speech-to-speech: {condition: service_started}
+      fake-deepseek: {condition: service_started}
+    networks: [backend]
+
+  migrate:
+    environment:
+      DATABASE_URL: ${CHAOS_DATABASE_URL:-}
+      SSL_CERT_FILE: /chaos-ca/ca.pem
+    volumes:
+      - chaos-ca:/chaos-ca:ro
+    depends_on:
+      toxiproxy-init: {condition: service_completed_successfully}
+      chaos-edge: {condition: service_healthy}
+
   gateway:
     environment:
-      CHAOS_MODE: "extension-ready"
+      DATABASE_URL: ${CHAOS_DATABASE_URL:-}
+      SSL_CERT_FILE: /chaos-ca/ca.pem
+    volumes:
+      - ./config/chaos.yaml:/etc/live/config.yaml:ro
+      - chaos-ca:/chaos-ca:ro
+    ports:
+      - "127.0.0.1:${CHAOS_GATEWAY_ADMIN_PROXY_PORT:-19092}:9091"
+    depends_on:
+      toxiproxy-init: {condition: service_completed_successfully}
+      speech-to-speech: {condition: service_started}
+      chaos-edge: {condition: service_healthy}
+
   worker:
     environment:
-      CHAOS_MODE: "extension-ready"
+      DATABASE_URL: ${CHAOS_DATABASE_URL:-}
+      SSL_CERT_FILE: /chaos-ca/ca.pem
+    volumes:
+      - ./config/chaos.yaml:/etc/live/config.yaml:ro
+      - chaos-ca:/chaos-ca:ro
+    ports:
+      - "127.0.0.1:${CHAOS_WORKER_ADMIN_PROXY_PORT:-19093}:9091"
+    depends_on:
+      toxiproxy-init: {condition: service_completed_successfully}
+      fake-deepseek: {condition: service_started}
+      chaos-edge: {condition: service_healthy}
 
+  gateway-admin-proxy:
+    image: gpt-live-load:local
+    entrypoint: ["/usr/local/bin/live-chaos-provider"]
+    command: ["-mode", "proxy", "-listen", ":9091", "-upstream", "http://127.0.0.1:9090"]
+    network_mode: "service:gateway"
+    depends_on:
+      gateway: {condition: service_started}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+  worker-admin-proxy:
+    image: gpt-live-load:local
+    entrypoint: ["/usr/local/bin/live-chaos-provider"]
+    command: ["-mode", "proxy", "-listen", ":9091", "-upstream", "http://127.0.0.1:9090"]
+    network_mode: "service:worker"
+    depends_on:
+      worker: {condition: service_started}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+
+volumes:
+  chaos-ca: {}

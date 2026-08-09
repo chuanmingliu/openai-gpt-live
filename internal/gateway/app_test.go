@@ -139,6 +139,7 @@ func TestNewWiresRecoveryStoreAndReconnectRetryConfiguration(t *testing.T) {
 	dependencies := DurableDependencies{
 		Service:            &handoffServiceFake{creates: make(chan handoff.CreateRequest, 1)},
 		ConversationWriter: &transcriptWriterFake{}, RecoveryStore: store,
+		ConversationProvisioner: gatewayConversationProvisioner{}, ConversationTTL: 24 * time.Hour,
 		Journal: newCoordinatorJournalFake(), DeliveryAffinity: "recovery-affinity", JournalOwner: "recovery-owner",
 		JournalClaimLease: time.Minute, HandoffQueueCapacity: 1, TranscriptQueueCapacity: 1,
 		Snapshot: validHandoffWork().Snapshot,
@@ -153,6 +154,12 @@ func TestNewWiresRecoveryStoreAndReconnectRetryConfiguration(t *testing.T) {
 }
 
 type gatewayRecoveryStore struct{}
+
+type gatewayConversationProvisioner struct{}
+
+func (gatewayConversationProvisioner) ProvisionConversation(context.Context, handoff.Scope, time.Duration) error {
+	return nil
+}
 
 func (*gatewayRecoveryStore) LoadRecovery(_ context.Context, scope handoff.Scope, _, _ int) (session.RecoverySnapshot, error) {
 	return session.RecoverySnapshot{ConversationID: scope.ConversationID}, nil
@@ -198,6 +205,7 @@ func TestNewHandoffsFeatureFailsClosedAndFeatureOffStaysCompatible(t *testing.T)
 	writer := &transcriptWriterFake{items: make(chan postgres.ConversationItem, 1)}
 	dependencies := DurableDependencies{
 		Service: service, ConversationWriter: writer, HandoffQueueCapacity: 2, TranscriptQueueCapacity: 2,
+		ConversationProvisioner: gatewayConversationProvisioner{}, ConversationTTL: 24 * time.Hour,
 		Journal: newCoordinatorJournalFake(), DeliveryAffinity: "app-test-affinity", JournalOwner: "app-test", JournalClaimLease: time.Minute,
 		Snapshot: validHandoffWork().Snapshot,
 	}
@@ -245,8 +253,9 @@ func TestRunPropagatesUnexpectedCoordinatorFailure(t *testing.T) {
 	cfg := validConfig()
 	cfg.Features.Handoffs = true
 	dependencies := DurableDependencies{
-		Service:              &handoffServiceFake{creates: make(chan handoff.CreateRequest, 1)},
-		ConversationWriter:   &transcriptWriterFake{err: sentinel},
+		Service:                 &handoffServiceFake{creates: make(chan handoff.CreateRequest, 1)},
+		ConversationWriter:      &transcriptWriterFake{err: sentinel},
+		ConversationProvisioner: gatewayConversationProvisioner{}, ConversationTTL: 24 * time.Hour,
 		Journal:              newCoordinatorJournalFake(),
 		DeliveryAffinity:     "run-test-affinity",
 		JournalOwner:         "run-test",
@@ -272,9 +281,10 @@ func TestRunPropagatesUnexpectedHandoffListenerFailure(t *testing.T) {
 	cfg := validConfig()
 	cfg.Features.Handoffs = true
 	dependencies := DurableDependencies{
-		Service:            &handoffServiceFake{creates: make(chan handoff.CreateRequest, 1)},
-		ConversationWriter: &transcriptWriterFake{items: make(chan postgres.ConversationItem, 1)},
-		Journal:            newCoordinatorJournalFake(), DeliveryAffinity: "listener-test-affinity", JournalOwner: "listener-test", JournalClaimLease: time.Minute,
+		Service:                 &handoffServiceFake{creates: make(chan handoff.CreateRequest, 1)},
+		ConversationWriter:      &transcriptWriterFake{items: make(chan postgres.ConversationItem, 1)},
+		ConversationProvisioner: gatewayConversationProvisioner{}, ConversationTTL: 24 * time.Hour,
+		Journal: newCoordinatorJournalFake(), DeliveryAffinity: "listener-test-affinity", JournalOwner: "listener-test", JournalClaimLease: time.Minute,
 		HandoffQueueCapacity: 1, TranscriptQueueCapacity: 1, Snapshot: validHandoffWork().Snapshot,
 	}
 	app, err := New(cfg, testkit.NewFakeConnector(1), WithIDGenerator(deterministicIDs{}), WithDurableHandoffs(dependencies), testHandoffPresentationOptionWithListener(gatewayEventListenerFake{err: sentinel}))
@@ -291,9 +301,10 @@ func TestRunFailsBeforeServingWhenCoordinatorAffinityIsAlreadyOwned(t *testing.T
 	cfg := validConfig()
 	cfg.Features.Handoffs = true
 	dependencies := DurableDependencies{
-		Service:            &handoffServiceFake{creates: make(chan handoff.CreateRequest, 1)},
-		ConversationWriter: &transcriptWriterFake{items: make(chan postgres.ConversationItem, 1)},
-		Journal:            journal, DeliveryAffinity: "shared-affinity", JournalOwner: "second-app", JournalClaimLease: time.Minute,
+		Service:                 &handoffServiceFake{creates: make(chan handoff.CreateRequest, 1)},
+		ConversationWriter:      &transcriptWriterFake{items: make(chan postgres.ConversationItem, 1)},
+		ConversationProvisioner: gatewayConversationProvisioner{}, ConversationTTL: 24 * time.Hour,
+		Journal: journal, DeliveryAffinity: "shared-affinity", JournalOwner: "second-app", JournalClaimLease: time.Minute,
 		HandoffQueueCapacity: 1, TranscriptQueueCapacity: 1, Snapshot: validHandoffWork().Snapshot,
 	}
 	app, err := New(cfg, testkit.NewFakeConnector(1), WithIDGenerator(deterministicIDs{}), WithDurableHandoffs(dependencies), testHandoffPresentationOption())
@@ -311,9 +322,10 @@ func TestRunRejectsNilAffinityLockAndJoinsReleaseFailure(t *testing.T) {
 		cfg := validConfig()
 		cfg.Features.Handoffs = true
 		app, err := New(cfg, testkit.NewFakeConnector(1), WithIDGenerator(deterministicIDs{}), WithDurableHandoffs(DurableDependencies{
-			Service:            &handoffServiceFake{creates: make(chan handoff.CreateRequest, 1)},
-			ConversationWriter: &transcriptWriterFake{items: make(chan postgres.ConversationItem, 1)},
-			Journal:            journal, DeliveryAffinity: "app-affinity", JournalOwner: "app-owner", JournalClaimLease: time.Minute,
+			Service:                 &handoffServiceFake{creates: make(chan handoff.CreateRequest, 1)},
+			ConversationWriter:      &transcriptWriterFake{items: make(chan postgres.ConversationItem, 1)},
+			ConversationProvisioner: gatewayConversationProvisioner{}, ConversationTTL: 24 * time.Hour,
+			Journal: journal, DeliveryAffinity: "app-affinity", JournalOwner: "app-owner", JournalClaimLease: time.Minute,
 			HandoffQueueCapacity: 1, TranscriptQueueCapacity: 1, Snapshot: validHandoffWork().Snapshot,
 		}), testHandoffPresentationOption())
 		require.NoError(t, err)

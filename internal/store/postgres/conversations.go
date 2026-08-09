@@ -26,6 +26,44 @@ type ConversationItem struct {
 	UpdatedAt   time.Time
 }
 
+// ProvisionConversation creates the authenticated owner's logical conversation
+// before any transcript or handoff effect can reference it. Replays for the
+// same exact owner are idempotent; an existing foreign or deleted conversation
+// remains indistinguishable from absence.
+func (r *Repository) ProvisionConversation(ctx context.Context, scope handoff.Scope, ttl time.Duration) error {
+	if err := validateContext(ctx); err != nil {
+		return err
+	}
+	if err := validateScope(scope); err != nil {
+		return err
+	}
+	if ttl < time.Hour || ttl > 10*365*24*time.Hour {
+		return errors.New("conversation retention TTL is invalid")
+	}
+	now := r.clock.Now().UTC()
+	result, err := r.pool.Exec(ctx, `
+		INSERT INTO conversations (tenant_id,id,user_id,retention_until,created_at,updated_at)
+		VALUES ($1,$2,$3,$4,$5,$5)
+		ON CONFLICT (tenant_id,id) DO NOTHING`,
+		scope.TenantID, scope.ConversationID, scope.UserID, now.Add(ttl), now)
+	if err != nil {
+		return mapWriteError(err)
+	}
+	if result.RowsAffected() == 1 {
+		return nil
+	}
+	var owned bool
+	if err := r.pool.QueryRow(ctx, `SELECT EXISTS (
+		SELECT 1 FROM conversations WHERE tenant_id=$1 AND id=$2 AND user_id=$3 AND status <> 'deleted'
+	)`, scope.TenantID, scope.ConversationID, scope.UserID).Scan(&owned); err != nil {
+		return err
+	}
+	if !owned {
+		return handoff.ErrNotFound
+	}
+	return nil
+}
+
 // LoadRecovery reads one ownership-consistent, observational recovery view.
 // The transaction is read-only and repeatable so items, active jobs, and the
 // event high-water cannot come from different durable moments.

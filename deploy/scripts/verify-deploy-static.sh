@@ -27,6 +27,7 @@ LIVE_PRODUCTION_RENDER_MODE=fixture "$root/deploy/scripts/render-kustomize.sh" p
 "$root/deploy/scripts/validate-render.sh" local local "$scratch/local.yaml"
 "$root/deploy/scripts/validate-render.sh" production fixture "$scratch/production-fixture.yaml"
 (cd "$root" && GOCACHE="$cache" go test ./deploy/validate)
+(cd "$root" && GOCACHE="$cache" go test ./cmd/live-load ./internal/loadgen)
 "$root/deploy/scripts/test-validate-deploy.sh"
 
 # Deploy readiness must fail closed when reviewed production inputs are absent.
@@ -58,6 +59,10 @@ if rg -n -i '(insert|update)[^;]*(raw_audio|pcm|audio_bytes)' "$root/migrations"
 fi
 if rg -n --hidden --glob '!.git/**' --glob '!go.sum' -- '-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----' "$root"; then
   echo "private key material detected" >&2
+  exit 1
+fi
+if [ -e "$root/deploy/scripts/live-load-placeholder.sh" ] || ! grep -q '/out/live-load ./cmd/live-load' "$root/Dockerfile"; then
+  echo "Docker load target is not the real live-load binary" >&2
   exit 1
 fi
 

@@ -2,11 +2,16 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -22,9 +27,13 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/config"
 	"github.com/chuanmingliu/openai-gpt-live/internal/feature"
 	"github.com/chuanmingliu/openai-gpt-live/internal/gateway"
+	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/health"
+	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/lifecycle"
+	"github.com/chuanmingliu/openai-gpt-live/internal/presentation"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime/s2sws"
+	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
 	"github.com/chuanmingliu/openai-gpt-live/internal/secretbuf"
 	"github.com/chuanmingliu/openai-gpt-live/internal/session"
 	"github.com/chuanmingliu/openai-gpt-live/internal/store/postgres"
@@ -40,11 +49,11 @@ const providerConnectTimeout = 10 * time.Second
 var commandOutput io.Writer = os.Stdout
 
 func main() {
-	slog.SetDefault(slog.New(telemetry.NewRedactingHandler(slog.Default().Handler(), nil)))
+	telemetry.InstallDefaultRedactingLogger(nil)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	if err := run(ctx, os.Args[1:], os.LookupEnv); err != nil {
-		log.Printf("live gateway stopped: %v", err)
+		slog.Error("live gateway stopped", "error", err)
 		os.Exit(1)
 	}
 }
@@ -69,7 +78,7 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 	if err != nil {
 		return fmt.Errorf("load gateway configuration: %w", err)
 	}
-	slog.SetDefault(slog.New(telemetry.NewRedactingHandler(slog.Default().Handler(), cfg.Safety.RedactionDeniedKeys)))
+	telemetry.InstallDefaultRedactingLogger(cfg.Safety.RedactionDeniedKeys)
 	if err := validateComposition(cfg); err != nil {
 		return err
 	}
@@ -177,6 +186,11 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 		appOptions = append(appOptions, gateway.WithFeatureGates(featureRuntime.gates))
 		appOptions = append(appOptions, gateway.WithApprovalStore(featureRuntime.repo))
 	}
+	durableOptions, err := composeGatewayDurability(cfg, featureRuntime, configHash)
+	if err != nil {
+		return err
+	}
+	appOptions = append(appOptions, durableOptions...)
 	if admissionController != nil {
 		admissionController.SetMetricsObserver(metrics.ObserveAdmission)
 		appOptions = append(appOptions, gateway.WithAdmission(admissionController))
@@ -537,11 +551,98 @@ func composeAdmission(ctx context.Context, cfg config.Config, lookup func(string
 }
 
 func validateComposition(cfg config.Config) error {
-	if cfg.Features.Handoffs {
-		// The reviewed safety policy now exists, but this CLI still has no durable
-		// repository/event-listener composition. Starting without those components
-		// would acknowledge work that can never be delivered.
-		return errors.New("handoff delivery is unavailable: durable repository and event listener composition is required")
+	if cfg.Features.Handoffs && cfg.Mode != "production" {
+		return errors.New("handoff delivery requires production durability composition")
 	}
 	return nil
+}
+
+type gatewayHandoffIDs struct{}
+
+func (gatewayHandoffIDs) NewHandoffID() identity.HandoffID {
+	return identity.HandoffID(randomGatewayIdentifier("handoff"))
+}
+
+func (gatewayHandoffIDs) NewEventID() string { return randomGatewayIdentifier("event") }
+
+func randomGatewayIdentifier(prefix string) string {
+	var raw [24]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return ""
+	}
+	return prefix + "-" + base64.RawURLEncoding.EncodeToString(raw[:])
+}
+
+type gatewayCryptoJitter struct{}
+
+func (gatewayCryptoJitter) Duration(max time.Duration) time.Duration {
+	if max <= 0 {
+		return 0
+	}
+	var raw [8]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return 0
+	}
+	return time.Duration(binary.BigEndian.Uint64(raw[:]) % (uint64(max) + 1))
+}
+
+func composeGatewayDurability(cfg config.Config, runtime *gatewayFeatureRuntime, configHash string) ([]gateway.Option, error) {
+	if !cfg.Features.Handoffs {
+		return nil, nil
+	}
+	if runtime == nil || runtime.pool == nil || runtime.repo == nil {
+		return nil, errors.New("handoff durability runtime is unavailable")
+	}
+	if cfg.Admission.InstanceID == "" {
+		return nil, errors.New("admission.instance_id is required for durable handoff ownership")
+	}
+	service, err := handoff.NewService(runtime.repo, clock.Real{}, gatewayHandoffIDs{})
+	if err != nil {
+		return nil, fmt.Errorf("configure handoff service: %w", err)
+	}
+	listener, err := postgres.NewListener(runtime.pool, clock.Real{}, gatewayCryptoJitter{}, postgres.ListenerConfig{
+		ReconnectDelay: maxDuration(cfg.Worker.PollInterval, 10*time.Millisecond),
+		MaxJitter:      100 * time.Millisecond,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("configure handoff listener: %w", err)
+	}
+	policy, err := safety.NewStaticPolicy(safety.StaticConfig{
+		Mode: safety.StaticMode(cfg.Safety.Mode), MaxSummaryBytes: cfg.Safety.MaxSummaryBytes,
+		MaxStructuredBytes: cfg.Safety.MaxStructuredBytes, RedactedSummary: cfg.Safety.RedactedSummary,
+		ClarificationPrompt: cfg.Safety.ClarificationPrompt,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("configure handoff presentation safety: %w", err)
+	}
+	identityDigest := sha256.Sum256([]byte(cfg.Admission.InstanceID))
+	owner := "gateway-" + hex.EncodeToString(identityDigest[:16])
+	snapshot := gateway.SessionHandoffSnapshot{
+		ContextRef: "context://conversation/current", ContextHash: configHash,
+		Deadline:    time.Date(9999, time.December, 31, 23, 59, 59, 0, time.UTC),
+		TokenBudget: cfg.Worker.MaxOutputTokens, ToolAllowlist: []string{}, ApprovalPolicy: json.RawMessage(`{"mode":"none"}`),
+		Versions:         handoff.Versions{Model: cfg.Worker.Reasoner.Model, Prompt: cfg.Safety.PolicyVersion, ToolRegistry: configHash, Config: configHash},
+		PresentationHint: "brief",
+	}
+	return []gateway.Option{
+		gateway.WithDurableHandoffs(gateway.DurableDependencies{
+			Service: service, ConversationWriter: runtime.repo, ConversationProvisioner: runtime.repo,
+			ConversationTTL: cfg.Store.Retention.ConversationTTL, RecoveryStore: runtime.repo, Journal: runtime.repo,
+			DeliveryAffinity: owner, JournalOwner: owner, JournalClaimLease: cfg.Admission.LeaseDuration,
+			HandoffQueueCapacity: cfg.Gateway.Session.ControlEvents, TranscriptQueueCapacity: cfg.Gateway.Session.ControlEvents,
+			Snapshot: snapshot,
+		}),
+		gateway.WithHandoffPresentation(gateway.HandoffPresentationDependencies{
+			Reader: runtime.repo, Cursors: runtime.repo, Listener: listener, Clock: clock.Real{},
+			PollInterval: maxDuration(cfg.Worker.PollInterval, 10*time.Millisecond), ConsumerID: owner,
+			WakeupCapacity: cfg.Gateway.Session.ControlEvents, Policy: presentation.NewPolicy(presentation.Config{}), Safety: policy,
+		}),
+	}, nil
+}
+
+func maxDuration(left, right time.Duration) time.Duration {
+	if left > right {
+		return left
+	}
+	return right
 }
