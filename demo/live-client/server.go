@@ -67,6 +67,12 @@ func (handler *demoHandler) ServeHTTP(writer http.ResponseWriter, request *http.
 		handler.serveAsset(writer, "web/index.html", "text/html; charset=utf-8")
 	case "/styles.css":
 		handler.serveAsset(writer, "web/styles.css", "text/css; charset=utf-8")
+	case "/audio-core.mjs":
+		handler.serveAsset(writer, "web/audio-core.mjs", "text/javascript; charset=utf-8")
+	case "/capture-worklet.js":
+		handler.serveAsset(writer, "web/capture-worklet.js", "text/javascript; charset=utf-8")
+	case "/playback-worklet.js":
+		handler.serveAsset(writer, "web/playback-worklet.js", "text/javascript; charset=utf-8")
 	case "/health/ready":
 		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		writer.WriteHeader(http.StatusOK)

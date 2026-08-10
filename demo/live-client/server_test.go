@@ -31,6 +31,21 @@ func TestStaticAssetsCarryStrictHeadersWithoutBearer(t *testing.T) {
 	assert.NotContains(t, fmtHeaders(response.Header()), "sentinel-browser-secret")
 }
 
+func TestAudioModulesAreServedAsNoStoreJavaScript(t *testing.T) {
+	handler := mustTestHandler(t, nil, []byte("sentinel"))
+	for _, path := range []string{"/audio-core.mjs", "/capture-worklet.js", "/playback-worklet.js"} {
+		path := path
+		t.Run(path, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:3000"+path, nil))
+			assert.Equal(t, http.StatusOK, response.Code)
+			assert.Equal(t, "text/javascript; charset=utf-8", response.Header().Get("Content-Type"))
+			assert.Equal(t, "no-store", response.Header().Get("Cache-Control"))
+			assert.Contains(t, response.Header().Get("Content-Security-Policy"), "default-src 'self'")
+		})
+	}
+}
+
 func TestHealthAndUnknownRoutesAreExact(t *testing.T) {
 	handler := mustTestHandler(t, nil, []byte("sentinel"))
 	ready := httptest.NewRecorder()
