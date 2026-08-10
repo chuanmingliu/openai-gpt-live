@@ -63,6 +63,61 @@ go run ./cmd/live-worker config-hash --config deploy/config/local.yaml
 
 `check-config` is intentionally narrow. It parses strict YAML, applies defaults, validates names and structure, and reads no secret value. It does **not** prove secret availability, database schema, provider authentication, OIDC discovery, OTLP reachability, or runtime composition. The two hash commands must print the same value for the same file.
 
+## Talk to the service in a browser
+
+The repository includes a loopback-only hands-free voice client. It streams
+microphone PCM through `live-gateway`, plays the real speech provider audio,
+shows live user and assistant transcripts, and clears queued playback when the
+server reports that you started speaking.
+
+Before starting the page, verify the services you configured are healthy. The
+ports below match the documented local/Compose shape; substitute your focused
+process ports when they differ:
+
+```sh
+curl --fail http://127.0.0.1:19090/health/ready  # gateway
+curl --fail http://127.0.0.1:19091/health/ready  # async worker
+curl --fail http://127.0.0.1:18765/v1/pool       # speech service, if it exposes the reference pool endpoint
+pg_isready -h 127.0.0.1 -p 15432 -U live -d live # PostgreSQL, for the documented dedicated local DB
+```
+
+Only the gateway and speech service are required for the interactive voice
+turn. PostgreSQL and `live-worker` are also required when the model delegates a
+durable asynchronous handoff.
+
+Supply the same local static bearer accepted by the gateway without writing it
+to a tracked file. One shell-safe option is a hidden prompt:
+
+```sh
+read -r -s "LIVE_DEMO_BEARER?Local gateway bearer: "
+export LIVE_DEMO_BEARER
+printf '\n'
+make demo-live-client
+```
+
+Then open [http://127.0.0.1:3000](http://127.0.0.1:3000), click **Start
+listening**, and grant microphone permission. Speak normally; server VAD ends
+the turn and creates the response. Speak over assistant playback to test
+barge-in. **Mute** pauses capture and discards any partial local capture frame;
+**Stop** releases both audio contexts, every microphone track, and both
+WebSockets.
+
+The page connects only to its loopback Go BFF at `/ws`. The BFF injects the
+bearer into the upstream gateway request; the bearer never enters HTML,
+JavaScript, a WebSocket URL or subprotocol, cookies, browser storage, response
+headers, or logs. Audio and transcript strings stay in page memory and are not
+written by the demo. This is a local development boundary, not the production
+OIDC/browser authentication design.
+
+Run its automated gate independently:
+
+```sh
+make test-demo-live-client
+```
+
+Stop only the foreground demo with `Ctrl-C`. That does not stop the gateway,
+worker, speech service, or PostgreSQL and does not delete database data.
+
 ## Configure speech-to-speech
 
 Use [configs/gateway.example.yaml](configs/gateway.example.yaml) for a direct local process, or edit the equivalent `gateway` block in your reviewed deployment config:
