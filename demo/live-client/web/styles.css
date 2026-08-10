@@ -1,0 +1,18 @@
+:root {
+  color-scheme: dark;
+  font-family: ui-sans-serif, system-ui, sans-serif;
+  background: #10141b;
+  color: #eef2f8;
+}
+
+body {
+  margin: 0;
+}
+
+main {
+  box-sizing: border-box;
+  margin: 0 auto;
+  max-width: 56rem;
+  min-height: 100vh;
+  padding: 4rem 1.5rem;
+}

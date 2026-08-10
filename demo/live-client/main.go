@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"log"
 	"os"
 )
@@ -20,8 +19,4 @@ func main() {
 	if err := run(context.Background(), cfg, bearer); err != nil {
 		log.Fatal("demo server stopped")
 	}
-}
-
-func run(context.Context, demoConfig, []byte) error {
-	return errors.New("demo server is not implemented")
 }
