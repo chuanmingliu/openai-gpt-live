@@ -142,6 +142,20 @@ func WithAdmission(admission transportws.Admission) Option {
 	}
 }
 
+func WithReconnectAuthority(credentials session.ReconnectCredentials, owners session.ReconnectOwnerStore, ownerID string, ttl time.Duration) Option {
+	return func(app *App) error {
+		if isNil(credentials) || isNil(owners) {
+			return errors.New("reconnect authority is required")
+		}
+		app.managerConfig.ReconnectCredentials = credentials
+		app.managerConfig.ReconnectOwners = owners
+		app.managerConfig.ReconnectOwnerID = ownerID
+		app.managerConfig.ReconnectCredentialTTL = ttl
+		app.wsOptions.ReconnectCredentials = credentials
+		return nil
+	}
+}
+
 func WithCanaryRuntimeIdentity(identity transportws.RuntimeIdentity) Option {
 	return func(app *App) error {
 		if err := identity.Validate(); err != nil {
@@ -230,6 +244,10 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 		ReconnectMaxRetries: cfg.Gateway.Reconnect.MaxRetries,
 		ReconnectRetryBase:  cfg.Gateway.Reconnect.RetryBase,
 		ReconnectRetryMax:   cfg.Gateway.Reconnect.RetryMax,
+		HandoffToolsEnabled: cfg.Features.Handoffs,
+	}
+	if cfg.Features.Handoffs {
+		managerConfig.InitialSession = session.ReservedHandoffSessionConfig()
 	}
 	if managerConfig.IngressBlockTimeout == 0 {
 		managerConfig.IngressBlockTimeout = defaultIngressBlockTimeout
@@ -237,12 +255,16 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 	if managerConfig.EgressBlockTimeout == 0 {
 		managerConfig.EgressBlockTimeout = defaultEgressBlockTimeout
 	}
+	handoffsEnabled := cfg.Features.Handoffs
 	wsOptions := transportws.Options{
-		MaxFrameBytes: int64(cfg.Gateway.WebSocket.MaxFrameBytes),
-		MaxJSONDepth:  defaultMaxJSONDepth,
-		MaxAudioBytes: cfg.Gateway.Session.IngressAudioBytes,
-		ReadTimeout:   cfg.Gateway.WebSocket.ReadTimeout,
-		WriteTimeout:  cfg.Gateway.WebSocket.WriteTimeout,
+		MaxFrameBytes:   int64(cfg.Gateway.WebSocket.MaxFrameBytes),
+		MaxJSONDepth:    defaultMaxJSONDepth,
+		MaxAudioBytes:   cfg.Gateway.Session.IngressAudioBytes,
+		ReadTimeout:     cfg.Gateway.WebSocket.ReadTimeout,
+		WriteTimeout:    cfg.Gateway.WebSocket.WriteTimeout,
+		AdvertisedModel: cfg.Gateway.AdvertisedModel,
+		ProviderModel:   cfg.Gateway.Voice.Model,
+		HandoffsEnabled: &handoffsEnabled,
 	}
 	if wsOptions.ReadTimeout == 0 {
 		wsOptions.ReadTimeout = defaultWebSocketReadTimeout
@@ -279,18 +301,54 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 	} else if app.admission == nil {
 		return nil, errors.New("production admission must be explicitly configured")
 	}
+	managerConfig = app.managerConfig
+	wsOptions = app.wsOptions
+	if cfg.Mode == "production" && (isNil(managerConfig.ReconnectCredentials) || isNil(managerConfig.ReconnectOwners)) {
+		return nil, errors.New("production reconnect authority must be explicitly configured")
+	}
 	if isNil(app.ids) {
 		return nil, errors.New("session ID generator is required")
 	}
 	managerConfig.FeatureGates = app.featureGates
 	managerConfig.ApprovalStore = app.approvalStore
 
+	if !cfg.Features.Handoffs && app.presentation != nil {
+		return nil, errors.New("handoff presentation dependencies supplied while feature is disabled")
+	}
+	if app.durable == nil {
+		if cfg.Features.Handoffs {
+			return nil, errors.New("durable handoff dependencies and valid server snapshot are required")
+		}
+		if cfg.Mode == "production" {
+			return nil, errors.New("production conversation recovery durability is required")
+		}
+	}
+	var dispatcher *durableDispatcher
+	if app.durable != nil {
+		if isNil(app.durable.ConversationWriter) || isNil(app.durable.ConversationProvisioner) ||
+			app.durable.ConversationTTL < time.Hour || app.durable.ConversationTTL > 10*365*24*time.Hour ||
+			isNil(app.durable.Journal) || strings.TrimSpace(app.durable.DeliveryAffinity) == "" ||
+			strings.TrimSpace(app.durable.JournalOwner) == "" || app.durable.JournalClaimLease <= 0 ||
+			app.durable.TranscriptQueueCapacity <= 0 {
+			return nil, errors.New("conversation recovery durability dependencies are required and must be bounded")
+		}
+		managerConfig.ConversationProvisioner = app.durable.ConversationProvisioner
+		managerConfig.ConversationTTL = app.durable.ConversationTTL
+		managerConfig.RecoveryStore = app.durable.RecoveryStore
+		if isNil(managerConfig.RecoveryStore) {
+			if store, ok := app.durable.ConversationWriter.(session.RecoveryStore); ok {
+				managerConfig.RecoveryStore = store
+			}
+		}
+		if cfg.Mode == "production" && isNil(managerConfig.RecoveryStore) {
+			return nil, errors.New("production conversation recovery durability is required")
+		}
+		dispatcher = &durableDispatcher{snapshot: cloneHandoffSnapshot(app.durable.Snapshot)}
+		managerConfig.DurableDispatcher = dispatcher
+	}
+
 	if cfg.Features.Handoffs {
-		if app.durable == nil || isNil(app.durable.Service) || isNil(app.durable.ConversationWriter) ||
-			isNil(app.durable.ConversationProvisioner) || app.durable.ConversationTTL < time.Hour || app.durable.ConversationTTL > 10*365*24*time.Hour ||
-			isNil(app.durable.Journal) || app.durable.DeliveryAffinity == "" || app.durable.JournalOwner == "" || app.durable.JournalClaimLease <= 0 ||
-			app.durable.HandoffQueueCapacity <= 0 || app.durable.TranscriptQueueCapacity <= 0 ||
-			validateHandoffSnapshot(app.durable.Snapshot) != nil {
+		if isNil(app.durable.Service) || app.durable.HandoffQueueCapacity <= 0 || validateHandoffSnapshot(app.durable.Snapshot) != nil {
 			return nil, errors.New("durable handoff dependencies and valid server snapshot are required")
 		}
 		if app.presentation == nil || isNil(app.presentation.Reader) || isNil(app.presentation.Cursors) ||
@@ -317,24 +375,40 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 		}
 		app.eventListener = app.presentation.Listener
 		managerConfig.HandoffConsumerID = app.presentation.ConsumerID
-		managerConfig.ConversationProvisioner = app.durable.ConversationProvisioner
-		managerConfig.ConversationTTL = app.durable.ConversationTTL
 		managerConfig.HandoffSubscriptions = app.eventPump
 		managerConfig.PresentationPolicy = app.presentation.Policy
 		managerConfig.SafetyPolicy = app.presentation.Safety
-		managerConfig.RecoveryStore = app.durable.RecoveryStore
-		if isNil(managerConfig.RecoveryStore) {
-			if store, ok := app.durable.ConversationWriter.(session.RecoveryStore); ok {
-				managerConfig.RecoveryStore = store
+		managerConfig.Clock = app.presentation.Clock
+	}
+
+	app.managerConfig = managerConfig
+	app.manager = session.NewManager(managerConfig, connector, app.ids)
+	if app.durable != nil {
+		app.transcripts = NewTranscriptCoordinator(app.durable.ConversationWriter, app.manager, app.durable.TranscriptQueueCapacity)
+		if app.transcripts == nil {
+			return nil, errors.New("durable transcript coordinator is invalid")
+		}
+		transcriptClock := clock.Clock(clock.Real{})
+		if app.presentation != nil && !isNil(app.presentation.Clock) {
+			transcriptClock = app.presentation.Clock
+		}
+		if cfg.Gateway.StorageGrace > 0 {
+			app.transcripts.health = &durabilityHealth{}
+			if err := app.transcripts.configureOutage(cfg.Gateway.StorageGrace, transcriptClock); err != nil {
+				return nil, err
 			}
 		}
-		managerConfig.Clock = app.presentation.Clock
-		dispatcher := &durableDispatcher{snapshot: cloneHandoffSnapshot(app.durable.Snapshot)}
-		managerConfig.DurableDispatcher = dispatcher
-		app.managerConfig = managerConfig
-		app.manager = session.NewManager(managerConfig, connector, app.ids)
+		if err := app.transcripts.configureJournal(app.durable.Journal, app.durable.DeliveryAffinity, app.durable.JournalOwner, app.durable.JournalClaimLease); err != nil {
+			return nil, err
+		}
+		dispatcher.transcripts = app.transcripts
+	}
+	if cfg.Features.Handoffs {
 		app.eventPump.Sink = app.manager
 		app.handoffs = NewHandoffCoordinator(app.durable.Service, app.manager, app.durable.HandoffQueueCapacity)
+		if app.handoffs == nil {
+			return nil, errors.New("durable handoff coordinator is invalid")
+		}
 		if app.featureGates != nil {
 			if err := app.handoffs.SetFeatureGates(app.featureGates); err != nil {
 				return nil, err
@@ -343,34 +417,16 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 		app.handoffs.tracer = app.tracer
 		app.handoffs.metricsClock = app.presentation.Clock
 		app.handoffs.ackMetric = app.handoffMetrics.Acknowledgement
-		app.transcripts = NewTranscriptCoordinator(app.durable.ConversationWriter, app.manager, app.durable.TranscriptQueueCapacity)
-		if app.handoffs == nil || app.transcripts == nil {
-			return nil, errors.New("durable handoff coordinators are invalid")
-		}
 		if cfg.Gateway.StorageGrace > 0 {
-			health := &durabilityHealth{}
-			app.handoffs.health = health
-			app.transcripts.health = health
+			app.handoffs.health = app.transcripts.health
 			if err := app.handoffs.configureOutage(cfg.Gateway.StorageGrace, app.presentation.Clock); err != nil {
 				return nil, err
 			}
-			if err := app.transcripts.configureOutage(cfg.Gateway.StorageGrace, app.presentation.Clock); err != nil {
-				return nil, err
-			}
 		}
-		if err := app.handoffs.configureJournal(app.durable.Journal, app.durable.DeliveryAffinity, app.durable.JournalOwner+":handoff", app.durable.JournalClaimLease); err != nil {
-			return nil, err
-		}
-		if err := app.transcripts.configureJournal(app.durable.Journal, app.durable.DeliveryAffinity, app.durable.JournalOwner+":transcript", app.durable.JournalClaimLease); err != nil {
+		if err := app.handoffs.configureJournal(app.durable.Journal, app.durable.DeliveryAffinity, app.durable.JournalOwner, app.durable.JournalClaimLease); err != nil {
 			return nil, err
 		}
 		dispatcher.handoffs = app.handoffs
-		dispatcher.transcripts = app.transcripts
-	} else {
-		if app.durable != nil || app.presentation != nil {
-			return nil, errors.New("durable handoff dependencies supplied while feature is disabled")
-		}
-		app.manager = session.NewManager(managerConfig, connector, app.ids)
 	}
 	app.manager.SetMetricsHooks(app.metricsHooks)
 	app.handler = &trackedHandler{next: transportws.NewHandler(wsOptions, app.manager, app.admission), active: &app.activeHandlers, drainer: app.drainer}
@@ -440,20 +496,6 @@ func (a *App) Run(ctx context.Context) (runErr error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if a.durable != nil {
-		affinityLock, err := a.durable.Journal.AcquireCoordinatorAffinity(ctx, a.durable.DeliveryAffinity)
-		if err != nil {
-			return fmt.Errorf("acquire coordinator delivery affinity: %w", err)
-		}
-		if isNil(affinityLock) {
-			return errors.New("acquire coordinator delivery affinity: nil lock")
-		}
-		defer func() {
-			if err := affinityLock.Close(); err != nil {
-				runErr = errors.Join(runErr, fmt.Errorf("release coordinator delivery affinity: %w", err))
-			}
-		}()
-	}
 	// Process cancellation is a request to begin draining, not permission to
 	// tear down already-admitted client/provider streams. The drain sequence
 	// below owns the only cancellation of serving I/O.
@@ -474,7 +516,7 @@ func (a *App) Run(ctx context.Context) (runErr error) {
 		name string
 		err  error
 	}
-	coordinatorResult := make(chan coordinatorRunResult, 4)
+	coordinatorResult := make(chan coordinatorRunResult, 5)
 	coordinatorDone := make(chan struct{})
 	coordinatorCount := 0
 	var coordinatorWG sync.WaitGroup
@@ -497,6 +539,9 @@ func (a *App) Run(ctx context.Context) (runErr error) {
 	}
 	if a.eventPump != nil {
 		startCoordinator("handoff event pump", a.eventPump.Run)
+	}
+	if a.manager != nil && a.manager.ReconnectEnabled() {
+		startCoordinator("reconnect owner maintenance", a.manager.RunReconnectMaintenance)
 	}
 	go func() {
 		coordinatorWG.Wait()
@@ -628,6 +673,15 @@ func (a *App) ActiveSessions() int64 {
 		return 0
 	}
 	return a.manager.ActiveSessions()
+}
+
+// ReconnectReady reports whether the bounded durable-owner maintenance loop
+// has completed a successful sweep. It is a no-op when reconnect is disabled.
+func (a *App) ReconnectReady(ctx context.Context) error {
+	if a == nil || a.manager == nil {
+		return errors.New("gateway session manager is unavailable")
+	}
+	return a.manager.ReconnectReady(ctx)
 }
 func (a *App) CapacitySnapshot() (active, limit int64) {
 	if a == nil {

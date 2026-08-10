@@ -25,6 +25,7 @@ func TestCapabilitiesPublishesPinnedFirstReleaseContract(t *testing.T) {
 	}, got.ClientEvents)
 	assert.Equal(t, []string{
 		"session.created",
+		"session.reconnect.updated",
 		"session.updated",
 		"error",
 		"input_audio_buffer.speech_started",

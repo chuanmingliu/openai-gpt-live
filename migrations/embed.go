@@ -20,7 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const latestVersion uint = 5
+const latestVersion uint = 7
 
 const (
 	migrationCancelTimeout     = 2 * time.Second
@@ -381,10 +381,10 @@ func (d *cancellablePGXDriver) recoverCoordinatorPendingRefusal() error {
 	if err != nil {
 		return err
 	}
-	if version != 1 || !dirty {
+	if !dirty || version != 1 && version != 6 {
 		return fmt.Errorf("unexpected migration state version=%d dirty=%t", version, dirty)
 	}
-	var journalExists bool
+	var journalExists, shardExists, affinityGenerationExists bool
 	if err := d.connection.QueryRow(d.ctx, `SELECT EXISTS (
 		SELECT 1 FROM pg_catalog.pg_class c
 		JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
@@ -395,7 +395,22 @@ func (d *cancellablePGXDriver) recoverCoordinatorPendingRefusal() error {
 	if !journalExists {
 		return errors.New("coordinator journal table is absent")
 	}
-	return d.SetVersion(2, false)
+	if version == 1 {
+		return d.SetVersion(2, false)
+	}
+	if err := d.connection.QueryRow(d.ctx, `SELECT
+		to_regclass('coordinator_delivery_shards') IS NOT NULL,
+		EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema=$1 AND table_name='coordinator_work_journal'
+				AND column_name='claim_affinity_generation'
+		)`, d.schema).Scan(&shardExists, &affinityGenerationExists); err != nil {
+		return err
+	}
+	if !shardExists || !affinityGenerationExists {
+		return errors.New("coordinator delivery shard fence is absent")
+	}
+	return d.SetVersion(7, false)
 }
 
 func (d *cancellablePGXDriver) SetVersion(version int, dirty bool) error {

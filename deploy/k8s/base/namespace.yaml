@@ -4,4 +4,3 @@ metadata:
   name: gpt-live
   labels:
     app.kubernetes.io/part-of: gpt-live
-

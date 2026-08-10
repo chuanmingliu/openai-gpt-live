@@ -1,15 +1,19 @@
 package ws
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
+	"github.com/chuanmingliu/openai-gpt-live/internal/session"
 	"github.com/coder/websocket"
 )
 
@@ -80,6 +84,41 @@ func (c *clientConn) Read(ctx context.Context) (protocol.ClientEvent, error) {
 		return nil, fmt.Errorf("decode client event: %w", err)
 	}
 	return event, nil
+}
+
+func (c *clientConn) readReconnectControl(ctx context.Context) (string, error) {
+	if ctx == nil {
+		return "", errors.New("read context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	readCtx, cancel := operationContext(ctx, c.readTimeout)
+	defer cancel()
+	typ, raw, err := c.conn.Read(readCtx)
+	if err != nil {
+		return "", err
+	}
+	if typ != websocket.MessageText || !utf8.Valid(raw) {
+		return "", errors.New("reconnect control must be UTF-8 text")
+	}
+	var control struct {
+		Type       string `json:"type"`
+		Credential string `json:"credential"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&control); err != nil {
+		return "", errors.New("invalid reconnect control")
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return "", errors.New("invalid reconnect control")
+	}
+	if control.Type != "session.reconnect" || control.Credential == "" ||
+		len(control.Credential) > session.MaximumReconnectCredentialBytes || strings.TrimSpace(control.Credential) != control.Credential {
+		return "", errors.New("invalid reconnect control")
+	}
+	return control.Credential, nil
 }
 
 func (c *clientConn) Write(ctx context.Context, event protocol.ServerEvent) error {

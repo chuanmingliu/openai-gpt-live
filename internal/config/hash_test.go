@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"testing"
@@ -33,6 +34,35 @@ func TestHashIsStableAndIgnoresSecretReferences(t *testing.T) {
 	}
 	if ha == hb {
 		t.Fatal("meaningful change did not alter hash")
+	}
+}
+
+func TestHashIgnoresReconnectSecretReferenceButBindsKeyIdentity(t *testing.T) {
+	cfg, err := loadFixture(t, "mode: local\ngateway:\n  reconnect: {hmac_key_env: RECONNECT_A, hmac_key_id: reconnect-v1}\n", func(string) (string, bool) {
+		return base64.StdEncoding.EncodeToString(make([]byte, 32)), true
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := Hash(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Gateway.Reconnect.HMACKeyEnv = "RECONNECT_B"
+	b, err := Hash(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a != b {
+		t.Fatal("secret reference name changed canonical hash")
+	}
+	cfg.Gateway.Reconnect.HMACKeyID = "reconnect-v2"
+	c, err := Hash(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a == c {
+		t.Fatal("reconnect key identity did not change canonical hash")
 	}
 }
 
@@ -70,7 +100,7 @@ func TestGatewayExampleConfigHashGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = "v1:3360f5f98073e3e09f6b920492f26eba915db2a77e861556664f942094bf2a42"
+	const want = "v1:c8f2a22720611f61ceed20e0ba4d37ea00433de3da9fd1f4951a424dbfa446fd"
 	if hash != want {
 		t.Fatalf("hash=%s want=%s", hash, want)
 	}

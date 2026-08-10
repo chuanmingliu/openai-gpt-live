@@ -19,15 +19,16 @@ import (
 )
 
 const (
-	defaultIngressFrames       = 25
-	defaultEgressFrames        = 75
-	defaultControlEvents       = 256
-	defaultWriterControlEvents = 64
-	defaultSampleRate          = 24_000
-	defaultPCMFrameBytes       = 960
-	defaultReconnectRetries    = 2
-	defaultReconnectRetryBase  = 100 * time.Millisecond
-	defaultReconnectRetryMax   = time.Second
+	defaultIngressFrames          = 25
+	defaultEgressFrames           = 75
+	defaultControlEvents          = 256
+	defaultWriterControlEvents    = 64
+	defaultSampleRate             = 24_000
+	defaultPCMFrameBytes          = 960
+	defaultReconnectRetries       = 2
+	defaultReconnectRetryBase     = 100 * time.Millisecond
+	defaultReconnectRetryMax      = time.Second
+	defaultReconnectCredentialTTL = 5 * time.Minute
 )
 
 type Config struct {
@@ -103,9 +104,12 @@ type RetryConfig struct {
 }
 
 type ReconnectConfig struct {
-	MaxRetries int           `yaml:"max_retries"`
-	RetryBase  time.Duration `yaml:"retry_base"`
-	RetryMax   time.Duration `yaml:"retry_max"`
+	MaxRetries    int           `yaml:"max_retries"`
+	RetryBase     time.Duration `yaml:"retry_base"`
+	RetryMax      time.Duration `yaml:"retry_max"`
+	HMACKeyEnv    string        `yaml:"hmac_key_env"`
+	HMACKeyID     string        `yaml:"hmac_key_id"`
+	CredentialTTL time.Duration `yaml:"credential_ttl"`
 }
 
 type WorkerConfig struct {
@@ -315,6 +319,9 @@ func (c *Config) applyDefaults() {
 	if c.Gateway.Reconnect.RetryMax == 0 {
 		c.Gateway.Reconnect.RetryMax = defaultReconnectRetryMax
 	}
+	if c.Gateway.Reconnect.CredentialTTL == 0 {
+		c.Gateway.Reconnect.CredentialTTL = defaultReconnectCredentialTTL
+	}
 	if c.Auth.OIDCTenantClaim == "" {
 		c.Auth.OIDCTenantClaim = "tenant_id"
 	}
@@ -494,7 +501,7 @@ func (c Config) Validate() error {
 	}
 	if c.Gateway.Voice.URL != "" {
 		u, err := url.Parse(c.Gateway.Voice.URL)
-		if err != nil || (u.Scheme != "ws" && u.Scheme != "wss") || u.Host == "" {
+		if err != nil || (u.Scheme != "ws" && u.Scheme != "wss") || u.Host == "" || !canonicalEndpointURL(u) {
 			return fmt.Errorf("gateway.voice.url must be an absolute ws or wss URL")
 		}
 		if c.Mode == "production" && u.Scheme != "wss" {
@@ -529,11 +536,21 @@ func (c Config) Validate() error {
 	if c.Gateway.StorageGrace < 0 || c.Gateway.StorageGrace > 10*time.Minute {
 		return errors.New("gateway.storage_grace must be positive and bounded when set")
 	}
+	reconnectCredentialTTL := c.Gateway.Reconnect.CredentialTTL
+	if reconnectCredentialTTL == 0 {
+		reconnectCredentialTTL = defaultReconnectCredentialTTL
+	}
 	if c.Gateway.Reconnect.MaxRetries < 0 || c.Gateway.Reconnect.MaxRetries > 16 ||
 		c.Gateway.Reconnect.RetryBase < 0 || c.Gateway.Reconnect.RetryMax < 0 ||
 		c.Gateway.Reconnect.RetryBase > 0 && c.Gateway.Reconnect.RetryMax < c.Gateway.Reconnect.RetryBase ||
-		c.Gateway.Reconnect.RetryMax > time.Minute {
+		c.Gateway.Reconnect.RetryMax > time.Minute ||
+		reconnectCredentialTTL < 10*time.Second || reconnectCredentialTTL > time.Hour {
 		return errors.New("gateway reconnect retry limits must be bounded")
+	}
+	if c.Gateway.Reconnect.HMACKeyEnv != "" || c.Gateway.Reconnect.HMACKeyID != "" {
+		if !environmentName(c.Gateway.Reconnect.HMACKeyEnv) || !validKeyID(c.Gateway.Reconnect.HMACKeyID) {
+			return errors.New("gateway reconnect HMAC environment and key ID must be configured together")
+		}
 	}
 	if c.Worker.Concurrency <= 0 {
 		return errors.New("worker.concurrency must be positive")
@@ -652,6 +669,9 @@ func (c Config) Validate() error {
 		if retention.HMACKeyEnv == "" || retention.HMACKeyID == "" {
 			return errors.New("production retention HMAC environment and key ID are required")
 		}
+		if c.Gateway.Reconnect.HMACKeyEnv == "" || c.Gateway.Reconnect.HMACKeyID == "" {
+			return errors.New("production reconnect HMAC environment and key ID are required")
+		}
 		if c.Store.URL == "" && c.Store.DatabaseURLEnv == "" {
 			return errors.New("production admission requires PostgreSQL storage")
 		}
@@ -695,13 +715,22 @@ func validateHTTPURL(raw, name string, requireHTTPS bool) error {
 		return nil
 	}
 	u, err := url.Parse(raw)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || !canonicalEndpointURL(u) {
 		return fmt.Errorf("%s must be an absolute http or https URL", name)
 	}
 	if requireHTTPS && u.Scheme != "https" {
 		return fmt.Errorf("production %s must use https", name)
 	}
 	return nil
+}
+
+// canonicalEndpointURL limits provider configuration to endpoint components
+// that are represented by the immutable configuration hash. Authentication,
+// routing parameters, and fragments must use typed configuration instead of
+// hiding additional semantics in a URL.
+func canonicalEndpointURL(u *url.URL) bool {
+	return u != nil && u.User == nil && u.Opaque == "" && !u.OmitHost &&
+		u.RawQuery == "" && !u.ForceQuery && u.Fragment == "" && u.RawFragment == ""
 }
 
 func (c Config) validateSecrets(lookup func(string) (string, bool)) error {
@@ -738,6 +767,21 @@ func (c Config) validateSecrets(lookup func(string) (string, bool)) error {
 			return fmt.Errorf("%s must contain a base64-encoded HMAC key", name)
 		}
 	}
+	if name := c.Gateway.Reconnect.HMACKeyEnv; name != "" {
+		value, ok := lookup(name)
+		if !ok {
+			return fmt.Errorf("required secret environment variable %q is not set", name)
+		}
+		err := secretbuf.WithDecodedBase64(value, func(key []byte) error {
+			if len(key) < 32 || len(key) > 4096 {
+				return errors.New("reconnect HMAC key length is invalid")
+			}
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("%s must contain a base64-encoded HMAC key", name)
+		}
+	}
 	if c.Features.ToolEncryptionKeyEnv != "" {
 		name := c.Features.ToolEncryptionKeyEnv
 		value, ok := lookup(name)
@@ -753,7 +797,7 @@ func (c Config) validateSecrets(lookup func(string) (string, bool)) error {
 }
 
 func (c Config) validateSecretReferences() error {
-	for _, name := range []string{c.Gateway.Voice.APIKeyEnv, c.Worker.Reasoner.APIKeyEnv, c.Store.DatabaseURLEnv, c.Auth.StaticBearerEnv, c.Safety.PrivacyHMACKeyEnv, c.Features.ToolEncryptionKeyEnv, c.Store.Retention.HMACKeyEnv} {
+	for _, name := range []string{c.Gateway.Voice.APIKeyEnv, c.Worker.Reasoner.APIKeyEnv, c.Store.DatabaseURLEnv, c.Auth.StaticBearerEnv, c.Safety.PrivacyHMACKeyEnv, c.Features.ToolEncryptionKeyEnv, c.Store.Retention.HMACKeyEnv, c.Gateway.Reconnect.HMACKeyEnv} {
 		if name != "" && !environmentName(name) {
 			return fmt.Errorf("secret environment variable name %q is invalid", name)
 		}

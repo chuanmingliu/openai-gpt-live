@@ -41,6 +41,16 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
+          fetch-depth: 0
+      - name: Event-aware whitespace gate
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          EVENT_HEAD_SHA: ${{ github.sha }}
+        run: |
+          ./deploy/scripts/check-event-diff.sh "$EVENT_NAME" "$PR_BASE_SHA" "$PUSH_BEFORE_SHA" "$EVENT_HEAD_SHA"
       - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32
         with:
           go-version: 1.26.0

@@ -104,6 +104,31 @@ the production binary fails closed if it is absent, and the PodMonitor preserves
 that exporter label with `honorLabels: true` so replica-local series do not
 collapse.
 
+## Protected candidate canary release edge
+
+The first phase of `manual-release-gate` cannot collect unsigned evidence until
+the `release-candidate-canary` protected environment approves and completes an
+explicit candidate deployment edge. That edge consumes the three immutable
+image digests, rendered production manifest and its SHA-256, exact config hash,
+commit, and reviewed region. The dedicated runner must provide
+`/usr/local/libexec/gpt-live/candidate-canary-edge`; both that executable and
+its containing directory are root-owned, are not symlinks, and are not writable
+by group or other users. The repository wrapper fails closed when any of those
+conditions or the external authority is unavailable.
+
+The platform authority owns deployment, observation, halt evaluation, and
+rollback. It observes for at least 1,800 seconds and halts on any readiness or
+synthetic failure, cross-session leak, queue overflow, or stale-output
+violation, as fixed by
+`deploy/release/candidate-canary-halt-policy-v1.json`. It must restore the prior
+state on success and failure. Only after rollback may it emit the canonical,
+content-free receipt and detached Ed25519 signature. The workflow verifies that
+signature with `RELEASE_CANARY_RECEIPT_PUBLIC_KEY_BASE64`, binds the public-key
+and halt-policy digests into the human-reviewed release inputs, and reverifies
+the receipt during collection, signed-evidence finalization, and promotion.
+Missing approval, runner authority, rollback confirmation, observation time,
+receipt, or signature prevents evidence collection and promotion.
+
 Gateway pods have 45 seconds and workers 135 seconds to terminate. The preStop
 hook invokes a fixed image helper, which reads no secret argument: the helper
 resolves `LIVE_ADMIN_BEARER_TOKEN` from its environment and sends it only

@@ -2,6 +2,7 @@ package handoff
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 
@@ -9,6 +10,27 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestReservedToolSchemasAreCompleteAndImmutable(t *testing.T) {
+	want := []string{ToolStartBackgroundTask, ToolSteerBackgroundTask, ToolCancelBackgroundTask}
+	first := ReservedToolSchemas()
+	require.Len(t, first, len(want))
+	for index, schema := range first {
+		assert.Equal(t, want[index], schema.Name)
+		assert.Equal(t, "function", schema.Type)
+		assert.NotEmpty(t, schema.Description)
+		var parameters map[string]any
+		require.NoError(t, json.Unmarshal(schema.Parameters, &parameters))
+		assert.Equal(t, false, parameters["additionalProperties"])
+		assert.Equal(t, "object", parameters["type"])
+	}
+
+	first[0].Name = "mutated"
+	first[1].Parameters[0] = '['
+	second := ReservedToolSchemas()
+	assert.True(t, slices.Equal(want, []string{second[0].Name, second[1].Name, second[2].Name}))
+	assert.True(t, json.Valid(second[1].Parameters))
+}
 
 func TestParseReservedTool_Valid(t *testing.T) {
 	tests := []struct {

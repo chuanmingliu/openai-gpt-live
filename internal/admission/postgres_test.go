@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/session"
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -140,6 +141,138 @@ func (countsRow) Scan(dest ...any) error {
 		*(value.(*int)) = 0
 	}
 	return nil
+}
+
+type heartbeatTestDB struct {
+	mu      sync.Mutex
+	results []scanRow
+	deletes int
+}
+
+func (*heartbeatTestDB) Ping(context.Context) error { return nil }
+func (*heartbeatTestDB) BeginTx(context.Context) (leaseTx, error) {
+	return nil, errors.New("unexpected transaction")
+}
+func (d *heartbeatTestDB) Exec(_ context.Context, sql string, _ ...any) error {
+	if !strings.HasPrefix(strings.TrimSpace(sql), "DELETE FROM session_admission_leases") {
+		return errors.New("unexpected statement")
+	}
+	d.mu.Lock()
+	d.deletes++
+	d.mu.Unlock()
+	return nil
+}
+func (d *heartbeatTestDB) QueryRow(context.Context, string, ...any) scanRow {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.results) == 0 {
+		return errorRow{err: errors.New("heartbeat outage")}
+	}
+	result := d.results[0]
+	d.results = d.results[1:]
+	return result
+}
+
+type errorRow struct{ err error }
+
+func (r errorRow) Scan(...any) error { return r.err }
+
+type heartbeatTimeRow struct{ expiresAt, databaseNow time.Time }
+
+func (r heartbeatTimeRow) Scan(dest ...any) error {
+	*(dest[0].(*time.Time)) = r.expiresAt
+	*(dest[1].(*time.Time)) = r.databaseNow
+	return nil
+}
+
+type delayedHeartbeatTimeRow struct {
+	heartbeatTimeRow
+	delay time.Duration
+}
+
+func (r delayedHeartbeatTimeRow) Scan(dest ...any) error {
+	time.Sleep(r.delay)
+	return r.heartbeatTimeRow.Scan(dest...)
+}
+
+func TestPostgresMonitoredHeartbeatFailsClosedAtConfirmedExpiryAndRecoversBriefOutage(t *testing.T) {
+	t.Run("uncertainty cancels by the last confirmed deadline", func(t *testing.T) {
+		db := &heartbeatTestDB{}
+		store, err := newPostgres(db, PostgresConfig{InstanceID: "store", LeaseDuration: 120 * time.Millisecond, HeartbeatInterval: 30 * time.Millisecond, OperationTimeout: 10 * time.Millisecond})
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, store.Close()) })
+		started := time.Now()
+		lease := store.maintain("lease", started.Add(120*time.Millisecond), started, started)
+		defer lease.Release()
+		require.Eventually(t, func() bool { return errors.Is(store.Ready(t.Context()), ErrUnavailable) }, 80*time.Millisecond, 5*time.Millisecond)
+		select {
+		case <-lease.Lost:
+		case <-time.After(150 * time.Millisecond):
+			t.Fatal("lease loss was not reported before the confirmed database lease could expire")
+		}
+	})
+
+	t.Run("one heartbeat outage is tolerated when authority recovers", func(t *testing.T) {
+		now := time.Now()
+		db := &heartbeatTestDB{results: []scanRow{
+			errorRow{err: errors.New("brief outage")},
+			heartbeatTimeRow{expiresAt: now.Add(240 * time.Millisecond), databaseNow: now.Add(120 * time.Millisecond)},
+			heartbeatTimeRow{expiresAt: now.Add(270 * time.Millisecond), databaseNow: now.Add(150 * time.Millisecond)},
+		}}
+		store, err := newPostgres(db, PostgresConfig{InstanceID: "store", LeaseDuration: 120 * time.Millisecond, HeartbeatInterval: 30 * time.Millisecond, OperationTimeout: 10 * time.Millisecond})
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, store.Close()) })
+		lease := store.maintain("lease", now.Add(120*time.Millisecond), now, now)
+		defer lease.Release()
+		require.Eventually(t, func() bool { return errors.Is(store.Ready(t.Context()), ErrUnavailable) }, 80*time.Millisecond, 5*time.Millisecond)
+		require.Eventually(t, func() bool { return store.Ready(t.Context()) == nil }, 80*time.Millisecond, 5*time.Millisecond)
+		select {
+		case <-lease.Lost:
+			t.Fatal("brief recovered outage must not revoke the lease")
+		case <-time.After(20 * time.Millisecond):
+		}
+	})
+
+	t.Run("zero updated rows is immediate definitive loss", func(t *testing.T) {
+		db := &heartbeatTestDB{results: []scanRow{errorRow{err: pgx.ErrNoRows}}}
+		store, err := newPostgres(db, PostgresConfig{InstanceID: "store", LeaseDuration: 120 * time.Millisecond, HeartbeatInterval: 30 * time.Millisecond, OperationTimeout: 10 * time.Millisecond})
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, store.Close()) })
+		started := time.Now()
+		lease := store.maintain("lease", started.Add(120*time.Millisecond), started, started)
+		defer lease.Release()
+		select {
+		case <-lease.Lost:
+		case <-time.After(70 * time.Millisecond):
+			t.Fatal("zero-row heartbeat did not revoke the lease immediately")
+		}
+	})
+
+	t.Run("a delayed success cannot extend authority during the following outage", func(t *testing.T) {
+		started := time.Now()
+		databaseNow := started.Add(100 * time.Millisecond)
+		db := &heartbeatTestDB{results: []scanRow{
+			delayedHeartbeatTimeRow{
+				heartbeatTimeRow: heartbeatTimeRow{expiresAt: databaseNow.Add(400 * time.Millisecond), databaseNow: databaseNow},
+				delay:            150 * time.Millisecond,
+			},
+		}}
+		store, err := newPostgres(db, PostgresConfig{
+			InstanceID: "store", LeaseDuration: 400 * time.Millisecond, HeartbeatInterval: 100 * time.Millisecond,
+			OperationTimeout: 250 * time.Millisecond,
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, store.Close()) })
+		lease := store.maintain("lease", started.Add(400*time.Millisecond), started, started)
+		defer lease.Release()
+		select {
+		case <-lease.Lost:
+			assert.Less(t, time.Since(started), 480*time.Millisecond,
+				"response latency must not be added to the last database-confirmed authority window")
+		case <-time.After(480 * time.Millisecond):
+			t.Fatal("delayed heartbeat response extended local authority past the conservative deadline")
+		}
+	})
 }
 
 func (d *blockingReconcileDB) Exec(ctx context.Context, sql string, args ...any) error {

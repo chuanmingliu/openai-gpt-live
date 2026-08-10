@@ -30,7 +30,10 @@ const testTimeout = 3 * time.Second
 
 type fixedIDs struct{}
 
-type e2eLeaseStore struct{ calls, releases atomic.Int32 }
+type e2eLeaseStore struct {
+	calls, releases atomic.Int32
+	lost            chan struct{}
+}
 
 type forgedOriginAdmission struct {
 	*admissionpkg.Controller
@@ -56,6 +59,17 @@ func (s *e2eLeaseStore) Acquire(context.Context, session.Subject, admissionpkg.L
 			s.releases.Add(1)
 		}
 	}, nil
+}
+
+func (s *e2eLeaseStore) AcquireMonitored(ctx context.Context, subject session.Subject, limits admissionpkg.Limits) (admissionpkg.MonitoredLease, error) {
+	release, err := s.Acquire(ctx, subject, limits)
+	if err != nil {
+		return admissionpkg.MonitoredLease{}, err
+	}
+	if s.lost == nil {
+		s.lost = make(chan struct{})
+	}
+	return admissionpkg.MonitoredLease{Release: release, Lost: s.lost}, nil
 }
 
 func (fixedIDs) NewSessionID() identity.SessionID           { return "session-test" }
@@ -149,6 +163,69 @@ func TestHandlerCapabilitiesAreExactAndDoNotUpgrade(t *testing.T) {
 	require.NoError(t, err)
 	require.JSONEq(t, string(want), recorder.Body.String())
 	require.Empty(t, recorder.Header().Get("Sec-WebSocket-Accept"))
+}
+
+func TestHandlerCapabilitiesReflectStaticHandoffFeature(t *testing.T) {
+	tests := []struct {
+		name       string
+		handoffs   bool
+		extensions []string
+	}{
+		{
+			name:     "disabled",
+			handoffs: false,
+			extensions: []string{
+				"live.session.degraded",
+				"live.session.resumed",
+				"live.tool.approval.required",
+			},
+		},
+		{
+			name:     "enabled",
+			handoffs: true,
+			extensions: []string{
+				"live.handoff.created",
+				"live.handoff.progress",
+				"live.handoff.needs_input",
+				"live.handoff.completed",
+				"live.handoff.failed",
+				"live.handoff.cancelled",
+				"live.session.degraded",
+				"live.session.resumed",
+				"live.tool.approval.required",
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handoffs := test.handoffs
+			handler, _, _ := testHandler(t, Options{HandoffsEnabled: &handoffs})
+			handoffs = !handoffs
+			recorder := httptest.NewRecorder()
+
+			handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/realtime/capabilities", nil))
+
+			require.Equal(t, http.StatusOK, recorder.Code)
+			var capabilities protocol.CapabilityDocument
+			require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &capabilities))
+			require.Equal(t, test.extensions, capabilities.Extensions)
+		})
+	}
+}
+
+func TestReconnectModeUsesOnlyAConstantNonSecretURLMarker(t *testing.T) {
+	reconnecting, err := reconnectMode("")
+	require.NoError(t, err)
+	require.False(t, reconnecting)
+	reconnecting, err = reconnectMode("model=public&reconnect=1")
+	require.NoError(t, err)
+	require.True(t, reconnecting)
+	for _, rawQuery := range []string{
+		"reconnect=", "reconnect=lrt1.payload.signature", "reconnect=1&reconnect=1", "reconnect=true", "reconnect=%zz",
+	} {
+		_, err = reconnectMode(rawQuery)
+		require.Error(t, err, rawQuery)
+	}
 }
 
 func TestHandlerRejectsWrongRoutesAndMethodsBeforeAdmission(t *testing.T) {
@@ -342,6 +419,25 @@ func TestRealAdmissionOriginPolicyAndWebSocketUpgradeAgree(t *testing.T) {
 	}
 }
 
+func TestMonitoredAdmissionLossClosesWebSocketBeforeLeaseRelease(t *testing.T) {
+	store := &e2eLeaseStore{lost: make(chan struct{})}
+	static := auth.NewStatic([]byte("development-token"), auth.Principal{TenantID: "tenant", UserID: "user", Scopes: map[string]struct{}{"realtime": {}}})
+	controller, err := admissionpkg.New(static, admissionpkg.Config{AllowEmptyOrigin: true, GlobalRate: 10, GlobalBurst: 10, IPRate: 10, IPBurst: 10, IPKeyTTL: time.Minute, MaxIPKeys: 10, RequiredScopes: []string{"realtime"}, Limits: admissionpkg.Limits{Global: 10, PerTenant: 10, PerUser: 10}}, store)
+	require.NoError(t, err)
+	server := httptest.NewServer(NewHandler(Options{WriteTimeout: 100 * time.Millisecond}, validManager(testkit.NewFakeConnector(2)), controller))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/v1/realtime", &websocket.DialOptions{HTTPHeader: http.Header{"Authorization": []string{"Bearer development-token"}}})
+	require.NoError(t, err)
+	require.Equal(t, "session.created", readServerType(t, conn))
+	close(store.lost)
+	_, _, err = conn.Read(ctx)
+	require.Error(t, err)
+	assert.Equal(t, websocket.StatusInternalError, websocket.CloseStatus(err))
+	require.Eventually(t, func() bool { return store.releases.Load() == 1 }, testTimeout, 5*time.Millisecond)
+}
+
 func TestCustomAdmissionCannotForgeOriginCapability(t *testing.T) {
 	// Embedding the real controller would promote any structural marker it
 	// implemented. Exact concrete-type recognition must still reject this fake.
@@ -478,11 +574,13 @@ func TestHandlerDoesNotTrustClientIdentityParameters(t *testing.T) {
 		admitted = session.Subject{TenantID: "trusted", UserID: "trusted-user", Scopes: map[string]struct{}{}, ExpiresAt: time.Now().Add(time.Minute)}
 		return admitted, nil, nil
 	})
-	server := httptest.NewServer(NewHandler(Options{MaxFrameBytes: 4096}, validManager(connector), admission))
+	server := httptest.NewServer(NewHandler(Options{
+		MaxFrameBytes: 4096, AdvertisedModel: "public-live-model", ProviderModel: "provider-voice-model",
+	}, validManager(connector), admission))
 	defer server.Close()
 	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
 	defer cancel()
-	url := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/realtime?tenant=attacker&user=attacker&model=test-model"
+	url := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/realtime?tenant=attacker&user=attacker&model=public-live-model"
 	conn, response, err := websocket.Dial(ctx, url, nil)
 	if response != nil && response.Body != nil {
 		defer response.Body.Close()
@@ -493,7 +591,58 @@ func TestHandlerDoesNotTrustClientIdentityParameters(t *testing.T) {
 	require.Equal(t, "session.created", readServerType(t, conn))
 	select {
 	case request := <-requests:
-		require.Equal(t, "test-model", request.Model)
+		require.Equal(t, "provider-voice-model", request.Model)
+	case <-time.After(testTimeout):
+		t.Fatal("connector did not receive open request")
+	}
+}
+
+func TestHandlerRejectsUnadvertisedOrAmbiguousPublicModelBeforeProviderOpen(t *testing.T) {
+	for name, query := range map[string]string{
+		"unadvertised": "?model=attacker-model",
+		"duplicate":    "?model=public-live-model&model=public-live-model",
+		"oversized":    "?model=" + strings.Repeat("x", 257),
+	} {
+		t.Run(name, func(t *testing.T) {
+			requests := make(chan realtime.OpenRequest, 1)
+			connector := &recordingConnector{delegate: testkit.NewFakeConnector(2), requests: requests}
+			handler := NewHandler(Options{
+				MaxFrameBytes: 4096, AdvertisedModel: "public-live-model", ProviderModel: "provider-voice-model",
+			}, validManager(connector), trustedAdmission(nil))
+			server := httptest.NewServer(handler)
+			defer server.Close()
+
+			ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+			defer cancel()
+			conn, response, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/v1/realtime"+query, nil)
+			if conn != nil {
+				conn.CloseNow()
+			}
+			require.Error(t, err)
+			require.NotNil(t, response)
+			require.Equal(t, http.StatusBadRequest, response.StatusCode)
+			select {
+			case request := <-requests:
+				t.Fatalf("provider opened with untrusted model %q", request.Model)
+			default:
+			}
+		})
+	}
+}
+
+func TestHandlerAbsentPublicModelUsesConfiguredProviderModel(t *testing.T) {
+	requests := make(chan realtime.OpenRequest, 1)
+	connector := &recordingConnector{delegate: testkit.NewFakeConnector(2), requests: requests}
+	server := httptest.NewServer(NewHandler(Options{
+		MaxFrameBytes: 4096, AdvertisedModel: "public-live-model", ProviderModel: "provider-voice-model",
+	}, validManager(connector), trustedAdmission(nil)))
+	defer server.Close()
+	client := dialRealtime(t, server)
+	defer client.CloseNow()
+	require.Equal(t, "session.created", readServerType(t, client))
+	select {
+	case request := <-requests:
+		require.Equal(t, "provider-voice-model", request.Model)
 	case <-time.After(testTimeout):
 		t.Fatal("connector did not receive open request")
 	}

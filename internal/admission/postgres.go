@@ -41,6 +41,7 @@ type Postgres struct {
 	reconcileDone   chan struct{}
 	reconcileMu     sync.Mutex
 	pending         map[leaseKey]reconcileEntry
+	uncertain       map[leaseKey]time.Time
 	pendingCap      int
 	reservations    int
 	state           postgresState
@@ -146,6 +147,7 @@ func newPostgres(pool leaseDB, cfg PostgresConfig) (*Postgres, error) {
 		reconcileWake:   make(chan struct{}, 1),
 		reconcileDone:   make(chan struct{}),
 		pending:         make(map[leaseKey]reconcileEntry),
+		uncertain:       make(map[leaseKey]time.Time),
 		acquireCtx:      acquireCtx,
 		acquireCancel:   acquireCancel,
 	}
@@ -177,7 +179,7 @@ func (p *Postgres) Ready(ctx context.Context) error {
 		return ErrUnavailable
 	}
 	p.reconcileMu.Lock()
-	unavailable := p.state != postgresOpen || len(p.pending) > 0 || (p.pendingCap > 0 && len(p.pending)+p.reservations >= p.pendingCap)
+	unavailable := p.state != postgresOpen || len(p.pending) > 0 || len(p.uncertain) > 0 || (p.pendingCap > 0 && len(p.pending)+p.reservations >= p.pendingCap)
 	p.reconcileMu.Unlock()
 	if unavailable {
 		return ErrUnavailable
@@ -188,24 +190,34 @@ func (p *Postgres) Ready(ctx context.Context) error {
 }
 
 func (p *Postgres) Acquire(ctx context.Context, subject session.Subject, limits Limits) (ReleaseFunc, error) {
+	lease, err := p.acquire(ctx, subject, limits)
+	return lease.Release, err
+}
+
+func (p *Postgres) AcquireMonitored(ctx context.Context, subject session.Subject, limits Limits) (MonitoredLease, error) {
+	return p.acquire(ctx, subject, limits)
+}
+
+func (p *Postgres) acquire(ctx context.Context, subject session.Subject, limits Limits) (MonitoredLease, error) {
 	if p == nil || p.pool == nil || !validID(subject.TenantID) || !validID(subject.UserID) || limits.Global <= 0 || limits.PerTenant <= 0 || limits.PerUser <= 0 {
-		return nil, ErrUnavailable
+		return MonitoredLease{}, ErrUnavailable
 	}
 	if !p.beginAcquire() {
-		return nil, ErrUnavailable
+		return MonitoredLease{}, ErrUnavailable
 	}
 	defer p.acquisitions.Done()
+	operationStarted := time.Now()
 	opCtx, cancel := context.WithTimeout(ctx, p.cfg.OperationTimeout)
 	stopClosing := context.AfterFunc(p.acquireCtx, cancel)
 	defer stopClosing()
 	defer cancel()
 	sessionID, err := RandomInstanceID()
 	if err != nil {
-		return nil, ErrUnavailable
+		return MonitoredLease{}, ErrUnavailable
 	}
 	tx, err := p.pool.BeginTx(opCtx)
 	if err != nil {
-		return nil, ErrUnavailable
+		return MonitoredLease{}, ErrUnavailable
 	}
 	committed := false
 	defer func() {
@@ -216,25 +228,25 @@ func (p *Postgres) Acquire(ctx context.Context, subject session.Subject, limits 
 		}
 	}()
 	if err = tx.Exec(opCtx, `SELECT pg_advisory_xact_lock(716773219507)`); err != nil {
-		return nil, ErrUnavailable
+		return MonitoredLease{}, ErrUnavailable
 	}
 	var databaseNow time.Time
 	if err = tx.QueryRow(opCtx, `SELECT clock_timestamp()`).Scan(&databaseNow); err != nil {
-		return nil, ErrUnavailable
+		return MonitoredLease{}, ErrUnavailable
 	}
 	if err = tx.Exec(opCtx, `DELETE FROM session_admission_leases WHERE expires_at <= $1`, databaseNow); err != nil {
-		return nil, ErrUnavailable
+		return MonitoredLease{}, ErrUnavailable
 	}
 	var global, tenant, user int
 	err = tx.QueryRow(opCtx, `SELECT count(*), count(*) FILTER (WHERE tenant_id=$1), count(*) FILTER (WHERE tenant_id=$1 AND user_id=$2) FROM session_admission_leases WHERE expires_at > $3`, subject.TenantID, subject.UserID, databaseNow).Scan(&global, &tenant, &user)
 	if err != nil {
-		return nil, ErrUnavailable
+		return MonitoredLease{}, ErrUnavailable
 	}
 	if global >= limits.Global || tenant >= limits.PerTenant || user >= limits.PerUser {
-		return nil, ErrLimited
+		return MonitoredLease{}, ErrLimited
 	}
 	if !p.reserveReconciliation(limits.Global) {
-		return nil, ErrUnavailable
+		return MonitoredLease{}, ErrUnavailable
 	}
 	reserved := true
 	defer func() {
@@ -244,57 +256,133 @@ func (p *Postgres) Acquire(ctx context.Context, subject session.Subject, limits 
 	}()
 	err = tx.Exec(opCtx, `INSERT INTO session_admission_leases(instance_id,session_id,tenant_id,user_id,expires_at,heartbeat_at) VALUES($1,$2,$3,$4,$5,$6)`, p.cfg.InstanceID, sessionID, subject.TenantID, subject.UserID, databaseNow.Add(p.cfg.LeaseDuration), databaseNow)
 	if err != nil {
-		return nil, ErrUnavailable
+		return MonitoredLease{}, ErrUnavailable
 	}
 	if err = tx.Commit(opCtx); err != nil {
 		p.retainAmbiguous(leaseKey{instanceID: p.cfg.InstanceID, sessionID: sessionID}, databaseNow.Add(p.cfg.LeaseDuration+p.cfg.OperationTimeout))
 		reserved = false
-		return nil, ErrUnavailable
+		return MonitoredLease{}, ErrUnavailable
 	}
 	committed = true
 	p.releaseReservation()
 	reserved = false
-	return p.maintain(sessionID), nil
+	return p.maintain(sessionID, databaseNow.Add(p.cfg.LeaseDuration), databaseNow, operationStarted), nil
 }
 
 func (p *Postgres) beginAcquire() bool {
 	p.reconcileMu.Lock()
 	defer p.reconcileMu.Unlock()
-	if p.state != postgresOpen || len(p.pending) > 0 {
+	if p.state != postgresOpen || len(p.pending) > 0 || len(p.uncertain) > 0 {
 		return false
 	}
 	p.acquisitions.Add(1)
 	return true
 }
 
-func (p *Postgres) maintain(sessionID string) ReleaseFunc {
+func (p *Postgres) maintain(sessionID string, confirmedExpiry, databaseNow, operationStarted time.Time) MonitoredLease {
+	key := leaseKey{instanceID: p.cfg.InstanceID, sessionID: sessionID}
 	stop := make(chan struct{})
 	done := make(chan struct{})
+	lost := make(chan struct{})
 	var once sync.Once
 	go func() {
 		defer close(done)
 		ticker := time.NewTicker(p.cfg.HeartbeatInterval)
 		defer ticker.Stop()
+		remaining := confirmedExpiry.Sub(databaseNow) - p.cfg.HeartbeatInterval
+		if remaining < 0 {
+			remaining = 0
+		}
+		lossDeadline := operationStarted.Add(remaining)
+		untilLoss := time.Until(lossDeadline)
+		if untilLoss < 0 {
+			untilLoss = 0
+		}
+		lossTimer := time.NewTimer(untilLoss)
+		defer lossTimer.Stop()
+		resetLossTimer := func() {
+			if !lossTimer.Stop() {
+				select {
+				case <-lossTimer.C:
+				default:
+				}
+			}
+			untilLoss := time.Until(lossDeadline)
+			if untilLoss < 0 {
+				untilLoss = 0
+			}
+			lossTimer.Reset(untilLoss)
+		}
 		for {
 			select {
 			case <-stop:
 				return
+			case <-lossTimer.C:
+				close(lost)
+				return
 			case <-ticker.C:
-				ctx, cancel := context.WithTimeout(context.Background(), p.cfg.OperationTimeout)
-				_ = p.pool.Exec(ctx, `WITH lease_clock AS (SELECT clock_timestamp() AS at) UPDATE session_admission_leases SET heartbeat_at=lease_clock.at, expires_at=lease_clock.at+$3::interval FROM lease_clock WHERE instance_id=$1 AND session_id=$2 AND expires_at>lease_clock.at`, p.cfg.InstanceID, sessionID, p.cfg.LeaseDuration.String())
+				heartbeatStarted := time.Now()
+				queryDeadline := heartbeatStarted.Add(p.cfg.OperationTimeout)
+				if lossDeadline.Before(queryDeadline) {
+					queryDeadline = lossDeadline
+				}
+				ctx, cancel := context.WithDeadline(context.Background(), queryDeadline)
+				var nextExpiry, databaseNow time.Time
+				err := p.pool.QueryRow(ctx, `WITH lease_clock AS (SELECT clock_timestamp() AS at), updated AS (
+					UPDATE session_admission_leases SET heartbeat_at=lease_clock.at, expires_at=lease_clock.at+$3::interval
+					FROM lease_clock WHERE instance_id=$1 AND session_id=$2 AND expires_at>lease_clock.at
+					RETURNING expires_at
+				) SELECT updated.expires_at, lease_clock.at FROM updated CROSS JOIN lease_clock`,
+					p.cfg.InstanceID, sessionID, p.cfg.LeaseDuration.String()).Scan(&nextExpiry, &databaseNow)
 				cancel()
+				if err == nil {
+					confirmedExpiry = nextExpiry
+					remaining := nextExpiry.Sub(databaseNow) - p.cfg.HeartbeatInterval
+					if remaining < 0 {
+						remaining = 0
+					}
+					lossDeadline = heartbeatStarted.Add(remaining)
+					if !time.Now().Before(lossDeadline) {
+						p.markHeartbeatUncertain(key, confirmedExpiry)
+						close(lost)
+						return
+					}
+					p.clearHeartbeatUncertainty(key)
+					resetLossTimer()
+					continue
+				}
+				if errors.Is(err, pgx.ErrNoRows) {
+					p.clearHeartbeatUncertainty(key)
+					close(lost)
+					return
+				}
+				p.markHeartbeatUncertain(key, confirmedExpiry)
 			}
 		}
 	}()
-	return func() {
+	release := func() {
 		once.Do(func() {
 			close(stop)
 			<-done
 			ctx, cancel := context.WithTimeout(context.Background(), p.cfg.OperationTimeout)
 			defer cancel()
 			_ = p.pool.Exec(ctx, `DELETE FROM session_admission_leases WHERE instance_id=$1 AND session_id=$2`, p.cfg.InstanceID, sessionID)
+			p.clearHeartbeatUncertainty(key)
 		})
 	}
+	return MonitoredLease{Release: release, Lost: lost}
+}
+
+func (p *Postgres) markHeartbeatUncertain(key leaseKey, confirmedExpiry time.Time) {
+	p.reconcileMu.Lock()
+	p.uncertain[key] = confirmedExpiry
+	p.reconcileMu.Unlock()
+}
+
+func (p *Postgres) clearHeartbeatUncertainty(key leaseKey) {
+	p.reconcileMu.Lock()
+	delete(p.uncertain, key)
+	p.reconcileMu.Unlock()
 }
 
 func (p *Postgres) reserveReconciliation(globalLimit int) bool {

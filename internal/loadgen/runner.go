@@ -1302,3 +1302,14 @@ func LoadPinnedProfile(path string) (HostProfile, error) {
 	}
 	return profile, nil
 }
+
+func VerifyPinnedHost(path string) error {
+	profile, err := LoadPinnedProfile(path)
+	if err != nil {
+		return errors.New("pinned runner preflight failed")
+	}
+	if !DetectHostProfile().ExactMatch(profile) {
+		return errors.New("pinned runner preflight failed")
+	}
+	return nil
+}

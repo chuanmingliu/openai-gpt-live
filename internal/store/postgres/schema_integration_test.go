@@ -37,7 +37,12 @@ var requiredColumns = map[string]map[string]string{
 		"work_key": "text", "kind": "text", "tenant_id": "text", "user_id": "text", "conversation_id": "text",
 		"session_id": "text", "delivery_affinity": "text", "incarnation": "bigint", "local_sequence": "bigint", "payload": "json",
 		"payload_hash": "text", "storage_sequence": "bigint", "delivered": "boolean", "claim_owner": "text",
-		"claim_until": "timestamp with time zone", "claim_generation": "bigint", "created_at": "timestamp with time zone", "delivered_at": "timestamp with time zone",
+		"claim_until": "timestamp with time zone", "claim_generation": "bigint", "claim_affinity_generation": "bigint",
+		"created_at": "timestamp with time zone", "delivered_at": "timestamp with time zone",
+	},
+	"coordinator_delivery_shards": {
+		"delivery_affinity": "text", "lease_owner": "text", "lease_until": "timestamp with time zone",
+		"lease_generation": "bigint", "created_at": "timestamp with time zone", "updated_at": "timestamp with time zone",
 	},
 	"handoffs": {
 		"tenant_id": "text", "conversation_id": "text", "id": "text", "user_id": "text", "session_id": "text",
@@ -76,6 +81,15 @@ var requiredColumns = map[string]map[string]string{
 		"instance_id": "text", "session_id": "text", "tenant_id": "text", "user_id": "text",
 		"expires_at": "timestamp with time zone", "heartbeat_at": "timestamp with time zone", "created_at": "timestamp with time zone",
 	},
+	"session_reconnect_owners": {
+		"session_id": "text", "tenant_id": "text", "user_id": "text", "conversation_id": "text",
+		"incarnation": "numeric", "event_cursor": "bigint", "provider_model": "text", "response_epoch": "numeric",
+		"credential_id": "text", "owner_id": "text", "owner_state": "text", "turn_boundary": "boolean",
+		"expires_at": "timestamp with time zone", "subject_expires_at": "timestamp with time zone",
+		"previous_credential_id": "text", "previous_incarnation": "numeric", "previous_event_cursor": "bigint", "previous_expires_at": "timestamp with time zone",
+		"previous_accept_until": "timestamp with time zone", "owner_lease_expires_at": "timestamp with time zone", "ephemeral": "boolean",
+		"created_at": "timestamp with time zone", "updated_at": "timestamp with time zone",
+	},
 	"deletion_audits": {
 		"audit_id": "text", "tenant_id": "text", "conversation_hash": "text", "actor": "text",
 		"reason_code": "text", "deleted_at": "timestamp with time zone",
@@ -100,6 +114,8 @@ var requiredDefaults = map[string]string{
 	"coordinator_work_journal.delivered":        `false`,
 	"coordinator_work_journal.claim_generation": `0`,
 	"coordinator_work_journal.created_at":       `CURRENT_TIMESTAMP`,
+	"coordinator_delivery_shards.created_at":    `CURRENT_TIMESTAMP`,
+	"coordinator_delivery_shards.updated_at":    `CURRENT_TIMESTAMP`,
 	"handoffs.priority":                         `0`,
 	"handoffs.tool_allowlist":                   `'[]'::json`,
 	"handoffs.presentation_hint":                `''::text`,
@@ -126,6 +142,10 @@ var requiredDefaults = map[string]string{
 	"delivery_cursors.created_at":               `CURRENT_TIMESTAMP`,
 	"delivery_cursors.updated_at":               `CURRENT_TIMESTAMP`,
 	"session_admission_leases.created_at":       `CURRENT_TIMESTAMP`,
+	"session_reconnect_owners.turn_boundary":    `false`,
+	"session_reconnect_owners.ephemeral":        `false`,
+	"session_reconnect_owners.created_at":       `CURRENT_TIMESTAMP`,
+	"session_reconnect_owners.updated_at":       `CURRENT_TIMESTAMP`,
 	"deletion_audits.deleted_at":                `CURRENT_TIMESTAMP`,
 	"runtime_feature_authority.singleton":       `true`,
 	"runtime_feature_authority.updated_at":      `CURRENT_TIMESTAMP`,
@@ -148,6 +168,9 @@ var requiredNamedConstraintNames = strings.Fields(`
 	coordinator_work_journal_payload_depth_check
 	coordinator_work_journal_storage_sequence_check coordinator_work_journal_delivery_check coordinator_work_journal_claim_check
 	coordinator_work_journal_claim_owner_size coordinator_work_journal_claim_generation_check
+	coordinator_work_journal_claim_affinity_generation_check
+	coordinator_delivery_shards_affinity_size_check coordinator_delivery_shards_owner_size_check
+	coordinator_delivery_shards_generation_check coordinator_delivery_shards_timestamps_check
 	handoffs_tenant_idempotency_uniq handoffs_tenant_id_size_check handoffs_conversation_id_size_check
 	handoffs_id_size_check handoffs_user_id_size_check handoffs_session_id_size_check
 	handoffs_source_turn_id_size_check handoffs_source_turn_revision_check handoffs_user_request_size_check
@@ -175,6 +198,8 @@ var requiredNamedConstraintNames = strings.Fields(`
 	session_admission_leases_instance_id_size_check session_admission_leases_session_id_size_check
 	session_admission_leases_tenant_id_size_check session_admission_leases_user_id_size_check
 	session_admission_leases_timestamps_check deletion_audits_audit_id_size_check deletion_audits_tenant_id_size_check
+	session_reconnect_owners_identifiers_check session_reconnect_owners_counters_check
+	session_reconnect_owners_state_check session_reconnect_owners_times_check session_reconnect_owners_previous_check
 	deletion_audits_conversation_hash_size_check deletion_audits_actor_size_check deletion_audits_reason_code_size_check
 	runtime_feature_authority_singleton_check runtime_feature_authority_version_check
 	runtime_feature_flags_name_check runtime_feature_flags_version_check
@@ -194,7 +219,7 @@ func TestSchemaMigrationLifecycle(t *testing.T) {
 
 	version, dirty, err := migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
-	assert.Equal(t, uint(5), version)
+	assert.Equal(t, uint(7), version)
 	assert.False(t, dirty)
 	var journalPresent bool
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
@@ -216,6 +241,20 @@ func TestSchemaMigrationLifecycle(t *testing.T) {
 	}
 	require.NoError(t, migrations.Down(t.Context(), pool))
 	require.NoError(t, migrations.Up(t.Context(), pool))
+	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
+	version, dirty, err = migrations.Version(t.Context(), pool)
+	require.NoError(t, err)
+	assert.Equal(t, uint(6), version)
+	assert.False(t, dirty)
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
+	assert.True(t, journalPresent)
+	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
+	version, dirty, err = migrations.Version(t.Context(), pool)
+	require.NoError(t, err)
+	assert.Equal(t, uint(5), version)
+	assert.False(t, dirty)
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
+	assert.True(t, journalPresent)
 	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
 	version, dirty, err = migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
@@ -244,7 +283,7 @@ func TestSchemaMigrationLifecycle(t *testing.T) {
 	assert.False(t, dirty)
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
 	assert.False(t, journalPresent)
-	require.NoError(t, migrations.Steps(t.Context(), pool, 4))
+	require.NoError(t, migrations.Steps(t.Context(), pool, 6))
 	require.NoError(t, migrations.Steps(t.Context(), pool, 0))
 	require.NoError(t, migrations.Check(t.Context(), pool))
 }
@@ -742,132 +781,141 @@ func TestSchemaEveryNamedCheckRejectsInvalidMutation(t *testing.T) {
 	) VALUES ('check-work','handoff','tenant-c','user','conversation-c','session-c','app-c',
 		1,1,$1::json,$2,NULL)`, coordinatorPayload, hex.EncodeToString(coordinatorHash[:]))
 	require.NoError(t, err)
+	_, err = pool.Exec(t.Context(), `INSERT INTO coordinator_delivery_shards
+		(delivery_affinity,lease_owner,lease_until,lease_generation)
+		VALUES ('app-c','worker-c',CURRENT_TIMESTAMP+interval '1 minute',1)`)
+	require.NoError(t, err)
 
 	mutations := map[string]string{
-		"conversations_tenant_id_size_check":              `UPDATE conversations SET tenant_id='' WHERE tenant_id='tenant-free'`,
-		"conversations_id_size_check":                     `UPDATE conversations SET id='' WHERE tenant_id='tenant-free'`,
-		"conversations_user_id_size_check":                `UPDATE conversations SET user_id='' WHERE tenant_id='tenant-free'`,
-		"conversations_status_check":                      `UPDATE conversations SET status='unknown' WHERE tenant_id='tenant-free'`,
-		"conversations_retention_check":                   `UPDATE conversations SET retention_until=created_at-interval '1 second' WHERE tenant_id='tenant-free'`,
-		"conversations_timestamps_check":                  `UPDATE conversations SET updated_at=created_at-interval '1 second' WHERE tenant_id='tenant-free'`,
-		"conversations_deletion_actor_size_check":         `UPDATE conversations SET deletion_actor='',deletion_reason_code='reason',deletion_requested_at=CURRENT_TIMESTAMP WHERE tenant_id='tenant-free'`,
-		"conversations_deletion_reason_size_check":        `UPDATE conversations SET deletion_actor='actor',deletion_reason_code='',deletion_requested_at=CURRENT_TIMESTAMP WHERE tenant_id='tenant-free'`,
-		"conversations_deletion_tuple_check":              `UPDATE conversations SET deletion_actor='actor' WHERE tenant_id='tenant-free'`,
-		"conversation_items_tenant_id_size_check":         `UPDATE conversation_items SET tenant_id='' WHERE session_id='session-c'`,
-		"conversation_items_conversation_id_size_check":   `UPDATE conversation_items SET conversation_id='' WHERE session_id='session-c'`,
-		"conversation_items_session_id_size_check":        `UPDATE conversation_items SET session_id='' WHERE session_id='session-c'`,
-		"conversation_items_turn_id_size_check":           `UPDATE conversation_items SET turn_id='' WHERE session_id='session-c'`,
-		"conversation_items_turn_revision_check":          `UPDATE conversation_items SET turn_revision=-1 WHERE session_id='session-c'`,
-		"conversation_items_sequence_check":               `UPDATE conversation_items SET sequence=-1 WHERE session_id='session-c'`,
-		"conversation_items_role_check":                   `UPDATE conversation_items SET role='unknown' WHERE session_id='session-c'`,
-		"conversation_items_content_size_check":           `UPDATE conversation_items SET content='' WHERE session_id='session-c'`,
-		"conversation_items_content_hash_size_check":      `UPDATE conversation_items SET content_hash='' WHERE session_id='session-c'`,
-		"conversation_items_timestamps_check":             `UPDATE conversation_items SET updated_at=created_at-interval '1 second' WHERE session_id='session-c'`,
-		"coordinator_work_journal_kind_check":             `UPDATE coordinator_work_journal SET kind='unknown' WHERE work_key='check-work'`,
-		"coordinator_work_journal_work_key_size":          `UPDATE coordinator_work_journal SET work_key='' WHERE work_key='check-work'`,
-		"coordinator_work_journal_identity_size":          `UPDATE coordinator_work_journal SET delivery_affinity='' WHERE work_key='check-work'`,
-		"coordinator_work_journal_incarnation_check":      `UPDATE coordinator_work_journal SET incarnation=0 WHERE work_key='check-work'`,
-		"coordinator_work_journal_local_sequence_check":   `UPDATE coordinator_work_journal SET local_sequence=-1 WHERE work_key='check-work'`,
-		"coordinator_work_journal_payload_size":           `UPDATE coordinator_work_journal SET payload=to_json(repeat('x',262145)) WHERE work_key='check-work'`,
-		"coordinator_work_journal_payload_depth_check":    `UPDATE coordinator_work_journal SET payload=(repeat('[',65)||repeat(']',65))::json WHERE work_key='check-work'`,
-		"coordinator_work_journal_payload_hash_size":      `UPDATE coordinator_work_journal SET payload_hash='' WHERE work_key='check-work'`,
-		"coordinator_work_journal_storage_sequence_check": `UPDATE coordinator_work_journal SET storage_sequence=1 WHERE work_key='check-work'`,
-		"coordinator_work_journal_delivery_check":         `UPDATE coordinator_work_journal SET delivered=true WHERE work_key='check-work'`,
-		"coordinator_work_journal_claim_check":            `UPDATE coordinator_work_journal SET claim_owner='worker' WHERE work_key='check-work'`,
-		"coordinator_work_journal_claim_owner_size":       `UPDATE coordinator_work_journal SET claim_owner='',claim_until=CURRENT_TIMESTAMP WHERE work_key='check-work'`,
-		"coordinator_work_journal_claim_generation_check": `UPDATE coordinator_work_journal SET claim_generation=-1 WHERE work_key='check-work'`,
-		"handoffs_tenant_id_size_check":                   `UPDATE handoffs SET tenant_id='' WHERE id='handoff-c'`,
-		"handoffs_conversation_id_size_check":             `UPDATE handoffs SET conversation_id='' WHERE id='handoff-c'`,
-		"handoffs_id_size_check":                          `UPDATE handoffs SET id='' WHERE id='handoff-c'`,
-		"handoffs_user_id_size_check":                     `UPDATE handoffs SET user_id='' WHERE id='handoff-c'`,
-		"handoffs_session_id_size_check":                  `UPDATE handoffs SET session_id='' WHERE id='handoff-c'`,
-		"handoffs_source_turn_id_size_check":              `UPDATE handoffs SET source_turn_id='' WHERE id='handoff-c'`,
-		"handoffs_source_turn_revision_check":             `UPDATE handoffs SET source_turn_revision=0 WHERE id='handoff-c'`,
-		"handoffs_user_request_size_check":                `UPDATE handoffs SET user_request='' WHERE id='handoff-c'`,
-		"handoffs_objective_size_check":                   `UPDATE handoffs SET objective='' WHERE id='handoff-c'`,
-		"handoffs_context_ref_size_check":                 `UPDATE handoffs SET context_ref='' WHERE id='handoff-c'`,
-		"handoffs_context_hash_size_check":                `UPDATE handoffs SET context_hash='' WHERE id='handoff-c'`,
-		"handoffs_deadline_check":                         `UPDATE handoffs SET deadline=created_at WHERE id='handoff-c'`,
-		"handoffs_token_budget_check":                     `UPDATE handoffs SET token_budget=0 WHERE id='handoff-c'`,
-		"handoffs_priority_check":                         `UPDATE handoffs SET priority=1001 WHERE id='handoff-c'`,
-		"handoffs_tool_allowlist_check":                   `UPDATE handoffs SET tool_allowlist='[1]' WHERE id='handoff-c'`,
-		"handoffs_approval_policy_check":                  `UPDATE handoffs SET approval_policy=to_json(repeat('x',65535)) WHERE id='handoff-c'`,
-		"handoffs_model_version_size_check":               `UPDATE handoffs SET model_version='' WHERE id='handoff-c'`,
-		"handoffs_prompt_version_size_check":              `UPDATE handoffs SET prompt_version='' WHERE id='handoff-c'`,
-		"handoffs_tool_registry_version_size_check":       `UPDATE handoffs SET tool_registry_version='' WHERE id='handoff-c'`,
-		"handoffs_config_version_size_check":              `UPDATE handoffs SET config_version='' WHERE id='handoff-c'`,
-		"handoffs_presentation_hint_size_check":           `UPDATE handoffs SET presentation_hint=repeat('x',2049) WHERE id='handoff-c'`,
-		"handoffs_idempotency_key_size_check":             `UPDATE handoffs SET idempotency_key='' WHERE id='handoff-c'`,
-		"handoffs_request_hash_size_check":                `UPDATE handoffs SET request_hash='' WHERE id='handoff-c'`,
-		"handoffs_state_check":                            `UPDATE handoffs SET state='unknown' WHERE id='handoff-c'`,
-		"handoffs_revision_check":                         `UPDATE handoffs SET objective_revision=-1 WHERE id='handoff-c'`,
-		"handoffs_input_check":                            `UPDATE handoffs SET input_revision=1,input=NULL WHERE id='handoff-c'`,
-		"handoffs_ready_at_check":                         `UPDATE handoffs SET ready_at=created_at-interval '1 second' WHERE id='handoff-c'`,
-		"handoffs_attempt_check":                          `UPDATE handoffs SET attempt=-1 WHERE id='handoff-c'`,
-		"handoffs_lease_tuple_check":                      `UPDATE handoffs SET lease_owner='worker' WHERE id='handoff-c'`,
-		"handoffs_lease_owner_size_check":                 `UPDATE handoffs SET lease_owner='',lease_expires_at=CURRENT_TIMESTAMP WHERE id='handoff-c'`,
-		"handoffs_cancel_tuple_check":                     `UPDATE handoffs SET cancel_actor='actor' WHERE id='handoff-c'`,
-		"handoffs_cancel_actor_size_check":                `UPDATE handoffs SET cancel_requested_at=CURRENT_TIMESTAMP,cancel_actor='' WHERE id='handoff-c'`,
-		"handoffs_cancel_reason_size_check":               `UPDATE handoffs SET cancel_requested_at=CURRENT_TIMESTAMP,cancel_actor='actor',cancel_reason=repeat('x',2049) WHERE id='handoff-c'`,
-		"handoffs_terminal_mutation_id_size_check":        `UPDATE handoffs SET terminal_mutation_id='' WHERE id='handoff-success'`,
-		"handoffs_result_summary_size_check":              `UPDATE handoffs SET result_summary='' WHERE id='handoff-success'`,
-		"handoffs_structured_result_check":                `UPDATE handoffs SET structured_result=to_json(repeat('x',65535)) WHERE id='handoff-success'`,
-		"handoffs_failure_code_size_check":                `UPDATE handoffs SET failure_code='' WHERE id='handoff-failed'`,
-		"handoffs_failure_message_size_check":             `UPDATE handoffs SET failure_message='' WHERE id='handoff-failed'`,
-		"handoffs_safety_decision_check":                  `UPDATE handoffs SET safety_decision='[]' WHERE id='handoff-c'`,
-		"handoffs_usage_check":                            `UPDATE handoffs SET usage=to_json(repeat('x',65535)) WHERE id='handoff-success'`,
-		"handoffs_terminal_fields_check":                  `UPDATE handoffs SET terminal_at=CURRENT_TIMESTAMP WHERE id='handoff-c'`,
-		"handoffs_timestamps_check":                       `UPDATE handoffs SET updated_at=created_at-interval '1 second' WHERE id='handoff-c'`,
-		"handoff_events_event_id_size_check":              `UPDATE handoff_events SET event_id='' WHERE event_id='event-c'`,
-		"handoff_events_kind_size_check":                  `UPDATE handoff_events SET kind='' WHERE event_id='event-c'`,
-		"handoff_events_state_check":                      `UPDATE handoff_events SET state='unknown' WHERE event_id='event-c'`,
-		"handoff_events_attempt_check":                    `UPDATE handoff_events SET attempt=-1 WHERE event_id='event-c'`,
-		"handoff_events_payload_check":                    `UPDATE handoff_events SET payload='[]' WHERE event_id='event-c'`,
-		"outbox_topic_size_check":                         `UPDATE outbox SET topic='' WHERE event_seq=` + fmt.Sprint(sequence),
-		"outbox_aggregate_id_size_check":                  `UPDATE outbox SET aggregate_id='' WHERE event_seq=` + fmt.Sprint(sequence),
-		"outbox_event_seq_check":                          `UPDATE outbox SET event_seq=-1 WHERE event_seq=` + fmt.Sprint(sequence),
-		"outbox_payload_check":                            `UPDATE outbox SET payload=json_build_object('tenant_id',repeat('x',8192)) WHERE event_seq=` + fmt.Sprint(sequence),
-		"outbox_payload_keys_check":                       `UPDATE outbox SET payload='{"secret":"x"}' WHERE event_seq=` + fmt.Sprint(sequence),
-		"outbox_attempts_check":                           `UPDATE outbox SET attempts=-1 WHERE event_seq=` + fmt.Sprint(sequence),
-		"outbox_last_error_size_check":                    `UPDATE outbox SET last_error=repeat('x',2049) WHERE event_seq=` + fmt.Sprint(sequence),
-		"outbox_timestamps_check":                         `UPDATE outbox SET published_at=created_at-interval '1 second' WHERE event_seq=` + fmt.Sprint(sequence),
-		"tool_invocations_invocation_id_size_check":       `UPDATE tool_invocations SET invocation_id='' WHERE invocation_id='invocation-c'`,
-		"tool_invocations_attempt_check":                  `UPDATE tool_invocations SET attempt=-1 WHERE invocation_id='invocation-c'`,
-		"tool_invocations_objective_revision_check":       `UPDATE tool_invocations SET objective_revision=-1 WHERE invocation_id='invocation-c'`,
-		"tool_invocations_tool_ordinal_check":             `UPDATE tool_invocations SET tool_ordinal=-1 WHERE invocation_id='invocation-c'`,
-		"tool_invocations_tool_name_size_check":           `UPDATE tool_invocations SET tool_name='' WHERE invocation_id='invocation-c'`,
-		"tool_invocations_approval_state_check":           `UPDATE tool_invocations SET approval_state='unknown' WHERE invocation_id='invocation-c'`,
-		"tool_invocations_idempotency_key_size_check":     `UPDATE tool_invocations SET idempotency_key='' WHERE invocation_id='invocation-c'`,
-		"tool_invocations_arguments_hash_size_check":      `UPDATE tool_invocations SET canonical_arguments_hash='' WHERE invocation_id='invocation-c'`,
-		"tool_invocations_ciphertext_check":               `UPDATE tool_invocations SET arguments_ciphertext=decode(repeat('00',15),'hex') WHERE invocation_id='invocation-c'`,
-		"tool_invocations_nonce_check":                    `UPDATE tool_invocations SET arguments_nonce=decode(repeat('00',11),'hex') WHERE invocation_id='invocation-c'`,
-		"tool_invocations_key_id_size_check":              `UPDATE tool_invocations SET arguments_key_id='' WHERE invocation_id='invocation-c'`,
-		"tool_invocations_result_metadata_check":          `UPDATE tool_invocations SET result_metadata='[]' WHERE invocation_id='invocation-c'`,
-		"tool_invocations_result_check":                   `UPDATE tool_invocations SET result=to_json(repeat('x',65535)) WHERE invocation_id='invocation-c'`,
-		"tool_invocations_mutation_id_size_check":         `UPDATE tool_invocations SET mutation_id='' WHERE invocation_id='invocation-c'`,
-		"tool_invocations_status_check":                   `UPDATE tool_invocations SET status='unknown' WHERE invocation_id='invocation-c'`,
-		"tool_invocations_timestamps_check":               `UPDATE tool_invocations SET updated_at=created_at-interval '1 second' WHERE invocation_id='invocation-c'`,
-		"delivery_cursors_consumer_id_size_check":         `UPDATE delivery_cursors SET consumer_id='' WHERE consumer_id='consumer-c'`,
-		"delivery_cursors_sequence_check":                 `UPDATE delivery_cursors SET last_sequence=-1 WHERE consumer_id='consumer-c'`,
-		"delivery_cursors_timestamps_check":               `UPDATE delivery_cursors SET updated_at=created_at-interval '1 second' WHERE consumer_id='consumer-c'`,
-		"session_admission_leases_instance_id_size_check": `UPDATE session_admission_leases SET instance_id='' WHERE instance_id='instance-c'`,
-		"session_admission_leases_session_id_size_check":  `UPDATE session_admission_leases SET session_id='' WHERE instance_id='instance-c'`,
-		"session_admission_leases_tenant_id_size_check":   `UPDATE session_admission_leases SET tenant_id='' WHERE instance_id='instance-c'`,
-		"session_admission_leases_user_id_size_check":     `UPDATE session_admission_leases SET user_id='' WHERE instance_id='instance-c'`,
-		"session_admission_leases_timestamps_check":       `UPDATE session_admission_leases SET heartbeat_at=created_at-interval '1 second' WHERE instance_id='instance-c'`,
-		"deletion_audits_audit_id_size_check":             `UPDATE deletion_audits SET audit_id='' WHERE audit_id='audit-c'`,
-		"deletion_audits_tenant_id_size_check":            `UPDATE deletion_audits SET tenant_id='' WHERE audit_id='audit-c'`,
-		"deletion_audits_conversation_hash_size_check":    `UPDATE deletion_audits SET conversation_hash='' WHERE audit_id='audit-c'`,
-		"deletion_audits_actor_size_check":                `UPDATE deletion_audits SET actor='' WHERE audit_id='audit-c'`,
-		"deletion_audits_reason_code_size_check":          `UPDATE deletion_audits SET reason_code='' WHERE audit_id='audit-c'`,
-		"runtime_feature_authority_singleton_check":       `INSERT INTO runtime_feature_authority(singleton,version) VALUES(false,1)`,
-		"runtime_feature_authority_version_check":         `UPDATE runtime_feature_authority SET version=0 WHERE singleton=true`,
-		"runtime_feature_flags_name_check":                `INSERT INTO runtime_feature_flags(name,enabled,version) VALUES('unknown',false,1)`,
-		"runtime_feature_flags_version_check":             `UPDATE runtime_feature_flags SET version=0 WHERE name='shadow_mode'`,
-		"runtime_feature_audit_name_check":                `INSERT INTO runtime_feature_audit(version,name,enabled,actor,reason) VALUES(2,'unknown',false,'actor','reason')`,
-		"runtime_feature_audit_actor_size_check":          `INSERT INTO runtime_feature_audit(version,name,enabled,actor,reason) VALUES(2,'handoffs_enabled',false,'','reason')`,
-		"runtime_feature_audit_reason_size_check":         `INSERT INTO runtime_feature_audit(version,name,enabled,actor,reason) VALUES(2,'handoffs_enabled',false,'actor','')`,
-		"runtime_feature_audit_version_check":             `INSERT INTO runtime_feature_audit(version,name,enabled,actor,reason) VALUES(1,'handoffs_enabled',false,'actor','reason')`,
+		"conversations_tenant_id_size_check":                       `UPDATE conversations SET tenant_id='' WHERE tenant_id='tenant-free'`,
+		"conversations_id_size_check":                              `UPDATE conversations SET id='' WHERE tenant_id='tenant-free'`,
+		"conversations_user_id_size_check":                         `UPDATE conversations SET user_id='' WHERE tenant_id='tenant-free'`,
+		"conversations_status_check":                               `UPDATE conversations SET status='unknown' WHERE tenant_id='tenant-free'`,
+		"conversations_retention_check":                            `UPDATE conversations SET retention_until=created_at-interval '1 second' WHERE tenant_id='tenant-free'`,
+		"conversations_timestamps_check":                           `UPDATE conversations SET updated_at=created_at-interval '1 second' WHERE tenant_id='tenant-free'`,
+		"conversations_deletion_actor_size_check":                  `UPDATE conversations SET deletion_actor='',deletion_reason_code='reason',deletion_requested_at=CURRENT_TIMESTAMP WHERE tenant_id='tenant-free'`,
+		"conversations_deletion_reason_size_check":                 `UPDATE conversations SET deletion_actor='actor',deletion_reason_code='',deletion_requested_at=CURRENT_TIMESTAMP WHERE tenant_id='tenant-free'`,
+		"conversations_deletion_tuple_check":                       `UPDATE conversations SET deletion_actor='actor' WHERE tenant_id='tenant-free'`,
+		"conversation_items_tenant_id_size_check":                  `UPDATE conversation_items SET tenant_id='' WHERE session_id='session-c'`,
+		"conversation_items_conversation_id_size_check":            `UPDATE conversation_items SET conversation_id='' WHERE session_id='session-c'`,
+		"conversation_items_session_id_size_check":                 `UPDATE conversation_items SET session_id='' WHERE session_id='session-c'`,
+		"conversation_items_turn_id_size_check":                    `UPDATE conversation_items SET turn_id='' WHERE session_id='session-c'`,
+		"conversation_items_turn_revision_check":                   `UPDATE conversation_items SET turn_revision=-1 WHERE session_id='session-c'`,
+		"conversation_items_sequence_check":                        `UPDATE conversation_items SET sequence=-1 WHERE session_id='session-c'`,
+		"conversation_items_role_check":                            `UPDATE conversation_items SET role='unknown' WHERE session_id='session-c'`,
+		"conversation_items_content_size_check":                    `UPDATE conversation_items SET content='' WHERE session_id='session-c'`,
+		"conversation_items_content_hash_size_check":               `UPDATE conversation_items SET content_hash='' WHERE session_id='session-c'`,
+		"conversation_items_timestamps_check":                      `UPDATE conversation_items SET updated_at=created_at-interval '1 second' WHERE session_id='session-c'`,
+		"coordinator_work_journal_kind_check":                      `UPDATE coordinator_work_journal SET kind='unknown' WHERE work_key='check-work'`,
+		"coordinator_work_journal_work_key_size":                   `UPDATE coordinator_work_journal SET work_key='' WHERE work_key='check-work'`,
+		"coordinator_work_journal_identity_size":                   `UPDATE coordinator_work_journal SET delivery_affinity='' WHERE work_key='check-work'`,
+		"coordinator_work_journal_incarnation_check":               `UPDATE coordinator_work_journal SET incarnation=0 WHERE work_key='check-work'`,
+		"coordinator_work_journal_local_sequence_check":            `UPDATE coordinator_work_journal SET local_sequence=-1 WHERE work_key='check-work'`,
+		"coordinator_work_journal_payload_size":                    `UPDATE coordinator_work_journal SET payload=to_json(repeat('x',262145)) WHERE work_key='check-work'`,
+		"coordinator_work_journal_payload_depth_check":             `UPDATE coordinator_work_journal SET payload=(repeat('[',65)||repeat(']',65))::json WHERE work_key='check-work'`,
+		"coordinator_work_journal_payload_hash_size":               `UPDATE coordinator_work_journal SET payload_hash='' WHERE work_key='check-work'`,
+		"coordinator_work_journal_storage_sequence_check":          `UPDATE coordinator_work_journal SET storage_sequence=1 WHERE work_key='check-work'`,
+		"coordinator_work_journal_delivery_check":                  `UPDATE coordinator_work_journal SET delivered=true WHERE work_key='check-work'`,
+		"coordinator_work_journal_claim_check":                     `UPDATE coordinator_work_journal SET claim_owner='worker' WHERE work_key='check-work'`,
+		"coordinator_work_journal_claim_owner_size":                `UPDATE coordinator_work_journal SET claim_owner='',claim_until=CURRENT_TIMESTAMP+interval '1 minute',claim_affinity_generation=1 WHERE work_key='check-work'`,
+		"coordinator_work_journal_claim_generation_check":          `UPDATE coordinator_work_journal SET claim_generation=-1 WHERE work_key='check-work'`,
+		"coordinator_work_journal_claim_affinity_generation_check": `UPDATE coordinator_work_journal SET claim_owner='worker-c',claim_until=CURRENT_TIMESTAMP+interval '1 minute',claim_affinity_generation=0 WHERE work_key='check-work'`,
+		"coordinator_delivery_shards_affinity_size_check":          `UPDATE coordinator_delivery_shards SET delivery_affinity='' WHERE delivery_affinity='app-c'`,
+		"coordinator_delivery_shards_owner_size_check":             `UPDATE coordinator_delivery_shards SET lease_owner='' WHERE delivery_affinity='app-c'`,
+		"coordinator_delivery_shards_generation_check":             `UPDATE coordinator_delivery_shards SET lease_generation=0 WHERE delivery_affinity='app-c'`,
+		"coordinator_delivery_shards_timestamps_check":             `UPDATE coordinator_delivery_shards SET updated_at=lease_until WHERE delivery_affinity='app-c'`,
+		"handoffs_tenant_id_size_check":                            `UPDATE handoffs SET tenant_id='' WHERE id='handoff-c'`,
+		"handoffs_conversation_id_size_check":                      `UPDATE handoffs SET conversation_id='' WHERE id='handoff-c'`,
+		"handoffs_id_size_check":                                   `UPDATE handoffs SET id='' WHERE id='handoff-c'`,
+		"handoffs_user_id_size_check":                              `UPDATE handoffs SET user_id='' WHERE id='handoff-c'`,
+		"handoffs_session_id_size_check":                           `UPDATE handoffs SET session_id='' WHERE id='handoff-c'`,
+		"handoffs_source_turn_id_size_check":                       `UPDATE handoffs SET source_turn_id='' WHERE id='handoff-c'`,
+		"handoffs_source_turn_revision_check":                      `UPDATE handoffs SET source_turn_revision=0 WHERE id='handoff-c'`,
+		"handoffs_user_request_size_check":                         `UPDATE handoffs SET user_request='' WHERE id='handoff-c'`,
+		"handoffs_objective_size_check":                            `UPDATE handoffs SET objective='' WHERE id='handoff-c'`,
+		"handoffs_context_ref_size_check":                          `UPDATE handoffs SET context_ref='' WHERE id='handoff-c'`,
+		"handoffs_context_hash_size_check":                         `UPDATE handoffs SET context_hash='' WHERE id='handoff-c'`,
+		"handoffs_deadline_check":                                  `UPDATE handoffs SET deadline=created_at WHERE id='handoff-c'`,
+		"handoffs_token_budget_check":                              `UPDATE handoffs SET token_budget=0 WHERE id='handoff-c'`,
+		"handoffs_priority_check":                                  `UPDATE handoffs SET priority=1001 WHERE id='handoff-c'`,
+		"handoffs_tool_allowlist_check":                            `UPDATE handoffs SET tool_allowlist='[1]' WHERE id='handoff-c'`,
+		"handoffs_approval_policy_check":                           `UPDATE handoffs SET approval_policy=to_json(repeat('x',65535)) WHERE id='handoff-c'`,
+		"handoffs_model_version_size_check":                        `UPDATE handoffs SET model_version='' WHERE id='handoff-c'`,
+		"handoffs_prompt_version_size_check":                       `UPDATE handoffs SET prompt_version='' WHERE id='handoff-c'`,
+		"handoffs_tool_registry_version_size_check":                `UPDATE handoffs SET tool_registry_version='' WHERE id='handoff-c'`,
+		"handoffs_config_version_size_check":                       `UPDATE handoffs SET config_version='' WHERE id='handoff-c'`,
+		"handoffs_presentation_hint_size_check":                    `UPDATE handoffs SET presentation_hint=repeat('x',2049) WHERE id='handoff-c'`,
+		"handoffs_idempotency_key_size_check":                      `UPDATE handoffs SET idempotency_key='' WHERE id='handoff-c'`,
+		"handoffs_request_hash_size_check":                         `UPDATE handoffs SET request_hash='' WHERE id='handoff-c'`,
+		"handoffs_state_check":                                     `UPDATE handoffs SET state='unknown' WHERE id='handoff-c'`,
+		"handoffs_revision_check":                                  `UPDATE handoffs SET objective_revision=-1 WHERE id='handoff-c'`,
+		"handoffs_input_check":                                     `UPDATE handoffs SET input_revision=1,input=NULL WHERE id='handoff-c'`,
+		"handoffs_ready_at_check":                                  `UPDATE handoffs SET ready_at=created_at-interval '1 second' WHERE id='handoff-c'`,
+		"handoffs_attempt_check":                                   `UPDATE handoffs SET attempt=-1 WHERE id='handoff-c'`,
+		"handoffs_lease_tuple_check":                               `UPDATE handoffs SET lease_owner='worker' WHERE id='handoff-c'`,
+		"handoffs_lease_owner_size_check":                          `UPDATE handoffs SET lease_owner='',lease_expires_at=CURRENT_TIMESTAMP WHERE id='handoff-c'`,
+		"handoffs_cancel_tuple_check":                              `UPDATE handoffs SET cancel_actor='actor' WHERE id='handoff-c'`,
+		"handoffs_cancel_actor_size_check":                         `UPDATE handoffs SET cancel_requested_at=CURRENT_TIMESTAMP,cancel_actor='' WHERE id='handoff-c'`,
+		"handoffs_cancel_reason_size_check":                        `UPDATE handoffs SET cancel_requested_at=CURRENT_TIMESTAMP,cancel_actor='actor',cancel_reason=repeat('x',2049) WHERE id='handoff-c'`,
+		"handoffs_terminal_mutation_id_size_check":                 `UPDATE handoffs SET terminal_mutation_id='' WHERE id='handoff-success'`,
+		"handoffs_result_summary_size_check":                       `UPDATE handoffs SET result_summary='' WHERE id='handoff-success'`,
+		"handoffs_structured_result_check":                         `UPDATE handoffs SET structured_result=to_json(repeat('x',65535)) WHERE id='handoff-success'`,
+		"handoffs_failure_code_size_check":                         `UPDATE handoffs SET failure_code='' WHERE id='handoff-failed'`,
+		"handoffs_failure_message_size_check":                      `UPDATE handoffs SET failure_message='' WHERE id='handoff-failed'`,
+		"handoffs_safety_decision_check":                           `UPDATE handoffs SET safety_decision='[]' WHERE id='handoff-c'`,
+		"handoffs_usage_check":                                     `UPDATE handoffs SET usage=to_json(repeat('x',65535)) WHERE id='handoff-success'`,
+		"handoffs_terminal_fields_check":                           `UPDATE handoffs SET terminal_at=CURRENT_TIMESTAMP WHERE id='handoff-c'`,
+		"handoffs_timestamps_check":                                `UPDATE handoffs SET updated_at=created_at-interval '1 second' WHERE id='handoff-c'`,
+		"handoff_events_event_id_size_check":                       `UPDATE handoff_events SET event_id='' WHERE event_id='event-c'`,
+		"handoff_events_kind_size_check":                           `UPDATE handoff_events SET kind='' WHERE event_id='event-c'`,
+		"handoff_events_state_check":                               `UPDATE handoff_events SET state='unknown' WHERE event_id='event-c'`,
+		"handoff_events_attempt_check":                             `UPDATE handoff_events SET attempt=-1 WHERE event_id='event-c'`,
+		"handoff_events_payload_check":                             `UPDATE handoff_events SET payload='[]' WHERE event_id='event-c'`,
+		"outbox_topic_size_check":                                  `UPDATE outbox SET topic='' WHERE event_seq=` + fmt.Sprint(sequence),
+		"outbox_aggregate_id_size_check":                           `UPDATE outbox SET aggregate_id='' WHERE event_seq=` + fmt.Sprint(sequence),
+		"outbox_event_seq_check":                                   `UPDATE outbox SET event_seq=-1 WHERE event_seq=` + fmt.Sprint(sequence),
+		"outbox_payload_check":                                     `UPDATE outbox SET payload=json_build_object('tenant_id',repeat('x',8192)) WHERE event_seq=` + fmt.Sprint(sequence),
+		"outbox_payload_keys_check":                                `UPDATE outbox SET payload='{"secret":"x"}' WHERE event_seq=` + fmt.Sprint(sequence),
+		"outbox_attempts_check":                                    `UPDATE outbox SET attempts=-1 WHERE event_seq=` + fmt.Sprint(sequence),
+		"outbox_last_error_size_check":                             `UPDATE outbox SET last_error=repeat('x',2049) WHERE event_seq=` + fmt.Sprint(sequence),
+		"outbox_timestamps_check":                                  `UPDATE outbox SET published_at=created_at-interval '1 second' WHERE event_seq=` + fmt.Sprint(sequence),
+		"tool_invocations_invocation_id_size_check":                `UPDATE tool_invocations SET invocation_id='' WHERE invocation_id='invocation-c'`,
+		"tool_invocations_attempt_check":                           `UPDATE tool_invocations SET attempt=-1 WHERE invocation_id='invocation-c'`,
+		"tool_invocations_objective_revision_check":                `UPDATE tool_invocations SET objective_revision=-1 WHERE invocation_id='invocation-c'`,
+		"tool_invocations_tool_ordinal_check":                      `UPDATE tool_invocations SET tool_ordinal=-1 WHERE invocation_id='invocation-c'`,
+		"tool_invocations_tool_name_size_check":                    `UPDATE tool_invocations SET tool_name='' WHERE invocation_id='invocation-c'`,
+		"tool_invocations_approval_state_check":                    `UPDATE tool_invocations SET approval_state='unknown' WHERE invocation_id='invocation-c'`,
+		"tool_invocations_idempotency_key_size_check":              `UPDATE tool_invocations SET idempotency_key='' WHERE invocation_id='invocation-c'`,
+		"tool_invocations_arguments_hash_size_check":               `UPDATE tool_invocations SET canonical_arguments_hash='' WHERE invocation_id='invocation-c'`,
+		"tool_invocations_ciphertext_check":                        `UPDATE tool_invocations SET arguments_ciphertext=decode(repeat('00',15),'hex') WHERE invocation_id='invocation-c'`,
+		"tool_invocations_nonce_check":                             `UPDATE tool_invocations SET arguments_nonce=decode(repeat('00',11),'hex') WHERE invocation_id='invocation-c'`,
+		"tool_invocations_key_id_size_check":                       `UPDATE tool_invocations SET arguments_key_id='' WHERE invocation_id='invocation-c'`,
+		"tool_invocations_result_metadata_check":                   `UPDATE tool_invocations SET result_metadata='[]' WHERE invocation_id='invocation-c'`,
+		"tool_invocations_result_check":                            `UPDATE tool_invocations SET result=to_json(repeat('x',65535)) WHERE invocation_id='invocation-c'`,
+		"tool_invocations_mutation_id_size_check":                  `UPDATE tool_invocations SET mutation_id='' WHERE invocation_id='invocation-c'`,
+		"tool_invocations_status_check":                            `UPDATE tool_invocations SET status='unknown' WHERE invocation_id='invocation-c'`,
+		"tool_invocations_timestamps_check":                        `UPDATE tool_invocations SET updated_at=created_at-interval '1 second' WHERE invocation_id='invocation-c'`,
+		"delivery_cursors_consumer_id_size_check":                  `UPDATE delivery_cursors SET consumer_id='' WHERE consumer_id='consumer-c'`,
+		"delivery_cursors_sequence_check":                          `UPDATE delivery_cursors SET last_sequence=-1 WHERE consumer_id='consumer-c'`,
+		"delivery_cursors_timestamps_check":                        `UPDATE delivery_cursors SET updated_at=created_at-interval '1 second' WHERE consumer_id='consumer-c'`,
+		"session_admission_leases_instance_id_size_check":          `UPDATE session_admission_leases SET instance_id='' WHERE instance_id='instance-c'`,
+		"session_admission_leases_session_id_size_check":           `UPDATE session_admission_leases SET session_id='' WHERE instance_id='instance-c'`,
+		"session_admission_leases_tenant_id_size_check":            `UPDATE session_admission_leases SET tenant_id='' WHERE instance_id='instance-c'`,
+		"session_admission_leases_user_id_size_check":              `UPDATE session_admission_leases SET user_id='' WHERE instance_id='instance-c'`,
+		"session_admission_leases_timestamps_check":                `UPDATE session_admission_leases SET heartbeat_at=created_at-interval '1 second' WHERE instance_id='instance-c'`,
+		"deletion_audits_audit_id_size_check":                      `UPDATE deletion_audits SET audit_id='' WHERE audit_id='audit-c'`,
+		"deletion_audits_tenant_id_size_check":                     `UPDATE deletion_audits SET tenant_id='' WHERE audit_id='audit-c'`,
+		"deletion_audits_conversation_hash_size_check":             `UPDATE deletion_audits SET conversation_hash='' WHERE audit_id='audit-c'`,
+		"deletion_audits_actor_size_check":                         `UPDATE deletion_audits SET actor='' WHERE audit_id='audit-c'`,
+		"deletion_audits_reason_code_size_check":                   `UPDATE deletion_audits SET reason_code='' WHERE audit_id='audit-c'`,
+		"runtime_feature_authority_singleton_check":                `INSERT INTO runtime_feature_authority(singleton,version) VALUES(false,1)`,
+		"runtime_feature_authority_version_check":                  `UPDATE runtime_feature_authority SET version=0 WHERE singleton=true`,
+		"runtime_feature_flags_name_check":                         `INSERT INTO runtime_feature_flags(name,enabled,version) VALUES('unknown',false,1)`,
+		"runtime_feature_flags_version_check":                      `UPDATE runtime_feature_flags SET version=0 WHERE name='shadow_mode'`,
+		"runtime_feature_audit_name_check":                         `INSERT INTO runtime_feature_audit(version,name,enabled,actor,reason) VALUES(2,'unknown',false,'actor','reason')`,
+		"runtime_feature_audit_actor_size_check":                   `INSERT INTO runtime_feature_audit(version,name,enabled,actor,reason) VALUES(2,'handoffs_enabled',false,'','reason')`,
+		"runtime_feature_audit_reason_size_check":                  `INSERT INTO runtime_feature_audit(version,name,enabled,actor,reason) VALUES(2,'handoffs_enabled',false,'actor','')`,
+		"runtime_feature_audit_version_check":                      `INSERT INTO runtime_feature_audit(version,name,enabled,actor,reason) VALUES(1,'handoffs_enabled',false,'actor','reason')`,
 	}
 
 	rows, err := pool.Query(t.Context(), `
@@ -1338,6 +1386,12 @@ func TestSchemaRequiredIndexesAndPlans(t *testing.T) {
 		"session_admission_leases_active_tenant_user_idx": {
 			keys: []string{"tenant_id", "user_id", "expires_at"}, options: []int16{0, 0, 0},
 		},
+		"session_reconnect_owners_expiry_idx": {
+			keys: []string{"expires_at"}, options: []int16{0},
+		},
+		"session_reconnect_owners_cleanup_idx": {
+			keys: []string{"owner_lease_expires_at", "expires_at"}, options: []int16{0, 0},
+		},
 	}
 	for name, want := range expected {
 		var keyCount, attributeCount int
@@ -1531,8 +1585,12 @@ func allowedNullableColumn(table, column string) bool {
 	key := table + "." + column
 	allowed := map[string]bool{
 		"conversations.deletion_actor": true, "conversations.deletion_reason_code": true,
-		"conversations.deletion_requested_at": true,
-		"handoffs.input":                      true, "handoffs.lease_owner": true, "handoffs.lease_expires_at": true,
+		"conversations.deletion_requested_at":         true,
+		"session_reconnect_owners.subject_expires_at": true, "session_reconnect_owners.previous_credential_id": true,
+		"session_reconnect_owners.previous_incarnation":  true,
+		"session_reconnect_owners.previous_event_cursor": true, "session_reconnect_owners.previous_expires_at": true,
+		"session_reconnect_owners.previous_accept_until": true,
+		"handoffs.input": true, "handoffs.lease_owner": true, "handoffs.lease_expires_at": true,
 		"handoffs.cancel_requested_at": true, "handoffs.cancel_actor": true, "handoffs.cancel_reason": true,
 		"handoffs.terminal_mutation_id": true, "handoffs.result_summary": true, "handoffs.structured_result": true,
 		"handoffs.failure_code": true, "handoffs.failure_retryable": true, "handoffs.failure_message": true,
@@ -1541,7 +1599,8 @@ func allowedNullableColumn(table, column string) bool {
 		"tool_invocations.approval_expires_at": true, "tool_invocations.result_metadata": true,
 		"tool_invocations.result": true, "tool_invocations.mutation_id": true,
 		"coordinator_work_journal.storage_sequence": true, "coordinator_work_journal.claim_owner": true,
-		"coordinator_work_journal.claim_until": true, "coordinator_work_journal.delivered_at": true,
+		"coordinator_work_journal.claim_until": true, "coordinator_work_journal.claim_affinity_generation": true,
+		"coordinator_work_journal.delivered_at": true,
 	}
 	return allowed[key]
 }

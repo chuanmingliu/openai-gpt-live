@@ -8,7 +8,7 @@ The accepted subset is `session.update`, `input_audio_buffer.append`, `input_aud
 
 ## Server events
 
-The gateway emits `session.created`, `session.updated`, `error`, speech start/stop, input transcription delta/completed, `response.created`, output audio delta/done, output transcript delta/done, function-call completion, and `response.done`.
+The gateway emits `session.created`, `session.reconnect.updated`, `session.updated`, `error`, speech start/stop, input transcription delta/completed, `response.created`, output audio delta/done, output transcript delta/done, function-call completion, and `response.done`. `session.reconnect.updated` replaces the reconnect metadata after a cursor advance or before credential expiry; the immediately previous credential remains valid only for a bounded overlap.
 
 The durable extensions are:
 
@@ -17,11 +17,13 @@ The durable extensions are:
 - `live.tool.approval.required`, which exposes a bounded action summary and risk class but no executable inputs.
 - `live.tool.approval.resolve`, the only client-to-server extension.
 
-Reconnect restores only committed durable state and advances exact delivery cursors. Response incarnation and epoch fence every provider event. A cancellation advances the fence before later output can be presented; stale output is discarded and counted.
+When the static handoff capability is disabled, `/v1/realtime/capabilities` omits the `live.handoff.*` extensions while retaining the remaining extension contract.
+
+Reconnect mode is selected with the non-secret URL marker `reconnect=1`; the first bounded post-upgrade text frame is exactly `{"type":"session.reconnect","credential":"..."}`. The credential never appears in a URL or HTTP header. Reconnect restores only committed durable state and advances exact delivery cursors. Response incarnation and epoch fence every provider event. A cancellation advances the fence before later output can be presented; stale output is discarded and counted.
 
 ## Reserved tools
 
-The model-facing reserved names are `start_background_task`, `steer_background_task`, and `cancel_background_task`. Start accepts `objective` and optional `presentation_hint`. Steer accepts `handoff_id` and `objective`. Cancel accepts `handoff_id` and optional `reason`. The parser admits one exact JSON object, rejects unknown or server-derived fields, and bounds every string. Ordinary tools cannot enter the handoff path.
+The reserved names are `start_background_task`, `steer_background_task`, and `cancel_background_task`. When the static handoff capability is enabled, the gateway injects these model-facing tools: start accepts `objective` and optional `presentation_hint`, steer accepts `handoff_id` and `objective`, and cancel accepts `handoff_id` and optional `reason`. The parser admits one exact JSON object, rejects unknown or server-derived fields, and bounds every string. With handoffs disabled, the gateway injects none of these tools; clients still cannot declare or collide with the reserved names, while provider-originated calls using those names are treated as ordinary calls.
 
 ## Audio
 

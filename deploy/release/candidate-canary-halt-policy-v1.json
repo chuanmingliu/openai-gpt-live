@@ -1,0 +1,12 @@
+{
+  "schema_version": "candidate-canary-halt-policy-v1",
+  "minimum_observation_seconds": 1800,
+  "halt_on": [
+    "readiness_failure",
+    "synthetic_failure",
+    "cross_session_leak",
+    "queue_overflow",
+    "stale_output_violation"
+  ],
+  "cleanup": "rollback_candidate"
+}

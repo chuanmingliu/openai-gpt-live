@@ -17,4 +17,3 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: live-worker
-

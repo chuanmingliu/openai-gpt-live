@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"sync"
 	"testing"
 	"time"
@@ -34,23 +33,6 @@ type coordinatorIDs struct {
 type commitResponseLossRepository struct {
 	handoff.Repository
 	err error
-}
-
-type signalingCoordinatorJournal struct {
-	CoordinatorJournal
-	ready chan struct{}
-	once  sync.Once
-}
-
-type signalingAffinityCloser struct{ io.Closer }
-
-func (j *signalingCoordinatorJournal) AcquireCoordinatorAffinity(ctx context.Context, affinity string) (io.Closer, error) {
-	closer, err := j.CoordinatorJournal.AcquireCoordinatorAffinity(ctx, affinity)
-	if err != nil {
-		return nil, err
-	}
-	j.once.Do(func() { close(j.ready) })
-	return &signalingAffinityCloser{Closer: closer}, nil
 }
 
 func (r commitResponseLossRepository) CreateHandoff(ctx context.Context, record handoff.CreateRecord) (handoff.Snapshot, bool, error) {
@@ -206,23 +188,21 @@ func TestHandoffAdmissionRaceDisableCommittedBeforeCreateWritesNothing(t *testin
 	require.NoError(t, <-done)
 }
 
-func TestAppsHoldExclusiveCoordinatorAffinityUntilTeardown(t *testing.T) {
-	repository, _, manual := gatewayRepositoryHarness(t)
+func TestAppsLeaseStableCoordinatorShardAndReplacementTakesOver(t *testing.T) {
+	repository, pool, manual := gatewayRepositoryHarness(t)
 	service, err := handoff.NewService(repository, manual, coordinatorIDs{handoffID: "unused-handoff", eventID: "unused-event"})
 	require.NoError(t, err)
-	newApp := func(affinity, owner string) (*App, <-chan struct{}) {
-		ready := make(chan struct{})
-		journal := &signalingCoordinatorJournal{CoordinatorJournal: repository, ready: ready}
+	newApp := func(affinity, owner string) *App {
 		cfg := validConfig()
 		cfg.Features.Handoffs = true
 		app, appErr := New(cfg, testkit.NewFakeConnector(1), WithIDGenerator(deterministicIDs{}), WithDurableHandoffs(DurableDependencies{
-			Service: service, ConversationWriter: repository, ConversationProvisioner: repository, ConversationTTL: 24 * time.Hour, Journal: journal,
+			Service: service, ConversationWriter: repository, ConversationProvisioner: repository, ConversationTTL: 24 * time.Hour, Journal: repository,
 			DeliveryAffinity: affinity, JournalOwner: owner, JournalClaimLease: 100 * time.Millisecond,
 			HandoffQueueCapacity: 1, TranscriptQueueCapacity: 1, Snapshot: validHandoffWork().Snapshot,
 		}), testHandoffPresentationOption())
 		require.NoError(t, appErr)
 		app.listener = newBlockingListener()
-		return app, ready
+		return app
 	}
 	start := func(app *App) (context.CancelFunc, <-chan error) {
 		ctx, cancel := context.WithCancel(t.Context())
@@ -230,38 +210,39 @@ func TestAppsHoldExclusiveCoordinatorAffinityUntilTeardown(t *testing.T) {
 		go func() { done <- app.Run(ctx) }()
 		return cancel, done
 	}
-	waitReady := func(ready <-chan struct{}) {
-		select {
-		case <-ready:
-		case <-time.After(time.Second):
-			t.Fatal("app did not acquire coordinator affinity")
-		}
+	waitOwner := func(affinity, owner string) uint64 {
+		var current string
+		var generation uint64
+		require.Eventually(t, func() bool {
+			err := pool.QueryRow(t.Context(), `SELECT lease_owner,lease_generation
+				FROM coordinator_delivery_shards WHERE delivery_affinity=$1`, affinity).Scan(&current, &generation)
+			return err == nil && current == owner
+		}, 2*time.Second, 5*time.Millisecond)
+		return generation
 	}
 
-	firstApp, firstReady := newApp("shared-affinity", "first")
+	firstApp := newApp("shared-affinity", "first")
 	firstCancel, firstDone := start(firstApp)
-	waitReady(firstReady)
-	duplicate, _ := newApp("shared-affinity", "second")
-	duplicateCtx, duplicateCancel := context.WithTimeout(t.Context(), time.Second)
-	require.ErrorIs(t, duplicate.Run(duplicateCtx), postgres.ErrCoordinatorAffinityInUse)
-	duplicateCancel()
-
-	otherApp, otherReady := newApp("other-affinity", "other")
-	otherCancel, otherDone := start(otherApp)
-	waitReady(otherReady)
-	unexpectedLock, lockErr := repository.AcquireCoordinatorAffinity(t.Context(), "shared-affinity")
-	if lockErr == nil {
-		require.NoError(t, unexpectedLock.Close())
+	firstGeneration := waitOwner("shared-affinity", "first")
+	duplicate := newApp("shared-affinity", "second")
+	duplicateCancel, duplicateDone := start(duplicate)
+	select {
+	case duplicateErr := <-duplicateDone:
+		t.Fatalf("standby app exited while the shard owner was live: %v", duplicateErr)
+	case <-time.After(150 * time.Millisecond):
 	}
-	require.ErrorIs(t, lockErr, postgres.ErrCoordinatorAffinityInUse)
+	assert.Equal(t, firstGeneration, waitOwner("shared-affinity", "first"))
+
+	otherApp := newApp("other-affinity", "other")
+	otherCancel, otherDone := start(otherApp)
+	waitOwner("other-affinity", "other")
 
 	firstCancel()
 	require.NoError(t, <-firstDone)
-	restartedApp, restartedReady := newApp("shared-affinity", "restarted")
-	restartedCancel, restartedDone := start(restartedApp)
-	waitReady(restartedReady)
-	restartedCancel()
-	require.NoError(t, <-restartedDone)
+	replacementGeneration := waitOwner("shared-affinity", "second")
+	assert.Greater(t, replacementGeneration, firstGeneration)
+	duplicateCancel()
+	require.NoError(t, <-duplicateDone)
 	otherCancel()
 	require.NoError(t, <-otherDone)
 }
@@ -313,6 +294,16 @@ func TestPostgresRestartAfterCreateAndDeadlineReturnsSameIDExactlyOnce(t *testin
 	go func() { done <- second.Run(ctx) }()
 	require.Eventually(t, func() bool { return submit.itemCount() == 1 }, 2*time.Second, time.Millisecond)
 	assert.Equal(t, 1, submit.itemCount())
+	var shardOwner string
+	var shardGeneration uint64
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT lease_owner,lease_generation
+		FROM coordinator_delivery_shards WHERE delivery_affinity='app-a'`).Scan(&shardOwner, &shardGeneration))
+	assert.Equal(t, "worker-after-crash", shardOwner)
+	assert.Greater(t, shardGeneration, uint64(1))
+	var delivered bool
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT delivered FROM coordinator_work_journal
+		WHERE work_key=$1`, handoffWorkKey(mustCanonicalHandoffWork(t, work))).Scan(&delivered))
+	assert.True(t, delivered)
 	var handoffCount int
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM handoffs WHERE id='handoff-original'`).Scan(&handoffCount))
 	assert.Equal(t, 1, handoffCount)

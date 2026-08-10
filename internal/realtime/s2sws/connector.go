@@ -26,13 +26,18 @@ const (
 	responseHistoryLimit     = 1024
 	implicitEventLimit       = 16
 	implicitByteLimit        = 2 << 20
+	implicitAggregateEvents  = 64
+	implicitAggregateBytes   = 8 << 20
+	implicitUnboundLimit     = 8
 )
 
 var (
-	ErrUnknownResponseEpoch = errors.New("unknown response epoch")
-	ErrImplicitBufferFull   = errors.New("implicit response buffer limit exceeded")
-	ErrPendingResponseLimit = errors.New("pending explicit response limit exceeded")
-	ErrSessionClosed        = errors.New("realtime WebSocket session closed")
+	ErrUnknownResponseEpoch  = errors.New("unknown response epoch")
+	ErrImplicitBufferFull    = errors.New("implicit response buffer limit exceeded")
+	ErrImplicitAggregateFull = errors.New("implicit response aggregate buffer limit exceeded")
+	ErrImplicitResponseLimit = errors.New("implicit unbound response limit exceeded")
+	ErrPendingResponseLimit  = errors.New("pending explicit response limit exceeded")
+	ErrSessionClosed         = errors.New("realtime WebSocket session closed")
 )
 
 type Config struct {
@@ -50,7 +55,9 @@ type Connector struct {
 
 func New(cfg Config) (*Connector, error) {
 	endpoint, err := url.Parse(cfg.URL)
-	if err != nil || endpoint.Host == "" || (endpoint.Scheme != "ws" && endpoint.Scheme != "wss") {
+	if err != nil || endpoint.Host == "" || (endpoint.Scheme != "ws" && endpoint.Scheme != "wss") ||
+		endpoint.User != nil || endpoint.Opaque != "" || endpoint.OmitHost || endpoint.RawQuery != "" ||
+		endpoint.ForceQuery || endpoint.Fragment != "" || endpoint.RawFragment != "" {
 		return nil, errors.New("URL must be an absolute ws or wss endpoint")
 	}
 	if cfg.ConnectTimeout <= 0 {
@@ -149,8 +156,10 @@ type correlationRequest struct {
 }
 
 type bufferedResponseEvent struct {
-	event realtime.Event
-	bytes int
+	event        realtime.Event
+	rawBytes     int
+	decodedBytes int
+	ownedBytes   int
 }
 
 type responseCorrelation struct {
@@ -160,6 +169,7 @@ type responseCorrelation struct {
 	terminal      bool
 	buffered      []bufferedResponseEvent
 	bufferedBytes int
+	unbound       bool
 }
 
 type voiceSession struct {
@@ -183,6 +193,10 @@ type voiceSession struct {
 	responses     map[string]*responseCorrelation
 	responseOrder []string
 	pending       map[identity.ResponseEpoch]struct{}
+
+	implicitUnbound        int
+	implicitBufferedEvents int
+	implicitBufferedBytes  int
 
 	terminalOnce      sync.Once
 	terminalMu        sync.RWMutex
@@ -510,6 +524,7 @@ func (s *voiceSession) correlate(ctx context.Context, request correlationRequest
 }
 
 func (s *voiceSession) mappingLoop() {
+	defer s.releaseAllImplicitBuffers()
 	for {
 		select {
 		case read := <-s.reads:
@@ -616,8 +631,15 @@ func (s *voiceSession) handleMapped(mapped mappedServerEvent) error {
 	if len(correlation.buffered) == implicitEventLimit || correlation.bufferedBytes+mapped.frameBytes > implicitByteLimit {
 		return fmt.Errorf("%w for response %q", ErrImplicitBufferFull, mapped.event.ResponseID)
 	}
-	correlation.buffered = append(correlation.buffered, bufferedResponseEvent{event: cloneEvent(mapped.event), bytes: mapped.frameBytes})
+	buffered := newBufferedResponseEvent(mapped)
+	if s.implicitBufferedEvents == implicitAggregateEvents || buffered.ownedBytes > implicitAggregateBytes-s.implicitBufferedBytes {
+		zeroRealtimeEvent(&buffered.event)
+		return fmt.Errorf("%w for response %q", ErrImplicitAggregateFull, mapped.event.ResponseID)
+	}
+	correlation.buffered = append(correlation.buffered, buffered)
 	correlation.bufferedBytes += mapped.frameBytes
+	s.implicitBufferedEvents++
+	s.implicitBufferedBytes += buffered.ownedBytes
 	return nil
 }
 
@@ -660,6 +682,11 @@ func (s *voiceSession) handleResponseCreated(mapped mappedServerEvent) error {
 		correlation.epoch = created.epoch
 		mapped.event.Epoch = created.epoch
 	} else {
+		if s.implicitUnbound == implicitUnboundLimit {
+			return ErrImplicitResponseLimit
+		}
+		correlation.unbound = true
+		s.implicitUnbound++
 		mapped.event.NeedsEpochBinding = true
 	}
 	s.responses[created.responseID] = correlation
@@ -681,10 +708,16 @@ func (s *voiceSession) bindImplicit(request correlationRequest) error {
 	if correlation.bound && correlation.epoch != request.epoch {
 		return fmt.Errorf("response %q is already bound to epoch %d", request.responseID, correlation.epoch)
 	}
+	if correlation.unbound {
+		correlation.unbound = false
+		if s.implicitUnbound > 0 {
+			s.implicitUnbound--
+		}
+	}
 	correlation.bound = true
 	correlation.epoch = request.epoch
 	for len(correlation.buffered) > 0 {
-		buffered := correlation.buffered[0]
+		buffered := &correlation.buffered[0]
 		buffered.event.Epoch = request.epoch
 		if err := s.deliver(request.ctx, buffered.event); err != nil {
 			return err
@@ -692,10 +725,96 @@ func (s *voiceSession) bindImplicit(request correlationRequest) error {
 		if buffered.event.Kind == realtime.EventResponseDone {
 			correlation.terminal = true
 		}
-		correlation.bufferedBytes -= buffered.bytes
+		correlation.bufferedBytes -= buffered.rawBytes
+		s.releaseBufferedEvent(buffered)
+		correlation.buffered[0] = bufferedResponseEvent{}
 		correlation.buffered = correlation.buffered[1:]
 	}
+	correlation.buffered = nil
+	correlation.bufferedBytes = 0
 	return nil
+}
+
+func newBufferedResponseEvent(mapped mappedServerEvent) bufferedResponseEvent {
+	event := cloneEvent(mapped.event)
+	decoded := ownedDecodedEventBytes(event)
+	owned := cap(event.Payload) + decoded
+	return bufferedResponseEvent{event: event, rawBytes: mapped.frameBytes, decodedBytes: decoded, ownedBytes: owned}
+}
+
+func ownedDecodedEventBytes(event realtime.Event) int {
+	return cap(event.Audio) + cap(event.Arguments) + len(event.ProviderEventID) + len(event.ResponseID) +
+		len(event.ItemID) + len(event.CallID) + len(event.Name) + len(event.Text) + len(event.Status) + len(event.Reason)
+}
+
+func (s *voiceSession) releaseBufferedEvent(buffered *bufferedResponseEvent) {
+	if buffered == nil {
+		return
+	}
+	if s.implicitBufferedEvents > 0 {
+		s.implicitBufferedEvents--
+	}
+	if buffered.ownedBytes <= s.implicitBufferedBytes {
+		s.implicitBufferedBytes -= buffered.ownedBytes
+	} else {
+		s.implicitBufferedBytes = 0
+	}
+	zeroRealtimeEvent(&buffered.event)
+	buffered.rawBytes = 0
+	buffered.decodedBytes = 0
+	buffered.ownedBytes = 0
+}
+
+func (s *voiceSession) releaseCorrelationBuffer(correlation *responseCorrelation) {
+	if correlation == nil {
+		return
+	}
+	if correlation.unbound {
+		correlation.unbound = false
+		if s.implicitUnbound > 0 {
+			s.implicitUnbound--
+		}
+	}
+	for index := range correlation.buffered {
+		s.releaseBufferedEvent(&correlation.buffered[index])
+	}
+	correlation.buffered = nil
+	correlation.bufferedBytes = 0
+}
+
+func (s *voiceSession) releaseAllImplicitBuffers() {
+	for _, correlation := range s.responses {
+		s.releaseCorrelationBuffer(correlation)
+	}
+	s.implicitUnbound = 0
+	s.implicitBufferedEvents = 0
+	s.implicitBufferedBytes = 0
+}
+
+func zeroRealtimeEvent(event *realtime.Event) {
+	if event == nil {
+		return
+	}
+	for index := range event.Audio {
+		event.Audio[index] = 0
+	}
+	for index := range event.Arguments {
+		event.Arguments[index] = 0
+	}
+	for index := range event.Payload {
+		event.Payload[index] = 0
+	}
+	event.Audio = nil
+	event.Arguments = nil
+	event.Payload = nil
+	event.ProviderEventID = ""
+	event.ResponseID = ""
+	event.ItemID = ""
+	event.CallID = ""
+	event.Name = ""
+	event.Text = ""
+	event.Status = ""
+	event.Reason = ""
 }
 
 func (s *voiceSession) trimResponseHistory() error {

@@ -91,8 +91,8 @@ if [ "$verify_existing" -eq 0 ]; then
 	      printf '{"schema_version":"release-artifact-v2","artifact_type":"vulnerability_report","status":"passed","suite":"govulncheck"}\n' >"$bundle/artifacts/vulnerability-report.json"
       dashboard_sha=$(shasum -a 256 deploy/observability/grafana-dashboard.json | awk '{print $1}')
       printf '{"schema_version":"release-artifact-v2","artifact_type":"dashboard_snapshot","status":"passed","source_sha256":"%s"}\n' "$dashboard_sha" >"$bundle/artifacts/dashboard-snapshot.json"
-      : "${RELEASE_CANARY_SNAPSHOT:?actual deployed canary observation is required}"
-      cp "$RELEASE_CANARY_SNAPSHOT" "$bundle/artifacts/canary-snapshot.json" || failed=1
+      : "${RELEASE_CANDIDATE_CANARY_RECEIPT:?verified candidate canary receipt is required}"
+      cp "$RELEASE_CANDIDATE_CANARY_RECEIPT" "$bundle/artifacts/candidate-canary-receipt.json" || failed=1
       : "${RELEASE_PRODUCTION_MANIFEST:?production manifest is required}"
       manifest_sha=$(shasum -a 256 "$RELEASE_PRODUCTION_MANIFEST" | awk '{print $1}')
       printf '{"schema_version":"release-artifact-v2","artifact_type":"production_manifest","status":"passed","source_sha256":"%s"}\n' "$manifest_sha" >"$bundle/artifacts/production-manifest.json"
@@ -116,7 +116,7 @@ do
   collect_args="$collect_args --gate-evidence $gates/$gate_id.json"
 done
 
-add_artifact canary_snapshot artifacts/canary-snapshot.json
+add_artifact candidate_canary_receipt artifacts/candidate-canary-receipt.json
 add_artifact dashboard_snapshot artifacts/dashboard-snapshot.json
 if [ "$verify_existing" -eq 0 ]; then
 formal_bundle=$(find "$LIVE_EVIDENCE_DIR" -mindepth 1 -maxdepth 1 -type d -name 'task24-formal.*' -print)
@@ -202,6 +202,7 @@ done <"$artifact_specs"
 
 release_input_args=
 for input_name in \
+  candidate_canary_halt_policy_sha256 candidate_canary_public_key_sha256 \
   candidate_gateway_image candidate_migrate_image candidate_worker_image deployment_region \
   egress_proxy_cidr manifest_sha256 oidc_issuer optional_provider_result production_host \
   production_tls_secret run_provider_tests trusted_proxy_cidr voice_url

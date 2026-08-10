@@ -32,19 +32,26 @@ type canonicalConfig struct {
 }
 
 type canonicalGateway struct {
-	AdvertisedModel string          `json:"advertised_model"`
-	ListenAddr      string          `json:"listen_addr"`
-	BehindIngress   bool            `json:"behind_ingress"`
-	TrustedProxies  []string        `json:"trusted_proxies"`
-	VoiceProvider   string          `json:"voice_provider"`
-	VoiceURL        string          `json:"voice_url"`
-	VoiceModel      string          `json:"voice_model"`
-	Audio           AudioConfig     `json:"audio"`
-	Session         SessionConfig   `json:"session"`
-	WebSocket       WebSocketConfig `json:"websocket"`
-	ProviderRetry   RetryConfig     `json:"provider_retry"`
-	StorageGrace    time.Duration   `json:"storage_grace"`
-	Reconnect       ReconnectConfig `json:"reconnect"`
+	AdvertisedModel string             `json:"advertised_model"`
+	ListenAddr      string             `json:"listen_addr"`
+	BehindIngress   bool               `json:"behind_ingress"`
+	TrustedProxies  []string           `json:"trusted_proxies"`
+	VoiceProvider   string             `json:"voice_provider"`
+	VoiceURL        string             `json:"voice_url"`
+	VoiceModel      string             `json:"voice_model"`
+	Audio           AudioConfig        `json:"audio"`
+	Session         SessionConfig      `json:"session"`
+	WebSocket       WebSocketConfig    `json:"websocket"`
+	ProviderRetry   RetryConfig        `json:"provider_retry"`
+	StorageGrace    time.Duration      `json:"storage_grace"`
+	Reconnect       canonicalReconnect `json:"reconnect"`
+}
+type canonicalReconnect struct {
+	MaxRetries    int           `json:"max_retries"`
+	RetryBase     time.Duration `json:"retry_base"`
+	RetryMax      time.Duration `json:"retry_max"`
+	HMACKeyID     string        `json:"hmac_key_id"`
+	CredentialTTL time.Duration `json:"credential_ttl"`
 }
 type canonicalWorker struct {
 	Concurrency       int           `json:"concurrency"`
@@ -125,7 +132,7 @@ func Canonical(cfg Config) ([]byte, error) {
 	retention := effectiveRetention(cfg.Store.Retention)
 	c := canonicalConfig{
 		Version: HashVersion, Mode: cfg.Mode,
-		Gateway:   canonicalGateway{AdvertisedModel: cfg.Gateway.AdvertisedModel, ListenAddr: cfg.Gateway.ListenAddr, BehindIngress: cfg.Gateway.BehindIngress, TrustedProxies: sorted(cfg.Gateway.TrustedProxies), VoiceProvider: cfg.Gateway.Voice.Provider, VoiceURL: safeURL(cfg.Gateway.Voice.URL), VoiceModel: cfg.Gateway.Voice.Model, Audio: cfg.Gateway.Audio, Session: cfg.Gateway.Session, WebSocket: cfg.Gateway.WebSocket, ProviderRetry: cfg.Gateway.ProviderRetry, StorageGrace: cfg.Gateway.StorageGrace, Reconnect: cfg.Gateway.Reconnect},
+		Gateway:   canonicalGateway{AdvertisedModel: cfg.Gateway.AdvertisedModel, ListenAddr: cfg.Gateway.ListenAddr, BehindIngress: cfg.Gateway.BehindIngress, TrustedProxies: sorted(cfg.Gateway.TrustedProxies), VoiceProvider: cfg.Gateway.Voice.Provider, VoiceURL: safeURL(cfg.Gateway.Voice.URL), VoiceModel: cfg.Gateway.Voice.Model, Audio: cfg.Gateway.Audio, Session: cfg.Gateway.Session, WebSocket: cfg.Gateway.WebSocket, ProviderRetry: cfg.Gateway.ProviderRetry, StorageGrace: cfg.Gateway.StorageGrace, Reconnect: canonicalReconnect{MaxRetries: cfg.Gateway.Reconnect.MaxRetries, RetryBase: cfg.Gateway.Reconnect.RetryBase, RetryMax: cfg.Gateway.Reconnect.RetryMax, HMACKeyID: cfg.Gateway.Reconnect.HMACKeyID, CredentialTTL: cfg.Gateway.Reconnect.CredentialTTL}},
 		Worker:    canonicalWorker{Concurrency: cfg.Worker.Concurrency, LeaseDuration: cfg.Worker.LeaseDuration, HeartbeatInterval: cfg.Worker.HeartbeatInterval, PollInterval: cfg.Worker.PollInterval, RequestTimeout: cfg.Worker.RequestTimeout, RetryBase: cfg.Worker.RetryBase, RetryMax: cfg.Worker.RetryMax, MaxRetries: cfg.Worker.MaxRetries, MaxOutputBytes: cfg.Worker.MaxOutputBytes, MaxOutputTokens: cfg.Worker.MaxOutputTokens, MaxToolRounds: cfg.Worker.MaxToolRounds, ReasonerProvider: cfg.Worker.Reasoner.Provider, ReasonerURL: safeURL(cfg.Worker.Reasoner.BaseURL), ReasonerModel: cfg.Worker.Reasoner.Model},
 		Auth:      canonicalAuth{OIDCIssuer: safeURL(cfg.Auth.OIDCIssuer), OIDCAudience: cfg.Auth.OIDCAudience, OIDCTenantClaim: cfg.Auth.OIDCTenantClaim, OIDCUserClaim: cfg.Auth.OIDCUserClaim, OIDCScopeClaim: cfg.Auth.OIDCScopeClaim, OIDCRequiredScopes: sorted(cfg.Auth.OIDCRequiredScopes), OIDCCacheOutage: cfg.Auth.OIDCCacheOutage, OIDCHTTPTimeout: cfg.Auth.OIDCHTTPTimeout, StaticTenantID: cfg.Auth.StaticTenantID, StaticUserID: cfg.Auth.StaticUserID, StaticScopes: sorted(cfg.Auth.StaticScopes), AllowedOrigins: sorted(cfg.Auth.AllowedOrigins), AllowNonBrowser: cfg.Auth.AllowNonBrowser, EphemeralTenantID: cfg.Auth.EphemeralTenantID, EphemeralUserID: cfg.Auth.EphemeralUserID},
 		Admission: canonicalAdmission{MaxSessions: cfg.Admission.MaxSessions, MaxSessionsPerTenant: cfg.Admission.MaxSessionsPerTenant, MaxSessionsPerUser: cfg.Admission.MaxSessionsPerUser, LeaseDuration: cfg.Admission.LeaseDuration, HeartbeatInterval: cfg.Admission.HeartbeatInterval, GlobalRate: cfg.Admission.GlobalRate, GlobalBurst: cfg.Admission.GlobalBurst, IPRate: cfg.Admission.IPRate, IPBurst: cfg.Admission.IPBurst, IPKeyTTL: cfg.Admission.IPKeyTTL, MaxIPKeys: cfg.Admission.MaxIPKeys, InstanceID: cfg.Admission.InstanceID},

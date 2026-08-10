@@ -444,7 +444,8 @@ func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecret
 	drainer := lifecycle.NewDrainer()
 	runnerConfig := worker.Runner{Store: repo, Reasoner: client, Safety: staticPolicy, Tools: registry, Clock: realClock, Jitter: jitter, Drainer: drainer, Tracer: traceRuntime.TracerProvider().Tracer("live.worker"),
 		FeatureGates: gates,
-		Retry:        worker.RetryPolicy{Base: cfg.Worker.RetryBase, Maximum: cfg.Worker.RetryMax, MaxRetries: uint32(cfg.Worker.MaxRetries)}, WorkerID: workerIdentity(), LeaseDuration: cfg.Worker.LeaseDuration, Concurrency: cfg.Worker.Concurrency,
+		Retry:        worker.RetryPolicy{Base: cfg.Worker.RetryBase, Maximum: cfg.Worker.RetryMax, MaxRetries: uint32(cfg.Worker.MaxRetries)}, WorkerID: workerIdentity(),
+		LeaseDuration: cfg.Worker.LeaseDuration, HeartbeatInterval: cfg.Worker.HeartbeatInterval, Concurrency: cfg.Worker.Concurrency,
 		PollInterval: cfg.Worker.PollInterval, MaxOutputBytes: cfg.Worker.MaxOutputBytes, MaxOutputTokens: cfg.Worker.MaxOutputTokens, MaxToolRounds: cfg.Worker.MaxToolRounds, MaxToolCalls: 64,
 		MaxToolArgumentBytes: minInt(cfg.Worker.MaxOutputBytes, 256<<10), MaxToolOutputBytes: minInt(cfg.Worker.MaxOutputBytes, 256<<10),
 		ProviderSafetyID: func(tenant, user string) (string, error) { return safety.ProviderSafetyID(privacyKey, tenant, user) },

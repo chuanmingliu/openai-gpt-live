@@ -60,4 +60,3 @@ features:
   tool_encryption_key_env: LIVE_TOOL_ENCRYPTION_KEY
   tool_encryption_key_id: local-tools-v1
   runtime_refresh_interval: 1s
-

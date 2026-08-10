@@ -212,10 +212,17 @@ func (c *HandoffCoordinator) Run(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("handoff coordinator context is nil")
 	}
+	parentCtx := ctx
+	var affinityGuard *coordinatorAffinityGuard
+	if c.journal != nil {
+		affinityGuard = startCoordinatorAffinityGuard(ctx, c.journal, c.journalAffinity, c.journalOwner, c.claimLease)
+		defer affinityGuard.stopAndJoin()
+		ctx = affinityGuard.ctx
+	}
 	if c.journal != nil {
 		if err := c.retryDurability(ctx, func() error { return c.drainJournal(ctx) }); err != nil {
 			if ctx.Err() != nil {
-				return nil
+				return coordinatorCancellationResult(parentCtx, affinityGuard)
 			}
 			return err
 		}
@@ -229,11 +236,11 @@ func (c *HandoffCoordinator) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			return coordinatorCancellationResult(parentCtx, affinityGuard)
 		case <-replay:
 			if err := c.retryDurability(ctx, func() error { return c.drainJournal(ctx) }); err != nil {
 				if ctx.Err() != nil {
-					return nil
+					return coordinatorCancellationResult(parentCtx, affinityGuard)
 				}
 				return err
 			}
@@ -294,7 +301,7 @@ func (c *HandoffCoordinator) Run(ctx context.Context) error {
 			c.releaseWork(work)
 			if err != nil {
 				if ctx.Err() != nil {
-					return nil
+					return coordinatorCancellationResult(parentCtx, affinityGuard)
 				}
 				return err
 			}

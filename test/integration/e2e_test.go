@@ -497,7 +497,7 @@ func startDeterministicSystem(t *testing.T, configure ...deterministicOption) *d
 			Store: store, Reasoner: reasonerClient, Safety: allowPolicy{}, Tools: registry,
 			ArgumentSealer: argumentSealer,
 			Clock:          runnerClock, Jitter: zeroJitter{}, Retry: worker.RetryPolicy{Base: 20 * time.Millisecond, Maximum: 50 * time.Millisecond, MaxRetries: 1},
-			WorkerID: workerID, LeaseDuration: 3 * time.Second, Concurrency: 1, PollInterval: 10 * time.Millisecond,
+			WorkerID: workerID, LeaseDuration: 3 * time.Second, HeartbeatInterval: time.Second, Concurrency: 1, PollInterval: 10 * time.Millisecond,
 			MaxOutputBytes: 4096, MaxOutputTokens: 128, MaxToolRounds: 1, MaxToolCalls: 1, MaxToolArgumentBytes: 1024, MaxToolOutputBytes: 1024,
 			ProviderSafetyID: func(string, string) (string, error) { return "safety-e2e", nil },
 		})

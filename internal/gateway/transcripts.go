@@ -23,9 +23,10 @@ import (
 )
 
 var (
-	ErrCoordinatorOverflow    = errors.New("durable coordinator queue is full")
-	ErrDurabilityUnavailable  = errors.New("durability unavailable")
-	ErrDurabilityGraceExpired = errors.New("durability grace expired")
+	ErrCoordinatorOverflow     = errors.New("durable coordinator queue is full")
+	ErrDurabilityUnavailable   = errors.New("durability unavailable")
+	ErrDurabilityGraceExpired  = errors.New("durability grace expired")
+	ErrCoordinatorAffinityLost = errors.New("coordinator delivery shard authority lost")
 )
 
 type TranscriptWork struct {
@@ -47,11 +48,248 @@ type ConversationWriter interface {
 }
 
 type CoordinatorJournal interface {
-	AcquireCoordinatorAffinity(context.Context, string) (io.Closer, error)
+	AcquireCoordinatorAffinity(context.Context, string, string, time.Duration) (uint64, bool, error)
+	RenewCoordinatorAffinity(context.Context, string, string, uint64, time.Duration) error
 	AdmitCoordinatorWork(context.Context, postgres.CoordinatorJournalRecord) (postgres.CoordinatorJournalRecord, error)
 	ClaimCoordinatorWork(context.Context, string, string, string, time.Duration, int) ([]postgres.CoordinatorJournalRecord, error)
 	RenewCoordinatorWork(context.Context, string, string, uint64, time.Duration) error
 	AckCoordinatorWork(context.Context, string, string, uint64) error
+}
+
+type coordinatorAffinityGuard struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	done   chan error
+	once   sync.Once
+	err    error
+}
+
+func startCoordinatorAffinityGuard(
+	ctx context.Context,
+	journal CoordinatorJournal,
+	affinity, owner string,
+	lease time.Duration,
+) *coordinatorAffinityGuard {
+	guard := &coordinatorAffinityGuard{done: make(chan error, 1)}
+	guard.ctx, guard.cancel = context.WithCancel(ctx)
+	go func() {
+		err := runCoordinatorAffinityAuthority(guard.ctx, journal, affinity, owner, lease)
+		if err != nil {
+			guard.cancel()
+		}
+		guard.done <- err
+	}()
+	return guard
+}
+
+func (g *coordinatorAffinityGuard) stopAndJoin() error {
+	if g == nil {
+		return nil
+	}
+	g.once.Do(func() {
+		g.cancel()
+		g.err = <-g.done
+	})
+	return g.err
+}
+
+type coordinatorAffinityAcquisition struct {
+	generation uint64
+	acquired   bool
+}
+
+type coordinatorAffinityOperationResult[T any] struct {
+	value T
+	err   error
+}
+
+func runBoundedCoordinatorAffinityOperation[T any](
+	ctx context.Context,
+	timeout time.Duration,
+	lossDeadline time.Time,
+	operation func(context.Context) (T, error),
+) (T, error) {
+	var zero T
+	if err := ctx.Err(); err != nil {
+		return zero, err
+	}
+	if !lossDeadline.IsZero() && !time.Now().Before(lossDeadline) {
+		return zero, context.DeadlineExceeded
+	}
+
+	operationCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	var lossTimer *time.Timer
+	var loss <-chan time.Time
+	if !lossDeadline.IsZero() {
+		lossTimer = time.NewTimer(time.Until(lossDeadline))
+		loss = lossTimer.C
+		defer stopCoordinatorAffinityTimer(lossTimer)
+	}
+
+	result := make(chan coordinatorAffinityOperationResult[T], 1)
+	// Authority operations are strictly sequential. Any operation that ignores
+	// cancellation makes this guard terminate, so at most one such goroutine can
+	// be abandoned per guard; the buffered result also lets a late return exit.
+	go func() {
+		value, err := operation(operationCtx)
+		result <- coordinatorAffinityOperationResult[T]{value: value, err: err}
+	}()
+
+	select {
+	case completed := <-result:
+		if err := operationCtx.Err(); err != nil {
+			return zero, err
+		}
+		if !lossDeadline.IsZero() && !time.Now().Before(lossDeadline) {
+			return zero, context.DeadlineExceeded
+		}
+		return completed.value, completed.err
+	case <-operationCtx.Done():
+		return zero, operationCtx.Err()
+	case <-loss:
+		return zero, context.DeadlineExceeded
+	}
+}
+
+func runCoordinatorAffinityAuthority(
+	ctx context.Context,
+	journal CoordinatorJournal,
+	affinity, owner string,
+	lease time.Duration,
+) error {
+	interval := coordinatorAffinityHeartbeatInterval(lease)
+	operationTimeout := coordinatorAffinityOperationTimeout(lease)
+	var generation uint64
+	var lossDeadline time.Time
+	for {
+		if generation == 0 {
+			operationStarted := time.Now()
+			acquisition, err := runBoundedCoordinatorAffinityOperation(
+				ctx,
+				operationTimeout,
+				time.Time{},
+				func(operationCtx context.Context) (coordinatorAffinityAcquisition, error) {
+					acquiredGeneration, acquired, acquireErr := journal.AcquireCoordinatorAffinity(operationCtx, affinity, owner, lease)
+					return coordinatorAffinityAcquisition{generation: acquiredGeneration, acquired: acquired}, acquireErr
+				},
+			)
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				return fmt.Errorf("acquire coordinator delivery shard: %w", err)
+			}
+			if acquisition.acquired {
+				if acquisition.generation == 0 {
+					return errors.New("coordinator delivery shard returned an invalid generation")
+				}
+				generation = acquisition.generation
+				// The database computes its expiry during the operation. Measuring
+				// from operation start is a conservative local upper bound.
+				lossDeadline = operationStarted.Add(lease)
+				if !time.Now().Before(lossDeadline) {
+					return ErrCoordinatorAffinityLost
+				}
+			}
+		}
+		if err := waitForCoordinatorAffinityHeartbeat(ctx, interval, lossDeadline); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		if generation == 0 {
+			continue
+		}
+
+		operationStarted := time.Now()
+		_, err := runBoundedCoordinatorAffinityOperation(
+			ctx,
+			operationTimeout,
+			lossDeadline,
+			func(operationCtx context.Context) (struct{}, error) {
+				return struct{}{}, journal.RenewCoordinatorAffinity(operationCtx, affinity, owner, generation, lease)
+			},
+		)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return errors.Join(ErrCoordinatorAffinityLost, err)
+		}
+		lossDeadline = operationStarted.Add(lease)
+		if !time.Now().Before(lossDeadline) {
+			return ErrCoordinatorAffinityLost
+		}
+	}
+}
+
+func waitForCoordinatorAffinityHeartbeat(ctx context.Context, interval time.Duration, lossDeadline time.Time) error {
+	wait := interval
+	if !lossDeadline.IsZero() {
+		remaining := time.Until(lossDeadline)
+		if remaining <= 0 {
+			return ErrCoordinatorAffinityLost
+		}
+		if remaining < wait {
+			wait = remaining
+		}
+	}
+	timer := time.NewTimer(wait)
+	defer stopCoordinatorAffinityTimer(timer)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		if !lossDeadline.IsZero() && !time.Now().Before(lossDeadline) {
+			return ErrCoordinatorAffinityLost
+		}
+		return nil
+	}
+}
+
+func stopCoordinatorAffinityTimer(timer *time.Timer) {
+	if timer == nil || timer.Stop() {
+		return
+	}
+	select {
+	case <-timer.C:
+	default:
+	}
+}
+
+func coordinatorAffinityHeartbeatInterval(lease time.Duration) time.Duration {
+	interval := lease / 3
+	if interval < time.Millisecond {
+		return time.Millisecond
+	}
+	if interval > 5*time.Second {
+		return 5 * time.Second
+	}
+	return interval
+}
+
+func coordinatorAffinityOperationTimeout(lease time.Duration) time.Duration {
+	if lease < time.Millisecond {
+		return time.Millisecond
+	}
+	if lease > 5*time.Second {
+		return 5 * time.Second
+	}
+	return lease
+}
+
+func coordinatorCancellationResult(parent context.Context, guard *coordinatorAffinityGuard) error {
+	err := guard.stopAndJoin()
+	if parent.Err() != nil {
+		return nil
+	}
+	if err == nil {
+		return ErrCoordinatorAffinityLost
+	}
+	return err
 }
 
 type TranscriptCoordinator struct {
@@ -190,10 +428,17 @@ func (c *TranscriptCoordinator) Run(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("transcript coordinator context is nil")
 	}
+	parentCtx := ctx
+	var affinityGuard *coordinatorAffinityGuard
+	if c.journal != nil {
+		affinityGuard = startCoordinatorAffinityGuard(ctx, c.journal, c.journalAffinity, c.journalOwner, c.claimLease)
+		defer affinityGuard.stopAndJoin()
+		ctx = affinityGuard.ctx
+	}
 	if c.journal != nil {
 		if err := c.retryDurability(ctx, func() error { return c.drainJournal(ctx) }); err != nil {
 			if ctx.Err() != nil {
-				return nil
+				return coordinatorCancellationResult(parentCtx, affinityGuard)
 			}
 			return err
 		}
@@ -207,11 +452,11 @@ func (c *TranscriptCoordinator) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			return coordinatorCancellationResult(parentCtx, affinityGuard)
 		case <-replay:
 			if err := c.retryDurability(ctx, func() error { return c.drainJournal(ctx) }); err != nil {
 				if ctx.Err() != nil {
-					return nil
+					return coordinatorCancellationResult(parentCtx, affinityGuard)
 				}
 				return err
 			}
@@ -234,7 +479,7 @@ func (c *TranscriptCoordinator) Run(ctx context.Context) error {
 			c.releaseWork(work)
 			if err != nil {
 				if ctx.Err() != nil {
-					return nil
+					return coordinatorCancellationResult(parentCtx, affinityGuard)
 				}
 				return err
 			}

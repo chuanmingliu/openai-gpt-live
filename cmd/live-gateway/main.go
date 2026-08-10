@@ -17,8 +17,10 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/admin"
 	"github.com/chuanmingliu/openai-gpt-live/internal/admission"
@@ -248,11 +250,18 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 		appOptions = append(appOptions, gateway.WithFeatureGates(featureRuntime.gates))
 		appOptions = append(appOptions, gateway.WithApprovalStore(featureRuntime.repo))
 	}
-	durableOptions, err := composeGatewayDurability(cfg, featureRuntime, configHash)
+	durableOptions, err := composeGatewayDurability(cfg, featureRuntime, configHash, instance, region)
 	if err != nil {
 		return err
 	}
 	appOptions = append(appOptions, durableOptions...)
+	reconnectOption, err := composeGatewayReconnect(cfg, featureRuntime, lookup)
+	if err != nil {
+		return err
+	}
+	if reconnectOption != nil {
+		appOptions = append(appOptions, reconnectOption)
+	}
 	if admissionController != nil {
 		admissionController.SetMetricsObserver(metrics.ObserveAdmission)
 		appOptions = append(appOptions, gateway.WithAdmission(admissionController))
@@ -260,6 +269,9 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 	app, err := gateway.New(cfg, connector, appOptions...)
 	if err != nil {
 		return fmt.Errorf("configure gateway: %w", err)
+	}
+	if cfg.Mode == "production" {
+		_ = ready.RegisterRequired("reconnect_owners", health.CheckFunc(app.ReconnectReady))
 	}
 	diagnostics, err := startGatewayDiagnostics(ctx, cfg, admissionController, app, drainer, ready, registry, featureRuntime)
 	if err != nil {
@@ -673,15 +685,32 @@ func (gatewayCryptoJitter) Duration(max time.Duration) time.Duration {
 	return time.Duration(binary.BigEndian.Uint64(raw[:]) % (uint64(max) + 1))
 }
 
-func composeGatewayDurability(cfg config.Config, runtime *gatewayFeatureRuntime, configHash string) ([]gateway.Option, error) {
-	if !cfg.Features.Handoffs {
+func composeGatewayDurability(cfg config.Config, runtime *gatewayFeatureRuntime, configHash, runtimeInstance, deliveryRegion string) ([]gateway.Option, error) {
+	if cfg.Mode != "production" {
 		return nil, nil
 	}
-	if runtime == nil || runtime.pool == nil || runtime.repo == nil {
-		return nil, errors.New("handoff durability runtime is unavailable")
+	if runtime == nil || runtime.repo == nil {
+		return nil, errors.New("conversation durability runtime is unavailable")
 	}
-	if cfg.Admission.InstanceID == "" {
-		return nil, errors.New("admission.instance_id is required for durable handoff ownership")
+	owner, err := gatewayDurabilityIdentity(runtimeInstance)
+	if err != nil {
+		return nil, err
+	}
+	shard, err := gatewayDeliveryShard(deliveryRegion)
+	if err != nil {
+		return nil, err
+	}
+	dependencies := gateway.DurableDependencies{
+		ConversationWriter: runtime.repo, ConversationProvisioner: runtime.repo,
+		ConversationTTL: cfg.Store.Retention.ConversationTTL, RecoveryStore: runtime.repo, Journal: runtime.repo,
+		DeliveryAffinity: shard, JournalOwner: owner, JournalClaimLease: cfg.Admission.LeaseDuration,
+		TranscriptQueueCapacity: cfg.Gateway.Session.ControlEvents,
+	}
+	if !cfg.Features.Handoffs {
+		return []gateway.Option{gateway.WithDurableHandoffs(dependencies)}, nil
+	}
+	if runtime.pool == nil {
+		return nil, errors.New("handoff durability runtime is unavailable")
 	}
 	service, err := handoff.NewService(runtime.repo, clock.Real{}, gatewayHandoffIDs{})
 	if err != nil {
@@ -702,8 +731,6 @@ func composeGatewayDurability(cfg config.Config, runtime *gatewayFeatureRuntime,
 	if err != nil {
 		return nil, fmt.Errorf("configure handoff presentation safety: %w", err)
 	}
-	identityDigest := sha256.Sum256([]byte(cfg.Admission.InstanceID))
-	owner := "gateway-" + hex.EncodeToString(identityDigest[:16])
 	snapshot := gateway.SessionHandoffSnapshot{
 		ContextRef: "context://conversation/current", ContextHash: configHash,
 		Deadline:    time.Date(9999, time.December, 31, 23, 59, 59, 0, time.UTC),
@@ -711,20 +738,74 @@ func composeGatewayDurability(cfg config.Config, runtime *gatewayFeatureRuntime,
 		Versions:         handoff.Versions{Model: cfg.Worker.Reasoner.Model, Prompt: cfg.Safety.PolicyVersion, ToolRegistry: configHash, Config: configHash},
 		PresentationHint: "brief",
 	}
+	dependencies.Service = service
+	dependencies.HandoffQueueCapacity = cfg.Gateway.Session.ControlEvents
+	dependencies.Snapshot = snapshot
 	return []gateway.Option{
-		gateway.WithDurableHandoffs(gateway.DurableDependencies{
-			Service: service, ConversationWriter: runtime.repo, ConversationProvisioner: runtime.repo,
-			ConversationTTL: cfg.Store.Retention.ConversationTTL, RecoveryStore: runtime.repo, Journal: runtime.repo,
-			DeliveryAffinity: owner, JournalOwner: owner, JournalClaimLease: cfg.Admission.LeaseDuration,
-			HandoffQueueCapacity: cfg.Gateway.Session.ControlEvents, TranscriptQueueCapacity: cfg.Gateway.Session.ControlEvents,
-			Snapshot: snapshot,
-		}),
+		gateway.WithDurableHandoffs(dependencies),
 		gateway.WithHandoffPresentation(gateway.HandoffPresentationDependencies{
 			Reader: runtime.repo, Cursors: runtime.repo, Listener: listener, Clock: clock.Real{},
 			PollInterval: maxDuration(cfg.Worker.PollInterval, 10*time.Millisecond), ConsumerID: owner,
 			WakeupCapacity: cfg.Gateway.Session.ControlEvents, Policy: presentation.NewPolicy(presentation.Config{}), Safety: policy,
 		}),
 	}, nil
+}
+
+func gatewayDurabilityIdentity(runtimeInstance string) (string, error) {
+	if strings.TrimSpace(runtimeInstance) == "" || strings.TrimSpace(runtimeInstance) != runtimeInstance ||
+		len(runtimeInstance) > session.DurableIdentifierBytes || !utf8.ValidString(runtimeInstance) {
+		return "", errors.New("gateway runtime identity is required for durable ownership")
+	}
+	digest := sha256.Sum256([]byte(runtimeInstance))
+	return "gateway-" + hex.EncodeToString(digest[:16]), nil
+}
+
+func gatewayDeliveryShard(region string) (string, error) {
+	if strings.TrimSpace(region) == "" || strings.TrimSpace(region) != region ||
+		len(region) > session.DurableIdentifierBytes || !utf8.ValidString(region) {
+		return "", errors.New("gateway delivery region is required for durable ownership")
+	}
+	digest := sha256.Sum256([]byte("gateway-delivery-shard/v1\x00" + region))
+	return "gateway-shard-" + hex.EncodeToString(digest[:16]), nil
+}
+
+func composeGatewayReconnect(cfg config.Config, runtime *gatewayFeatureRuntime, lookup func(string) (string, bool)) (gateway.Option, error) {
+	if cfg.Mode != "production" {
+		return nil, nil
+	}
+	if runtime == nil || runtime.pool == nil {
+		return nil, errors.New("reconnect authority runtime is unavailable")
+	}
+	ownerID, err := metricInstance(cfg.Mode, lookup)
+	if err != nil {
+		return nil, fmt.Errorf("configure reconnect owner identity: %w", err)
+	}
+	if lookup == nil {
+		return nil, errors.New("reconnect HMAC key is unavailable")
+	}
+	encoded, ok := lookup(cfg.Gateway.Reconnect.HMACKeyEnv)
+	if !ok {
+		return nil, errors.New("reconnect HMAC key is unavailable")
+	}
+	var credentials session.ReconnectCredentials
+	if err := secretbuf.WithDecodedBase64(encoded, func(key []byte) error {
+		if len(key) < 32 || len(key) > 4096 {
+			return errors.New("reconnect HMAC key length is invalid")
+		}
+		configured, err := session.NewReconnectCredentials(key, clock.Real{})
+		if err != nil {
+			return err
+		}
+		credentials = configured
+		return nil
+	}); err != nil {
+		return nil, errors.New("reconnect HMAC key is invalid")
+	}
+	owners, err := postgres.NewReconnectOwners(runtime.pool)
+	if err != nil {
+		return nil, fmt.Errorf("configure reconnect owner store: %w", err)
+	}
+	return gateway.WithReconnectAuthority(credentials, owners, ownerID, cfg.Gateway.Reconnect.CredentialTTL), nil
 }
 
 func maxDuration(left, right time.Duration) time.Duration {

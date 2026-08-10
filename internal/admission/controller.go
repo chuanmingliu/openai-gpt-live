@@ -55,6 +55,16 @@ type LeaseStore interface {
 	Ready(context.Context) error
 }
 
+type MonitoredLease struct {
+	Release ReleaseFunc
+	Lost    <-chan struct{}
+}
+
+type MonitoredLeaseStore interface {
+	LeaseStore
+	AcquireMonitored(context.Context, session.Subject, Limits) (MonitoredLease, error)
+}
+
 type Config struct {
 	RequireTLS        bool
 	BehindIngress     bool
@@ -149,6 +159,15 @@ func New(authn auth.Authenticator, cfg Config, stores ...LeaseStore) (*Controlle
 }
 
 func (c *Controller) Admit(ctx context.Context, request *http.Request) (session.Subject, ReleaseFunc, error) {
+	subject, release, _, err := c.admit(ctx, request, false)
+	return subject, release, err
+}
+
+func (c *Controller) AdmitMonitored(ctx context.Context, request *http.Request) (session.Subject, ReleaseFunc, <-chan struct{}, error) {
+	return c.admit(ctx, request, true)
+}
+
+func (c *Controller) admit(ctx context.Context, request *http.Request, monitor bool) (session.Subject, ReleaseFunc, <-chan struct{}, error) {
 	result := "rejected"
 	defer func() {
 		if c != nil && c.metrics != nil {
@@ -156,59 +175,75 @@ func (c *Controller) Admit(ctx context.Context, request *http.Request) (session.
 		}
 	}()
 	if c == nil || request == nil || ctx == nil {
-		return session.Subject{}, nil, ErrMalformed
+		return session.Subject{}, nil, nil, ErrMalformed
 	}
 	clientIP, peerTrusted, err := c.transport(request)
 	if err != nil {
-		return session.Subject{}, nil, err
+		return session.Subject{}, nil, nil, err
 	}
 	_ = peerTrusted
 	if err := checkOrigin(request.Header, c.origins, c.cfg.AllowEmptyOrigin); err != nil {
-		return session.Subject{}, nil, err
+		return session.Subject{}, nil, nil, err
 	}
 	if !c.limiter.allow(clientIP.String(), c.cfg.GlobalRate, c.cfg.GlobalBurst) {
-		return session.Subject{}, nil, ErrLimited
+		return session.Subject{}, nil, nil, ErrLimited
 	}
 	token, err := auth.Bearer(request.Header)
 	if err != nil {
-		return session.Subject{}, nil, ErrUnauthorized
+		return session.Subject{}, nil, nil, ErrUnauthorized
 	}
 	principal, err := c.authn.Authenticate(ctx, token)
 	if err != nil {
 		if errors.Is(err, auth.ErrForbidden) {
-			return session.Subject{}, nil, ErrForbidden
+			return session.Subject{}, nil, nil, ErrForbidden
 		}
-		return session.Subject{}, nil, ErrUnauthorized
+		return session.Subject{}, nil, nil, ErrUnauthorized
 	}
 	if err := c.validatePrincipal(principal); err != nil {
-		return session.Subject{}, nil, ErrUnauthorized
+		return session.Subject{}, nil, nil, ErrUnauthorized
 	}
 	for _, required := range c.cfg.RequiredScopes {
 		if _, ok := principal.Scopes[required]; !ok {
-			return session.Subject{}, nil, ErrForbidden
+			return session.Subject{}, nil, nil, ErrForbidden
 		}
 	}
 	subject := session.Subject{TenantID: principal.TenantID, UserID: principal.UserID, Scopes: cloneScopes(principal.Scopes), ExpiresAt: principal.ExpiresAt}
 	subject.Ephemeral = c.cfg.EphemeralTenantID != "" && principal.TenantID == c.cfg.EphemeralTenantID && principal.UserID == c.cfg.EphemeralUserID
 	if c.store == nil {
 		result = "ok"
-		return subject, func() {}, nil
+		return subject, func() {}, nil, nil
 	}
 	if err := c.store.Ready(ctx); err != nil {
-		return session.Subject{}, nil, ErrUnavailable
+		return session.Subject{}, nil, nil, ErrUnavailable
+	}
+	if monitor {
+		if store, ok := c.store.(MonitoredLeaseStore); ok {
+			lease, err := store.AcquireMonitored(ctx, subject, c.cfg.Limits)
+			if err != nil {
+				if errors.Is(err, ErrLimited) {
+					return session.Subject{}, nil, nil, ErrLimited
+				}
+				return session.Subject{}, nil, nil, ErrUnavailable
+			}
+			if lease.Release == nil || lease.Lost == nil {
+				return session.Subject{}, nil, nil, ErrUnavailable
+			}
+			result = "ok"
+			return subject, lease.Release, lease.Lost, nil
+		}
 	}
 	release, err := c.store.Acquire(ctx, subject, c.cfg.Limits)
 	if err != nil {
 		if errors.Is(err, ErrLimited) {
-			return session.Subject{}, nil, ErrLimited
+			return session.Subject{}, nil, nil, ErrLimited
 		}
-		return session.Subject{}, nil, ErrUnavailable
+		return session.Subject{}, nil, nil, ErrUnavailable
 	}
 	if release == nil {
-		return session.Subject{}, nil, ErrUnavailable
+		return session.Subject{}, nil, nil, ErrUnavailable
 	}
 	result = "ok"
-	return subject, release, nil
+	return subject, release, nil, nil
 }
 
 func (c *Controller) SetMetricsObserver(observer func(string)) {

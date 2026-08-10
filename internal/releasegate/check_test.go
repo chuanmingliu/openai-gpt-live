@@ -254,11 +254,15 @@ func TestVerifyDefaultsZeroClockOnceForBundleAndAttestation(t *testing.T) {
 			artifact.StartedAt = evidence.Gates[len(evidence.Gates)-1].FinishedAt.Add(time.Second)
 			artifact.FinishedAt = evidence.GeneratedAt.Add(-time.Nanosecond)
 			replaceFixtureArtifact(t, &evidence, options.ArtifactRoot, descriptor.Name, mustCanonical(t, artifact))
-		case descriptor.Name == "canary_snapshot":
-			var artifact canaryArtifact
-			mustStrictDecode(t, document, &artifact)
-			artifact.ObservedAt = evidence.GeneratedAt.Add(-time.Second)
-			replaceFixtureArtifact(t, &evidence, options.ArtifactRoot, descriptor.Name, mustCanonical(t, artifact))
+		case descriptor.Name == "candidate_canary_receipt":
+			var envelope SignedCandidateCanaryReceipt
+			mustStrictDecode(t, document, &envelope)
+			envelope.Receipt.ObservationStartedAt = evidence.GeneratedAt.Add(-32 * time.Minute)
+			envelope.Receipt.ObservationFinishedAt = evidence.GeneratedAt.Add(-2 * time.Minute)
+			envelope.Receipt.CleanupCompletedAt = evidence.GeneratedAt.Add(-time.Minute)
+			receiptDocument := mustCanonical(t, envelope.Receipt)
+			envelope.Signature = base64.StdEncoding.EncodeToString(ed25519.Sign(candidateCanaryTestPrivateKey(), receiptDocument))
+			replaceFixtureArtifact(t, &evidence, options.ArtifactRoot, descriptor.Name, mustCanonical(t, envelope))
 		}
 	}
 	resignFixtureAt(t, &evidence, now.Add(-time.Second))
@@ -334,6 +338,24 @@ func TestCanaryArtifactAcceptsOnlyTwoDistinctLowercaseSHA256ResponseCommitments(
 				t.Fatal("invalid response identity evidence was accepted")
 			}
 		})
+	}
+}
+
+func TestCandidateCanaryReceiptArtifactCryptographicallyVerifiesItsContentFreeEnvelope(t *testing.T) {
+	document := validArtifactDocument(t, "candidate_canary_receipt")
+	if err := ValidateArtifact("candidate_canary_receipt", document); err != nil {
+		t.Fatalf("valid candidate canary receipt rejected: %v", err)
+	}
+	var envelope SignedCandidateCanaryReceipt
+	mustStrictDecode(t, document, &envelope)
+	signature, err := base64.StdEncoding.DecodeString(envelope.Signature)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signature[0] ^= 1
+	envelope.Signature = base64.StdEncoding.EncodeToString(signature)
+	if err := ValidateArtifact("candidate_canary_receipt", mustCanonical(t, envelope)); err == nil {
+		t.Fatal("candidate canary artifact accepted a forged platform signature")
 	}
 }
 
@@ -597,13 +619,13 @@ func TestVerifyRejectsContextuallyMismatchedArtifacts(t *testing.T) {
 			artifact.SourceSHA = strings.Repeat("b", 40)
 			return mustCanonical(t, artifact)
 		}},
-		"canary runtime": {"canary_snapshot", func(document []byte) []byte {
-			var artifact canaryArtifact
-			mustStrictDecode(t, document, &artifact)
-			artifact.Region = "eu-west-1"
-			artifact.ConfigHash = "v1:" + strings.Repeat("f", 64)
-			artifact.ObservedAt = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
-			return mustCanonical(t, artifact)
+		"candidate canary runtime": {"candidate_canary_receipt", func(document []byte) []byte {
+			var envelope SignedCandidateCanaryReceipt
+			mustStrictDecode(t, document, &envelope)
+			envelope.Receipt.Region = "eu-west-1"
+			receiptDocument := mustCanonical(t, envelope.Receipt)
+			envelope.Signature = base64.StdEncoding.EncodeToString(ed25519.Sign(candidateCanaryTestPrivateKey(), receiptDocument))
+			return mustCanonical(t, envelope)
 		}},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -816,6 +838,8 @@ func signedFixture(t *testing.T) (Evidence, VerifyOptions) {
 		ConfigHash:    "v1:" + strings.Repeat("a", 64),
 		GeneratedAt:   testNow,
 		ReleaseInputs: []ReleaseInput{
+			{Name: "candidate_canary_halt_policy_sha256", Value: strings.Repeat("8", 64)},
+			{Name: "candidate_canary_public_key_sha256", Value: candidateCanaryTestPublicKeySHA256()},
 			{Name: "candidate_gateway_image", Value: testGatewayRef},
 			{Name: "candidate_migrate_image", Value: testMigrateRef},
 			{Name: "candidate_worker_image", Value: testWorkerRef},
@@ -831,7 +855,7 @@ func signedFixture(t *testing.T) (Evidence, VerifyOptions) {
 			{Name: "voice_url", Value: "wss://voice.example.com/v1/realtime"},
 		},
 	}
-	artifactNames := []string{"canary_snapshot", "dashboard_snapshot", "gateway_provenance", "gateway_sbom", "migrate_provenance", "migrate_sbom", "migration_rollback", "production_manifest", "vulnerability_report", "worker_provenance", "worker_sbom"}
+	artifactNames := []string{"candidate_canary_receipt", "dashboard_snapshot", "gateway_provenance", "gateway_sbom", "migrate_provenance", "migrate_sbom", "migration_rollback", "production_manifest", "vulnerability_report", "worker_provenance", "worker_sbom"}
 	artifactNames = append(artifactNames, RequiredFormalArtifactNames...)
 	sort.Strings(artifactNames)
 	for _, name := range artifactNames {
@@ -905,6 +929,9 @@ func resignFixtureAt(t *testing.T, evidence *Evidence, signedAt time.Time) {
 
 func validArtifactDocument(t *testing.T, name string) []byte {
 	t.Helper()
+	if name == "candidate_canary_receipt" {
+		return validCandidateCanaryArtifact(t)
+	}
 	documents := map[string]string{
 		"vulnerability_report": `{"schema_version":"release-artifact-v2","artifact_type":"vulnerability_report","status":"passed","suite":"govulncheck"}`,
 		"migration_rollback":   `{"schema_version":"release-artifact-v2","artifact_type":"migration_rollback","status":"passed","migration":"up-down-up","candidate_image":"` + testMigrateRef + `","executions":[{"direction":"up","container_id":"` + strings.Repeat("1", 64) + `","exit_code":0},{"direction":"down","container_id":"` + strings.Repeat("3", 64) + `","exit_code":0},{"direction":"up","container_id":"` + strings.Repeat("4", 64) + `","exit_code":0}],"database_image":"` + testPostgresRef + `","database_container_id":"` + strings.Repeat("2", 64) + `","database_server_major":16,"started_at":"2026-08-09T11:57:10Z","finished_at":"2026-08-09T11:58:00Z"}`,
@@ -943,6 +970,45 @@ func validArtifactDocument(t *testing.T, name string) []byte {
 		t.Fatalf("no fixture artifact for %q", name)
 	}
 	return []byte(document + "\n")
+}
+
+func validCandidateCanaryArtifact(t *testing.T) []byte {
+	t.Helper()
+	privateKey := candidateCanaryTestPrivateKey()
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+	expected := CandidateCanaryExpected{
+		Commit: strings.Repeat("a", 40), ConfigHash: "v1:" + strings.Repeat("a", 64),
+		ManifestSHA256: strings.Repeat("b", 64), HaltPolicySHA256: strings.Repeat("8", 64),
+		PublicKeySHA256: candidateCanaryTestPublicKeySHA256(), Region: "us-east-1",
+		GatewayImage: testGatewayRef, WorkerImage: testWorkerRef, MigrateImage: testMigrateRef,
+	}
+	receipt := CandidateCanaryReceipt{
+		SchemaVersion: CandidateCanaryReceiptSchemaVersion, Authority: CandidateCanaryAuthority,
+		Status: "passed", CleanupStatus: "rolled_back", DeploymentID: "canary-run-123",
+		Commit: expected.Commit, ConfigHash: expected.ConfigHash, ManifestSHA256: expected.ManifestSHA256,
+		HaltPolicySHA256: expected.HaltPolicySHA256, Region: expected.Region,
+		GatewayImage: expected.GatewayImage, WorkerImage: expected.WorkerImage, MigrateImage: expected.MigrateImage,
+		ObservationStartedAt: testNow.Add(-32 * time.Minute), ObservationFinishedAt: testNow.Add(-2 * time.Minute),
+		CleanupCompletedAt: testNow.Add(-time.Minute), ObservationSeconds: 1800, ProbesTotal: 30,
+	}
+	receiptDocument := mustCanonical(t, receipt)
+	envelope, err := VerifyCandidateCanaryReceipt(receiptDocument,
+		[]byte(base64.StdEncoding.EncodeToString(ed25519.Sign(privateKey, receiptDocument))),
+		[]byte(base64.StdEncoding.EncodeToString(publicKey)), expected, testNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return mustCanonical(t, envelope)
+}
+
+func candidateCanaryTestPrivateKey() ed25519.PrivateKey {
+	seed := sha256.Sum256([]byte("gpt-live-candidate-canary-test-only-ed25519-seed"))
+	return ed25519.NewKeyFromSeed(seed[:])
+}
+
+func candidateCanaryTestPublicKeySHA256() string {
+	digest := sha256.Sum256(candidateCanaryTestPrivateKey().Public().(ed25519.PublicKey))
+	return hex.EncodeToString(digest[:])
 }
 
 func mustStrictDecode(t *testing.T, document []byte, target any) {

@@ -36,6 +36,7 @@ gateway:
   behind_ingress: true
   trusted_proxies: [127.0.0.1/32]
   voice: {url: wss://voice.invalid/v1/realtime, model: voice-v1}
+  reconnect: {hmac_key_env: LIVE_RECONNECT_HMAC_KEY, hmac_key_id: reconnect-v1}
 store:
   database_url_env: DATABASE_URL
   retention: {hmac_key_env: LIVE_RETENTION_HMAC_KEY, hmac_key_id: retention-v1}
@@ -54,8 +55,13 @@ features: {handoffs: true, runtime_refresh_interval: 1s}
 	require.NoError(t, err)
 	hash, err := config.Hash(cfg)
 	require.NoError(t, err)
-	options, err := composeGatewayDurability(cfg, &gatewayFeatureRuntime{pool: pool, repo: repository}, hash)
+	options, err := composeGatewayDurability(cfg, &gatewayFeatureRuntime{pool: pool, repo: repository}, hash, "gateway-integration", "test-region")
 	require.NoError(t, err)
+	credentials, err := session.NewReconnectCredentials([]byte("0123456789abcdef0123456789abcdef"), clock.Real{})
+	require.NoError(t, err)
+	owners, err := postgres.NewReconnectOwners(pool)
+	require.NoError(t, err)
+	options = append(options, gateway.WithReconnectAuthority(credentials, owners, "gateway-integration", time.Minute))
 	options = append(options, gateway.WithAdmission(transportws.AdmissionFunc(func(context.Context, *http.Request) (session.Subject, func(), error) {
 		return session.Subject{TenantID: "tenant", UserID: "user", Scopes: map[string]struct{}{"realtime": {}}}, func() {}, nil
 	})))

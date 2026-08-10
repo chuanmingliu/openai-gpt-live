@@ -33,6 +33,10 @@ type Options struct {
 	MaxAudioBytes         int
 	ReadTimeout           time.Duration
 	WriteTimeout          time.Duration
+	AdvertisedModel       string
+	ProviderModel         string
+	HandoffsEnabled       *bool
+	ReconnectCredentials  session.ReconnectCredentials
 	CanaryRuntimeIdentity RuntimeIdentity
 }
 
@@ -59,6 +63,7 @@ type handler struct {
 	limits                   protocol.Limits
 	manager                  *session.Manager
 	admission                Admission
+	handoffsEnabled          bool
 	canaryRuntimeIdentity    RuntimeIdentity
 	canaryRuntimeIdentityErr error
 	err                      error
@@ -72,8 +77,15 @@ func NewHandler(opts Options, manager *session.Manager, admission Admission) htt
 	if isNilAdmission(admission) {
 		err = errors.New("admission is required")
 	}
+	if manager != nil && (isNilReconnectCredentials(normalized.ReconnectCredentials) != !manager.ReconnectEnabled()) {
+		err = errors.New("reconnect transport and manager authority must be configured together")
+	}
+	handoffsEnabled := true
+	if normalized.HandoffsEnabled != nil {
+		handoffsEnabled = *normalized.HandoffsEnabled
+	}
 	identityErr := validateRuntimeIdentity(normalized.CanaryRuntimeIdentity)
-	return &handler{opts: normalized, limits: limits, manager: manager, admission: admission, canaryRuntimeIdentity: normalized.CanaryRuntimeIdentity, canaryRuntimeIdentityErr: identityErr, err: err}
+	return &handler{opts: normalized, limits: limits, manager: manager, admission: admission, handoffsEnabled: handoffsEnabled, canaryRuntimeIdentity: normalized.CanaryRuntimeIdentity, canaryRuntimeIdentityErr: identityErr, err: err}
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -89,7 +101,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(protocol.Capabilities(h.limits))
+		_ = json.NewEncoder(w).Encode(protocol.CapabilitiesForFeatures(h.limits, protocol.CapabilityFeatures{Handoffs: h.handoffsEnabled}))
 	case "/v1/realtime":
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)
@@ -108,7 +120,16 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *handler) serveRealtime(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	subject, release, err := h.admission.Admit(r.Context(), r)
+	var subject session.Subject
+	var release func()
+	var leaseLost <-chan struct{}
+	var err error
+	controller, exactAdmission := h.admission.(*admission.Controller)
+	if exactAdmission {
+		subject, release, leaseLost, err = controller.AdmitMonitored(r.Context(), r)
+	} else {
+		subject, release, err = h.admission.Admit(r.Context(), r)
+	}
 	if err != nil {
 		writeAdmissionError(w, err)
 		return
@@ -117,15 +138,21 @@ func (h *handler) serveRealtime(w http.ResponseWriter, r *http.Request) {
 		release = func() {}
 	}
 	defer release()
+	providerModel, err := h.providerModel(r.URL.RawQuery)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	reconnecting, err := reconnectMode(r.URL.RawQuery)
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
 	if !r.ProtoAtLeast(1, 1) || !validHandshake(r.Header) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	exactOrigin := false
-	if _, ok := h.admission.(*admission.Controller); ok {
-		exactOrigin = true
-	}
-	if !exactOrigin && !sameOrigin(r) {
+	if !exactAdmission && !sameOrigin(r) {
 		w.WriteHeader(http.StatusForbidden)
 		return
 	}
@@ -133,7 +160,7 @@ func (h *handler) serveRealtime(w http.ResponseWriter, r *http.Request) {
 	sessionCtx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	acceptOptions := &websocket.AcceptOptions{}
-	if exactOrigin {
+	if exactAdmission {
 		acceptOptions.InsecureSkipVerify = true
 	}
 	if subject.Ephemeral {
@@ -150,11 +177,93 @@ func (h *handler) serveRealtime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	client := newClientConn(conn, h.limits, h.opts.ReadTimeout, h.opts.WriteTimeout)
-	runErr := h.manager.Run(sessionCtx, session.OpenRequest{
-		Subject:        subject,
-		RequestedModel: r.URL.Query().Get("model"),
-	}, client)
+	var leaseMonitorDone chan struct{}
+	if leaseLost != nil {
+		leaseMonitorDone = make(chan struct{})
+		go func() {
+			defer close(leaseMonitorDone)
+			select {
+			case <-sessionCtx.Done():
+				return
+			case <-leaseLost:
+				closeCtx, closeCancel := operationContext(context.Background(), h.opts.WriteTimeout)
+				_ = client.Close(closeCtx, int(websocket.StatusInternalError), "admission lease lost")
+				closeCancel()
+				cancel()
+			}
+		}()
+	}
+	var runErr error
+	if reconnecting {
+		credential, controlErr := client.readReconnectControl(sessionCtx)
+		if controlErr != nil {
+			runErr = session.ErrInvalidReconnectCredential
+			_ = client.closeNow(websocket.StatusPolicyViolation, "invalid reconnect control")
+		} else {
+			claims, verifyErr := h.verifyReconnectCredential(credential, subject, providerModel)
+			if verifyErr != nil {
+				runErr = verifyErr
+				_ = client.closeNow(websocket.StatusPolicyViolation, "invalid reconnect control")
+			} else {
+				runErr = h.manager.Reconnect(sessionCtx, session.ReconnectRequest{Scope: claims.Scope, SessionID: claims.SessionID,
+					LastIncarnation: claims.Incarnation, LastEventSeq: claims.Cursor, Subject: subject, Credential: claims}, client)
+			}
+		}
+	} else {
+		runErr = h.manager.Run(sessionCtx, session.OpenRequest{Subject: subject, RequestedModel: providerModel}, client)
+	}
+	cancel()
+	if leaseMonitorDone != nil {
+		<-leaseMonitorDone
+	}
 	_ = client.finish(runErr)
+}
+
+func reconnectMode(rawQuery string) (bool, error) {
+	query, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return false, session.ErrInvalidReconnectCredential
+	}
+	values, present := query["reconnect"]
+	if !present {
+		return false, nil
+	}
+	if len(values) != 1 || values[0] != "1" {
+		return false, session.ErrInvalidReconnectCredential
+	}
+	return true, nil
+}
+
+func (h *handler) verifyReconnectCredential(credential string, subject session.Subject, providerModel string) (session.ReconnectClaims, error) {
+	if isNilReconnectCredentials(h.opts.ReconnectCredentials) {
+		return session.ReconnectClaims{}, session.ErrInvalidReconnectCredential
+	}
+	claims, err := h.opts.ReconnectCredentials.Verify(credential)
+	if err != nil {
+		return session.ReconnectClaims{}, err
+	}
+	if claims.Scope.TenantID != subject.TenantID || claims.Scope.UserID != subject.UserID {
+		return session.ReconnectClaims{}, admission.ErrForbidden
+	}
+	if claims.Model != providerModel {
+		return session.ReconnectClaims{}, session.ErrInvalidReconnectCredential
+	}
+	return claims, nil
+}
+
+func (h *handler) providerModel(rawQuery string) (string, error) {
+	query, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return "", errors.New("invalid realtime query")
+	}
+	models, present := query["model"]
+	if !present {
+		return h.opts.ProviderModel, nil
+	}
+	if len(models) != 1 || models[0] == "" || models[0] != h.opts.AdvertisedModel {
+		return "", errors.New("requested realtime model is not advertised")
+	}
+	return h.opts.ProviderModel, nil
 }
 
 func validateRuntimeIdentity(identity RuntimeIdentity) error {
@@ -288,11 +397,39 @@ func normalizeOptions(opts Options) (Options, protocol.Limits, error) {
 	if opts.WriteTimeout == 0 {
 		opts.WriteTimeout = defaultWriteTimeout
 	}
+	if !boundedModel(opts.AdvertisedModel) || !boundedModel(opts.ProviderModel) {
+		return opts, protocol.Limits{}, errors.New("realtime models must be bounded canonical identifiers")
+	}
 	limits := protocol.Limits{MaxFrameBytes: int(opts.MaxFrameBytes), MaxJSONDepth: opts.MaxJSONDepth, MaxAudioBytes: opts.MaxAudioBytes}
 	return opts, limits, nil
 }
 
+func boundedModel(value string) bool {
+	if len(value) > 256 || strings.TrimSpace(value) != value {
+		return false
+	}
+	for _, character := range value {
+		if character < 0x20 || character == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
 func isNilAdmission(value Admission) bool {
+	if value == nil {
+		return true
+	}
+	rv := reflect.ValueOf(value)
+	switch rv.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return rv.IsNil()
+	default:
+		return false
+	}
+}
+
+func isNilReconnectCredentials(value session.ReconnectCredentials) bool {
 	if value == nil {
 		return true
 	}

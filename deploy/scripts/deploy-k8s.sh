@@ -27,7 +27,7 @@ kubeconform -strict -summary "$scratch/all.yaml"
 kubectl apply -f "$root/deploy/k8s/base/namespace.yaml"
 
 kubectl get secret live-secrets -n gpt-live >/dev/null 2>&1 || { echo "preflight failed: external Secret gpt-live/live-secrets is missing" >&2; exit 1; }
-required_keys="DATABASE_URL S2S_API_KEY DEEPSEEK_API_KEY LIVE_ADMIN_BEARER_TOKEN LIVE_PRIVACY_HMAC_KEY LIVE_RETENTION_HMAC_KEY LIVE_TOOL_ENCRYPTION_KEY"
+required_keys="DATABASE_URL S2S_API_KEY DEEPSEEK_API_KEY LIVE_ADMIN_BEARER_TOKEN LIVE_PRIVACY_HMAC_KEY LIVE_RETENTION_HMAC_KEY LIVE_RECONNECT_HMAC_KEY LIVE_TOOL_ENCRYPTION_KEY"
 [ "$overlay" = local ] && required_keys="$required_keys LIVE_STATIC_BEARER_TOKEN"
 for key in $required_keys; do
   present=$(kubectl get secret live-secrets -n gpt-live -o "go-template={{if index .data \"$key\"}}present{{end}}")

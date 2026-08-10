@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/config"
+	"github.com/chuanmingliu/openai-gpt-live/internal/store/postgres"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -53,6 +54,69 @@ func TestGatewayHandoffsRequireProductionDurabilityComposition(t *testing.T) {
 	err := validateComposition(config.Config{Mode: "local", Features: config.FeatureConfig{Handoffs: true}})
 	assert.ErrorContains(t, err, "production durability composition")
 	assert.NoError(t, validateComposition(config.Config{}), "non-handoff local startup stays compatible")
+}
+
+func TestComposeGatewayDurabilityIncludesRecoveryWhenHandoffsAreDisabled(t *testing.T) {
+	cfg := config.Config{Mode: "production"}
+	cfg.Store.Retention.ConversationTTL = 24 * time.Hour
+	cfg.Admission.LeaseDuration = time.Minute
+
+	options, err := composeGatewayDurability(cfg, nil, "v1:"+strings.Repeat("a", 64), "gateway-replica-a", "us-east-1")
+	assert.Nil(t, options)
+	assert.ErrorContains(t, err, "conversation durability runtime")
+
+	options, err = composeGatewayDurability(cfg, &gatewayFeatureRuntime{repo: &postgres.Repository{}}, "v1:"+strings.Repeat("a", 64), "gateway-replica-a", "us-east-1")
+	require.NoError(t, err)
+	require.Len(t, options, 1, "feature-off production still needs the common durable dependency option")
+}
+
+func TestGatewayDurabilityIdentityIsStableAndReplicaDistinct(t *testing.T) {
+	first, err := gatewayDurabilityIdentity("gateway-replica-a")
+	require.NoError(t, err)
+	replay, err := gatewayDurabilityIdentity("gateway-replica-a")
+	require.NoError(t, err)
+	second, err := gatewayDurabilityIdentity("gateway-replica-b")
+	require.NoError(t, err)
+	assert.Equal(t, first, replay)
+	assert.NotEqual(t, first, second)
+	assert.Regexp(t, `^gateway-[0-9a-f]{32}$`, first)
+	_, err = gatewayDurabilityIdentity("")
+	assert.Error(t, err)
+}
+
+func TestGatewayDeliveryShardIsStableAcrossReplicaReplacementAndRegionIsolated(t *testing.T) {
+	first, err := gatewayDeliveryShard("us-east-1")
+	require.NoError(t, err)
+	replacement, err := gatewayDeliveryShard("us-east-1")
+	require.NoError(t, err)
+	otherRegion, err := gatewayDeliveryShard("eu-west-1")
+	require.NoError(t, err)
+
+	firstOwner, err := gatewayDurabilityIdentity("live-gateway-old-pod")
+	require.NoError(t, err)
+	replacementOwner, err := gatewayDurabilityIdentity("live-gateway-replacement-pod")
+	require.NoError(t, err)
+	assert.Equal(t, first, replacement, "pod replacement must retain the delivery shard")
+	assert.NotEqual(t, firstOwner, replacementOwner, "runtime owners must remain independently fenced")
+	assert.NotEqual(t, first, otherRegion, "delivery shards in different regions must remain isolated")
+	assert.Regexp(t, `^gateway-shard-[0-9a-f]{32}$`, first)
+	_, err = gatewayDeliveryShard("")
+	assert.Error(t, err)
+}
+
+func TestComposeGatewayReconnectFailsClosedWithoutProductionRuntime(t *testing.T) {
+	option, err := composeGatewayReconnect(config.Config{Mode: "local"}, nil, nil)
+	assert.NoError(t, err)
+	assert.Nil(t, option)
+
+	cfg := config.Config{Mode: "production"}
+	cfg.Gateway.Reconnect.HMACKeyEnv = "RECONNECT_KEY"
+	cfg.Gateway.Reconnect.HMACKeyID = "reconnect-v1"
+	cfg.Gateway.Reconnect.CredentialTTL = 5 * time.Minute
+	cfg.Admission.InstanceID = "gateway-a"
+	option, err = composeGatewayReconnect(cfg, nil, func(string) (string, bool) { return "", false })
+	assert.Nil(t, option)
+	assert.ErrorContains(t, err, "runtime")
 }
 
 func TestGatewayMetricInstanceRequiresDedicatedProductionPodIdentity(t *testing.T) {

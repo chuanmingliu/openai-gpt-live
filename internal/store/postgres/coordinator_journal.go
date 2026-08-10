@@ -4,15 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"sort"
-	"sync"
 	"time"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
@@ -30,74 +27,106 @@ const (
 )
 
 type CoordinatorJournalRecord struct {
-	WorkKey          string
-	Kind             string
-	Scope            handoff.Scope
-	SessionID        identity.SessionID
-	DeliveryAffinity string
-	Incarnation      identity.Incarnation
-	LocalSequence    uint64
-	Payload          json.RawMessage
-	PayloadHash      string
-	StorageSequence  uint64
-	CreatedAt        time.Time
-	ClaimGeneration  uint64
+	WorkKey            string
+	Kind               string
+	Scope              handoff.Scope
+	SessionID          identity.SessionID
+	DeliveryAffinity   string
+	Incarnation        identity.Incarnation
+	LocalSequence      uint64
+	Payload            json.RawMessage
+	PayloadHash        string
+	StorageSequence    uint64
+	CreatedAt          time.Time
+	ClaimGeneration    uint64
+	AffinityGeneration uint64
 }
 
-var ErrCoordinatorAffinityInUse = errors.New("coordinator delivery affinity is already owned")
-
-const coordinatorAffinityLockNamespace = "openai-gpt-live/coordinator-affinity/v1\x00"
-
-type coordinatorAffinityLock struct {
-	connection *pgx.Conn
-	once       sync.Once
-	err        error
-}
-
-var _ io.Closer = (*coordinatorAffinityLock)(nil)
-
-func (r *Repository) AcquireCoordinatorAffinity(ctx context.Context, affinity string) (io.Closer, error) {
+func (r *Repository) AcquireCoordinatorAffinity(
+	ctx context.Context,
+	affinity, owner string,
+	lease time.Duration,
+) (uint64, bool, error) {
 	if err := validateContext(ctx); err != nil {
-		return nil, err
+		return 0, false, err
 	}
 	if err := bounded("delivery affinity", affinity, maxIdentityBytes, true); err != nil {
-		return nil, err
+		return 0, false, err
 	}
-	poolConnection, err := r.pool.Acquire(ctx)
+	if err := bounded("affinity owner", owner, maxIdentityBytes, true); err != nil {
+		return 0, false, err
+	}
+	leaseMicros, err := coordinatorLeaseMicroseconds(lease)
 	if err != nil {
-		return nil, fmt.Errorf("acquire coordinator affinity connection: %w", err)
+		return 0, false, err
 	}
-	var acquired bool
-	if err := poolConnection.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, coordinatorAffinityLockID(affinity)).Scan(&acquired); err != nil {
-		poolConnection.Release()
-		return nil, fmt.Errorf("acquire coordinator affinity lock: %w", err)
+	var generation int64
+	err = r.pool.QueryRow(ctx, `
+		INSERT INTO coordinator_delivery_shards (
+			delivery_affinity, lease_owner, lease_until, lease_generation, updated_at
+		) VALUES (
+			$1, $2, clock_timestamp() + ($3::bigint * interval '1 microsecond'), 1, clock_timestamp()
+		)
+		ON CONFLICT (delivery_affinity) DO UPDATE
+		SET lease_owner=EXCLUDED.lease_owner,
+			lease_until=EXCLUDED.lease_until,
+			lease_generation=CASE
+				WHEN coordinator_delivery_shards.lease_owner=EXCLUDED.lease_owner
+					AND coordinator_delivery_shards.lease_until > clock_timestamp()
+				THEN coordinator_delivery_shards.lease_generation
+				ELSE coordinator_delivery_shards.lease_generation + 1
+			END,
+			updated_at=clock_timestamp()
+		WHERE coordinator_delivery_shards.lease_owner=EXCLUDED.lease_owner
+			OR coordinator_delivery_shards.lease_until <= clock_timestamp()
+		RETURNING lease_generation`, affinity, owner, leaseMicros).Scan(&generation)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
 	}
-	if !acquired {
-		poolConnection.Release()
-		return nil, ErrCoordinatorAffinityInUse
+	if err != nil {
+		return 0, false, err
 	}
-	// Session locks must never return to the pool. Hijacking and closing the
-	// dedicated connection releases the affinity lock with the backend itself.
-	return &coordinatorAffinityLock{connection: poolConnection.Hijack()}, nil
+	if generation <= 0 {
+		return 0, false, errors.New("postgres: corrupt coordinator affinity generation")
+	}
+	return uint64(generation), true, nil
 }
 
-func coordinatorAffinityLockID(affinity string) int64 {
-	digest := sha256.Sum256([]byte(coordinatorAffinityLockNamespace + affinity))
-	return int64(binary.BigEndian.Uint64(digest[:8]))
-}
-
-func (l *coordinatorAffinityLock) Close() error {
-	if l == nil || l.connection == nil {
-		return errors.New("coordinator affinity lock is nil")
+func (r *Repository) RenewCoordinatorAffinity(
+	ctx context.Context,
+	affinity, owner string,
+	generation uint64,
+	lease time.Duration,
+) error {
+	if err := validateContext(ctx); err != nil {
+		return err
 	}
-	l.once.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := l.connection.Close(ctx); err != nil {
-			l.err = fmt.Errorf("release coordinator affinity lock: %w", err)
+	if err := bounded("delivery affinity", affinity, maxIdentityBytes, true); err != nil {
+		return err
+	}
+	if err := bounded("affinity owner", owner, maxIdentityBytes, true); err != nil {
+		return err
+	}
+	leaseMicros, leaseErr := coordinatorLeaseMicroseconds(lease)
+	if leaseErr != nil || generation == 0 || generation > math.MaxInt64 {
+		if leaseErr != nil {
+			return leaseErr
 		}
-	})
-	return l.err
+		return fmt.Errorf("%w: invalid coordinator affinity renewal", handoff.ErrInvalidRequest)
+	}
+	command, err := r.pool.Exec(ctx, `
+		UPDATE coordinator_delivery_shards
+		SET lease_until=clock_timestamp() + ($4::bigint * interval '1 microsecond'),
+			updated_at=clock_timestamp()
+		WHERE delivery_affinity=$1 AND lease_owner=$2 AND lease_generation=$3
+			AND lease_until > clock_timestamp()`, affinity, owner, int64(generation), leaseMicros)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() != 1 {
+		return handoff.ErrNotFound
+	}
+	return nil
 }
 
 func (r *Repository) AdmitCoordinatorWork(ctx context.Context, record CoordinatorJournalRecord) (CoordinatorJournalRecord, error) {
@@ -204,7 +233,34 @@ func (r *Repository) ClaimCoordinatorWork(
 		}
 		return nil, fmt.Errorf("%w: invalid coordinator claim", handoff.ErrInvalidRequest)
 	}
-	rows, err := r.pool.Query(ctx, `
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer rollback(tx)
+
+	// Affinity ownership is maintained independently from work claims. Lock the
+	// live authority row so takeover cannot race the per-item generation written
+	// below.
+	var affinityGeneration int64
+	err = tx.QueryRow(ctx, `SELECT lease_generation
+		FROM coordinator_delivery_shards
+		WHERE delivery_affinity=$1 AND lease_owner=$2 AND lease_until > clock_timestamp()
+		FOR UPDATE`, affinity, owner).Scan(&affinityGeneration)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if affinityGeneration <= 0 {
+		return nil, errors.New("postgres: corrupt coordinator affinity generation")
+	}
+
+	rows, err := tx.Query(ctx, `
 		WITH candidates AS (
 			SELECT work_key FROM coordinator_work_journal
 			WHERE kind=$1 AND delivery_affinity=$2 AND delivered=FALSE
@@ -216,12 +272,14 @@ func (r *Repository) ClaimCoordinatorWork(
 		UPDATE coordinator_work_journal j
 		SET claim_owner=$4,
 			claim_until=clock_timestamp() + ($5::bigint * interval '1 microsecond'),
-			claim_generation=claim_generation + 1
+			claim_generation=claim_generation + 1,
+			claim_affinity_generation=$6
 		FROM candidates c
 		WHERE j.work_key=c.work_key
 		RETURNING j.work_key,j.kind,j.tenant_id,j.user_id,j.conversation_id,j.session_id,j.delivery_affinity,
-			j.incarnation,j.local_sequence,j.payload,j.payload_hash,j.storage_sequence,j.created_at,j.claim_generation`,
-		kind, affinity, limit, owner, leaseMicros)
+			j.incarnation,j.local_sequence,j.payload,j.payload_hash,j.storage_sequence,j.created_at,j.claim_generation,
+			j.claim_affinity_generation`,
+		kind, affinity, limit, owner, leaseMicros, affinityGeneration)
 	if err != nil {
 		return nil, err
 	}
@@ -238,6 +296,10 @@ func (r *Repository) ClaimCoordinatorWork(
 		records = append(records, record)
 	}
 	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	sort.Slice(records, func(i, j int) bool {
@@ -266,18 +328,28 @@ func (r *Repository) RenewCoordinatorWork(ctx context.Context, workKey, owner st
 		}
 		return fmt.Errorf("%w: invalid coordinator renewal", handoff.ErrInvalidRequest)
 	}
-	command, err := r.pool.Exec(ctx, `
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer rollback(tx)
+	_, affinityGeneration, err := lockCoordinatorAffinityAuthority(ctx, tx, workKey, owner, generation)
+	if err != nil {
+		return err
+	}
+	command, err := tx.Exec(ctx, `
 		UPDATE coordinator_work_journal
 		SET claim_until=clock_timestamp() + ($4::bigint * interval '1 microsecond')
 		WHERE work_key=$1 AND claim_owner=$2 AND claim_generation=$3 AND delivered=FALSE
-		  AND claim_until > clock_timestamp()`, workKey, owner, int64(generation), leaseMicros)
+		  AND claim_affinity_generation=$5 AND claim_until > clock_timestamp()`,
+		workKey, owner, int64(generation), leaseMicros, affinityGeneration)
 	if err != nil {
 		return err
 	}
 	if command.RowsAffected() != 1 {
 		return handoff.ErrNotFound
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 func (r *Repository) AckCoordinatorWork(ctx context.Context, workKey, owner string, generation uint64) error {
@@ -293,18 +365,29 @@ func (r *Repository) AckCoordinatorWork(ctx context.Context, workKey, owner stri
 		}
 		return fmt.Errorf("%w: invalid coordinator acknowledgement", handoff.ErrInvalidRequest)
 	}
-	command, err := r.pool.Exec(ctx, `
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer rollback(tx)
+	_, affinityGeneration, err := lockCoordinatorAffinityAuthority(ctx, tx, workKey, owner, generation)
+	if err != nil {
+		return err
+	}
+	command, err := tx.Exec(ctx, `
 		UPDATE coordinator_work_journal
-		SET delivered=TRUE, delivered_at=clock_timestamp(), claim_owner=NULL, claim_until=NULL
+		SET delivered=TRUE, delivered_at=clock_timestamp(), claim_owner=NULL, claim_until=NULL,
+			claim_affinity_generation=NULL
 		WHERE work_key=$1 AND claim_owner=$2 AND claim_generation=$3 AND delivered=FALSE
-		  AND claim_until > clock_timestamp()`, workKey, owner, int64(generation))
+		  AND claim_affinity_generation=$4 AND claim_until > clock_timestamp()`,
+		workKey, owner, int64(generation), affinityGeneration)
 	if err != nil {
 		return err
 	}
 	if command.RowsAffected() != 1 {
 		return handoff.ErrNotFound
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 // DiscardCoordinatorWork terminally removes a claimed item that was rejected
@@ -323,17 +406,57 @@ func (r *Repository) DiscardCoordinatorWork(ctx context.Context, workKey, owner 
 		}
 		return fmt.Errorf("%w: invalid coordinator discard", handoff.ErrInvalidRequest)
 	}
-	command, err := r.pool.Exec(ctx, `
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer rollback(tx)
+	_, affinityGeneration, err := lockCoordinatorAffinityAuthority(ctx, tx, workKey, owner, generation)
+	if err != nil {
+		return err
+	}
+	command, err := tx.Exec(ctx, `
 		DELETE FROM coordinator_work_journal
 		WHERE work_key=$1 AND claim_owner=$2 AND claim_generation=$3 AND delivered=FALSE
-		  AND claim_until > clock_timestamp()`, workKey, owner, int64(generation))
+		  AND claim_affinity_generation=$4 AND claim_until > clock_timestamp()`,
+		workKey, owner, int64(generation), affinityGeneration)
 	if err != nil {
 		return err
 	}
 	if command.RowsAffected() != 1 {
 		return handoff.ErrNotFound
 	}
-	return nil
+	return tx.Commit(ctx)
+}
+
+func lockCoordinatorAffinityAuthority(
+	ctx context.Context,
+	tx pgx.Tx,
+	workKey, owner string,
+	claimGeneration uint64,
+) (string, int64, error) {
+	var affinity string
+	var affinityGeneration int64
+	err := tx.QueryRow(ctx, `
+		SELECT shard.delivery_affinity, shard.lease_generation
+		FROM coordinator_delivery_shards shard
+		JOIN coordinator_work_journal journal
+			ON journal.delivery_affinity=shard.delivery_affinity
+		WHERE journal.work_key=$1 AND journal.claim_owner=$2 AND journal.claim_generation=$3
+			AND journal.delivered=FALSE AND journal.claim_until > clock_timestamp()
+			AND journal.claim_affinity_generation=shard.lease_generation
+			AND shard.lease_owner=$2 AND shard.lease_until > clock_timestamp()
+		FOR UPDATE OF shard`, workKey, owner, int64(claimGeneration)).Scan(&affinity, &affinityGeneration)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", 0, handoff.ErrNotFound
+	}
+	if err != nil {
+		return "", 0, err
+	}
+	if affinityGeneration <= 0 {
+		return "", 0, errors.New("postgres: corrupt coordinator affinity generation")
+	}
+	return affinity, affinityGeneration, nil
 }
 
 func validateCoordinatorRecord(record CoordinatorJournalRecord) (CoordinatorJournalRecord, error) {
@@ -377,7 +500,8 @@ func validateCoordinatorRecord(record CoordinatorJournalRecord) (CoordinatorJour
 
 func loadCoordinatorRecord(ctx context.Context, tx pgx.Tx, key string, lock bool) (CoordinatorJournalRecord, bool, error) {
 	query := `SELECT work_key,kind,tenant_id,user_id,conversation_id,session_id,
-		delivery_affinity,incarnation,local_sequence,payload,payload_hash,storage_sequence,created_at,claim_generation
+		delivery_affinity,incarnation,local_sequence,payload,payload_hash,storage_sequence,created_at,claim_generation,
+		claim_affinity_generation
 		FROM coordinator_work_journal WHERE work_key=$1`
 	if lock {
 		query += ` FOR UPDATE`
@@ -394,10 +518,10 @@ type coordinatorScanner interface{ Scan(...any) error }
 func scanCoordinatorRecord(row coordinatorScanner) (CoordinatorJournalRecord, error) {
 	var record CoordinatorJournalRecord
 	var incarnation, local, generation int64
-	var storage *int64
+	var storage, affinityGeneration *int64
 	err := row.Scan(&record.WorkKey, &record.Kind, &record.Scope.TenantID, &record.Scope.UserID,
 		&record.Scope.ConversationID, &record.SessionID, &record.DeliveryAffinity, &incarnation, &local, &record.Payload,
-		&record.PayloadHash, &storage, &record.CreatedAt, &generation)
+		&record.PayloadHash, &storage, &record.CreatedAt, &generation, &affinityGeneration)
 	if err != nil {
 		return CoordinatorJournalRecord{}, err
 	}
@@ -407,6 +531,12 @@ func scanCoordinatorRecord(row coordinatorScanner) (CoordinatorJournalRecord, er
 	record.Incarnation = identity.Incarnation(incarnation)
 	record.LocalSequence = uint64(local)
 	record.ClaimGeneration = uint64(generation)
+	if affinityGeneration != nil {
+		if *affinityGeneration <= 0 {
+			return CoordinatorJournalRecord{}, errors.New("postgres: corrupt coordinator affinity generation")
+		}
+		record.AffinityGeneration = uint64(*affinityGeneration)
+	}
 	if storage != nil {
 		record.StorageSequence = uint64(*storage)
 	}

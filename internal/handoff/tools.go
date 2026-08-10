@@ -14,6 +14,43 @@ const (
 	ToolCancelBackgroundTask = "cancel_background_task"
 )
 
+// ReservedToolSchema is the immutable server-owned model-facing definition of
+// one durable handoff control. Callers receive owned parameter bytes so a
+// client/session cannot mutate the definitions used by another session.
+type ReservedToolSchema struct {
+	Type        string
+	Name        string
+	Description string
+	Parameters  json.RawMessage
+}
+
+var reservedToolSchemas = []ReservedToolSchema{
+	{
+		Type: "function", Name: ToolStartBackgroundTask,
+		Description: "Start a durable background task for the current committed user turn.",
+		Parameters:  json.RawMessage(`{"type":"object","additionalProperties":false,"properties":{"objective":{"type":"string","minLength":1,"maxLength":8192},"presentation_hint":{"type":"string","minLength":1,"maxLength":2048}},"required":["objective"]}`),
+	},
+	{
+		Type: "function", Name: ToolSteerBackgroundTask,
+		Description: "Revise the objective of an existing durable background task.",
+		Parameters:  json.RawMessage(`{"type":"object","additionalProperties":false,"properties":{"handoff_id":{"type":"string","minLength":1,"maxLength":256},"objective":{"type":"string","minLength":1,"maxLength":8192}},"required":["handoff_id","objective"]}`),
+	},
+	{
+		Type: "function", Name: ToolCancelBackgroundTask,
+		Description: "Request cancellation of an existing durable background task.",
+		Parameters:  json.RawMessage(`{"type":"object","additionalProperties":false,"properties":{"handoff_id":{"type":"string","minLength":1,"maxLength":256},"reason":{"type":"string","minLength":1,"maxLength":2048}},"required":["handoff_id"]}`),
+	},
+}
+
+func ReservedToolSchemas() []ReservedToolSchema {
+	out := make([]ReservedToolSchema, len(reservedToolSchemas))
+	for index, schema := range reservedToolSchemas {
+		out[index] = schema
+		out[index].Parameters = append(json.RawMessage(nil), schema.Parameters...)
+	}
+	return out
+}
+
 type StartBackgroundTaskArgs struct {
 	Objective        string `json:"objective"`
 	PresentationHint string `json:"presentation_hint,omitempty"`

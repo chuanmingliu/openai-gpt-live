@@ -6,7 +6,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -26,6 +28,317 @@ type recoveryStoreFake struct {
 	snapshot RecoverySnapshot
 	err      error
 	calls    atomic.Int32
+}
+
+type failNthRecoveryStore struct {
+	mu       sync.Mutex
+	calls    int
+	failCall int
+}
+
+func (s *failNthRecoveryStore) LoadRecovery(_ context.Context, scope handoff.Scope, _, _ int) (RecoverySnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+	if s.calls == s.failCall {
+		return RecoverySnapshot{}, errors.New("scripted recovery failure")
+	}
+	return RecoverySnapshot{ConversationID: scope.ConversationID}, nil
+}
+
+type reconnectOwnersProbe struct {
+	*MemoryReconnectOwners
+	aborts           atomic.Int32
+	publishCalls     atomic.Int32
+	failPublishCall  int32
+	blockPublishCall int32
+	publishStarted   chan struct{}
+	publishRelease   chan struct{}
+	heartbeatStarted chan struct{}
+	heartbeatRelease chan struct{}
+	rotateStarted    chan struct{}
+	rotateRelease    chan struct{}
+	heartbeatErr     atomic.Bool
+	tombstoneErr     error
+}
+
+type blockingCleanupOwners struct {
+	*MemoryReconnectOwners
+	started chan struct{}
+	release chan struct{}
+	calls   atomic.Int32
+}
+
+func (s *blockingCleanupOwners) CleanupExpired(ctx context.Context, limit int) (int, error) {
+	if s.calls.Add(1) == 1 {
+		close(s.started)
+		<-s.release
+		ctx = context.Background()
+	}
+	return s.MemoryReconnectOwners.CleanupExpired(ctx, limit)
+}
+
+func (s *reconnectOwnersProbe) AbortClaim(ctx context.Context, failed ReconnectOwnerKey, previous ReconnectOwner) error {
+	s.aborts.Add(1)
+	return s.MemoryReconnectOwners.AbortClaim(ctx, failed, previous)
+}
+
+func (s *reconnectOwnersProbe) Heartbeat(ctx context.Context, key ReconnectOwnerKey, epoch identity.ResponseEpoch, boundary bool, lease time.Duration) (ReconnectOwnerLease, error) {
+	if s.heartbeatStarted != nil {
+		select {
+		case <-s.heartbeatStarted:
+		default:
+			close(s.heartbeatStarted)
+		}
+		<-s.heartbeatRelease
+		ctx = context.Background()
+	}
+	if s.heartbeatErr.Load() {
+		return ReconnectOwnerLease{}, ErrStaleReconnect
+	}
+	return s.MemoryReconnectOwners.Heartbeat(ctx, key, epoch, boundary, lease)
+}
+
+func (s *reconnectOwnersProbe) Publish(ctx context.Context, key ReconnectOwnerKey, epoch identity.ResponseEpoch, boundary bool, lease time.Duration) (ReconnectOwnerLease, error) {
+	call := s.publishCalls.Add(1)
+	if s.blockPublishCall != 0 && call == s.blockPublishCall {
+		close(s.publishStarted)
+		<-s.publishRelease
+		ctx = context.Background()
+	}
+	if s.failPublishCall != 0 && call == s.failPublishCall {
+		return ReconnectOwnerLease{}, ErrRecoveryUnavailable
+	}
+	return s.MemoryReconnectOwners.Publish(ctx, key, epoch, boundary, lease)
+}
+
+func (s *reconnectOwnersProbe) Rotate(ctx context.Context, key ReconnectOwnerKey, current, next ReconnectClaims, overlapUntil time.Time) error {
+	if s.rotateStarted != nil {
+		select {
+		case <-s.rotateStarted:
+		default:
+			close(s.rotateStarted)
+		}
+		<-s.rotateRelease
+		ctx = context.Background()
+	}
+	return s.MemoryReconnectOwners.Rotate(ctx, key, current, next, overlapUntil)
+}
+
+func TestManagerReconnectOwnerBlockedPublishAndHeartbeatFenceIOAtOperationDeadline(t *testing.T) {
+	t.Run("publish", func(t *testing.T) {
+		credentials, err := NewReconnectCredentials([]byte(strings.Repeat("o", 32)), clock.Real{})
+		require.NoError(t, err)
+		owners := &reconnectOwnersProbe{MemoryReconnectOwners: NewMemoryReconnectOwners(clock.Real{}), blockPublishCall: 1,
+			publishStarted: make(chan struct{}), publishRelease: make(chan struct{})}
+		defer func() {
+			select {
+			case <-owners.publishRelease:
+			default:
+				close(owners.publishRelease)
+			}
+		}()
+		connector := newLifecycleConnector()
+		manager := NewManager(Config{
+			IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+			ReconnectCredentials: credentials, ReconnectOwners: owners, ReconnectOwnerID: "replica-blocked-publish",
+			ReconnectCredentialTTL: 12 * time.Second, ReconnectCredentialOverlap: 2 * time.Second,
+			ReconnectOwnerLeaseDuration: 3 * time.Second, ReconnectOwnerHeartbeatInterval: time.Second,
+			ReconnectOwnerOperationTimeout: 25 * time.Millisecond, Clock: clock.Real{},
+		}, connector, managerIDs{session: "blocked-publish-session", conversation: "blocked-publish-conversation"})
+		require.NoError(t, manager.validationErr)
+		client := newChannelClient(8)
+		done := make(chan error, 1)
+		go func() {
+			done <- manager.Run(t.Context(), OpenRequest{Subject: Subject{TenantID: "tenant-blocked-publish", UserID: "user", ExpiresAt: time.Now().Add(time.Hour)}, RequestedModel: "provider-model"}, client)
+		}()
+		<-connector.connected
+		voice := connector.voice
+		created := (<-client.writes).(protocol.SessionCreatedEvent)
+		require.NotNil(t, created.Reconnect)
+		<-owners.publishStarted
+		select {
+		case <-client.done:
+		case <-time.After(250 * time.Millisecond):
+			t.Fatal("blocked owner Publish did not independently fence client I/O")
+		}
+		select {
+		case <-voice.closed:
+		case <-time.After(250 * time.Millisecond):
+			t.Fatal("blocked owner Publish did not independently fence provider I/O")
+		}
+		close(owners.publishRelease)
+		require.ErrorIs(t, <-done, ErrRecoveryUnavailable)
+	})
+
+	t.Run("heartbeat", func(t *testing.T) {
+		credentials, err := NewReconnectCredentials([]byte(strings.Repeat("h", 32)), clock.Real{})
+		require.NoError(t, err)
+		owners := &reconnectOwnersProbe{MemoryReconnectOwners: NewMemoryReconnectOwners(clock.Real{}),
+			heartbeatStarted: make(chan struct{}), heartbeatRelease: make(chan struct{})}
+		defer func() {
+			select {
+			case <-owners.heartbeatRelease:
+			default:
+				close(owners.heartbeatRelease)
+			}
+		}()
+		connector := newLifecycleConnector()
+		manager := NewManager(Config{
+			IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+			ReconnectCredentials: credentials, ReconnectOwners: owners, ReconnectOwnerID: "replica-blocked-heartbeat",
+			ReconnectCredentialTTL: 12 * time.Second, ReconnectCredentialOverlap: 2 * time.Second,
+			ReconnectOwnerLeaseDuration: 3 * time.Second, ReconnectOwnerHeartbeatInterval: time.Second,
+			ReconnectOwnerOperationTimeout: 25 * time.Millisecond, Clock: clock.Real{},
+		}, connector, managerIDs{session: "blocked-heartbeat-session", conversation: "blocked-heartbeat-conversation"})
+		require.NoError(t, manager.validationErr)
+		client := newChannelClient(8)
+		done := make(chan error, 1)
+		go func() {
+			done <- manager.Run(t.Context(), OpenRequest{Subject: Subject{TenantID: "tenant-blocked-heartbeat", UserID: "user", ExpiresAt: time.Now().Add(time.Hour)}, RequestedModel: "provider-model"}, client)
+		}()
+		<-connector.connected
+		voice := connector.voice
+		<-client.writes
+		<-owners.heartbeatStarted
+		select {
+		case <-client.done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("blocked owner Heartbeat did not independently fence client I/O")
+		}
+		select {
+		case <-voice.closed:
+		case <-time.After(250 * time.Millisecond):
+			t.Fatal("blocked owner Heartbeat did not independently fence provider I/O")
+		}
+		close(owners.heartbeatRelease)
+		require.ErrorIs(t, <-done, ErrRecoveryUnavailable)
+	})
+
+	t.Run("credential rotation", func(t *testing.T) {
+		manual := clock.NewManual(time.Now().UTC())
+		credentials, err := NewReconnectCredentials([]byte(strings.Repeat("r", 32)), manual)
+		require.NoError(t, err)
+		owners := &reconnectOwnersProbe{MemoryReconnectOwners: NewMemoryReconnectOwners(manual),
+			rotateStarted: make(chan struct{}), rotateRelease: make(chan struct{})}
+		defer func() {
+			select {
+			case <-owners.rotateRelease:
+			default:
+				close(owners.rotateRelease)
+			}
+		}()
+		connector := newLifecycleConnector()
+		heartbeatReady := make(chan struct{})
+		var heartbeatReadyOnce sync.Once
+		manager := NewManager(Config{
+			IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+			ReconnectCredentials: credentials, ReconnectOwners: owners, ReconnectOwnerID: "replica-blocked-rotation",
+			ReconnectCredentialTTL: 12 * time.Second, ReconnectCredentialOverlap: 2 * time.Second,
+			ReconnectOwnerLeaseDuration: 6 * time.Second, ReconnectOwnerHeartbeatInterval: time.Second,
+			ReconnectOwnerOperationTimeout: 25 * time.Millisecond, Clock: manual,
+			reconnectHeartbeatReady: func() { heartbeatReadyOnce.Do(func() { close(heartbeatReady) }) },
+		}, connector, managerIDs{session: "blocked-rotation-session", conversation: "blocked-rotation-conversation"})
+		require.NoError(t, manager.validationErr)
+		client := newChannelClient(16)
+		done := make(chan error, 1)
+		go func() {
+			done <- manager.Run(t.Context(), OpenRequest{Subject: Subject{TenantID: "tenant-blocked-rotation", UserID: "user", ExpiresAt: manual.Now().Add(time.Hour)}, RequestedModel: "provider-model"}, client)
+		}()
+		<-connector.connected
+		voice := connector.voice
+		<-client.writes
+		<-heartbeatReady
+		for range 8 {
+			manual.Advance(time.Second)
+			time.Sleep(time.Millisecond)
+		}
+		select {
+		case <-owners.rotateStarted:
+		case <-time.After(time.Second):
+			t.Fatal("credential rotation did not reach the blocked owner store")
+		}
+		select {
+		case <-client.done:
+		case <-time.After(250 * time.Millisecond):
+			t.Fatal("blocked owner Rotate did not independently fence client I/O")
+		}
+		select {
+		case <-voice.closed:
+		case <-time.After(250 * time.Millisecond):
+			t.Fatal("blocked owner Rotate did not independently fence provider I/O")
+		}
+		close(owners.rotateRelease)
+		require.ErrorIs(t, <-done, ErrRecoveryUnavailable)
+	})
+}
+
+func TestManagerReconnectOwnerOperationSlotsBoundNonCooperativeStoreCalls(t *testing.T) {
+	credentials, err := NewReconnectCredentials([]byte(strings.Repeat("s", 32)), clock.Real{})
+	require.NoError(t, err)
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		ReconnectCredentials: credentials, ReconnectOwners: NewMemoryReconnectOwners(clock.Real{}), ReconnectOwnerID: "replica-operation-slots",
+		ReconnectCredentialTTL: 12 * time.Second, ReconnectCredentialOverlap: 2 * time.Second,
+		ReconnectOwnerLeaseDuration: 3 * time.Second, ReconnectOwnerHeartbeatInterval: time.Second,
+		ReconnectOwnerOperationTimeout: 10 * time.Millisecond, ReconnectOwnerMaxOperations: 1, Clock: clock.Real{},
+	}, testkit.NewFakeConnector(1), managerIDs{})
+	require.NoError(t, manager.validationErr)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	firstDone := make(chan error, 1)
+	go func() {
+		_, operationErr := manager.runReconnectOwnerLeaseOperation(t.Context(), time.Now().Add(time.Second),
+			func(context.Context) (ReconnectOwnerLease, error) {
+				close(started)
+				<-release
+				return ReconnectOwnerLease{}, nil
+			})
+		firstDone <- operationErr
+	}()
+	<-started
+	require.ErrorIs(t, <-firstDone, ErrRecoveryUnavailable)
+
+	var secondCalled atomic.Bool
+	secondStarted := time.Now()
+	_, err = manager.runReconnectOwnerLeaseOperation(t.Context(), time.Now().Add(time.Second),
+		func(context.Context) (ReconnectOwnerLease, error) {
+			secondCalled.Store(true)
+			return ReconnectOwnerLease{}, nil
+		})
+	require.ErrorIs(t, err, ErrRecoveryUnavailable)
+	require.False(t, secondCalled.Load(), "saturation must fail closed without spawning another unbounded store goroutine")
+	require.Less(t, time.Since(secondStarted), 100*time.Millisecond)
+
+	close(release)
+	require.Eventually(t, func() bool {
+		_, operationErr := manager.runReconnectOwnerLeaseOperation(t.Context(), time.Now().Add(time.Second),
+			func(context.Context) (ReconnectOwnerLease, error) { return ReconnectOwnerLease{}, nil })
+		return operationErr == nil
+	}, time.Second, time.Millisecond, "a completed underlying call releases its bounded slot")
+}
+
+func TestManagerReconnectOwnerOperationSlotValidationCannotPanicConstruction(t *testing.T) {
+	credentials, err := NewReconnectCredentials([]byte(strings.Repeat("v", 32)), clock.Real{})
+	require.NoError(t, err)
+	require.NotPanics(t, func() {
+		manager := NewManager(Config{
+			IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+			ReconnectCredentials: credentials, ReconnectOwners: NewMemoryReconnectOwners(clock.Real{}), ReconnectOwnerID: "replica-invalid-slots",
+			ReconnectCredentialTTL: 12 * time.Second, ReconnectCredentialOverlap: 2 * time.Second,
+			ReconnectOwnerLeaseDuration: 3 * time.Second, ReconnectOwnerHeartbeatInterval: time.Second,
+			ReconnectOwnerMaxOperations: -1, Clock: clock.Real{},
+		}, testkit.NewFakeConnector(1), managerIDs{})
+		require.ErrorIs(t, manager.validationErr, ErrInvalidManagerConfig)
+	})
+}
+
+func (s *reconnectOwnersProbe) Tombstone(ctx context.Context, sessionID identity.SessionID, incarnation identity.Incarnation, ownerID string, epoch identity.ResponseEpoch, boundary bool) error {
+	err := s.MemoryReconnectOwners.Tombstone(ctx, sessionID, incarnation, ownerID, epoch, boundary)
+	if err != nil {
+		return err
+	}
+	return s.tombstoneErr
 }
 
 type conversationProvisionerFake struct {
@@ -140,6 +453,26 @@ func (zeroJitter) Duration(time.Duration) time.Duration { return 0 }
 
 type failingReconnectConnector struct {
 	calls atomic.Int32
+}
+
+type blockingApprovalStore struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingApprovalStore) ResolveApproval(ctx context.Context, _ handoff.Scope, _ handoff.ApprovalResolution) error {
+	s.once.Do(func() { close(s.started) })
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.release:
+		return nil
+	}
+}
+
+func (*blockingApprovalStore) LoadApproval(context.Context, handoff.Scope, string) (handoff.ToolApproval, error) {
+	return handoff.ToolApproval{}, handoff.ErrNotFound
 }
 
 type contextBlockingCloseClient struct {
@@ -291,6 +624,605 @@ func TestManagerReconnectCASRestoresBeforePublishingAndRejectsReplay(t *testing.
 	}
 }
 
+func TestManagerReconnectRestoresContentFreeActiveHandoffStateRegardlessOfCursor(t *testing.T) {
+	connector := testkit.NewFakeConnector(16)
+	scope := handoff.Scope{TenantID: "tenant-active-recovery", UserID: "user", ConversationID: "conversation-active-recovery"}
+	secret := json.RawMessage(`{"credential":"must-not-cross-recovery"}`)
+	store := &recoveryStoreFake{snapshot: RecoverySnapshot{
+		ConversationID: scope.ConversationID,
+		ActiveHandoffs: []RecoveryActiveHandoff{
+			{EventID: "recovery-event-running", Snapshot: handoff.Snapshot{ID: "handoff-running", Request: handoff.CreateRequest{Scope: scope, Objective: "private objective", PresentationHint: "private hint"}, State: handoff.StateRunning, Input: secret}},
+			{EventID: "recovery-event-needs-input", Snapshot: handoff.Snapshot{ID: "handoff-needs-input", Request: handoff.CreateRequest{Scope: scope, Objective: "another private objective"}, State: handoff.StateNeedsInput, Input: secret}},
+		},
+		LastEventSeq: 91,
+	}}
+	manager := NewManager(Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second, RecoveryStore: store}, connector,
+		managerIDs{session: "active-recovery-session", conversation: scope.ConversationID})
+	oldCtx, oldCancel := context.WithCancel(context.Background())
+	defer oldCancel()
+	oldDone := make(chan error, 1)
+	oldClient := newChannelClient(8)
+	go func() {
+		oldDone <- manager.Run(oldCtx, OpenRequest{Subject: Subject{TenantID: scope.TenantID, UserID: scope.UserID, ExpiresAt: time.Now().Add(time.Hour)}, ConversationID: scope.ConversationID}, oldClient)
+	}()
+	_, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "session.created", (<-oldClient.writes).EventType())
+	waitForActiveRuntime(t, manager, "active-recovery-session", 1)
+
+	newCtx, newCancel := context.WithCancel(context.Background())
+	defer newCancel()
+	newClient := newChannelClient(8)
+	reconnectDone := make(chan error, 1)
+	go func() {
+		reconnectDone <- manager.Reconnect(newCtx, ReconnectRequest{Scope: scope, SessionID: "active-recovery-session", LastIncarnation: 1, LastEventSeq: 91}, newClient)
+	}()
+	voice, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	for _, expected := range []string{"handoff-running", "handoff-needs-input"} {
+		command, commandErr := voice.NextCommand(t.Context())
+		require.NoError(t, commandErr)
+		require.Equal(t, realtime.CommandCreateItem, command.Kind)
+		require.Contains(t, string(command.Item), expected)
+		require.NotContains(t, string(command.Item), "private objective")
+		require.NotContains(t, string(command.Item), "private hint")
+		require.NotContains(t, string(command.Item), "must-not-cross-recovery")
+	}
+	require.Equal(t, "session.created", (<-newClient.writes).EventType())
+	progress, ok := (<-newClient.writes).(protocol.LiveHandoffProgressEvent)
+	require.True(t, ok)
+	require.Equal(t, "recovery-event-running", progress.EventID)
+	require.Equal(t, "handoff-running", progress.HandoffID)
+	require.Equal(t, int64(91), progress.SequenceID)
+	needsInput, ok := (<-newClient.writes).(protocol.LiveHandoffNeedsInputEvent)
+	require.True(t, ok)
+	require.Equal(t, "recovery-event-needs-input", needsInput.EventID)
+	require.Equal(t, "handoff-needs-input", needsInput.HandoffID)
+	require.Equal(t, int64(91), needsInput.SequenceID)
+	progressWire, err := protocol.Encode(progress)
+	require.NoError(t, err, "recovery progress must traverse the production encoder")
+	needsInputWire, err := protocol.Encode(needsInput)
+	require.NoError(t, err, "recovery needs-input must traverse the production encoder")
+	encoded, err := json.Marshal([]json.RawMessage{progressWire, needsInputWire})
+	require.NoError(t, err)
+	require.NotContains(t, string(encoded), "private objective")
+	require.NotContains(t, string(encoded), "must-not-cross-recovery")
+	newCancel()
+	require.Error(t, <-reconnectDone)
+	require.Error(t, <-oldDone)
+}
+
+func TestManagerReconnectAbortsExactClaimAfterPostClaimRecoveryFailureAndCredentialRetries(t *testing.T) {
+	manual := clock.NewManual(time.Now().UTC())
+	credentials, err := NewReconnectCredentials([]byte(strings.Repeat("a", 32)), manual)
+	require.NoError(t, err)
+	owners := &reconnectOwnersProbe{MemoryReconnectOwners: NewMemoryReconnectOwners(manual)}
+	recovery := &failNthRecoveryStore{failCall: 2}
+	connector := testkit.NewFakeConnector(8)
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second, RecoveryStore: recovery,
+		ReconnectCredentials: credentials, ReconnectOwners: owners, ReconnectOwnerID: "replica-a",
+		ReconnectCredentialTTL: time.Minute, Clock: manual,
+	}, connector, managerIDs{session: "abort-claim-session", conversation: "abort-claim-conversation"})
+	require.NoError(t, manager.validationErr)
+	subject := Subject{TenantID: "tenant-abort", UserID: "user-abort", ExpiresAt: manual.Now().Add(time.Hour)}
+	_, ownerProbe, probeErr := manager.issueReconnectCredential(subject,
+		handoff.Scope{TenantID: subject.TenantID, UserID: subject.UserID, ConversationID: "abort-claim-conversation"},
+		"abort-claim-session", 1, 0, "provider-model", ReconnectOwnerEstablishing)
+	require.NoError(t, probeErr)
+	require.True(t, validReconnectOwner(ownerProbe))
+	baseCtx, baseCancel := context.WithCancel(t.Context())
+	baseClient := newChannelClient(8)
+	baseDone := make(chan error, 1)
+	go func() {
+		baseDone <- manager.Run(baseCtx, OpenRequest{Subject: subject, RequestedModel: "provider-model"}, baseClient)
+	}()
+	_, err = connector.NextSession(t.Context())
+	require.NoError(t, err)
+	var createdEvent protocol.ServerEvent
+	select {
+	case createdEvent = <-baseClient.writes:
+	case runErr := <-baseDone:
+		require.NoError(t, runErr)
+	}
+	created, ok := createdEvent.(protocol.SessionCreatedEvent)
+	require.True(t, ok)
+	require.NotNil(t, created.Reconnect)
+	claims, err := credentials.Verify(created.Reconnect.Credential)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		owner, found := owners.Read(claims.SessionID)
+		return found && owner.State == ReconnectOwnerActive
+	}, time.Second, time.Millisecond, "the base owner must publish before this test exercises tombstone/claim rollback")
+	baseCancel()
+	require.Error(t, <-baseDone)
+	require.Eventually(t, func() bool {
+		owner, found := owners.Read(claims.SessionID)
+		return found && owner.State == ReconnectOwnerTombstoned
+	}, time.Second, time.Millisecond)
+
+	request := ReconnectRequest{Scope: claims.Scope, SessionID: claims.SessionID, LastIncarnation: claims.Incarnation,
+		LastEventSeq: claims.Cursor, Subject: subject, Credential: claims}
+	err = manager.Reconnect(t.Context(), request, newChannelClient(4))
+	require.ErrorIs(t, err, ErrRecoveryUnavailable)
+	require.Equal(t, int32(1), owners.aborts.Load())
+	restored, found := owners.Read(claims.SessionID)
+	require.True(t, found)
+	require.Equal(t, claims.CredentialID, restored.CredentialID)
+	require.Equal(t, ReconnectOwnerTombstoned, restored.State)
+
+	retryCtx, retryCancel := context.WithCancel(t.Context())
+	retryClient := newChannelClient(8)
+	retryDone := make(chan error, 1)
+	go func() { retryDone <- manager.Reconnect(retryCtx, request, retryClient) }()
+	_, err = connector.NextSession(t.Context())
+	require.NoError(t, err)
+	reconnected, ok := (<-retryClient.writes).(protocol.SessionCreatedEvent)
+	require.True(t, ok)
+	require.Equal(t, uint64(2), reconnected.Reconnect.Incarnation)
+	retryCancel()
+	require.Error(t, <-retryDone)
+}
+
+func TestManagerReconnectPublishFailureRollsBackLocalPublicationAndRetainsAdvertisedStage(t *testing.T) {
+	manual := clock.NewManual(time.Now().UTC())
+	credentials, err := NewReconnectCredentials([]byte(strings.Repeat("p", 32)), manual)
+	require.NoError(t, err)
+	owners := &reconnectOwnersProbe{MemoryReconnectOwners: NewMemoryReconnectOwners(manual), failPublishCall: 2}
+	connector := testkit.NewFakeConnector(8)
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		RecoveryStore:        &recoveryStoreFake{snapshot: RecoverySnapshot{ConversationID: "publish-fail-conversation"}},
+		ReconnectCredentials: credentials, ReconnectOwners: owners, ReconnectOwnerID: "replica-publish",
+		ReconnectCredentialTTL: time.Minute, Clock: manual,
+	}, connector, managerIDs{session: "publish-fail-session", conversation: "publish-fail-conversation"})
+	require.NoError(t, manager.validationErr)
+	subject := Subject{TenantID: "tenant-publish", UserID: "user-publish", ExpiresAt: manual.Now().Add(time.Hour)}
+	baseCtx, baseCancel := context.WithCancel(t.Context())
+	baseClient := newChannelClient(8)
+	baseDone := make(chan error, 1)
+	go func() {
+		baseDone <- manager.Run(baseCtx, OpenRequest{Subject: subject, RequestedModel: "provider-model"}, baseClient)
+	}()
+	_, err = connector.NextSession(t.Context())
+	require.NoError(t, err)
+	created := (<-baseClient.writes).(protocol.SessionCreatedEvent)
+	claims, err := credentials.Verify(created.Reconnect.Credential)
+	require.NoError(t, err)
+	waitForActiveRuntime(t, manager, claims.SessionID, claims.Incarnation)
+	baseCancel()
+	require.Error(t, <-baseDone)
+
+	reconnectClient := newChannelClient(8)
+	err = manager.Reconnect(t.Context(), ReconnectRequest{Scope: claims.Scope, SessionID: claims.SessionID,
+		LastIncarnation: claims.Incarnation, LastEventSeq: claims.Cursor, Subject: subject, Credential: claims}, reconnectClient)
+	require.ErrorIs(t, err, ErrRecoveryUnavailable)
+	advertised := (<-reconnectClient.writes).(protocol.SessionCreatedEvent)
+	advertisedClaims, err := credentials.Verify(advertised.Reconnect.Credential)
+	require.NoError(t, err)
+	require.Equal(t, int32(0), owners.aborts.Load(), "an advertised stage must not be rolled back to an incompatible durable key")
+	staged, ok := owners.Read(claims.SessionID)
+	require.True(t, ok)
+	require.Equal(t, advertisedClaims.CredentialID, staged.CredentialID)
+	require.Equal(t, advertisedClaims.Incarnation, staged.Incarnation)
+	require.Equal(t, claims.CredentialID, staged.PreviousCredentialID)
+	require.Equal(t, claims.Incarnation, staged.PreviousIncarnation)
+	require.Equal(t, ReconnectOwnerClaiming, staged.State)
+	manager.activeMu.RLock()
+	logical := manager.logical[claims.SessionID]
+	if logical != nil {
+		require.Equal(t, claims.Incarnation, logical.highWater)
+		require.Nil(t, logical.runtime)
+		require.False(t, logical.reconnecting)
+	}
+	manager.activeMu.RUnlock()
+
+	manual.Advance(staged.OwnerLeaseExpiresAt.Sub(manual.Now()))
+	retryCtx, retryCancel := context.WithCancel(t.Context())
+	retryClient := newChannelClient(8)
+	retryDone := make(chan error, 1)
+	go func() {
+		retryDone <- manager.Reconnect(retryCtx, ReconnectRequest{Scope: claims.Scope, SessionID: claims.SessionID,
+			LastIncarnation: claims.Incarnation, LastEventSeq: claims.Cursor, Subject: subject, Credential: claims}, retryClient)
+	}()
+	_, err = connector.NextSession(t.Context())
+	require.NoError(t, err)
+	var retried protocol.SessionCreatedEvent
+	select {
+	case event := <-retryClient.writes:
+		retried = event.(protocol.SessionCreatedEvent)
+	case retryErr := <-retryDone:
+		require.NoError(t, retryErr)
+	}
+	require.Equal(t, advertised.Reconnect.Credential, retried.Reconnect.Credential,
+		"retrying N after an ambiguous publish must re-advertise the same durable N+1 credential")
+	require.Eventually(t, func() bool {
+		owner, found := owners.Read(claims.SessionID)
+		return found && owner.State == ReconnectOwnerActive && owner.CredentialID == advertisedClaims.CredentialID
+	}, time.Second, time.Millisecond)
+	retryCancel()
+	require.Error(t, <-retryDone)
+}
+
+func TestManagerReconnectHeartbeatLossFencesRuntimeAndTombstoneFailureIsReturned(t *testing.T) {
+	manual := clock.NewManual(time.Now().UTC())
+	credentials, err := NewReconnectCredentials([]byte(strings.Repeat("b", 32)), manual)
+	require.NoError(t, err)
+	owners := &reconnectOwnersProbe{MemoryReconnectOwners: NewMemoryReconnectOwners(manual)}
+	connector := testkit.NewFakeConnector(4)
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		ReconnectCredentials: credentials, ReconnectOwners: owners, ReconnectOwnerID: "replica-heartbeat",
+		ReconnectCredentialTTL: 12 * time.Second, ReconnectCredentialOverlap: 2 * time.Second,
+		ReconnectOwnerLeaseDuration: 6 * time.Second, ReconnectOwnerHeartbeatInterval: time.Second, Clock: manual,
+	}, connector, managerIDs{session: "heartbeat-session", conversation: "heartbeat-conversation"})
+	require.NoError(t, manager.validationErr)
+	client := newChannelClient(8)
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.Run(t.Context(), OpenRequest{Subject: Subject{TenantID: "tenant-heartbeat", UserID: "user-heartbeat", ExpiresAt: manual.Now().Add(time.Hour)}, RequestedModel: "provider-model"}, client)
+	}()
+	_, err = connector.NextSession(t.Context())
+	require.NoError(t, err)
+	created := (<-client.writes).(protocol.SessionCreatedEvent)
+	require.Eventually(t, func() bool {
+		owner, ok := owners.Read(identity.SessionID(created.Reconnect.SessionID))
+		return ok && owner.State == ReconnectOwnerActive
+	}, time.Second, time.Millisecond)
+	owners.heartbeatErr.Store(true)
+	require.Eventually(t, func() bool {
+		manual.Advance(time.Second)
+		select {
+		case err = <-done:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, time.Millisecond)
+	require.ErrorIs(t, err, ErrRecoveryUnavailable)
+
+	owners = &reconnectOwnersProbe{MemoryReconnectOwners: NewMemoryReconnectOwners(manual), tombstoneErr: errors.New("tombstone unavailable")}
+	manager = NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		ReconnectCredentials: credentials, ReconnectOwners: owners, ReconnectOwnerID: "replica-tombstone",
+		ReconnectCredentialTTL: time.Minute, Clock: manual,
+	}, connector, managerIDs{session: "tombstone-session", conversation: "tombstone-conversation"})
+	require.NoError(t, manager.validationErr)
+	cancelCtx, cancel := context.WithCancel(t.Context())
+	done = make(chan error, 1)
+	tombstoneClient := newChannelClient(4)
+	go func() {
+		done <- manager.Run(cancelCtx, OpenRequest{Subject: Subject{TenantID: "tenant-tombstone", UserID: "user-tombstone", ExpiresAt: manual.Now().Add(time.Hour)}, RequestedModel: "provider-model"}, tombstoneClient)
+	}()
+	_, err = connector.NextSession(t.Context())
+	require.NoError(t, err)
+	created = (<-tombstoneClient.writes).(protocol.SessionCreatedEvent)
+	require.Eventually(t, func() bool {
+		owner, ok := owners.Read(identity.SessionID(created.Reconnect.SessionID))
+		return ok && owner.State == ReconnectOwnerActive
+	}, time.Second, time.Millisecond)
+	cancel()
+	err = <-done
+	require.ErrorContains(t, err, "tombstone unavailable")
+}
+
+func TestManagerReconnectCredentialRefreshSurvivesTTLAndAdvancesRepeatedNonzeroCursor(t *testing.T) {
+	manual := clock.NewManual(time.Now().UTC())
+	credentials, err := NewReconnectCredentials([]byte(strings.Repeat("c", 32)), manual)
+	require.NoError(t, err)
+	owners := NewMemoryReconnectOwners(manual)
+	connector := testkit.NewFakeConnector(4)
+	heartbeatReady := make(chan struct{})
+	var heartbeatReadyOnce sync.Once
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		ReconnectCredentials: credentials, ReconnectOwners: owners, ReconnectOwnerID: "replica-refresh",
+		ReconnectCredentialTTL: 12 * time.Second, ReconnectCredentialOverlap: 2 * time.Second,
+		ReconnectOwnerLeaseDuration: 6 * time.Second, ReconnectOwnerHeartbeatInterval: time.Second, Clock: manual,
+		reconnectHeartbeatReady: func() { heartbeatReadyOnce.Do(func() { close(heartbeatReady) }) },
+	}, connector, managerIDs{session: "refresh-token-session", conversation: "refresh-token-conversation"})
+	require.NoError(t, manager.validationErr)
+	ctx, cancel := context.WithCancel(t.Context())
+	client := newChannelClient(16)
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.Run(ctx, OpenRequest{Subject: Subject{TenantID: "tenant-refresh", UserID: "user-refresh", ExpiresAt: manual.Now().Add(time.Hour)}, RequestedModel: "provider-model"}, client)
+	}()
+	_, err = connector.NextSession(t.Context())
+	require.NoError(t, err)
+	created := (<-client.writes).(protocol.SessionCreatedEvent)
+	runtime := waitForActiveRuntime(t, manager, "refresh-token-session", 1)
+	require.Eventually(t, func() bool {
+		owner, ok := owners.Read("refresh-token-session")
+		return ok && owner.State == ReconnectOwnerActive
+	}, time.Second, time.Millisecond)
+	<-heartbeatReady
+	waitForLeaseRefresh := func() {
+		t.Helper()
+		deadline := time.NewTimer(time.Second)
+		defer deadline.Stop()
+		poll := time.NewTicker(time.Millisecond)
+		defer poll.Stop()
+		for {
+			owner, ok := owners.Read("refresh-token-session")
+			if ok && owner.OwnerLeaseExpiresAt.After(manual.Now().Add(4*time.Second)) {
+				return
+			}
+			select {
+			case runtimeErr := <-done:
+				t.Fatalf("reconnect owner maintainer stopped before lease refresh: %v", runtimeErr)
+			case <-deadline.C:
+				t.Fatal("reconnect owner lease did not refresh")
+			case <-poll.C:
+			}
+		}
+	}
+
+	for range 8 {
+		manual.Advance(time.Second)
+		waitForLeaseRefresh()
+	}
+	periodic, ok := (<-client.writes).(protocol.SessionReconnectUpdatedEvent)
+	require.True(t, ok)
+	require.Equal(t, int64(0), periodic.Reconnect.Cursor)
+	for range 5 {
+		manual.Advance(time.Second)
+		waitForLeaseRefresh()
+	}
+	_, err = credentials.Verify(created.Reconnect.Credential)
+	require.ErrorIs(t, err, ErrExpiredReconnectCredential)
+	_, err = credentials.Verify(periodic.Reconnect.Credential)
+	require.NoError(t, err, "periodic refresh keeps the live session reconnectable beyond the original TTL")
+
+	require.NoError(t, manager.rotateReconnectCredential(t.Context(), runtime, 7, false))
+	firstCursor := (<-client.writes).(protocol.SessionReconnectUpdatedEvent)
+	require.Equal(t, int64(7), firstCursor.Reconnect.Cursor)
+	require.NoError(t, manager.rotateReconnectCredential(t.Context(), runtime, 19, false))
+	secondCursor := (<-client.writes).(protocol.SessionReconnectUpdatedEvent)
+	require.Equal(t, int64(19), secondCursor.Reconnect.Cursor)
+	owner, ok := owners.Read("refresh-token-session")
+	require.True(t, ok)
+	require.Equal(t, int64(19), owner.Cursor)
+	require.Equal(t, int64(7), owner.PreviousCursor)
+	require.Equal(t, "lrt1", firstCursor.Reconnect.Credential[:4])
+	require.ErrorIs(t, manager.rotateReconnectCredential(t.Context(), runtime, 18, false), ErrStaleReconnect)
+	cancel()
+	require.Error(t, <-done)
+}
+
+func TestManagerReconnectMaintenanceGloballyCleansExpiredRowsAndBecomesReady(t *testing.T) {
+	manual := clock.NewManual(time.Now().UTC())
+	owners := NewMemoryReconnectOwners(manual)
+	insert := func(sessionID, ownerID string, active bool) {
+		owner := testReconnectOwner(manual.Now(), ownerID, "credential-"+sessionID, 1, 0)
+		owner.SessionID = identity.SessionID(sessionID)
+		owner.Scope.ConversationID = identity.ConversationID("conversation-" + sessionID)
+		owner.ExpiresAt = manual.Now().Add(2 * time.Second)
+		_, err := owners.Create(t.Context(), owner, 2*time.Second)
+		require.NoError(t, err)
+		_, err = owners.Publish(t.Context(), owner.Key(), 1, true, 2*time.Second)
+		require.NoError(t, err)
+		if !active {
+			require.NoError(t, owners.Tombstone(t.Context(), owner.SessionID, owner.Incarnation, owner.OwnerID, 1, true))
+		}
+	}
+	insert("owned-expired", "replica-cleaner", false)
+	insert("owned-active", "replica-cleaner", true)
+	insert("foreign-expired", "replica-foreign", false)
+	manual.Advance(3 * time.Second)
+	credentials, err := NewReconnectCredentials([]byte(strings.Repeat("m", 32)), manual)
+	require.NoError(t, err)
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		ReconnectCredentials: credentials, ReconnectOwners: owners, ReconnectOwnerID: "replica-cleaner",
+		ReconnectCredentialTTL: 12 * time.Second, ReconnectCredentialOverlap: 2 * time.Second,
+		ReconnectOwnerLeaseDuration: 6 * time.Second, ReconnectOwnerHeartbeatInterval: time.Second,
+		ReconnectCleanupInterval: time.Second, ReconnectCleanupBatch: 1, Clock: manual,
+	}, testkit.NewFakeConnector(1), managerIDs{session: "unused", conversation: "unused"})
+	require.NoError(t, manager.validationErr)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- manager.RunReconnectMaintenance(ctx) }()
+	require.Eventually(t, func() bool { return manager.ReconnectReady(t.Context()) == nil }, time.Second, time.Millisecond)
+	manual.Advance(time.Second)
+	manual.Advance(time.Second)
+	require.Eventually(t, func() bool {
+		_, ownedExpired := owners.Read("owned-expired")
+		_, ownedActive := owners.Read("owned-active")
+		_, foreignExpired := owners.Read("foreign-expired")
+		return !ownedExpired && !ownedActive && !foreignExpired
+	}, time.Second, time.Millisecond)
+	_, ownedExpired := owners.Read("owned-expired")
+	_, ownedActive := owners.Read("owned-active")
+	_, foreignExpired := owners.Read("foreign-expired")
+	require.False(t, ownedExpired)
+	require.False(t, ownedActive)
+	require.False(t, foreignExpired)
+	cancel()
+	require.NoError(t, <-done)
+}
+
+func TestManagerReconnectCleanupIsOperationBoundedAndReadinessExpiresWithoutFreshSuccess(t *testing.T) {
+	manual := clock.NewManual(time.Now().UTC())
+	owners := &blockingCleanupOwners{MemoryReconnectOwners: NewMemoryReconnectOwners(manual),
+		started: make(chan struct{}), release: make(chan struct{})}
+	credentials, err := NewReconnectCredentials([]byte(strings.Repeat("z", 32)), manual)
+	require.NoError(t, err)
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		ReconnectCredentials: credentials, ReconnectOwners: owners, ReconnectOwnerID: "replica-cleanup-bound",
+		ReconnectCredentialTTL: 12 * time.Second, ReconnectCredentialOverlap: 2 * time.Second,
+		ReconnectOwnerLeaseDuration: 3 * time.Second, ReconnectOwnerHeartbeatInterval: time.Second,
+		ReconnectOwnerOperationTimeout: 25 * time.Millisecond,
+		ReconnectCleanupInterval:       time.Second, ReconnectCleanupBatch: 8, Clock: manual,
+	}, testkit.NewFakeConnector(1), managerIDs{})
+	require.NoError(t, manager.validationErr)
+
+	started := time.Now()
+	manager.sweepReconnectOwners(t.Context())
+	require.Less(t, time.Since(started), 250*time.Millisecond, "a cleanup store that ignores context cannot block lifecycle readiness")
+	<-owners.started
+	require.Error(t, manager.ReconnectReady(t.Context()))
+	close(owners.release)
+	manager.sweepReconnectOwners(t.Context())
+	require.NoError(t, manager.ReconnectReady(t.Context()))
+	manual.Advance(3 * time.Second)
+	require.ErrorContains(t, manager.ReconnectReady(t.Context()), "stale")
+}
+
+func TestManagerReconnectEpochUsesQuiescedLiveFenceHighWaterAndStaysMonotonic(t *testing.T) {
+	connector := testkit.NewFakeConnector(16)
+	scope := handoff.Scope{TenantID: "tenant-epoch", UserID: "user", ConversationID: "conversation-epoch"}
+	manager := NewManager(Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		RecoveryStore: &recoveryStoreFake{snapshot: RecoverySnapshot{ConversationID: scope.ConversationID}}}, connector,
+		managerIDs{session: "epoch-session", conversation: scope.ConversationID})
+	oldCtx, oldCancel := context.WithCancel(context.Background())
+	defer oldCancel()
+	oldDone := make(chan error, 1)
+	oldClient := newChannelClient(4)
+	go func() {
+		oldDone <- manager.Run(oldCtx, OpenRequest{Subject: Subject{TenantID: scope.TenantID, UserID: scope.UserID, ExpiresAt: time.Now().Add(time.Hour)}, ConversationID: scope.ConversationID}, oldClient)
+	}()
+	_, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	<-oldClient.writes
+	waitForActiveRuntime(t, manager, "epoch-session", 1)
+	manager.activeMu.RLock()
+	oldRuntime := manager.active[runtimeKey{sessionID: "epoch-session", incarnation: 1}]
+	manager.activeMu.RUnlock()
+	for oldRuntime.state.fence.Current() < 41 {
+		oldRuntime.state.fence.Advance()
+	}
+	manager.activeMu.RLock()
+	require.Zero(t, manager.logical["epoch-session"].responseEpoch, "cached epoch deliberately trails the live fence")
+	manager.activeMu.RUnlock()
+
+	firstCtx, firstCancel := context.WithCancel(context.Background())
+	firstClient := newChannelClient(4)
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- manager.Reconnect(firstCtx, ReconnectRequest{Scope: scope, SessionID: "epoch-session", LastIncarnation: 1}, firstClient)
+	}()
+	_, err = connector.NextSession(t.Context())
+	require.NoError(t, err)
+	<-firstClient.writes
+	waitForActiveRuntime(t, manager, "epoch-session", 2)
+	manager.activeMu.RLock()
+	firstRuntime := manager.active[runtimeKey{sessionID: "epoch-session", incarnation: 2}]
+	require.Equal(t, identity.ResponseEpoch(42), firstRuntime.state.fence.Current())
+	manager.activeMu.RUnlock()
+	firstCancel()
+	require.Error(t, <-firstDone)
+
+	secondCtx, secondCancel := context.WithCancel(context.Background())
+	defer secondCancel()
+	secondClient := newChannelClient(4)
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- manager.Reconnect(secondCtx, ReconnectRequest{Scope: scope, SessionID: "epoch-session", LastIncarnation: 2}, secondClient)
+	}()
+	_, err = connector.NextSession(t.Context())
+	require.NoError(t, err)
+	<-secondClient.writes
+	waitForActiveRuntime(t, manager, "epoch-session", 3)
+	manager.activeMu.RLock()
+	require.Equal(t, identity.ResponseEpoch(43), manager.active[runtimeKey{sessionID: "epoch-session", incarnation: 3}].state.fence.Current())
+	manager.activeMu.RUnlock()
+	secondCancel()
+	require.Error(t, <-secondDone)
+	require.Error(t, <-oldDone)
+}
+
+func TestManagerReconnectWaitsForAcceptedApprovalDurableResolution(t *testing.T) {
+	connector := testkit.NewFakeConnector(8)
+	scope := handoff.Scope{TenantID: "tenant-approval-boundary", UserID: "user", ConversationID: "conversation-approval-boundary"}
+	approvalStore := &blockingApprovalStore{started: make(chan struct{}), release: make(chan struct{})}
+	manager := NewManager(Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		RecoveryStore: &recoveryStoreFake{snapshot: RecoverySnapshot{ConversationID: scope.ConversationID}}, ApprovalStore: approvalStore}, connector,
+		managerIDs{session: "approval-boundary-session", conversation: scope.ConversationID})
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := newChannelClient(8)
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- manager.Run(runCtx, OpenRequest{Subject: Subject{TenantID: scope.TenantID, UserID: scope.UserID, ExpiresAt: time.Now().Add(time.Hour)}, ConversationID: scope.ConversationID}, client)
+	}()
+	_, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	<-client.writes
+	waitForActiveRuntime(t, manager, "approval-boundary-session", 1)
+	client.reads <- protocol.LiveToolApprovalResolveEvent{Type: "live.tool.approval.resolve", InvocationID: "invocation", Decision: "approved", Reason: "confirmed", IdempotencyKey: "approval-key"}
+	select {
+	case <-approvalStore.started:
+	case <-time.After(time.Second):
+		t.Fatal("approval store did not begin durable resolution")
+	}
+	err = manager.Reconnect(t.Context(), ReconnectRequest{Scope: scope, SessionID: "approval-boundary-session", LastIncarnation: 1}, newChannelClient(2))
+	require.ErrorIs(t, err, ErrReconnectNotAtBoundary)
+	close(approvalStore.release)
+	require.Eventually(t, func() bool {
+		manager.activeMu.RLock()
+		runtime := manager.active[runtimeKey{sessionID: "approval-boundary-session", incarnation: 1}]
+		manager.activeMu.RUnlock()
+		return runtime != nil && runtime.state.externalAccepted.Load() == runtime.state.externalApplied.Load()
+	}, time.Second, time.Millisecond)
+	cancel()
+	require.Error(t, <-runDone)
+}
+
+func TestManagerRegistersReservedToolsBeforeFreshAndReconnectedProviderContext(t *testing.T) {
+	connector := testkit.NewFakeConnector(16)
+	scope := handoff.Scope{TenantID: "tenant-tools", UserID: "user-tools", ConversationID: "conversation-tools"}
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second,
+		EgressBlockTimeout:  time.Second,
+		RecoveryStore: &recoveryStoreFake{snapshot: RecoverySnapshot{
+			ConversationID: scope.ConversationID,
+			CommittedItems: []CommittedItem{{Sequence: 1, Role: "user", Content: "safe committed context"}},
+		}},
+		InitialSession: ReservedHandoffSessionConfig(), HandoffToolsEnabled: true,
+	}, connector, managerIDs{session: "tools-session", conversation: scope.ConversationID})
+
+	oldCtx, oldCancel := context.WithCancel(t.Context())
+	oldClient := newChannelClient(8)
+	oldDone := make(chan error, 1)
+	go func() {
+		oldDone <- manager.Run(oldCtx, OpenRequest{Subject: Subject{
+			TenantID: scope.TenantID, UserID: scope.UserID, ExpiresAt: time.Now().Add(time.Hour),
+		}, ConversationID: scope.ConversationID}, oldClient)
+	}()
+	oldVoice, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	freshRegistration, err := oldVoice.NextCommand(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, realtime.CommandSessionUpdate, freshRegistration.Kind)
+	require.Len(t, freshRegistration.Session.Tools, 3)
+	require.Equal(t, "session.created", (<-oldClient.writes).EventType())
+	waitForActiveRuntime(t, manager, "tools-session", 1)
+	oldCancel()
+	require.Error(t, <-oldDone)
+
+	newCtx, newCancel := context.WithCancel(t.Context())
+	newClient := newChannelClient(8)
+	reconnectDone := make(chan error, 1)
+	go func() {
+		reconnectDone <- manager.Reconnect(newCtx, ReconnectRequest{
+			Scope: scope, SessionID: "tools-session", LastIncarnation: 1,
+		}, newClient)
+	}()
+	newVoice, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	reconnectedRegistration, err := newVoice.NextCommand(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, realtime.CommandSessionUpdate, reconnectedRegistration.Kind)
+	require.Len(t, reconnectedRegistration.Session.Tools, 3)
+	restored, err := newVoice.NextCommand(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, realtime.CommandCreateItem, restored.Kind)
+	newCancel()
+	require.Error(t, <-reconnectDone)
+}
+
 func TestManagerReconnectFutureCursorDoesNotDisturbLiveRuntime(t *testing.T) {
 	connector := testkit.NewFakeConnector(4)
 	scope := handoff.Scope{TenantID: "tenant-future", UserID: "user", ConversationID: "conversation-future"}
@@ -392,7 +1324,7 @@ func TestManagerReconnectRejectsClientVisibleInitialEstablishment(t *testing.T) 
 	<-runDone
 }
 
-func TestManagerInitialEstablishmentFailureLeavesNonResurrectableTombstone(t *testing.T) {
+func TestManagerInitialEstablishmentFailureDoesNotConsumeReconnectCapacity(t *testing.T) {
 	registerReached := make(chan struct{})
 	releaseRegister := make(chan struct{})
 	connector := testkit.NewFakeConnector(4)
@@ -432,17 +1364,53 @@ func TestManagerInitialEstablishmentFailureLeavesNonResurrectableTombstone(t *te
 	require.Zero(t, store.calls.Load(), "failed establishment is not recovery input")
 	manager.activeMu.RLock()
 	logical := manager.logical["establish-fail-session"]
-	require.NotNil(t, logical)
-	require.Equal(t, identity.Incarnation(1), logical.highWater)
-	require.False(t, logical.reconnecting)
-	require.Nil(t, logical.runtime)
-	require.Equal(t, logicalEstablishmentFailed, logical.state)
+	require.Nil(t, logical)
 	require.Empty(t, manager.active)
 	manager.activeMu.RUnlock()
 	shortCtx, shortCancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
 	defer shortCancel()
 	_, err = connector.NextSession(shortCtx)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+func TestManagerTombstonesAreTTLAndBudgetBoundedWithoutEvictingActiveSessions(t *testing.T) {
+	manual := clock.NewManual(time.Unix(1_000, 0))
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		ReconnectTombstoneTTL: time.Minute, MaxReconnectTombstones: 2, Clock: manual,
+	}, testkit.NewFakeConnector(1), managerIDs{})
+	var observed []int
+	manager.SetMetricsHooks(MetricsHooks{ReconnectTombstones: func(count int) { observed = append(observed, count) }})
+	activeScope := handoff.Scope{TenantID: "tenant", UserID: "active", ConversationID: "active"}
+	manager.logical["active"] = &logicalSession{scope: activeScope, highWater: 1, state: logicalActive}
+	for index := range 3 {
+		sessionID := identity.SessionID(fmt.Sprintf("dead-%d", index))
+		scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: identity.ConversationID(sessionID)}
+		state := &runState{ids: IDs{SessionID: sessionID, ConversationID: scope.ConversationID, Incarnation: 1}, fence: NewEpochFence(identity.ResponseEpoch(index + 1))}
+		runtime := &sessionRuntime{key: runtimeKey{sessionID: sessionID, incarnation: 1}, subject: Subject{TenantID: scope.TenantID, UserID: scope.UserID}, state: state}
+		state.runtime = runtime
+		manager.logical[sessionID] = &logicalSession{scope: scope, highWater: 1, runtime: runtime, turnBoundary: true, state: logicalActive}
+		manager.active[runtime.key] = runtime
+		manager.current[scope] = runtime
+		manager.unregister(runtime.key, runtime)
+		manual.Advance(time.Second)
+	}
+	manager.activeMu.RLock()
+	require.NotNil(t, manager.logical["active"], "active sessions must never be tombstone eviction candidates")
+	require.Nil(t, manager.logical["dead-0"], "oldest reconnect tombstone is evicted first")
+	require.NotNil(t, manager.logical["dead-1"])
+	require.NotNil(t, manager.logical["dead-2"])
+	manager.activeMu.RUnlock()
+	require.Contains(t, observed, 2)
+
+	manual.Advance(time.Minute)
+	manager.pruneLogicalSessions()
+	manager.activeMu.RLock()
+	require.NotNil(t, manager.logical["active"])
+	require.Nil(t, manager.logical["dead-1"])
+	require.Nil(t, manager.logical["dead-2"])
+	manager.activeMu.RUnlock()
+	require.Equal(t, 0, observed[len(observed)-1])
 }
 
 func TestManagerReconnectRefreshesRecoveryAfterOldRuntimeQuiesces(t *testing.T) {
@@ -970,10 +1938,7 @@ func TestManagerProvisionsAuthenticatedConversationBeforeProviderConnectAndFails
 	manager.activeMu.RLock()
 	defer manager.activeMu.RUnlock()
 	require.Empty(t, manager.active)
-	failed := manager.logical["session-provision"]
-	require.NotNil(t, failed)
-	require.Equal(t, logicalEstablishmentFailed, failed.state)
-	require.Nil(t, failed.runtime)
+	require.Nil(t, manager.logical["session-provision"])
 }
 
 func TestManagerEphemeralSyntheticSessionUsesProviderWithoutConversationProvisioning(t *testing.T) {
@@ -1718,6 +2683,31 @@ func TestManagerConfigDefaultsAndBounds(t *testing.T) {
 		EgressBlockTimeout:  time.Second,
 	}, connector, ids)
 	require.ErrorIs(t, tooLarge.validationErr, ErrInvalidManagerConfig)
+}
+
+func TestManagerReconnectRefreshCadenceIsBoundedByCredentialTTL(t *testing.T) {
+	manual := clock.NewManual(time.Now().UTC())
+	credentials, err := NewReconnectCredentials([]byte(strings.Repeat("r", 32)), manual)
+	require.NoError(t, err)
+	base := Config{
+		IngressBlockTimeout:    time.Second,
+		EgressBlockTimeout:     time.Second,
+		ReconnectCredentials:   credentials,
+		ReconnectOwners:        NewMemoryReconnectOwners(manual),
+		ReconnectOwnerID:       "replica-refresh-cadence",
+		ReconnectCredentialTTL: 10 * time.Second,
+		Clock:                  manual,
+	}
+
+	normalized, err := normalizeManagerConfig(base)
+	require.NoError(t, err)
+	require.LessOrEqual(t, normalized.ReconnectOwnerHeartbeatInterval, normalized.ReconnectCredentialTTL/6,
+		"the default maintenance cadence must leave a bounded refresh margin before the credential expires")
+
+	base.ReconnectOwnerHeartbeatInterval = 2 * time.Second
+	_, err = normalizeManagerConfig(base)
+	require.ErrorIs(t, err, ErrInvalidManagerConfig,
+		"an explicit cadence that can miss the refresh margin must fail closed")
 }
 
 func TestManagerOddCommitKeepsTailForTheNextAppend(t *testing.T) {
@@ -2628,10 +3618,18 @@ func TestManagerDispatchesTypedDurableEffectsWithTrustedRuntimeIdentity(t *testi
 	}
 }
 
-func TestManagerTypedDurableEffectsFailClosedWithoutDispatcher(t *testing.T) {
+func TestManagerOrdinaryTranscriptDoesNotTerminateWithoutDurableDispatcher(t *testing.T) {
 	state := &runState{ids: testIDs()}
-	err := state.dispatchEffects(t.Context(), []Effect{{Transcript: &TranscriptRequestedEffect{
+	require.NoError(t, state.dispatchEffects(t.Context(), []Effect{{Transcript: &TranscriptRequestedEffect{
 		Turn: identity.TurnKey{ID: "turn", Revision: 1}, Sequence: 1, Role: "user", FinalText: "text",
+	}}}, 0, 0))
+}
+
+func TestManagerHandoffEffectFailsClosedWithoutDispatcher(t *testing.T) {
+	state := &runState{ids: testIDs()}
+	err := state.dispatchEffects(t.Context(), []Effect{{Handoff: &HandoffRequestedEffect{
+		Turn: identity.TurnKey{ID: "turn", Revision: 1}, ResponseID: "response", CallID: "call",
+		ToolName: StartBackgroundTaskTool, Arguments: json.RawMessage(`{"objective":"test"}`),
 	}}}, 0, 0)
 	require.ErrorIs(t, err, ErrUnsupportedAsync)
 }

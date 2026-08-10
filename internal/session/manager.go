@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	rand "math/rand/v2"
 	"reflect"
@@ -27,18 +28,27 @@ import (
 )
 
 const (
-	defaultIngressFrames       = 25
-	defaultEgressFrames        = 75
-	defaultControlEvents       = 256
-	defaultWriterControlEvents = 64
-	maximumQueueCapacity       = 10_000
-	pcmFrameBytes              = 960
-	internalCloseTimeout       = time.Second
-	presentationOfferTimeout   = 250 * time.Millisecond
-	defaultReconnectRetries    = 2
-	defaultReconnectRetryBase  = 100 * time.Millisecond
-	defaultReconnectRetryMax   = time.Second
-	maximumLogicalSessions     = 10_000
+	defaultIngressFrames          = 25
+	defaultEgressFrames           = 75
+	defaultControlEvents          = 256
+	defaultWriterControlEvents    = 64
+	maximumQueueCapacity          = 10_000
+	pcmFrameBytes                 = 960
+	internalCloseTimeout          = time.Second
+	presentationOfferTimeout      = 250 * time.Millisecond
+	defaultReconnectRetries       = 2
+	defaultReconnectRetryBase     = 100 * time.Millisecond
+	defaultReconnectRetryMax      = time.Second
+	defaultReconnectTombstoneTTL  = 10 * time.Minute
+	defaultMaxReconnectTombstones = 4_096
+	defaultReconnectCredentialTTL = 5 * time.Minute
+	defaultReconnectOwnerLease    = 30 * time.Second
+	defaultReconnectHeartbeat     = 10 * time.Second
+	defaultReconnectOperation     = time.Second
+	defaultReconnectMaxOperations = 128
+	defaultReconnectCleanup       = 30 * time.Second
+	defaultReconnectCleanupBatch  = 128
+	maximumLogicalSessions        = 10_000
 )
 
 var (
@@ -61,32 +71,48 @@ type ClientConn interface {
 }
 
 type Config struct {
-	IngressFrames           int
-	EgressFrames            int
-	ControlEvents           int
-	WriterControlEvents     int
-	IngressBlockTimeout     time.Duration
-	EgressBlockTimeout      time.Duration
-	DurableDispatcher       DurableEffectDispatcher
-	HandoffConsumerID       string
-	HandoffSubscriptions    HandoffSubscriptionRegistrar
-	PresentationPolicy      presentation.Policy
-	SafetyPolicy            safety.Policy
-	RecoveryStore           RecoveryStore
-	RecoveryItemLimit       int
-	RecoveryByteLimit       int
-	ReconnectMaxRetries     int
-	ReconnectRetryBase      time.Duration
-	ReconnectRetryMax       time.Duration
-	Clock                   clock.Clock
-	Jitter                  clock.JitterSource
-	FeatureGates            interface{ Enabled(string) bool }
-	ApprovalStore           handoff.ApprovalStore
-	ConversationProvisioner ConversationProvisioner
-	ConversationTTL         time.Duration
-	reactorApplyGate        func(Input) <-chan struct{}
-	reconnectBoundaryGate   func() <-chan struct{}
-	initialRegisterGate     func() <-chan struct{}
+	IngressFrames                   int
+	EgressFrames                    int
+	ControlEvents                   int
+	WriterControlEvents             int
+	IngressBlockTimeout             time.Duration
+	EgressBlockTimeout              time.Duration
+	DurableDispatcher               DurableEffectDispatcher
+	HandoffConsumerID               string
+	HandoffSubscriptions            HandoffSubscriptionRegistrar
+	PresentationPolicy              presentation.Policy
+	SafetyPolicy                    safety.Policy
+	RecoveryStore                   RecoveryStore
+	RecoveryItemLimit               int
+	RecoveryByteLimit               int
+	ReconnectMaxRetries             int
+	ReconnectRetryBase              time.Duration
+	ReconnectRetryMax               time.Duration
+	ReconnectTombstoneTTL           time.Duration
+	MaxReconnectTombstones          int
+	ReconnectCredentials            ReconnectCredentials
+	ReconnectOwners                 ReconnectOwnerStore
+	ReconnectOwnerID                string
+	ReconnectCredentialTTL          time.Duration
+	ReconnectCredentialOverlap      time.Duration
+	ReconnectOwnerLeaseDuration     time.Duration
+	ReconnectOwnerHeartbeatInterval time.Duration
+	ReconnectOwnerOperationTimeout  time.Duration
+	ReconnectOwnerMaxOperations     int
+	ReconnectCleanupInterval        time.Duration
+	ReconnectCleanupBatch           int
+	InitialSession                  realtime.SessionConfig
+	HandoffToolsEnabled             bool
+	Clock                           clock.Clock
+	Jitter                          clock.JitterSource
+	FeatureGates                    interface{ Enabled(string) bool }
+	ApprovalStore                   handoff.ApprovalStore
+	ConversationProvisioner         ConversationProvisioner
+	ConversationTTL                 time.Duration
+	reactorApplyGate                func(Input) <-chan struct{}
+	reconnectBoundaryGate           func() <-chan struct{}
+	initialRegisterGate             func() <-chan struct{}
+	reconnectHeartbeatReady         func()
 }
 
 type ConversationProvisioner interface {
@@ -119,6 +145,7 @@ type MetricsHooks struct {
 	SessionEnded        func()
 	AudioTransit        func(time.Duration)
 	ReconnectRestore    func(time.Duration, string)
+	ReconnectTombstones func(int)
 	StaleOutputRejected func()
 	QueueState          func(string, int, int, time.Duration)
 	QueueBlocked        func(string, time.Duration)
@@ -144,6 +171,9 @@ func normalizeMetricsHooks(hooks MetricsHooks) MetricsHooks {
 	}
 	if hooks.ReconnectRestore == nil {
 		hooks.ReconnectRestore = func(time.Duration, string) {}
+	}
+	if hooks.ReconnectTombstones == nil {
+		hooks.ReconnectTombstones = func(int) {}
 	}
 	if hooks.StaleOutputRejected == nil {
 		hooks.StaleOutputRejected = func() {}
@@ -190,7 +220,6 @@ type OpenRequest struct {
 	Subject        Subject
 	RequestedModel string
 	ConversationID identity.ConversationID
-	ReconnectToken string
 }
 
 type IDGenerator interface {
@@ -203,13 +232,18 @@ type Manager struct {
 	connector realtime.Connector
 	ids       IDGenerator
 
-	validationErr error
-	activeMu      sync.RWMutex
-	active        map[runtimeKey]*sessionRuntime
-	current       map[handoff.Scope]*sessionRuntime
-	logical       map[identity.SessionID]*logicalSession
-	metricsMu     sync.RWMutex
-	metrics       MetricsHooks
+	validationErr                 error
+	activeMu                      sync.RWMutex
+	active                        map[runtimeKey]*sessionRuntime
+	current                       map[handoff.Scope]*sessionRuntime
+	logical                       map[identity.SessionID]*logicalSession
+	metricsMu                     sync.RWMutex
+	metrics                       MetricsHooks
+	reconnectMaintenanceMu        sync.RWMutex
+	reconnectMaintenanceAttempted bool
+	reconnectMaintenanceErr       error
+	reconnectMaintenanceSucceeded time.Time
+	reconnectOperationSlots       chan struct{}
 }
 
 type logicalSession struct {
@@ -221,6 +255,7 @@ type logicalSession struct {
 	runtime       *sessionRuntime
 	reconnecting  bool
 	turnBoundary  bool
+	tombstonedAt  time.Time
 	state         logicalSessionState
 }
 
@@ -230,7 +265,6 @@ const (
 	logicalEstablishing logicalSessionState = iota
 	logicalActive
 	logicalTombstoned
-	logicalEstablishmentFailed
 )
 
 type managerJitter struct{}
@@ -255,10 +289,14 @@ type sessionRuntime struct {
 	quiesced <-chan struct{}
 	state    *runState
 
-	mu          sync.Mutex
-	accepting   bool
-	inboxSlots  chan struct{}
-	replayAfter *int64
+	mu                    sync.Mutex
+	accepting             bool
+	inboxSlots            chan struct{}
+	replayAfter           *int64
+	reconnectMu           sync.Mutex
+	reconnectRotateMu     sync.Mutex
+	reconnect             *IssuedReconnectCredential
+	reconnectLossDeadline time.Time
 }
 
 // fenceAtTurnBoundary linearizes the final boundary decision with every
@@ -437,6 +475,11 @@ type clientControl struct {
 	incarnation identity.Incarnation
 }
 
+type approvalResolutionWork struct {
+	event    protocol.LiveToolApprovalResolveEvent
+	sequence uint64
+}
+
 type sequenceProgress struct {
 	mu        sync.Mutex
 	completed uint64
@@ -474,6 +517,15 @@ func (p *sequenceProgress) reached(sequence uint64) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.completed >= sequence
+}
+
+func (p *sequenceProgress) current() uint64 {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.completed
 }
 
 type activeAudioWrite struct {
@@ -544,7 +596,7 @@ type runState struct {
 	metrics            MetricsHooks
 	subject            Subject
 	dispatcher         DurableEffectDispatcher
-	approvals          chan protocol.LiveToolApprovalResolveEvent
+	approvalWork       chan approvalResolutionWork
 
 	ingressSequence uint64
 	egressSequence  uint64
@@ -570,21 +622,27 @@ type runState struct {
 	controlApplied   atomic.Uint64
 	externalAccepted atomic.Uint64
 	externalApplied  atomic.Uint64
+	externalProgress *sequenceProgress
 	pendingVoice     atomic.Int64
 	handoffEpoch     atomic.Uint64
 }
 
 func NewManager(cfg Config, connector realtime.Connector, ids IDGenerator) *Manager {
 	normalized, err := normalizeManagerConfig(cfg)
+	operationCapacity := normalized.ReconnectOwnerMaxOperations
+	if operationCapacity < 1 || operationCapacity > 4_096 {
+		operationCapacity = 0
+	}
 	return &Manager{
-		cfg:           normalized,
-		connector:     connector,
-		ids:           ids,
-		validationErr: err,
-		active:        make(map[runtimeKey]*sessionRuntime),
-		current:       make(map[handoff.Scope]*sessionRuntime),
-		logical:       make(map[identity.SessionID]*logicalSession),
-		metrics:       normalizeMetricsHooks(MetricsHooks{}),
+		cfg:                     normalized,
+		connector:               connector,
+		ids:                     ids,
+		validationErr:           err,
+		active:                  make(map[runtimeKey]*sessionRuntime),
+		current:                 make(map[handoff.Scope]*sessionRuntime),
+		logical:                 make(map[identity.SessionID]*logicalSession),
+		metrics:                 normalizeMetricsHooks(MetricsHooks{}),
+		reconnectOperationSlots: make(chan struct{}, operationCapacity),
 	}
 }
 
@@ -602,6 +660,13 @@ func (m *Manager) metricsSnapshot() MetricsHooks {
 	return m.metrics
 }
 
+func (m *Manager) observeReconnectTombstones(count int) {
+	hooks := m.metricsSnapshot()
+	if hooks.ReconnectTombstones != nil {
+		hooks.ReconnectTombstones(count)
+	}
+}
+
 // ActiveSessions returns only currently published runtimes; it never exposes
 // session identities.
 func (m *Manager) ActiveSessions() int64 {
@@ -613,7 +678,95 @@ func (m *Manager) ActiveSessions() int64 {
 	return int64(len(m.active))
 }
 
+func (m *Manager) ReconnectEnabled() bool {
+	return m != nil && m.validationErr == nil && !isNilInterface(m.cfg.ReconnectCredentials) && !isNilInterface(m.cfg.ReconnectOwners)
+}
+
+func (m *Manager) now() time.Time {
+	if m != nil && !isNilInterface(m.cfg.Clock) {
+		return m.cfg.Clock.Now()
+	}
+	return time.Now()
+}
+
+// pruneLogicalSessions is intentionally independent of session creation so a
+// quiet process releases expired reconnect metadata without requiring churn.
+func (m *Manager) pruneLogicalSessions() {
+	if m == nil {
+		return
+	}
+	m.activeMu.Lock()
+	count := m.pruneLogicalLocked(m.now())
+	m.activeMu.Unlock()
+	m.observeReconnectTombstones(count)
+}
+
+// activeMu must be held.
+func (m *Manager) pruneLogicalLocked(now time.Time) int {
+	if m.logical == nil {
+		return 0
+	}
+	ttl := m.cfg.ReconnectTombstoneTTL
+	if ttl <= 0 {
+		ttl = defaultReconnectTombstoneTTL
+	}
+	budget := m.cfg.MaxReconnectTombstones
+	if budget <= 0 {
+		budget = defaultMaxReconnectTombstones
+	}
+	for sessionID, logical := range m.logical {
+		if logical == nil || logical.state != logicalTombstoned || logical.runtime != nil || logical.reconnecting || logical.tombstonedAt.IsZero() {
+			continue
+		}
+		if !now.Before(logical.tombstonedAt.Add(ttl)) {
+			delete(m.logical, sessionID)
+		}
+	}
+	for m.countTombstonesLocked() > budget {
+		if !m.evictOldestTombstoneLocked() {
+			break
+		}
+	}
+	return m.countTombstonesLocked()
+}
+
+// activeMu must be held.
+func (m *Manager) countTombstonesLocked() int {
+	count := 0
+	for _, logical := range m.logical {
+		if logical != nil && logical.state == logicalTombstoned && logical.runtime == nil && !logical.reconnecting {
+			count++
+		}
+	}
+	return count
+}
+
+// activeMu must be held. Active, establishing, and reconnecting entries are
+// deliberately ineligible even when their timestamps are malformed.
+func (m *Manager) evictOldestTombstoneLocked() bool {
+	var selected identity.SessionID
+	var selectedAt time.Time
+	for sessionID, logical := range m.logical {
+		if logical == nil || logical.state != logicalTombstoned || logical.runtime != nil || logical.reconnecting {
+			continue
+		}
+		if selected == "" || logical.tombstonedAt.Before(selectedAt) || logical.tombstonedAt.Equal(selectedAt) && sessionID < selected {
+			selected, selectedAt = sessionID, logical.tombstonedAt
+		}
+	}
+	if selected == "" {
+		return false
+	}
+	delete(m.logical, selected)
+	return true
+}
+
+func minimalReconnectSubject(subject Subject) Subject {
+	return Subject{TenantID: subject.TenantID, UserID: subject.UserID, ExpiresAt: subject.ExpiresAt, Ephemeral: subject.Ephemeral}
+}
+
 func normalizeManagerConfig(cfg Config) (Config, error) {
+	cfg.InitialSession = cloneRealtimeSessionConfig(cfg.InitialSession)
 	defaults := []struct {
 		value *int
 		name  string
@@ -663,6 +816,78 @@ func normalizeManagerConfig(cfg Config) (Config, error) {
 	if cfg.ReconnectRetryBase < time.Millisecond || cfg.ReconnectRetryMax < cfg.ReconnectRetryBase || cfg.ReconnectRetryMax > time.Minute {
 		return cfg, fmt.Errorf("%w: reconnect retry bounds are unsafe", ErrInvalidManagerConfig)
 	}
+	if cfg.ReconnectTombstoneTTL == 0 {
+		cfg.ReconnectTombstoneTTL = defaultReconnectTombstoneTTL
+	}
+	if cfg.ReconnectTombstoneTTL < time.Second || cfg.ReconnectTombstoneTTL > 24*time.Hour {
+		return cfg, fmt.Errorf("%w: reconnect tombstone TTL is unsafe", ErrInvalidManagerConfig)
+	}
+	if cfg.MaxReconnectTombstones == 0 {
+		cfg.MaxReconnectTombstones = defaultMaxReconnectTombstones
+	}
+	if cfg.MaxReconnectTombstones < 1 || cfg.MaxReconnectTombstones >= maximumLogicalSessions {
+		return cfg, fmt.Errorf("%w: reconnect tombstone budget is unsafe", ErrInvalidManagerConfig)
+	}
+	reconnectAuthorityConfigured := !isNilInterface(cfg.ReconnectCredentials) || !isNilInterface(cfg.ReconnectOwners) || cfg.ReconnectOwnerID != "" ||
+		cfg.ReconnectCredentialTTL != 0 || cfg.ReconnectCredentialOverlap != 0 || cfg.ReconnectOwnerLeaseDuration != 0 ||
+		cfg.ReconnectOwnerHeartbeatInterval != 0 || cfg.ReconnectOwnerOperationTimeout != 0 || cfg.ReconnectOwnerMaxOperations != 0 ||
+		cfg.ReconnectCleanupInterval != 0 || cfg.ReconnectCleanupBatch != 0
+	if reconnectAuthorityConfigured {
+		if isNilInterface(cfg.ReconnectCredentials) || isNilInterface(cfg.ReconnectOwners) || !boundedReconnectValue(cfg.ReconnectOwnerID) {
+			return cfg, fmt.Errorf("%w: reconnect authority dependencies are incomplete", ErrInvalidManagerConfig)
+		}
+		if cfg.ReconnectCredentialTTL == 0 {
+			cfg.ReconnectCredentialTTL = defaultReconnectCredentialTTL
+		}
+		if cfg.ReconnectCredentialTTL < 10*time.Second || cfg.ReconnectCredentialTTL > time.Hour {
+			return cfg, fmt.Errorf("%w: reconnect credential TTL is unsafe", ErrInvalidManagerConfig)
+		}
+		if cfg.ReconnectCredentialOverlap == 0 {
+			cfg.ReconnectCredentialOverlap = cfg.ReconnectCredentialTTL / 4
+		}
+		if cfg.ReconnectCredentialOverlap < time.Second || cfg.ReconnectCredentialOverlap > cfg.ReconnectCredentialTTL/2 {
+			return cfg, fmt.Errorf("%w: reconnect credential overlap is unsafe", ErrInvalidManagerConfig)
+		}
+		if cfg.ReconnectOwnerLeaseDuration == 0 {
+			cfg.ReconnectOwnerLeaseDuration = defaultReconnectOwnerLease
+		}
+		if cfg.ReconnectOwnerHeartbeatInterval == 0 {
+			cfg.ReconnectOwnerHeartbeatInterval = defaultReconnectHeartbeat
+			if refreshCadence := cfg.ReconnectCredentialTTL / 6; cfg.ReconnectOwnerHeartbeatInterval > refreshCadence {
+				cfg.ReconnectOwnerHeartbeatInterval = refreshCadence
+			}
+		}
+		if cfg.ReconnectOwnerLeaseDuration < 3*time.Second || cfg.ReconnectOwnerLeaseDuration > 10*time.Minute ||
+			cfg.ReconnectOwnerHeartbeatInterval < time.Second || cfg.ReconnectOwnerHeartbeatInterval > cfg.ReconnectOwnerLeaseDuration/2 {
+			return cfg, fmt.Errorf("%w: reconnect owner lease is unsafe", ErrInvalidManagerConfig)
+		}
+		if cfg.ReconnectOwnerHeartbeatInterval > cfg.ReconnectCredentialTTL/6 {
+			return cfg, fmt.Errorf("%w: reconnect credential refresh cadence is unsafe", ErrInvalidManagerConfig)
+		}
+		if cfg.ReconnectOwnerOperationTimeout == 0 {
+			cfg.ReconnectOwnerOperationTimeout = defaultReconnectOperation
+		}
+		if cfg.ReconnectOwnerOperationTimeout < time.Millisecond || cfg.ReconnectOwnerOperationTimeout > 30*time.Second ||
+			cfg.ReconnectOwnerOperationTimeout > cfg.ReconnectOwnerLeaseDuration-cfg.ReconnectOwnerHeartbeatInterval {
+			return cfg, fmt.Errorf("%w: reconnect owner operation timeout is unsafe", ErrInvalidManagerConfig)
+		}
+		if cfg.ReconnectOwnerMaxOperations == 0 {
+			cfg.ReconnectOwnerMaxOperations = defaultReconnectMaxOperations
+		}
+		if cfg.ReconnectOwnerMaxOperations < 1 || cfg.ReconnectOwnerMaxOperations > 4_096 {
+			return cfg, fmt.Errorf("%w: reconnect owner operation concurrency is unsafe", ErrInvalidManagerConfig)
+		}
+		if cfg.ReconnectCleanupInterval == 0 {
+			cfg.ReconnectCleanupInterval = defaultReconnectCleanup
+		}
+		if cfg.ReconnectCleanupBatch == 0 {
+			cfg.ReconnectCleanupBatch = defaultReconnectCleanupBatch
+		}
+		if cfg.ReconnectCleanupInterval < time.Second || cfg.ReconnectCleanupInterval > time.Hour ||
+			cfg.ReconnectCleanupBatch < 1 || cfg.ReconnectCleanupBatch > 10_000 {
+			return cfg, fmt.Errorf("%w: reconnect cleanup bounds are unsafe", ErrInvalidManagerConfig)
+		}
+	}
 	if isNilInterface(cfg.Clock) {
 		cfg.Clock = clock.Real{}
 	}
@@ -685,7 +910,7 @@ func normalizeManagerConfig(cfg Config) (Config, error) {
 	return cfg, nil
 }
 
-func (m *Manager) Run(parent context.Context, request OpenRequest, client ClientConn) error {
+func (m *Manager) Run(parent context.Context, request OpenRequest, client ClientConn) (runErr error) {
 	if m == nil {
 		return errors.New("session manager is nil")
 	}
@@ -726,8 +951,13 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	if m.logical == nil {
 		m.logical = make(map[identity.SessionID]*logicalSession)
 	}
+	tombstones := m.pruneLogicalLocked(m.now())
+	if _, exists := m.logical[sessionID]; !exists && len(m.logical) >= maximumLogicalSessions && m.evictOldestTombstoneLocked() {
+		tombstones--
+	}
 	if _, exists := m.logical[sessionID]; exists || len(m.logical) >= maximumLogicalSessions {
 		m.activeMu.Unlock()
+		m.observeReconnectTombstones(tombstones)
 		return ErrSessionAlreadyActive
 	}
 	logical := &logicalSession{
@@ -736,6 +966,7 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	}
 	m.logical[sessionID] = logical
 	m.activeMu.Unlock()
+	m.observeReconnectTombstones(tombstones)
 	defer m.failInitialEstablishment(sessionID, logical)
 
 	sessionCtx, cancel := subjectContext(parent, subject.ExpiresAt)
@@ -757,6 +988,54 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	if isNilInterface(voice) {
 		return errors.New("realtime connector returned a nil session")
 	}
+	if err := m.sendInitialSession(sessionCtx, voice); err != nil {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), internalCloseTimeout)
+		_ = voice.Close(closeCtx)
+		closeCancel()
+		return fmt.Errorf("register server session tools: %w", err)
+	}
+	var reconnectMetadata *protocol.ReconnectMetadata
+	var reconnectIssued *IssuedReconnectCredential
+	reconnectOwnerCreated := false
+	reconnectOwnerPublished := false
+	reconnectAdvertisementAttempted := false
+	var reconnectOwnerLossDeadline time.Time
+	if m.ReconnectEnabled() {
+		issued, owner, issueErr := m.issueReconnectCredential(subject, scope, sessionID, ids.Incarnation, 0, request.RequestedModel, ReconnectOwnerEstablishing)
+		if issueErr != nil {
+			closeCtx, closeCancel := context.WithTimeout(context.Background(), internalCloseTimeout)
+			_ = voice.Close(closeCtx)
+			closeCancel()
+			return ErrRecoveryUnavailable
+		}
+		owner.TurnBoundary = true
+		createStarted := m.now()
+		createLease, createErr := m.cfg.ReconnectOwners.Create(sessionCtx, owner, m.cfg.ReconnectOwnerLeaseDuration)
+		if createErr != nil {
+			closeCtx, closeCancel := context.WithTimeout(context.Background(), internalCloseTimeout)
+			_ = voice.Close(closeCtx)
+			closeCancel()
+			return ErrRecoveryUnavailable
+		}
+		reconnectOwnerLossDeadline = reconnectLossDeadline(createStarted, createLease,
+			m.cfg.ReconnectOwnerHeartbeatInterval, m.cfg.ReconnectOwnerLeaseDuration)
+		if !m.now().Before(reconnectOwnerLossDeadline) {
+			closeCtx, closeCancel := context.WithTimeout(context.Background(), internalCloseTimeout)
+			_ = voice.Close(closeCtx)
+			closeCancel()
+			return ErrRecoveryUnavailable
+		}
+		reconnectOwnerCreated = true
+		reconnectIssued = &issued
+		reconnectMetadata = reconnectMetadataFromIssued(issued)
+		defer func() {
+			if !reconnectOwnerPublished && !reconnectAdvertisementAttempted {
+				ctx, cleanupCancel := context.WithTimeout(context.Background(), internalCloseTimeout)
+				_ = m.cfg.ReconnectOwners.Delete(ctx, sessionID, ids.Incarnation, m.cfg.ReconnectOwnerID)
+				cleanupCancel()
+			}
+		}()
+	}
 
 	group, groupCtx := errgroup.WithContext(sessionCtx)
 	quiesced := make(chan struct{})
@@ -766,14 +1045,19 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	state.subject = cloneSubject(subject)
 	state.metrics = m.metricsSnapshot()
 	runtime := &sessionRuntime{
-		key:        runtimeKey{sessionID: sessionID, incarnation: ids.Incarnation},
-		subject:    subject,
-		inbox:      state.inbox,
-		done:       groupCtx.Done(),
-		quiesced:   quiesced,
-		state:      state,
-		accepting:  true,
-		inboxSlots: state.inboxSlots,
+		key:                   runtimeKey{sessionID: sessionID, incarnation: ids.Incarnation},
+		subject:               subject,
+		inbox:                 state.inbox,
+		done:                  groupCtx.Done(),
+		quiesced:              quiesced,
+		state:                 state,
+		accepting:             true,
+		inboxSlots:            state.inboxSlots,
+		reconnectLossDeadline: reconnectOwnerLossDeadline,
+	}
+	if reconnectIssued != nil {
+		copy := *reconnectIssued
+		runtime.reconnect = &copy
 	}
 	state.runtime = runtime
 	var firstErr error
@@ -783,7 +1067,7 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 			err := loop(groupCtx)
 			runtime.stop()
 			if err != nil && !errors.Is(err, errGracefulSessionClose) && !state.graceful.Load() {
-				if !(errors.Is(err, context.Canceled) && groupCtx.Err() != nil) {
+				if !(groupCtx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, io.EOF))) {
 					firstErrOnce.Do(func() { firstErr = fmt.Errorf("%s: %w", name, err) })
 				}
 			}
@@ -814,8 +1098,9 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	// A runtime is not externally discoverable until ConnectedInput has been
 	// processed and the session.created frame has actually reached ClientConn.
 	// This prevents the durable pump from overtaking session establishment.
+	reconnectAdvertisementAttempted = reconnectMetadata != nil
 	<-state.inboxSlots
-	connected := reactorMessage{input: ConnectedInput{ProviderSession: json.RawMessage(`{}`)}, done: make(chan error, 1), requireClientWrites: true}
+	connected := reactorMessage{input: ConnectedInput{ProviderSession: json.RawMessage(`{}`), Reconnect: reconnectMetadata}, done: make(chan error, 1), requireClientWrites: true}
 	state.acceptControl(&connected)
 	state.inbox <- connected
 	select {
@@ -844,9 +1129,27 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	if err := m.register(runtime); err != nil {
 		return abortBeforePublication(err)
 	}
+	if reconnectOwnerCreated {
+		publishStarted := m.now()
+		key := runtime.reconnectKey()
+		lease, err := m.runReconnectOwnerLeaseOperation(sessionCtx, reconnectOwnerLossDeadline, func(operationCtx context.Context) (ReconnectOwnerLease, error) {
+			return m.cfg.ReconnectOwners.Publish(operationCtx, key, runtime.state.fence.Current(), runtime.atTurnBoundary(), m.cfg.ReconnectOwnerLeaseDuration)
+		})
+		if err != nil {
+			m.rollbackInitialPublication(runtime, logical)
+			return abortBeforePublication(ErrRecoveryUnavailable)
+		}
+		reconnectOwnerPublished = true
+		lossDeadline := reconnectLossDeadline(publishStarted, lease, m.cfg.ReconnectOwnerHeartbeatInterval, m.cfg.ReconnectOwnerLeaseDuration)
+		runtime.setReconnectLossDeadline(lossDeadline)
+		group.Go(runLoop("reconnect owner heartbeat", func(ctx context.Context) error { return m.maintainReconnectOwner(ctx, runtime, lossDeadline) }))
+	}
 	hooks := m.metricsSnapshot()
 	hooks.SessionStarted()
-	defer func() { m.unregister(runtime.key, runtime); hooks.SessionEnded() }()
+	defer func() {
+		runErr = errors.Join(runErr, m.unregister(runtime.key, runtime))
+		hooks.SessionEnded()
+	}()
 
 	waitErr := group.Wait()
 	cancel()
@@ -877,39 +1180,56 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 
 func (m *Manager) failInitialEstablishment(sessionID identity.SessionID, logical *logicalSession) {
 	m.activeMu.Lock()
-	defer m.activeMu.Unlock()
 	if m.logical[sessionID] != logical || logical.state != logicalEstablishing {
+		m.activeMu.Unlock()
 		return
 	}
-	logical.state = logicalEstablishmentFailed
-	logical.runtime = nil
-	logical.reconnecting = false
-	logical.turnBoundary = false
+	delete(m.logical, sessionID)
+	tombstones := m.countTombstonesLocked()
+	m.activeMu.Unlock()
+	m.observeReconnectTombstones(tombstones)
 }
 
 // Reconnect replaces a logical session through an exact-incarnation
 // compare-and-swap. Scope is expected to come from the authenticated transport
 // and is checked against the immutable scope retained by the manager.
-func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, client ClientConn) error {
-	started := m.cfg.Clock.Now()
+func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, client ClientConn) (returnErr error) {
 	if m == nil || m.validationErr != nil {
 		if m != nil && m.validationErr != nil {
 			return m.validationErr
 		}
 		return ErrStaleReconnect
 	}
+	started := m.now()
 	if parent == nil || isNilInterface(client) {
 		return ErrStaleReconnect
 	}
 	if err := validateReconnectRequest(request); err != nil {
 		return err
 	}
-	m.activeMu.RLock()
+	if uint64(request.LastIncarnation) == math.MaxUint64 {
+		return ErrStaleReconnect
+	}
+	authoritativeOwners := m.ReconnectEnabled()
+	if authoritativeOwners {
+		if err := validateSubject(request.Subject); err != nil || request.Credential.Scope != request.Scope ||
+			request.Credential.SessionID != request.SessionID || request.Credential.Incarnation != request.LastIncarnation ||
+			request.Credential.Cursor != request.LastEventSeq || validateReconnectClaims(request.Credential, m.now(), true) != nil {
+			return ErrStaleReconnect
+		}
+	}
+	m.activeMu.Lock()
+	tombstones := m.pruneLogicalLocked(m.now())
 	logical := m.logical[request.SessionID]
-	checkErr := m.checkReconnectLocked(request, logical)
-	m.activeMu.RUnlock()
+	remoteOwner := logical == nil && authoritativeOwners
+	var checkErr error
+	if !remoteOwner {
+		checkErr = m.checkReconnectLocked(request, logical)
+	}
+	m.activeMu.Unlock()
+	m.observeReconnectTombstones(tombstones)
 	if checkErr != nil {
-		m.metricsSnapshot().ReconnectRestore(m.cfg.Clock.Now().Sub(started), "rejected")
+		m.metricsSnapshot().ReconnectRestore(m.now().Sub(started), "rejected")
 		return checkErr
 	}
 	if isNilInterface(m.cfg.RecoveryStore) {
@@ -944,31 +1264,55 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 		m.activeMu.Unlock()
 		return ErrStaleReconnect
 	}
-	if err := m.checkReconnectLocked(request, logical); err != nil {
-		m.activeMu.Unlock()
-		return err
-	}
-	old := logical.runtime
-	if old != nil {
-		if err := old.fenceAtTurnBoundary(parent, m.cfg.reconnectBoundaryGate); err != nil {
+	var old *sessionRuntime
+	var subject Subject
+	var model string
+	if logical != nil {
+		if err := m.checkReconnectLocked(request, logical); err != nil {
 			m.activeMu.Unlock()
 			return err
 		}
+		old = logical.runtime
+		if old != nil {
+			if err := old.fenceAtTurnBoundary(parent, m.cfg.reconnectBoundaryGate); err != nil {
+				m.activeMu.Unlock()
+				return err
+			}
+		}
+		logical.reconnecting = true
+		subject = cloneSubject(logical.subject)
+		model = logical.model
+	} else {
+		if !authoritativeOwners {
+			m.activeMu.Unlock()
+			return ErrStaleReconnect
+		}
+		subject = cloneSubject(request.Subject)
+		model = request.Credential.Model
 	}
-	logical.reconnecting = true
-	subject := cloneSubject(logical.subject)
-	model := logical.model
-	initialEpoch := logical.responseEpoch + 1
-	newIncarnation := logical.highWater + 1
+	newIncarnation := request.LastIncarnation + 1
 	m.activeMu.Unlock()
 
-	published := false
+	var durablyPublished atomic.Bool
+	var advertisementAttempted atomic.Bool
+	claimSucceeded := false
+	remoteLogicalCreated := false
+	var claimedOwner ReconnectOwner
+	var claimedNext ReconnectOwner
+	var claimedLossDeadline time.Time
 	defer func() {
-		if published {
-			return
+		if claimSucceeded && !durablyPublished.Load() && !advertisementAttempted.Load() {
+			ctx, cancel := context.WithTimeout(context.Background(), internalCloseTimeout)
+			abortErr := m.cfg.ReconnectOwners.AbortClaim(ctx, claimedNext.Key(), claimedOwner)
+			cancel()
+			if abortErr != nil {
+				returnErr = errors.Join(returnErr, ErrRecoveryUnavailable, fmt.Errorf("abort reconnect claim: %w", abortErr))
+			}
 		}
 		m.activeMu.Lock()
-		if current := m.logical[request.SessionID]; current == logical && current.highWater == request.LastIncarnation {
+		if remoteLogicalCreated && !durablyPublished.Load() && m.logical[request.SessionID] == logical {
+			delete(m.logical, request.SessionID)
+		} else if current := m.logical[request.SessionID]; current != nil && current == logical && current.highWater == request.LastIncarnation {
 			current.reconnecting = false
 		}
 		m.activeMu.Unlock()
@@ -982,6 +1326,110 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 	if err := parent.Err(); err != nil {
 		return err
 	}
+	desiredNextEpoch := identity.ResponseEpoch(0)
+	m.activeMu.RLock()
+	if logical != nil && logical.responseEpoch > desiredNextEpoch {
+		desiredNextEpoch = logical.responseEpoch
+	}
+	m.activeMu.RUnlock()
+	if old != nil && old.state != nil && old.state.fence != nil && old.state.fence.Current() > desiredNextEpoch {
+		desiredNextEpoch = old.state.fence.Current()
+	}
+	if uint64(desiredNextEpoch) == math.MaxUint64 {
+		return ErrStaleReconnect
+	}
+	desiredNextEpoch++
+	var reconnectMetadata *protocol.ReconnectMetadata
+	var reconnectIssued *IssuedReconnectCredential
+	if authoritativeOwners {
+		issued, nextOwner, issueErr := m.issueReconnectCredential(subject, request.Scope, request.SessionID, newIncarnation,
+			request.LastEventSeq, model, ReconnectOwnerClaiming)
+		if issueErr != nil {
+			return ErrRecoveryUnavailable
+		}
+		nextOwner.ResponseEpoch = desiredNextEpoch
+		nextOwner.PreviousAcceptUntil = earlierTime(request.Credential.ExpiresAt,
+			m.now().Add(m.cfg.ReconnectOwnerLeaseDuration+m.cfg.ReconnectCredentialOverlap))
+		nextOwner.PreviousCredentialID = request.Credential.CredentialID
+		nextOwner.PreviousIncarnation = request.Credential.Incarnation
+		nextOwner.PreviousCursor = request.Credential.Cursor
+		nextOwner.PreviousExpiresAt = request.Credential.ExpiresAt
+		claimStarted := m.now()
+		var claimLease ReconnectOwnerLease
+		claimedOwner, claimLease, err = m.cfg.ReconnectOwners.Claim(parent, request.Credential, nextOwner, m.cfg.ReconnectOwnerLeaseDuration)
+		if err != nil {
+			return ErrStaleReconnect
+		}
+		claimedLossDeadline = reconnectLossDeadline(claimStarted, claimLease,
+			m.cfg.ReconnectOwnerHeartbeatInterval, m.cfg.ReconnectOwnerLeaseDuration)
+		if !m.now().Before(claimedLossDeadline) {
+			return ErrRecoveryUnavailable
+		}
+		restagedExisting := (claimedOwner.State == ReconnectOwnerClaiming || claimedOwner.State == ReconnectOwnerActive) && claimedOwner.Incarnation == newIncarnation &&
+			reconnectPreviousClaims(claimedOwner) == request.Credential
+		if restagedExisting {
+			issued, issueErr = m.cfg.ReconnectCredentials.Issue(claimedOwner.Claims())
+			if issueErr != nil {
+				return ErrRecoveryUnavailable
+			}
+			nextOwner = claimedOwner
+			nextOwner.OwnerID = m.cfg.ReconnectOwnerID
+			nextOwner.State = ReconnectOwnerClaiming
+		}
+		claimSucceeded, claimedNext = true, nextOwner
+		expectedClaimedIncarnation := request.LastIncarnation
+		if restagedExisting {
+			expectedClaimedIncarnation = newIncarnation
+		}
+		if claimedOwner.Scope != request.Scope || claimedOwner.Model != model || claimedOwner.Incarnation != expectedClaimedIncarnation {
+			return ErrStaleReconnect
+		}
+		reconnectIssued = &issued
+		reconnectMetadata = reconnectMetadataFromIssued(issued)
+		if logical == nil {
+			logical = &logicalSession{scope: request.Scope, subject: minimalReconnectSubject(subject), model: model,
+				highWater: request.LastIncarnation, responseEpoch: claimedOwner.ResponseEpoch, reconnecting: true,
+				turnBoundary: true, tombstonedAt: m.now(), state: logicalTombstoned}
+			m.activeMu.Lock()
+			if m.logical[request.SessionID] != nil {
+				m.activeMu.Unlock()
+				return ErrStaleReconnect
+			}
+			if len(m.logical) >= maximumLogicalSessions {
+				_ = m.evictOldestTombstoneLocked()
+			}
+			if len(m.logical) >= maximumLogicalSessions {
+				m.activeMu.Unlock()
+				return ErrRecoveryUnavailable
+			}
+			m.logical[request.SessionID] = logical
+			remoteLogicalCreated = true
+			m.activeMu.Unlock()
+		}
+	}
+
+	// The old runtime is now fenced and fully quiesced. Its live epoch fence is
+	// the authority; the logical cache may trail provider/control work that was
+	// accepted immediately before the intake fence closed.
+	m.activeMu.Lock()
+	if m.logical[request.SessionID] != logical || logical.highWater != request.LastIncarnation || !logical.reconnecting {
+		m.activeMu.Unlock()
+		return ErrStaleReconnect
+	}
+	authoritativeEpoch := logical.responseEpoch
+	if authoritativeOwners && claimedOwner.ResponseEpoch > authoritativeEpoch {
+		authoritativeEpoch = claimedOwner.ResponseEpoch
+	}
+	if old != nil && old.state != nil && old.state.fence != nil && old.state.fence.Current() > authoritativeEpoch {
+		authoritativeEpoch = old.state.fence.Current()
+	}
+	if uint64(authoritativeEpoch) == math.MaxUint64 {
+		m.activeMu.Unlock()
+		return ErrStaleReconnect
+	}
+	logical.responseEpoch = authoritativeEpoch
+	initialEpoch := authoritativeEpoch + 1
+	m.activeMu.Unlock()
 
 	// The preflight exists only to reject an invalid client cursor without
 	// disturbing the live runtime. Once old intake is fenced and the runtime is
@@ -1016,7 +1464,23 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 		}
 		return ErrRecoveryExhausted
 	}
+	if err := m.sendInitialSession(sessionCtx, voice); err != nil {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), internalCloseTimeout)
+		_ = voice.Close(closeCtx)
+		closeCancel()
+		m.closeUnpublishedClient(parent, client, 1011, "recovery unavailable")
+		if sessionCtx.Err() != nil {
+			return sessionCtx.Err()
+		}
+		return ErrRecoveryUnavailable
+	}
 	commands, err := recoveryCommands(snapshot.CommittedItems)
+	var activeEvents []protocol.ServerEvent
+	if err == nil {
+		var activeCommands []realtime.Command
+		activeCommands, activeEvents, err = activeHandoffRecovery(snapshot.ActiveHandoffs, snapshot.LastEventSeq)
+		commands = append(commands, activeCommands...)
+	}
 	if err == nil {
 		for _, command := range commands {
 			if err = voice.Send(sessionCtx, command); err != nil {
@@ -1036,10 +1500,9 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 	}
 
 	ids := IDs{SessionID: request.SessionID, ConversationID: request.Scope.ConversationID, Incarnation: newIncarnation}
-	err = m.runReplacement(sessionCtx, cancel, subject, ids, client, voice, initialEpoch, logical, request.LastIncarnation, request.LastEventSeq, snapshot.PendingApprovals)
-	m.activeMu.RLock()
-	published = logical.highWater == newIncarnation
-	m.activeMu.RUnlock()
+	err = m.runReplacement(sessionCtx, cancel, subject, ids, client, voice, initialEpoch, logical, request.LastIncarnation,
+		request.LastEventSeq, reconnectIssued, reconnectMetadata, activeEvents, snapshot.PendingApprovals,
+		claimedLossDeadline, advertisementAttempted.Store, durablyPublished.Store)
 	result := "ok"
 	if err != nil {
 		result = "error"
@@ -1048,13 +1511,375 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 	return err
 }
 
+func (m *Manager) sendInitialSession(ctx context.Context, voice realtime.Session) error {
+	config := cloneRealtimeSessionConfig(m.cfg.InitialSession)
+	if len(config.Tools) == 0 && len(config.ToolChoice) == 0 && config.Instructions == "" &&
+		config.InputFormat == (realtime.AudioFormat{}) && config.OutputFormat == (realtime.AudioFormat{}) &&
+		config.Voice == "" && len(config.TurnDetection) == 0 {
+		return nil
+	}
+	return voice.Send(ctx, realtime.Command{Kind: realtime.CommandSessionUpdate, Session: config})
+}
+
+func (m *Manager) issueReconnectCredential(subject Subject, scope handoff.Scope, sessionID identity.SessionID, incarnation identity.Incarnation,
+	cursor int64, model string, state ReconnectOwnerState,
+) (IssuedReconnectCredential, ReconnectOwner, error) {
+	if !m.ReconnectEnabled() {
+		return IssuedReconnectCredential{}, ReconnectOwner{}, ErrRecoveryUnavailable
+	}
+	expiresAt := m.now().Add(m.cfg.ReconnectCredentialTTL)
+	if !subject.ExpiresAt.IsZero() && subject.ExpiresAt.Before(expiresAt) {
+		expiresAt = subject.ExpiresAt
+	}
+	issued, err := m.cfg.ReconnectCredentials.Issue(ReconnectClaims{Scope: scope, SessionID: sessionID, Incarnation: incarnation,
+		Cursor: cursor, Model: model, ExpiresAt: expiresAt})
+	if err != nil {
+		return IssuedReconnectCredential{}, ReconnectOwner{}, err
+	}
+	owner := ReconnectOwner{Scope: scope, SessionID: sessionID, Incarnation: incarnation, Cursor: cursor, Model: model,
+		CredentialID: issued.Claims.CredentialID, OwnerID: m.cfg.ReconnectOwnerID, State: state,
+		ExpiresAt: issued.Claims.ExpiresAt, SubjectExpiresAt: subject.ExpiresAt, Ephemeral: subject.Ephemeral}
+	return issued, owner, nil
+}
+
+func reconnectMetadataFromIssued(issued IssuedReconnectCredential) *protocol.ReconnectMetadata {
+	return &protocol.ReconnectMetadata{Credential: issued.Credential, SessionID: string(issued.Claims.SessionID),
+		ConversationID: string(issued.Claims.Scope.ConversationID), Incarnation: uint64(issued.Claims.Incarnation),
+		Cursor: issued.Claims.Cursor, Model: issued.Claims.Model, ExpiresAt: issued.Claims.ExpiresAt}
+}
+
+func (r *sessionRuntime) reconnectKey() ReconnectOwnerKey {
+	if r == nil {
+		return ReconnectOwnerKey{}
+	}
+	r.reconnectMu.Lock()
+	defer r.reconnectMu.Unlock()
+	if r.reconnect == nil {
+		return ReconnectOwnerKey{SessionID: r.key.sessionID, Incarnation: r.key.incarnation}
+	}
+	return ReconnectOwnerKey{SessionID: r.key.sessionID, Incarnation: r.key.incarnation,
+		OwnerID: r.state.cfg.ReconnectOwnerID, CredentialID: r.reconnect.Claims.CredentialID}
+}
+
+func (r *sessionRuntime) setReconnectLossDeadline(deadline time.Time) {
+	if r == nil {
+		return
+	}
+	r.reconnectMu.Lock()
+	r.reconnectLossDeadline = deadline
+	r.reconnectMu.Unlock()
+}
+
+func (r *sessionRuntime) currentReconnectLossDeadline() time.Time {
+	if r == nil {
+		return time.Time{}
+	}
+	r.reconnectMu.Lock()
+	defer r.reconnectMu.Unlock()
+	return r.reconnectLossDeadline
+}
+
+func reconnectLossDeadline(operationStarted time.Time, lease ReconnectOwnerLease, heartbeat, maximum time.Duration) time.Time {
+	confirmed := lease.ExpiresAt.Sub(lease.DatabaseNow)
+	if confirmed > maximum {
+		confirmed = maximum
+	}
+	confirmed -= heartbeat
+	if confirmed < 0 {
+		confirmed = 0
+	}
+	return operationStarted.Add(confirmed)
+}
+
+type reconnectOwnerLeaseResult struct {
+	lease ReconnectOwnerLease
+	err   error
+}
+
+func (m *Manager) acquireReconnectOperation() bool {
+	if m == nil || m.reconnectOperationSlots == nil {
+		return false
+	}
+	select {
+	case m.reconnectOperationSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *Manager) releaseReconnectOperation() {
+	if m == nil || m.reconnectOperationSlots == nil {
+		return
+	}
+	<-m.reconnectOperationSlots
+}
+
+func (m *Manager) runReconnectOwnerLeaseOperation(ctx context.Context, lossDeadline time.Time,
+	operation func(context.Context) (ReconnectOwnerLease, error),
+) (ReconnectOwnerLease, error) {
+	if ctx == nil || operation == nil || lossDeadline.IsZero() {
+		return ReconnectOwnerLease{}, ErrRecoveryUnavailable
+	}
+	remaining := lossDeadline.Sub(m.now())
+	if remaining <= 0 {
+		return ReconnectOwnerLease{}, ErrRecoveryUnavailable
+	}
+	if !m.acquireReconnectOperation() {
+		return ReconnectOwnerLease{}, ErrRecoveryUnavailable
+	}
+	operationWindow := m.cfg.ReconnectOwnerOperationTimeout
+	if operationWindow <= 0 || operationWindow > remaining {
+		operationWindow = remaining
+	}
+	operationCtx, cancel := context.WithTimeout(ctx, operationWindow)
+	defer cancel()
+	lossTimer := m.cfg.Clock.NewTicker(remaining)
+	defer lossTimer.Stop()
+	result := make(chan reconnectOwnerLeaseResult, 1)
+	go func() {
+		defer m.releaseReconnectOperation()
+		lease, err := operation(operationCtx)
+		result <- reconnectOwnerLeaseResult{lease: lease, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return ReconnectOwnerLease{}, ctx.Err()
+	case <-lossTimer.C():
+		return ReconnectOwnerLease{}, ErrRecoveryUnavailable
+	case <-operationCtx.Done():
+		if ctx.Err() != nil {
+			return ReconnectOwnerLease{}, ctx.Err()
+		}
+		return ReconnectOwnerLease{}, ErrRecoveryUnavailable
+	case completed := <-result:
+		if !m.now().Before(lossDeadline) {
+			return ReconnectOwnerLease{}, ErrRecoveryUnavailable
+		}
+		return completed.lease, completed.err
+	}
+}
+
+func (m *Manager) runReconnectOwnerOperation(ctx context.Context, lossDeadline time.Time, operation func(context.Context) error) error {
+	_, err := m.runReconnectOwnerLeaseOperation(ctx, lossDeadline, func(operationCtx context.Context) (ReconnectOwnerLease, error) {
+		return ReconnectOwnerLease{}, operation(operationCtx)
+	})
+	return err
+}
+
+func (m *Manager) maintainReconnectOwner(ctx context.Context, runtime *sessionRuntime, lossDeadline time.Time) error {
+	ticker := m.cfg.Clock.NewTicker(m.cfg.ReconnectOwnerHeartbeatInterval)
+	defer ticker.Stop()
+	if m.cfg.reconnectHeartbeatReady != nil {
+		m.cfg.reconnectHeartbeatReady()
+	}
+	for {
+		remaining := lossDeadline.Sub(m.now())
+		if remaining <= 0 {
+			return ErrRecoveryUnavailable
+		}
+		lossTimer := m.cfg.Clock.NewTicker(remaining)
+		select {
+		case <-ctx.Done():
+			lossTimer.Stop()
+			return nil
+		case <-lossTimer.C():
+			lossTimer.Stop()
+			return ErrRecoveryUnavailable
+		case <-ticker.C():
+			lossTimer.Stop()
+			operationStarted := m.now()
+			lease, err := m.heartbeatReconnectOwner(ctx, runtime, lossDeadline)
+			if err == nil {
+				lossDeadline = reconnectLossDeadline(operationStarted, lease, m.cfg.ReconnectOwnerHeartbeatInterval, m.cfg.ReconnectOwnerLeaseDuration)
+				if !m.now().Before(lossDeadline) {
+					return ErrRecoveryUnavailable
+				}
+				runtime.setReconnectLossDeadline(lossDeadline)
+				if m.reconnectRefreshDue(runtime) {
+					if err := m.rotateReconnectCredential(ctx, runtime, -1, true); err != nil {
+						return err
+					}
+				}
+				continue
+			}
+			if errors.Is(err, ErrStaleReconnect) || !m.now().Before(lossDeadline) {
+				return ErrRecoveryUnavailable
+			}
+		}
+	}
+}
+
+func (m *Manager) heartbeatReconnectOwner(ctx context.Context, runtime *sessionRuntime, lossDeadline time.Time) (ReconnectOwnerLease, error) {
+	runtime.reconnectMu.Lock()
+	if runtime.reconnect == nil {
+		runtime.reconnectMu.Unlock()
+		return ReconnectOwnerLease{}, ErrRecoveryUnavailable
+	}
+	key := ReconnectOwnerKey{SessionID: runtime.key.sessionID, Incarnation: runtime.key.incarnation,
+		OwnerID: m.cfg.ReconnectOwnerID, CredentialID: runtime.reconnect.Claims.CredentialID}
+	runtime.reconnectMu.Unlock()
+	return m.runReconnectOwnerLeaseOperation(ctx, lossDeadline, func(operationCtx context.Context) (ReconnectOwnerLease, error) {
+		return m.cfg.ReconnectOwners.Heartbeat(operationCtx, key, runtime.state.fence.Current(), runtime.atTurnBoundary(), m.cfg.ReconnectOwnerLeaseDuration)
+	})
+}
+
+func (m *Manager) reconnectRefreshDue(runtime *sessionRuntime) bool {
+	runtime.reconnectMu.Lock()
+	defer runtime.reconnectMu.Unlock()
+	if runtime.reconnect == nil {
+		return false
+	}
+	return !m.now().Before(runtime.reconnect.Claims.ExpiresAt.Add(-m.cfg.ReconnectCredentialTTL / 3))
+}
+
+func (m *Manager) rotateReconnectCredential(ctx context.Context, runtime *sessionRuntime, cursor int64, force bool) error {
+	if !m.ReconnectEnabled() || runtime == nil {
+		return nil
+	}
+	runtime.reconnectRotateMu.Lock()
+	defer runtime.reconnectRotateMu.Unlock()
+	runtime.reconnectMu.Lock()
+	if runtime.reconnect == nil {
+		runtime.reconnectMu.Unlock()
+		return ErrRecoveryUnavailable
+	}
+	current := *runtime.reconnect
+	lossDeadline := runtime.reconnectLossDeadline
+	runtime.reconnectMu.Unlock()
+	if cursor < 0 {
+		cursor = current.Claims.Cursor
+	}
+	if cursor < current.Claims.Cursor {
+		return ErrStaleReconnect
+	}
+	if !force && cursor == current.Claims.Cursor {
+		return nil
+	}
+	scope := runtime.handoffScope()
+	issued, _, err := m.issueReconnectCredential(runtime.subject, scope, runtime.key.sessionID, runtime.key.incarnation,
+		cursor, current.Claims.Model, ReconnectOwnerActive)
+	if err != nil {
+		return ErrRecoveryUnavailable
+	}
+	overlapUntil := earlierTime(current.Claims.ExpiresAt, m.now().Add(m.cfg.ReconnectCredentialOverlap))
+	if !overlapUntil.After(m.now()) {
+		return ErrRecoveryUnavailable
+	}
+	key := ReconnectOwnerKey{SessionID: runtime.key.sessionID, Incarnation: runtime.key.incarnation,
+		OwnerID: m.cfg.ReconnectOwnerID, CredentialID: current.Claims.CredentialID}
+	if err := m.runReconnectOwnerOperation(ctx, lossDeadline, func(operationCtx context.Context) error {
+		return m.cfg.ReconnectOwners.Rotate(operationCtx, key, current.Claims, issued.Claims, overlapUntil)
+	}); err != nil {
+		return ErrRecoveryUnavailable
+	}
+	runtime.reconnectMu.Lock()
+	if runtime.reconnect == nil || runtime.reconnect.Claims != current.Claims {
+		runtime.reconnectMu.Unlock()
+		return ErrStaleReconnect
+	}
+	copy := issued
+	runtime.reconnect = &copy
+	runtime.reconnectMu.Unlock()
+	event := protocol.SessionReconnectUpdatedEvent{Type: "session.reconnect.updated",
+		EventID: "reconnect-" + issued.Claims.CredentialID, Reconnect: *reconnectMetadataFromIssued(issued)}
+	written := make(chan error, 1)
+	if err := runtime.state.enqueueClientControl(clientControl{event: event, writeCtx: ctx, written: written}); err != nil {
+		return err
+	}
+	select {
+	case err := <-written:
+		if err != nil {
+			return err
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return nil
+}
+
+// RunReconnectMaintenance owns bounded local tombstone pruning and global
+// durable expiry cleanup for the lifetime of the gateway process.
+func (m *Manager) RunReconnectMaintenance(ctx context.Context) error {
+	if m == nil || !m.ReconnectEnabled() {
+		return nil
+	}
+	if ctx == nil {
+		return errors.New("reconnect maintenance context is nil")
+	}
+	m.sweepReconnectOwners(ctx)
+	ticker := m.cfg.Clock.NewTicker(m.cfg.ReconnectCleanupInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C():
+			m.sweepReconnectOwners(ctx)
+		}
+	}
+}
+
+func (m *Manager) sweepReconnectOwners(ctx context.Context) {
+	m.activeMu.Lock()
+	tombstones := m.pruneLogicalLocked(m.now())
+	m.activeMu.Unlock()
+	m.observeReconnectTombstones(tombstones)
+	operationCtx, cancel := context.WithTimeout(ctx, m.cfg.ReconnectOwnerOperationTimeout)
+	result := make(chan error, 1)
+	var err error
+	if !m.acquireReconnectOperation() {
+		err = ErrRecoveryUnavailable
+	} else {
+		go func() {
+			defer m.releaseReconnectOperation()
+			_, cleanupErr := m.cfg.ReconnectOwners.CleanupExpired(operationCtx, m.cfg.ReconnectCleanupBatch)
+			result <- cleanupErr
+		}()
+		select {
+		case <-ctx.Done():
+			err = ctx.Err()
+		case <-operationCtx.Done():
+			err = operationCtx.Err()
+		case err = <-result:
+		}
+	}
+	cancel()
+	m.reconnectMaintenanceMu.Lock()
+	m.reconnectMaintenanceAttempted = true
+	m.reconnectMaintenanceErr = err
+	if err == nil {
+		m.reconnectMaintenanceSucceeded = m.now()
+	}
+	m.reconnectMaintenanceMu.Unlock()
+}
+
+func (m *Manager) ReconnectReady(context.Context) error {
+	if m == nil || !m.ReconnectEnabled() {
+		return nil
+	}
+	m.reconnectMaintenanceMu.RLock()
+	defer m.reconnectMaintenanceMu.RUnlock()
+	if !m.reconnectMaintenanceAttempted {
+		return errors.New("reconnect owner maintenance has not completed")
+	}
+	if m.reconnectMaintenanceErr != nil {
+		return fmt.Errorf("reconnect owner maintenance: %w", m.reconnectMaintenanceErr)
+	}
+	if m.reconnectMaintenanceSucceeded.IsZero() ||
+		m.now().Sub(m.reconnectMaintenanceSucceeded) > 2*m.cfg.ReconnectCleanupInterval+m.cfg.ReconnectOwnerOperationTimeout {
+		return errors.New("reconnect owner maintenance is stale")
+	}
+	return nil
+}
+
 // activeMu must be held for reading or writing.
 func (m *Manager) checkReconnectLocked(request ReconnectRequest, logical *logicalSession) error {
 	if logical == nil || logical.scope != request.Scope || logical.highWater != request.LastIncarnation || logical.reconnecting ||
 		uint64(logical.highWater) == math.MaxUint64 || uint64(logical.responseEpoch) == math.MaxUint64 {
 		return ErrStaleReconnect
 	}
-	if logical.state == logicalEstablishing || logical.state == logicalEstablishmentFailed {
+	if logical.state == logicalEstablishing {
 		return ErrStaleReconnect
 	}
 	if logical.state == logicalActive && logical.runtime == nil || logical.state == logicalTombstoned && logical.runtime != nil {
@@ -1104,8 +1929,10 @@ func (m *Manager) connectReplacement(ctx context.Context, request realtime.OpenR
 }
 
 func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.CancelFunc, subject Subject, ids IDs, client ClientConn,
-	voice realtime.Session, initialEpoch identity.ResponseEpoch, logical *logicalSession, expected identity.Incarnation, replayAfter int64, pendingApprovals []RecoveryApproval,
-) error {
+	voice realtime.Session, initialEpoch identity.ResponseEpoch, logical *logicalSession, expected identity.Incarnation, replayAfter int64,
+	reconnectIssued *IssuedReconnectCredential, reconnectMetadata *protocol.ReconnectMetadata, activeHandoffs []protocol.ServerEvent,
+	pendingApprovals []RecoveryApproval, ownerLossDeadline time.Time, markAdvertisement func(bool), markPublished func(bool),
+) (runErr error) {
 	group, groupCtx := errgroup.WithContext(sessionCtx)
 	quiesced := make(chan struct{})
 	var quiescedOnce sync.Once
@@ -1118,7 +1945,11 @@ func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.Canc
 	runtime := &sessionRuntime{
 		key: runtimeKey{sessionID: ids.SessionID, incarnation: ids.Incarnation}, subject: subject,
 		inbox: state.inbox, done: groupCtx.Done(), quiesced: quiesced, state: state,
-		accepting: true, inboxSlots: state.inboxSlots,
+		accepting: true, inboxSlots: state.inboxSlots, reconnectLossDeadline: ownerLossDeadline,
+	}
+	if reconnectIssued != nil {
+		copy := *reconnectIssued
+		runtime.reconnect = &copy
 	}
 	state.runtime = runtime
 	runtime.replayAfter = &replayAfter
@@ -1129,7 +1960,7 @@ func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.Canc
 			err := loop(groupCtx)
 			runtime.stop()
 			if err != nil && !errors.Is(err, errGracefulSessionClose) && !state.graceful.Load() &&
-				!(errors.Is(err, context.Canceled) && groupCtx.Err() != nil) {
+				!(groupCtx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, io.EOF))) {
 				firstErrOnce.Do(func() { firstErr = fmt.Errorf("%s: %w", name, err) })
 			}
 			return err
@@ -1154,8 +1985,11 @@ func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.Canc
 		}
 		return cause
 	}
+	if reconnectMetadata != nil && markAdvertisement != nil {
+		markAdvertisement(true)
+	}
 	<-state.inboxSlots
-	connected := reactorMessage{input: ConnectedInput{ProviderSession: json.RawMessage(`{}`)}, done: make(chan error, 1), requireClientWrites: true}
+	connected := reactorMessage{input: ConnectedInput{ProviderSession: json.RawMessage(`{}`), Reconnect: reconnectMetadata}, done: make(chan error, 1), requireClientWrites: true}
 	state.acceptControl(&connected)
 	state.inbox <- connected
 	select {
@@ -1165,6 +1999,20 @@ func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.Canc
 		}
 	case <-groupCtx.Done():
 		return abort(groupCtx.Err())
+	}
+	for _, event := range activeHandoffs {
+		written := make(chan error, 1)
+		if err := state.enqueueClientControl(clientControl{event: event, written: written}); err != nil {
+			return abort(err)
+		}
+		select {
+		case err := <-written:
+			if err != nil {
+				return abort(err)
+			}
+		case <-groupCtx.Done():
+			return abort(groupCtx.Err())
+		}
 	}
 	for _, pending := range pendingApprovals {
 		if pending.Sequence > replayAfter {
@@ -1180,9 +2028,29 @@ func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.Canc
 	if err := m.registerReplacement(runtime, logical, expected); err != nil {
 		return abort(err)
 	}
+	if m.ReconnectEnabled() {
+		publishStarted := m.now()
+		key := runtime.reconnectKey()
+		lease, err := m.runReconnectOwnerLeaseOperation(sessionCtx, ownerLossDeadline, func(operationCtx context.Context) (ReconnectOwnerLease, error) {
+			return m.cfg.ReconnectOwners.Publish(operationCtx, key, state.fence.Current(), runtime.atTurnBoundary(), m.cfg.ReconnectOwnerLeaseDuration)
+		})
+		if err != nil {
+			m.rollbackReplacementPublication(runtime, logical, expected, initialEpoch-1)
+			return abort(ErrRecoveryUnavailable)
+		}
+		if markPublished != nil {
+			markPublished(true)
+		}
+		lossDeadline := reconnectLossDeadline(publishStarted, lease, m.cfg.ReconnectOwnerHeartbeatInterval, m.cfg.ReconnectOwnerLeaseDuration)
+		runtime.setReconnectLossDeadline(lossDeadline)
+		group.Go(runLoop("reconnect owner heartbeat", func(ctx context.Context) error { return m.maintainReconnectOwner(ctx, runtime, lossDeadline) }))
+	}
 	hooks := m.metricsSnapshot()
 	hooks.SessionStarted()
-	defer func() { m.unregister(runtime.key, runtime); hooks.SessionEnded() }()
+	defer func() {
+		runErr = errors.Join(runErr, m.unregister(runtime.key, runtime))
+		hooks.SessionEnded()
+	}()
 
 	waitErr := group.Wait()
 	cancel()
@@ -1212,7 +2080,7 @@ func (m *Manager) registerReplacement(runtime *sessionRuntime, logical *logicalS
 	defer m.activeMu.Unlock()
 	if m.logical[runtime.key.sessionID] != logical || !logical.reconnecting || logical.highWater != expected ||
 		logical.scope != runtime.handoffScope() || runtime.key.incarnation != expected+1 ||
-		logical.state == logicalEstablishing || logical.state == logicalEstablishmentFailed {
+		logical.state == logicalEstablishing {
 		return ErrStaleReconnect
 	}
 	if _, exists := m.active[runtime.key]; exists {
@@ -1235,8 +2103,58 @@ func (m *Manager) registerReplacement(runtime *sessionRuntime, logical *logicalS
 	logical.runtime = runtime
 	logical.reconnecting = false
 	logical.turnBoundary = true
+	logical.tombstonedAt = time.Time{}
 	logical.state = logicalActive
 	return nil
+}
+
+func (m *Manager) rollbackInitialPublication(runtime *sessionRuntime, logical *logicalSession) {
+	if runtime == nil || logical == nil {
+		return
+	}
+	m.activeMu.Lock()
+	if m.active[runtime.key] == runtime {
+		delete(m.active, runtime.key)
+	}
+	if m.current[runtime.handoffScope()] == runtime {
+		delete(m.current, runtime.handoffScope())
+	}
+	if m.logical[runtime.key.sessionID] == logical && logical.runtime == runtime {
+		logical.runtime = nil
+		logical.state = logicalEstablishing
+		logical.reconnecting = false
+		logical.turnBoundary = false
+	}
+	m.activeMu.Unlock()
+	if !isNilInterface(m.cfg.HandoffSubscriptions) {
+		m.cfg.HandoffSubscriptions.Unregister(runtime.handoffSubscription(m.cfg.HandoffConsumerID))
+	}
+}
+
+func (m *Manager) rollbackReplacementPublication(runtime *sessionRuntime, logical *logicalSession, expected identity.Incarnation, epoch identity.ResponseEpoch) {
+	if runtime == nil || logical == nil {
+		return
+	}
+	m.activeMu.Lock()
+	if m.active[runtime.key] == runtime {
+		delete(m.active, runtime.key)
+	}
+	if m.current[runtime.handoffScope()] == runtime {
+		delete(m.current, runtime.handoffScope())
+	}
+	if m.logical[runtime.key.sessionID] == logical && logical.runtime == runtime && logical.highWater == runtime.key.incarnation {
+		logical.highWater = expected
+		logical.responseEpoch = epoch
+		logical.runtime = nil
+		logical.reconnecting = true
+		logical.turnBoundary = true
+		logical.tombstonedAt = m.now()
+		logical.state = logicalTombstoned
+	}
+	m.activeMu.Unlock()
+	if !isNilInterface(m.cfg.HandoffSubscriptions) {
+		m.cfg.HandoffSubscriptions.Unregister(runtime.handoffSubscription(m.cfg.HandoffConsumerID))
+	}
 }
 
 func newRunState(cfg Config, ids IDs, voice realtime.Session, client ClientConn, cancel context.CancelFunc) *runState {
@@ -1252,12 +2170,13 @@ func newRunState(cfg Config, ids IDs, voice realtime.Session, client ClientConn,
 		voiceCtl:           make(chan voiceControl, cfg.WriterControlEvents),
 		egress:             make(chan egressFrame, cfg.EgressFrames),
 		clientCtl:          make(chan clientControl, cfg.WriterControlEvents),
-		approvals:          make(chan protocol.LiveToolApprovalResolveEvent, cfg.ControlEvents),
+		approvalWork:       make(chan approvalResolutionWork, cfg.ControlEvents),
 		inboxSlots:         make(chan struct{}, cfg.ControlEvents),
 		voiceSlots:         make(chan struct{}, cfg.WriterControlEvents),
 		clientSlots:        make(chan struct{}, cfg.WriterControlEvents),
 		egressSlots:        make(chan struct{}, cfg.EgressFrames),
 		progress:           newSequenceProgress(),
+		externalProgress:   newSequenceProgress(),
 		activeWrite:        &activeAudioWrite{},
 		activeControlWrite: &activeAudioWrite{},
 		closeClientDone:    make(chan struct{}),
@@ -1400,11 +2319,16 @@ func (m *Manager) register(runtime *sessionRuntime) error {
 	logical.responseEpoch = runtime.state.fence.Current()
 	logical.reconnecting = false
 	logical.turnBoundary = true
+	logical.tombstonedAt = time.Time{}
 	logical.state = logicalActive
 	return nil
 }
 
-func (m *Manager) unregister(key runtimeKey, runtime *sessionRuntime) {
+func (m *Manager) unregister(key runtimeKey, runtime *sessionRuntime) error {
+	var unregisterErr error
+	var reconnectEpoch identity.ResponseEpoch
+	var reconnectBoundary bool
+	tombstoneReconnectOwner := false
 	m.activeMu.Lock()
 	if m.active[key] == runtime {
 		delete(m.active, key)
@@ -1416,14 +2340,30 @@ func (m *Manager) unregister(key runtimeKey, runtime *sessionRuntime) {
 	}
 	if logical := m.logical[key.sessionID]; logical != nil && logical.runtime == runtime {
 		logical.runtime = nil
-		logical.responseEpoch = runtime.state.fence.Current()
-		logical.turnBoundary = runtime.atTurnBoundary()
+		reconnectEpoch = runtime.state.fence.Current()
+		reconnectBoundary = runtime.atTurnBoundary()
+		logical.responseEpoch = reconnectEpoch
+		logical.turnBoundary = reconnectBoundary
+		logical.subject = minimalReconnectSubject(logical.subject)
+		logical.tombstonedAt = m.now()
 		logical.state = logicalTombstoned
+		tombstoneReconnectOwner = m.ReconnectEnabled()
 	}
+	tombstones := m.pruneLogicalLocked(m.now())
 	m.activeMu.Unlock()
+	m.observeReconnectTombstones(tombstones)
+	if tombstoneReconnectOwner {
+		ctx, cancel := context.WithTimeout(context.Background(), internalCloseTimeout)
+		err := m.cfg.ReconnectOwners.Tombstone(ctx, key.sessionID, key.incarnation, m.cfg.ReconnectOwnerID, reconnectEpoch, reconnectBoundary)
+		cancel()
+		if err != nil {
+			unregisterErr = fmt.Errorf("tombstone reconnect owner: %w", err)
+		}
+	}
 	if unregisterPresentation && !isNilInterface(m.cfg.HandoffSubscriptions) {
 		m.cfg.HandoffSubscriptions.Unregister(runtime.handoffSubscription(m.cfg.HandoffConsumerID))
 	}
+	return unregisterErr
 }
 
 func (r *sessionRuntime) handoffScope() handoff.Scope {
@@ -1503,6 +2443,12 @@ func (m *Manager) OfferHandoffEvent(ctx context.Context, scope handoff.Scope, ev
 		if err != nil && offerCtx.Err() != nil {
 			m.stopAndQuiesceRuntime(runtime)
 		}
+		if (err == nil || err == handoff.ErrPresentationSuppressed) && event.Seq > 0 && m.ReconnectEnabled() {
+			if rotateErr := m.rotateReconnectCredential(offerCtx, runtime, event.Seq, false); rotateErr != nil {
+				m.stopAndQuiesceRuntime(runtime)
+				return rotateErr
+			}
+		}
 		return err
 	case <-runtime.done:
 		m.stopAndQuiesceRuntime(runtime)
@@ -1579,37 +2525,37 @@ func (s *runState) clientReader(ctx context.Context) error {
 		if s.runtime == nil {
 			return ErrSessionNotActive
 		}
-		err = s.runtime.acceptClientEvent(ctx, func() error {
+		err = s.runtime.acceptClientEvent(ctx, func(sequence uint64) (bool, error) {
 			switch typed := event.(type) {
 			case protocol.LiveToolApprovalResolveEvent:
 				select {
-				case s.approvals <- typed:
-					return nil
+				case s.approvalWork <- approvalResolutionWork{event: typed, sequence: sequence}:
+					return false, nil
 				default:
-					return s.enqueueClientControl(clientControl{event: s.approvalProtocolError("approval_backpressure")})
+					return true, s.enqueueClientControl(clientControl{event: s.approvalProtocolError("approval_backpressure")})
 				}
 			case protocol.InputAudioBufferAppendEvent:
 				pcm, decodeErr := protocol.DecodePCM24k(typed, s.cfg.IngressFrames*pcmFrameBytes)
 				if decodeErr != nil {
-					return decodeErr
+					return false, decodeErr
 				}
 				if len(pcm) != 0 {
 					s.partialInput.Store(true)
 				}
 				frames, pushErr := framer.Push(pcm)
 				if pushErr != nil {
-					return pushErr
+					return false, pushErr
 				}
 				for _, audio := range frames {
 					latestSequence = s.nextIngressSequence()
 					if enqueueErr := s.enqueueIngress(ctx, ingressFrame{sequence: latestSequence, audio: append([]byte(nil), audio...)}); enqueueErr != nil {
-						return enqueueErr
+						return false, enqueueErr
 					}
 				}
 			case protocol.InputAudioBufferCommitEvent:
 				tail, flushErr := framer.Flush()
 				if flushErr != nil {
-					return s.enqueueClientControl(clientControl{event: protocol.ErrorEvent{
+					return true, s.enqueueClientControl(clientControl{event: protocol.ErrorEvent{
 						Type:    "error",
 						EventID: s.nextManagerEventID(),
 						Error: protocol.ProtocolError{
@@ -1620,17 +2566,17 @@ func (s *runState) clientReader(ctx context.Context) error {
 				if len(tail) != 0 {
 					latestSequence = s.nextIngressSequence()
 					if enqueueErr := s.enqueueIngress(ctx, ingressFrame{sequence: latestSequence, audio: append([]byte(nil), tail...)}); enqueueErr != nil {
-						return enqueueErr
+						return false, enqueueErr
 					}
 				}
 				if enqueueErr := s.enqueueReactor(reactorMessage{input: ClientInput{Event: typed}, ingressAfter: latestSequence}); enqueueErr != nil {
-					return enqueueErr
+					return false, enqueueErr
 				}
 				s.partialInput.Store(false)
 			default:
-				return s.enqueueReactor(reactorMessage{input: ClientInput{Event: event}, ingressAfter: latestSequence})
+				return true, s.enqueueReactor(reactorMessage{input: ClientInput{Event: event}, ingressAfter: latestSequence})
 			}
-			return nil
+			return true, nil
 		})
 		if err != nil {
 			return err
@@ -1643,11 +2589,13 @@ func (s *runState) approvalLoop(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
-		case event := <-s.approvals:
+		case work := <-s.approvalWork:
+			event := work.event
 			if isNilInterface(s.cfg.ApprovalStore) {
 				if err := s.enqueueClientControl(clientControl{event: s.approvalProtocolError("approval_unavailable")}); err != nil {
 					return err
 				}
+				s.markExternalApplied(work.sequence)
 				continue
 			}
 			decision := handoff.ApprovalDecision(event.Decision)
@@ -1663,6 +2611,7 @@ func (s *runState) approvalLoop(ctx context.Context) error {
 					return enqueueErr
 				}
 			}
+			s.markExternalApplied(work.sequence)
 		}
 	}
 }
@@ -1673,7 +2622,7 @@ func (s *runState) approvalProtocolError(code string) protocol.ErrorEvent {
 	}}
 }
 
-func (r *sessionRuntime) acceptClientEvent(ctx context.Context, accept func() error) error {
+func (r *sessionRuntime) acceptClientEvent(ctx context.Context, accept func(uint64) (bool, error)) error {
 	r.mu.Lock()
 	if err := ctx.Err(); err != nil {
 		r.mu.Unlock()
@@ -1691,11 +2640,26 @@ func (r *sessionRuntime) acceptClientEvent(ctx context.Context, accept func() er
 	}
 	sequence := r.state.externalAccepted.Add(1)
 	r.mu.Unlock()
-	if err := accept(); err != nil {
+	applied, err := accept(sequence)
+	if err != nil {
 		return err
 	}
-	r.state.externalApplied.Store(sequence)
+	if applied {
+		r.state.markExternalApplied(sequence)
+	}
 	return nil
+}
+
+func (s *runState) markExternalApplied(sequence uint64) {
+	if s == nil || sequence == 0 {
+		return
+	}
+	if s.externalProgress == nil {
+		s.externalApplied.Store(sequence)
+		return
+	}
+	s.externalProgress.mark(sequence)
+	s.externalApplied.Store(s.externalProgress.current())
 }
 
 func (s *runState) enqueueIngress(ctx context.Context, frame ingressFrame) error {
@@ -1952,7 +2916,7 @@ func (s *runState) enqueueEgress(ctx context.Context, event realtime.Event, audi
 }
 
 func (s *runState) reactorLoop(ctx context.Context) error {
-	reactor := NewReactorWithPresentation(s.ids, s.fence, s.cfg.PresentationPolicy, s.cfg.SafetyPolicy)
+	reactor := newReactorWithPresentationAndHandoffTools(s.ids, s.fence, s.cfg.PresentationPolicy, s.cfg.SafetyPolicy, s.cfg.HandoffToolsEnabled)
 	for {
 		select {
 		case <-ctx.Done():
@@ -2134,17 +3098,17 @@ func (s *runState) dispatchEffectsReconciled(ctx context.Context, effects []Effe
 			}
 		}
 		if effect.Transcript != nil || effect.Handoff != nil {
-			if isNilInterface(s.dispatcher) {
-				return fmt.Errorf("%w: durable typed effect", ErrUnsupportedAsync)
-			}
 			trusted := TrustedSessionContext{IDs: s.ids, Subject: cloneSubject(s.subject)}
-			if effect.Transcript != nil {
+			if effect.Transcript != nil && !isNilInterface(s.dispatcher) {
 				owned := *effect.Transcript
 				if err := s.dispatcher.DispatchTranscript(ctx, trusted, owned); err != nil {
 					return err
 				}
 			}
 			if effect.Handoff != nil {
+				if isNilInterface(s.dispatcher) {
+					return fmt.Errorf("%w: durable handoff effect", ErrUnsupportedAsync)
+				}
 				owned := *effect.Handoff
 				owned.Arguments = append(json.RawMessage(nil), effect.Handoff.Arguments...)
 				if err := s.dispatcher.DispatchHandoff(ctx, trusted, owned); err != nil {

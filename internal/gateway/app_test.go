@@ -116,6 +116,10 @@ func TestNewMapsConfigAndAppliesBoundedTimeoutDefaults(t *testing.T) {
 	require.Positive(t, app.managerConfig.EgressBlockTimeout)
 	require.Equal(t, cfg.Gateway.Session.IngressFrames, app.managerConfig.IngressFrames)
 	require.Equal(t, cfg.Gateway.Session.EgressFrames, app.managerConfig.EgressFrames)
+	require.Equal(t, cfg.Gateway.AdvertisedModel, app.wsOptions.AdvertisedModel)
+	require.Equal(t, cfg.Gateway.Voice.Model, app.wsOptions.ProviderModel)
+	require.NotNil(t, app.wsOptions.HandoffsEnabled)
+	require.False(t, *app.wsOptions.HandoffsEnabled)
 	require.Equal(t, session.DefaultRecoveryItemLimit, app.managerConfig.RecoveryItemLimit)
 	require.Equal(t, session.DefaultRecoveryByteLimit, app.managerConfig.RecoveryByteLimit)
 
@@ -151,6 +155,22 @@ func TestNewWiresRecoveryStoreAndReconnectRetryConfiguration(t *testing.T) {
 	require.Equal(t, 4, app.managerConfig.ReconnectMaxRetries)
 	require.Equal(t, 20*time.Millisecond, app.managerConfig.ReconnectRetryBase)
 	require.Equal(t, 80*time.Millisecond, app.managerConfig.ReconnectRetryMax)
+	require.NotNil(t, app.wsOptions.HandoffsEnabled)
+	require.True(t, *app.wsOptions.HandoffsEnabled)
+}
+
+func TestReconnectAuthorityOptionWiresTransportAndManagerTogether(t *testing.T) {
+	authority, err := session.NewReconnectCredentials([]byte(strings.Repeat("r", 32)), clock.Real{})
+	require.NoError(t, err)
+	owners := session.NewMemoryReconnectOwners(clock.Real{})
+	app, err := New(validConfig(), testkit.NewFakeConnector(2), WithIDGenerator(deterministicIDs{}),
+		WithReconnectAuthority(authority, owners, "gateway-a", 7*time.Minute))
+	require.NoError(t, err)
+	require.Same(t, authority, app.wsOptions.ReconnectCredentials)
+	require.Same(t, authority, app.managerConfig.ReconnectCredentials)
+	require.Same(t, owners, app.managerConfig.ReconnectOwners)
+	require.Equal(t, "gateway-a", app.managerConfig.ReconnectOwnerID)
+	require.Equal(t, 7*time.Minute, app.managerConfig.ReconnectCredentialTTL)
 }
 
 type gatewayRecoveryStore struct{}
@@ -312,9 +332,10 @@ func TestRunPropagatesUnexpectedHandoffListenerFailure(t *testing.T) {
 	require.ErrorIs(t, err, sentinel)
 }
 
-func TestRunFailsBeforeServingWhenCoordinatorAffinityIsAlreadyOwned(t *testing.T) {
+func TestRunFailsClosedWhenCoordinatorAffinityCannotBeAcquired(t *testing.T) {
 	journal := newCoordinatorJournalFake()
-	journal.affinityErr = postgres.ErrCoordinatorAffinityInUse
+	affinityErr := errors.New("coordinator delivery shard unavailable")
+	journal.affinityErr = affinityErr
 	cfg := validConfig()
 	cfg.Features.Handoffs = true
 	dependencies := DurableDependencies{
@@ -331,10 +352,10 @@ func TestRunFailsBeforeServingWhenCoordinatorAffinityIsAlreadyOwned(t *testing.T
 	defer cancel()
 
 	err = app.Run(ctx)
-	require.ErrorIs(t, err, postgres.ErrCoordinatorAffinityInUse)
+	require.ErrorIs(t, err, affinityErr)
 }
 
-func TestRunRejectsNilAffinityLockAndJoinsReleaseFailure(t *testing.T) {
+func TestRunFailsClosedWhenCoordinatorAffinityRenewalIsLost(t *testing.T) {
 	newDurableApp := func(journal *coordinatorJournalFake) *App {
 		cfg := validConfig()
 		cfg.Features.Handoffs = true
@@ -342,7 +363,7 @@ func TestRunRejectsNilAffinityLockAndJoinsReleaseFailure(t *testing.T) {
 			Service:                 &handoffServiceFake{creates: make(chan handoff.CreateRequest, 1)},
 			ConversationWriter:      &transcriptWriterFake{items: make(chan postgres.ConversationItem, 1)},
 			ConversationProvisioner: gatewayConversationProvisioner{}, ConversationTTL: 24 * time.Hour,
-			Journal: journal, DeliveryAffinity: "app-affinity", JournalOwner: "app-owner", JournalClaimLease: time.Minute,
+			Journal: journal, DeliveryAffinity: "app-affinity", JournalOwner: "app-owner", JournalClaimLease: 30 * time.Millisecond,
 			HandoffQueueCapacity: 1, TranscriptQueueCapacity: 1, Snapshot: validHandoffWork().Snapshot,
 		}), testHandoffPresentationOption())
 		require.NoError(t, err)
@@ -350,29 +371,46 @@ func TestRunRejectsNilAffinityLockAndJoinsReleaseFailure(t *testing.T) {
 		return app
 	}
 
-	nilJournal := newCoordinatorJournalFake()
-	nilJournal.affinityNil = true
-	require.ErrorContains(t, newDurableApp(nilJournal).Run(t.Context()), "nil lock")
+	renewErr := errors.New("affinity renewal failed")
+	journal := newCoordinatorJournalFake()
+	journal.affinityRenewErr = renewErr
+	err := newDurableApp(journal).Run(t.Context())
+	require.ErrorIs(t, err, ErrCoordinatorAffinityLost)
+	require.ErrorIs(t, err, renewErr)
 
-	releaseErr := errors.New("affinity connection close failed")
-	releaseJournal := newCoordinatorJournalFake()
-	releaseJournal.affinityLock = errorCloser{err: releaseErr}
+	blockedJournal := newCoordinatorJournalFake()
+	renewStarted := make(chan struct{}, 1)
+	renewRelease := make(chan struct{})
+	blockedJournal.affinityRenewStart = renewStarted
+	blockedJournal.affinityRenewBlock = renewRelease
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
-	go func() { done <- newDurableApp(releaseJournal).Run(ctx) }()
-	time.Sleep(20 * time.Millisecond)
-	cancel()
-	require.ErrorIs(t, <-done, releaseErr)
+	go func() { done <- newDurableApp(blockedJournal).Run(ctx) }()
+	select {
+	case <-renewStarted:
+	case <-time.After(time.Second):
+		cancel()
+		close(renewRelease)
+		<-done
+		t.Fatal("coordinator-affinity renewal did not start")
+	}
+	select {
+	case err := <-done:
+		close(renewRelease)
+		cancel()
+		require.ErrorIs(t, err, ErrCoordinatorAffinityLost)
+	case <-time.After(300 * time.Millisecond):
+		cancel()
+		close(renewRelease)
+		<-done
+		t.Fatal("gateway remained live after its last confirmed coordinator-affinity lease")
+	}
 }
 
 type blockingListener struct {
 	closed chan struct{}
 	once   sync.Once
 }
-
-type errorCloser struct{ err error }
-
-func (c errorCloser) Close() error { return c.err }
 
 func newBlockingListener() *blockingListener { return &blockingListener{closed: make(chan struct{})} }
 func (l *blockingListener) Accept() (net.Conn, error) {
@@ -397,7 +435,7 @@ func TestLocalAdmissionUsesOnlyFixedTrustedDevelopmentSubject(t *testing.T) {
 	require.True(t, subject.ExpiresAt.IsZero())
 }
 
-func TestProductionFailsClosedWithoutExplicitAdmission(t *testing.T) {
+func validProductionConfig() config.Config {
 	cfg := validConfig()
 	cfg.Mode = "production"
 	cfg.Gateway.TLS.CertFile = "server.crt"
@@ -409,14 +447,45 @@ func TestProductionFailsClosedWithoutExplicitAdmission(t *testing.T) {
 	cfg.Store.DatabaseURLEnv = "DATABASE_URL"
 	cfg.Store.Retention.HMACKeyEnv = "RETENTION_HMAC_KEY"
 	cfg.Store.Retention.HMACKeyID = "retention-key-1"
+	cfg.Gateway.Reconnect.HMACKeyEnv = "RECONNECT_HMAC_KEY"
+	cfg.Gateway.Reconnect.HMACKeyID = "reconnect-key-1"
+	return cfg
+}
+
+func TestProductionFailsClosedWithoutExplicitAdmission(t *testing.T) {
+	cfg := validProductionConfig()
 	_, err := New(cfg, testkit.NewFakeConnector(4), WithIDGenerator(deterministicIDs{}))
 	require.ErrorContains(t, err, "admission")
+}
 
+func TestProductionRequiresRecoveryDurabilityWhenHandoffsAreDisabled(t *testing.T) {
+	cfg := validProductionConfig()
 	admission := transportws.AdmissionFunc(func(context.Context, *http.Request) (session.Subject, func(), error) {
 		return session.Subject{TenantID: "tenant", UserID: "user", Scopes: map[string]struct{}{}, ExpiresAt: time.Now().Add(time.Minute)}, nil, nil
 	})
-	_, err = New(cfg, testkit.NewFakeConnector(4), WithIDGenerator(deterministicIDs{}), WithAdmission(admission))
+	authority, authorityErr := session.NewReconnectCredentials([]byte(strings.Repeat("r", 32)), clock.Real{})
+	require.NoError(t, authorityErr)
+	_, err := New(cfg, testkit.NewFakeConnector(4), WithIDGenerator(deterministicIDs{}), WithAdmission(admission), WithReconnectAuthority(authority, session.NewMemoryReconnectOwners(clock.Real{}), "gateway-a", time.Minute))
+	require.ErrorContains(t, err, "conversation recovery durability")
+
+	recovery := &gatewayRecoveryStore{}
+	durable := DurableDependencies{
+		ConversationWriter: &transcriptWriterFake{}, ConversationProvisioner: gatewayConversationProvisioner{},
+		ConversationTTL: 24 * time.Hour, RecoveryStore: recovery, Journal: newCoordinatorJournalFake(),
+		DeliveryAffinity: "gateway-a-transcripts", JournalOwner: "gateway-a", JournalClaimLease: time.Minute,
+		TranscriptQueueCapacity: 2,
+	}
+	app, err := New(cfg, testkit.NewFakeConnector(4), WithIDGenerator(deterministicIDs{}), WithAdmission(admission),
+		WithReconnectAuthority(authority, session.NewMemoryReconnectOwners(clock.Real{}), "gateway-a", time.Minute),
+		WithDurableHandoffs(durable))
 	require.NoError(t, err)
+	require.Same(t, recovery, app.managerConfig.RecoveryStore)
+	require.NotNil(t, app.managerConfig.ConversationProvisioner)
+	require.NotNil(t, app.managerConfig.DurableDispatcher)
+	require.NotNil(t, app.transcripts)
+	require.Nil(t, app.handoffs)
+	assert.False(t, app.managerConfig.HandoffToolsEnabled)
+	assert.Empty(t, app.managerConfig.InitialSession.Tools)
 }
 
 func TestRunStopsOnContextCancellationWithoutFixedPort(t *testing.T) {
@@ -852,6 +921,36 @@ func TestGatewayAudioVerticalSlice(t *testing.T) {
 	client.expectPCM(testkit.RampPCM(960))
 	emit(t, voice, realtime.Event{
 		Kind: realtime.EventResponseDone, Epoch: 1, ProviderEventID: "provider-done-1",
+		ResponseID: "r-1", Status: "completed",
+	})
+	client.expectResponseDone("r-1")
+}
+
+func TestGatewayFeatureOffKeepsSessionUpdatesTranscriptsAndReservedLookingProviderCallsOrdinary(t *testing.T) {
+	client, voice := startGatewayHarness(t)
+	client.expectType("session.created")
+	client.write([]byte(`{"type":"session.update","session":{"type":"realtime","tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]}}`))
+	update := nextCommand(t, voice)
+	require.Equal(t, realtime.CommandSessionUpdate, update.Kind)
+	require.Len(t, update.Session.Tools, 1)
+	assert.Equal(t, "lookup", update.Session.Tools[0].Name)
+	client.expectType("session.updated")
+
+	emit(t, voice, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ProviderEventID: "provider-transcript-disabled",
+		ItemID: "user-turn-disabled", Text: "ordinary transcript",
+	})
+	client.expectType("conversation.item.input_audio_transcription.completed")
+
+	establishResponse(t, client, voice)
+	emit(t, voice, realtime.Event{
+		Kind: realtime.EventFunctionCallDone, Epoch: 1, ProviderEventID: "provider-tool-disabled",
+		ResponseID: "r-1", ItemID: "tool-item-disabled", CallID: "call-disabled",
+		Name: session.StartBackgroundTaskTool, Arguments: json.RawMessage(`{"objective":"ordinary provider function"}`),
+	})
+	client.expectType("response.function_call_arguments.done")
+	emit(t, voice, realtime.Event{
+		Kind: realtime.EventResponseDone, Epoch: 1, ProviderEventID: "provider-done-disabled",
 		ResponseID: "r-1", Status: "completed",
 	})
 	client.expectResponseDone("r-1")

@@ -347,6 +347,24 @@ func TestDecodeServerRejectsUnknownAndOversizedEvents(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestSessionReconnectUpdatedRoundTripsBoundedMetadata(t *testing.T) {
+	event := SessionReconnectUpdatedEvent{Type: "session.reconnect.updated", EventID: "manager-credential-2", Reconnect: ReconnectMetadata{
+		Credential: "lrt1.payload.signature", SessionID: "session", ConversationID: "conversation", Incarnation: 2,
+		Cursor: 19, Model: "provider-model", ExpiresAt: time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC),
+	}}
+	raw, err := Encode(event)
+	require.NoError(t, err)
+	decoded, err := DecodeServer(raw, testLimits)
+	require.NoError(t, err)
+	assert.Equal(t, event, decoded)
+
+	event.Reconnect.Cursor = -1
+	raw, err = json.Marshal(event)
+	require.NoError(t, err)
+	_, err = DecodeServer(raw, testLimits)
+	assert.Error(t, err)
+}
+
 func TestDecodeServerRejectsOversizedAudioDelta(t *testing.T) {
 	raw := `{"type":"response.output_audio.delta","event_id":"evt","response_id":"resp-1","item_id":"item-1","output_index":0,"content_index":0,"delta":"` + strings.Repeat("A", 8) + `"}`
 	_, err := DecodeServer([]byte(raw), Limits{MaxFrameBytes: 1_000, MaxJSONDepth: 8, MaxAudioBytes: 3})

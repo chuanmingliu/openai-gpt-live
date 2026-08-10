@@ -18,6 +18,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime/s2sws"
+	sessionpkg "github.com/chuanmingliu/openai-gpt-live/internal/session"
 	"github.com/coder/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -302,6 +303,10 @@ func TestNewRejectsInvalidConfig(t *testing.T) {
 		{name: "empty URL", mutate: func(cfg *s2sws.Config) { cfg.URL = "" }},
 		{name: "HTTP URL", mutate: func(cfg *s2sws.Config) { cfg.URL = "https://example.com/v1/realtime" }},
 		{name: "relative URL", mutate: func(cfg *s2sws.Config) { cfg.URL = "/v1/realtime" }},
+		{name: "userinfo", mutate: func(cfg *s2sws.Config) { cfg.URL = "wss://user@example.com/v1/realtime" }},
+		{name: "query", mutate: func(cfg *s2sws.Config) { cfg.URL = "wss://example.com/v1/realtime?tenant=other" }},
+		{name: "fragment", mutate: func(cfg *s2sws.Config) { cfg.URL = "wss://example.com/v1/realtime#hidden" }},
+		{name: "opaque", mutate: func(cfg *s2sws.Config) { cfg.URL = "wss:provider-opaque" }},
 		{name: "zero connect timeout", mutate: func(cfg *s2sws.Config) { cfg.ConnectTimeout = 0 }},
 		{name: "negative connect timeout", mutate: func(cfg *s2sws.Config) { cfg.ConnectTimeout = -time.Second }},
 		{name: "zero frame limit", mutate: func(cfg *s2sws.Config) { cfg.MaxFrameBytes = 0 }},
@@ -318,11 +323,11 @@ func TestNewRejectsInvalidConfig(t *testing.T) {
 	}
 }
 
-// TestNewAcceptsAFullWebSocketEndpoint catches over-validation that rejects
-// provider query parameters or an optional API key/model.
-func TestNewAcceptsAFullWebSocketEndpoint(t *testing.T) {
+// TestNewAcceptsCanonicalWebSocketEndpoint catches over-validation that rejects
+// an ordinary absolute provider path or an optional API key/model.
+func TestNewAcceptsCanonicalWebSocketEndpoint(t *testing.T) {
 	connector, err := s2sws.New(s2sws.Config{
-		URL:            "wss://provider.example/v1/realtime?tenant=acme&model=old",
+		URL:            "wss://provider.example/v1/realtime",
 		ConnectTimeout: time.Second,
 		MaxFrameBytes:  1 << 20,
 	})
@@ -331,7 +336,7 @@ func TestNewAcceptsAFullWebSocketEndpoint(t *testing.T) {
 }
 
 // TestConnectPreservesURLAndAppliesModelAndAuth catches dial construction that
-// drops provider query parameters, duplicates model, or emits empty auth.
+// fails to derive the sole model query or emits empty auth.
 func TestConnectPreservesURLAndAppliesModelAndAuth(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -361,7 +366,7 @@ func TestConnectPreservesURLAndAppliesModelAndAuth(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			server := newTestVoiceServer(t)
-			session := connectTestSession(t, server.URL+"?tenant=acme&model=stale&model=older", func(cfg *s2sws.Config) {
+			session := connectTestSession(t, server.URL, func(cfg *s2sws.Config) {
 				cfg.APIKey = test.apiKey
 				cfg.Model = test.configModel
 			}, realtime.OpenRequest{SessionID: "session-1", Model: test.requestModel})
@@ -369,8 +374,8 @@ func TestConnectPreservesURLAndAppliesModelAndAuth(t *testing.T) {
 
 			request := <-server.requests
 			assert.Equal(t, "/v1/realtime", request.path)
-			assert.Equal(t, "acme", request.query.Get("tenant"))
 			assert.Equal(t, []string{test.wantModel}, request.query["model"])
+			assert.Len(t, request.query, 1)
 			assert.Equal(t, test.wantAuth, request.header.Get("Authorization"))
 			_, present := request.header["Authorization"]
 			assert.Equal(t, test.wantAuthField, present)
@@ -378,11 +383,43 @@ func TestConnectPreservesURLAndAppliesModelAndAuth(t *testing.T) {
 	}
 }
 
-// TestConnectRequiresAnEffectiveModel catches dials that silently retain a
-// stale model from the configured URL when both model sources are empty.
+func TestReservedToolRegistrationUsesActualUpstreamSessionUpdateWireEvent(t *testing.T) {
+	server := newTestVoiceServer(t)
+	session := connectTestSession(t, server.URL, nil, realtime.OpenRequest{})
+	require.NoError(t, session.Send(t.Context(), realtime.Command{
+		Kind:    realtime.CommandSessionUpdate,
+		Session: sessionpkg.ReservedHandoffSessionConfig(),
+	}))
+	raw := server.nextClientFrame(t)
+	var event struct {
+		Type    string `json:"type"`
+		Session struct {
+			Tools []struct {
+				Type       string          `json:"type"`
+				Name       string          `json:"name"`
+				Parameters json.RawMessage `json:"parameters"`
+			} `json:"tools"`
+		} `json:"session"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &event))
+	require.Equal(t, "session.update", event.Type)
+	require.Len(t, event.Session.Tools, 3)
+	require.Equal(t, []string{
+		"start_background_task", "steer_background_task", "cancel_background_task",
+	}, []string{event.Session.Tools[0].Name, event.Session.Tools[1].Name, event.Session.Tools[2].Name})
+	for _, tool := range event.Session.Tools {
+		require.Equal(t, "function", tool.Type)
+		var schema map[string]any
+		require.NoError(t, json.Unmarshal(tool.Parameters, &schema))
+		require.Equal(t, false, schema["additionalProperties"])
+	}
+}
+
+// TestConnectRequiresAnEffectiveModel catches dials without a trusted model
+// source when both the request and connector model are empty.
 func TestConnectRequiresAnEffectiveModel(t *testing.T) {
 	connector, err := s2sws.New(s2sws.Config{
-		URL:            "ws://127.0.0.1:1/v1/realtime?model=stale",
+		URL:            "ws://127.0.0.1:1/v1/realtime",
 		ConnectTimeout: time.Second,
 		MaxFrameBytes:  1 << 20,
 	})
@@ -909,6 +946,60 @@ func TestImplicitResponseBufferByteBoundary(t *testing.T) {
 		_, err := session.Receive(t.Context())
 		require.ErrorIs(t, err, s2sws.ErrImplicitBufferFull)
 	})
+}
+
+func TestImplicitResponsesEnforceAggregateOwnedByteBudgetAcrossIDs(t *testing.T) {
+	const frameBytes = 1536 << 10
+	server := newTestVoiceServer(t)
+	session := connectTestSession(t, server.URL, func(cfg *s2sws.Config) {
+		cfg.MaxFrameBytes = 2 << 20
+	}, realtime.OpenRequest{Model: "model"})
+	for index := range 2 {
+		responseID := fmt.Sprintf("aggregate-%d", index)
+		server.sendEvent(t, map[string]any{"type": "response.created", "response": map[string]any{"id": responseID, "status": "in_progress"}})
+		receiveEvent(t, session)
+		server.sendRaw(t, sizedTranscriptFrame(t, responseID, frameBytes))
+	}
+	server.sendEvent(t, map[string]any{"type": "response.created", "response": map[string]any{"id": "aggregate-overflow", "status": "in_progress"}})
+	receiveEvent(t, session)
+	server.sendRaw(t, sizedTranscriptFrame(t, "aggregate-overflow", frameBytes))
+	_, err := session.Receive(t.Context())
+	require.ErrorIs(t, err, s2sws.ErrImplicitAggregateFull)
+}
+
+func TestImplicitResponseCountIsBoundedBeforeEpochBinding(t *testing.T) {
+	server := newTestVoiceServer(t)
+	session := connectTestSession(t, server.URL, nil, realtime.OpenRequest{Model: "model"})
+	for index := range 8 {
+		server.sendEvent(t, map[string]any{"type": "response.created", "response": map[string]any{
+			"id": fmt.Sprintf("unbound-%d", index), "status": "in_progress",
+		}})
+		receiveEvent(t, session)
+	}
+	server.sendEvent(t, map[string]any{"type": "response.created", "response": map[string]any{"id": "unbound-overflow", "status": "in_progress"}})
+	_, err := session.Receive(t.Context())
+	require.ErrorIs(t, err, s2sws.ErrImplicitResponseLimit)
+}
+
+func TestBindingImplicitResponseReleasesAggregateBudget(t *testing.T) {
+	const frameBytes = 1536 << 10
+	server := newTestVoiceServer(t)
+	session := connectTestSession(t, server.URL, func(cfg *s2sws.Config) {
+		cfg.MaxFrameBytes = 2 << 20
+	}, realtime.OpenRequest{Model: "model"})
+	for _, responseID := range []string{"release-a", "release-b"} {
+		server.sendEvent(t, map[string]any{"type": "response.created", "response": map[string]any{"id": responseID, "status": "in_progress"}})
+		receiveEvent(t, session)
+		server.sendRaw(t, sizedTranscriptFrame(t, responseID, frameBytes))
+	}
+	require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandBindResponseEpoch, ResponseID: "release-a", Epoch: 301}))
+	require.Equal(t, "release-a", receiveEvent(t, session).ResponseID)
+
+	server.sendEvent(t, map[string]any{"type": "response.created", "response": map[string]any{"id": "release-c", "status": "in_progress"}})
+	receiveEvent(t, session)
+	server.sendRaw(t, sizedTranscriptFrame(t, "release-c", frameBytes))
+	require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandBindResponseEpoch, ResponseID: "release-c", Epoch: 302}))
+	require.Equal(t, "release-c", receiveEvent(t, session).ResponseID)
 }
 
 // TestBindResponseEpochRacesReader catches bind/read interleavings that lose,

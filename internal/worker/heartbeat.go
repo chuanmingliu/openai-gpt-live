@@ -49,8 +49,7 @@ func (c *generationCanceller) stop(cause error) {
 }
 
 func (r *Runner) heartbeatLoop(ctx context.Context, lease Lease, initial Control, canceller *generationCanceller, events chan heartbeatEvent) {
-	period := r.LeaseDuration / 3
-	ticker := r.Clock.NewTicker(period)
+	ticker := r.Clock.NewTicker(r.HeartbeatInterval)
 	defer ticker.Stop()
 	deadlineDelay := lease.Job.Request.Deadline.Sub(r.Clock.Now())
 	if deadlineDelay <= 0 {

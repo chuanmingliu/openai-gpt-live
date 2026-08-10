@@ -65,6 +65,8 @@ func DecodeServer(raw []byte, limits Limits) (ServerEvent, error) {
 	switch eventType {
 	case "session.created":
 		target = &SessionCreatedEvent{}
+	case "session.reconnect.updated":
+		target = &SessionReconnectUpdatedEvent{}
 	case "session.updated":
 		target = &SessionUpdatedEvent{}
 	case "error":
@@ -350,9 +352,47 @@ func validateServer(event ServerEvent, raw []byte, limits Limits) error {
 		}
 		return requireString(fields, "status", true)
 	}
+	requireReconnect := func(metadata ReconnectMetadata) error {
+		reconnect, reconnectErr := requiredObject(fields, "reconnect")
+		if reconnectErr != nil {
+			return reconnectErr
+		}
+		if err := exactFields(reconnect, "credential", "session_id", "conversation_id", "incarnation", "cursor", "model", "expires_at"); err != nil {
+			return err
+		}
+		for _, field := range []string{"session_id", "conversation_id", "model"} {
+			if err := requireBoundedString(reconnect, field, 256, true); err != nil {
+				return err
+			}
+		}
+		if err := requireBoundedString(reconnect, "credential", 2048, true); err != nil {
+			return err
+		}
+		if err := requireNonNegativeInt(reconnect, "incarnation"); err != nil || metadata.Incarnation == 0 {
+			return errors.New("reconnect incarnation is invalid")
+		}
+		if err := requireNonNegativeInt(reconnect, "cursor"); err != nil {
+			return err
+		}
+		if metadata.ExpiresAt.IsZero() || metadata.ExpiresAt.Year() < 1970 || metadata.ExpiresAt.Year() > 9999 {
+			return errors.New("reconnect expiry is invalid")
+		}
+		return nil
+	}
 
 	switch typed := event.(type) {
-	case SessionCreatedEvent, SessionUpdatedEvent:
+	case SessionCreatedEvent:
+		_, err = requiredObject(fields, "session")
+		if err != nil || typed.Reconnect == nil {
+			return err
+		}
+		return requireReconnect(*typed.Reconnect)
+	case SessionReconnectUpdatedEvent:
+		if err := exactFields(fields, "type", "event_id", "reconnect"); err != nil {
+			return err
+		}
+		return requireReconnect(typed.Reconnect)
+	case SessionUpdatedEvent:
 		_, err = requiredObject(fields, "session")
 		return err
 	case ErrorEvent:

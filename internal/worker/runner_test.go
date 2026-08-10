@@ -44,6 +44,18 @@ type workerSpanCapture struct {
 	attrs []string
 }
 
+type tickerReadyClock struct {
+	clock.Clock
+	once  sync.Once
+	ready chan struct{}
+}
+
+func (c *tickerReadyClock) NewTicker(period time.Duration) clock.Ticker {
+	ticker := c.Clock.NewTicker(period)
+	c.once.Do(func() { close(c.ready) })
+	return ticker
+}
+
 func (c *workerSpanCapture) ExportSpans(_ context.Context, spans []sdktrace.ReadOnlySpan) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -278,7 +290,7 @@ func allowPolicy() safety.Policy {
 
 func testRunner(store Store, stream reasoner.Streamer, policy safety.Policy, workerClock clock.Clock, jitter clock.JitterSource, registry ToolRegistry) Runner {
 	return Runner{Store: store, Reasoner: stream, Safety: policy, Tools: registry, Clock: workerClock, Jitter: jitter,
-		Retry: RetryPolicy{Base: time.Second, Maximum: time.Minute, MaxRetries: 3}, WorkerID: "worker", LeaseDuration: 9 * time.Second, Concurrency: 1,
+		Retry: RetryPolicy{Base: time.Second, Maximum: time.Minute, MaxRetries: 3}, WorkerID: "worker", LeaseDuration: 9 * time.Second, HeartbeatInterval: 3 * time.Second, Concurrency: 1,
 		PollInterval: time.Second, MaxOutputBytes: 64 << 10, MaxOutputTokens: 4096, MaxToolRounds: 3, MaxToolCalls: 8, MaxToolArgumentBytes: 16 << 10, MaxToolOutputBytes: 16 << 10,
 		ProviderSafetyID: func(tenant, user string) (string, error) { return "private-safety-id", nil },
 	}
@@ -903,6 +915,14 @@ func TestNewRunnerRejectsTypedNilDependenciesAndInvalidBounds(t *testing.T) {
 	assert.Error(t, err)
 	candidate = valid
 	candidate.LeaseDuration = time.Duration(2)
+	_, err = NewRunner(candidate)
+	assert.Error(t, err)
+	candidate = valid
+	candidate.HeartbeatInterval = 0
+	_, err = NewRunner(candidate)
+	assert.Error(t, err)
+	candidate = valid
+	candidate.HeartbeatInterval = candidate.LeaseDuration / 2
 	_, err = NewRunner(candidate)
 	assert.Error(t, err)
 }
@@ -1536,6 +1556,45 @@ func TestRunnerHeartbeatCadenceExpiryAndCleanup(t *testing.T) {
 	manual.Advance(time.Minute)
 	runtime.Gosched()
 	assert.Equal(t, before, beats.Load())
+}
+
+func TestRunnerUsesConfiguredHeartbeatInterval(t *testing.T) {
+	manual := clock.NewManual(time.Now().UTC())
+	workerClock := &tickerReadyClock{Clock: manual, ready: make(chan struct{})}
+	lease := workerLease()
+	lease.Job.CreatedAt = manual.Now()
+	lease.Job.Request.Deadline = manual.Now().Add(time.Hour)
+	started := make(chan struct{})
+	beat := make(chan time.Time, 1)
+	store := &memoryStore{leases: []Lease{lease}}
+	store.heartbeat = func(_ context.Context, _ LeaseToken, expiry time.Time) (Control, error) {
+		beat <- expiry
+		return Control{CancelRequested: true}, nil
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	store.onComplete = cancel
+	registry, _ := NewToolRegistry(map[string][]RegisteredTool{"tools-v1": {}})
+	stream := streamerFunc(func(ctx context.Context, _ reasoner.Request, _ func(reasoner.Chunk) error) (reasoner.Result, error) {
+		close(started)
+		<-ctx.Done()
+		return reasoner.Result{}, ctx.Err()
+	})
+	runner := testRunner(store, stream, allowPolicy(), workerClock, fixedJitter(0), registry)
+	runner.LeaseDuration = 12 * time.Second
+	runner.HeartbeatInterval = 2 * time.Second
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+	<-started
+	<-workerClock.ready
+
+	manual.Advance(2 * time.Second)
+	select {
+	case expiry := <-beat:
+		assert.Equal(t, manual.Now().Add(runner.LeaseDuration), expiry)
+	case <-time.After(time.Second):
+		t.Fatal("worker did not heartbeat at the configured nondefault interval")
+	}
+	require.NoError(t, <-done)
 }
 
 func TestRunnerDurableCancelPrecedesQueuedSteering(t *testing.T) {

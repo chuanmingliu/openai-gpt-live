@@ -11,13 +11,36 @@ type ServerEvent interface {
 }
 
 type SessionCreatedEvent struct {
-	Type    string          `json:"type"`
-	EventID string          `json:"event_id,omitempty"`
-	Session json.RawMessage `json:"session"`
+	Type      string             `json:"type"`
+	EventID   string             `json:"event_id,omitempty"`
+	Session   json.RawMessage    `json:"session"`
+	Reconnect *ReconnectMetadata `json:"reconnect,omitempty"`
+}
+
+type ReconnectMetadata struct {
+	Credential     string    `json:"credential"`
+	SessionID      string    `json:"session_id"`
+	ConversationID string    `json:"conversation_id"`
+	Incarnation    uint64    `json:"incarnation"`
+	Cursor         int64     `json:"cursor"`
+	Model          string    `json:"model"`
+	ExpiresAt      time.Time `json:"expires_at"`
 }
 
 func (e SessionCreatedEvent) EventType() string { return e.Type }
 func (SessionCreatedEvent) isServerEvent()      {}
+
+// SessionReconnectUpdatedEvent replaces reconnect metadata after a bounded
+// credential rotation. The prior credential remains accepted only for the
+// server-controlled overlap window.
+type SessionReconnectUpdatedEvent struct {
+	Type      string            `json:"type"`
+	EventID   string            `json:"event_id"`
+	Reconnect ReconnectMetadata `json:"reconnect"`
+}
+
+func (e SessionReconnectUpdatedEvent) EventType() string { return e.Type }
+func (SessionReconnectUpdatedEvent) isServerEvent()      {}
 
 type SessionUpdatedEvent struct {
 	Type    string          `json:"type"`

@@ -16,6 +16,13 @@ gateway:
     channels: 1
     bytes_per_sample: 2
   storage_grace: 30s
+  reconnect:
+    max_retries: 2
+    retry_base: 100ms
+    retry_max: 1s
+    hmac_key_env: LIVE_RECONNECT_HMAC_KEY
+    hmac_key_id: production-reconnect-v1
+    credential_ttl: 5m
 store:
   database_url_env: DATABASE_URL
   retention:

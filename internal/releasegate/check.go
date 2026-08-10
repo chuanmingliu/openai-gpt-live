@@ -180,7 +180,7 @@ func verifyBundleArtifacts(evidence Evidence, snapshot bundleSnapshot) error {
 	artifacts := evidence.Artifacts
 	required := map[string]bool{
 		"vulnerability_report": false, "migration_rollback": false, "dashboard_snapshot": false,
-		"canary_snapshot": false, "production_manifest": false,
+		"candidate_canary_receipt": false, "production_manifest": false,
 		"gateway_sbom": false, "gateway_provenance": false,
 		"worker_sbom": false, "worker_provenance": false,
 		"migrate_sbom": false, "migrate_provenance": false,
@@ -387,6 +387,26 @@ func ValidateArtifact(name string, document []byte) error {
 			return errors.New("artifact source digest is malformed")
 		}
 		return nil
+	case name == "candidate_canary_receipt":
+		var envelope SignedCandidateCanaryReceipt
+		if err := strictDecode(document, &envelope); err != nil {
+			return fmt.Errorf("decode candidate canary receipt: %w", err)
+		}
+		publicKey, err := base64.StdEncoding.DecodeString(envelope.PublicKey)
+		if err != nil || len(publicKey) != ed25519.PublicKeySize {
+			return errors.New("candidate canary public key is invalid")
+		}
+		publicKeyDigest := sha256.Sum256(publicKey)
+		receipt := envelope.Receipt
+		expected := CandidateCanaryExpected{
+			Commit: receipt.Commit, ConfigHash: receipt.ConfigHash, ManifestSHA256: receipt.ManifestSHA256,
+			HaltPolicySHA256: receipt.HaltPolicySHA256, PublicKeySHA256: hex.EncodeToString(publicKeyDigest[:]), Region: receipt.Region,
+			GatewayImage: receipt.GatewayImage, WorkerImage: receipt.WorkerImage, MigrateImage: receipt.MigrateImage,
+		}
+		if _, err := ValidateCandidateCanaryEnvelope(document, expected, receipt.CleanupCompletedAt); err != nil {
+			return err
+		}
+		return nil
 	case name == "canary_snapshot":
 		var artifact canaryArtifact
 		value = &artifact
@@ -521,16 +541,15 @@ func validateArtifactContext(name string, document []byte, evidence Evidence, sn
 		if artifact.SourceSHA256 != inputs["manifest_sha256"] {
 			return errors.New("production manifest digest differs from the signed release input")
 		}
-	case name == "canary_snapshot":
-		var artifact canaryArtifact
-		if err := strictDecode(document, &artifact); err != nil {
+	case name == "candidate_canary_receipt":
+		expected := CandidateCanaryExpected{
+			Commit: evidence.Commit, ConfigHash: evidence.ConfigHash,
+			ManifestSHA256: inputs["manifest_sha256"], HaltPolicySHA256: inputs["candidate_canary_halt_policy_sha256"],
+			PublicKeySHA256: inputs["candidate_canary_public_key_sha256"], Region: inputs["deployment_region"],
+			GatewayImage: inputs["candidate_gateway_image"], WorkerImage: inputs["candidate_worker_image"], MigrateImage: inputs["candidate_migrate_image"],
+		}
+		if _, err := ValidateCandidateCanaryEnvelope(document, expected, evidence.GeneratedAt); err != nil {
 			return err
-		}
-		if artifact.ConfigHash != evidence.ConfigHash || artifact.Region != inputs["deployment_region"] || artifact.GatewayImage != inputs["candidate_gateway_image"] {
-			return errors.New("canary runtime identity differs from the signed release inputs")
-		}
-		if artifact.ObservedAt.Before(evidence.GeneratedAt.Add(-maximumEvidenceAge)) || artifact.ObservedAt.After(evidence.GeneratedAt) {
-			return errors.New("canary observation is outside the fresh bundle window")
 		}
 	case strings.HasSuffix(name, "_sbom") || strings.HasSuffix(name, "_provenance"):
 		var artifact supplyArtifact
@@ -628,19 +647,21 @@ func verifyClosedWorld(snapshot bundleSnapshot, evidence Evidence) error {
 
 func verifyReleaseInputs(inputs []ReleaseInput) error {
 	validators := map[string]func(string) bool{
-		"candidate_gateway_image":  func(value string) bool { return exactCandidateImage("gateway", value) },
-		"candidate_migrate_image":  func(value string) bool { return exactCandidateImage("migrate", value) },
-		"candidate_worker_image":   func(value string) bool { return exactCandidateImage("worker", value) },
-		"deployment_region":        regionPattern.MatchString,
-		"egress_proxy_cidr":        validCanonicalPrefix,
-		"manifest_sha256":          digestPattern.MatchString,
-		"oidc_issuer":              func(value string) bool { return validReleaseURL(value, "https") },
-		"optional_provider_result": func(value string) bool { return value == "passed" || value == "not-requested" },
-		"production_host":          validDNSName,
-		"production_tls_secret":    kubernetesNamePattern.MatchString,
-		"run_provider_tests":       func(value string) bool { return value == "true" || value == "false" },
-		"trusted_proxy_cidr":       validCanonicalPrefix,
-		"voice_url":                func(value string) bool { return validReleaseURL(value, "wss") },
+		"candidate_canary_halt_policy_sha256": digestPattern.MatchString,
+		"candidate_canary_public_key_sha256":  digestPattern.MatchString,
+		"candidate_gateway_image":             func(value string) bool { return exactCandidateImage("gateway", value) },
+		"candidate_migrate_image":             func(value string) bool { return exactCandidateImage("migrate", value) },
+		"candidate_worker_image":              func(value string) bool { return exactCandidateImage("worker", value) },
+		"deployment_region":                   regionPattern.MatchString,
+		"egress_proxy_cidr":                   validCanonicalPrefix,
+		"manifest_sha256":                     digestPattern.MatchString,
+		"oidc_issuer":                         func(value string) bool { return validReleaseURL(value, "https") },
+		"optional_provider_result":            func(value string) bool { return value == "passed" || value == "not-requested" },
+		"production_host":                     validDNSName,
+		"production_tls_secret":               kubernetesNamePattern.MatchString,
+		"run_provider_tests":                  func(value string) bool { return value == "true" || value == "false" },
+		"trusted_proxy_cidr":                  validCanonicalPrefix,
+		"voice_url":                           func(value string) bool { return validReleaseURL(value, "wss") },
 	}
 	if len(inputs) != len(validators) {
 		return fmt.Errorf("release_inputs must contain the exact %d reviewed fields", len(validators))

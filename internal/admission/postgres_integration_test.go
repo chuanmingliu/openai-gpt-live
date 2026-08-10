@@ -128,11 +128,63 @@ type readinessFaultDB struct {
 	unavailable atomic.Bool
 }
 
+type heartbeatAuthorityFaultDB struct {
+	leaseDB
+	unavailable atomic.Bool
+}
+
+func (d *heartbeatAuthorityFaultDB) QueryRow(ctx context.Context, sql string, args ...any) scanRow {
+	if d.unavailable.Load() && strings.Contains(sql, "updated AS") {
+		return heartbeatAuthorityFaultRow{}
+	}
+	return d.leaseDB.QueryRow(ctx, sql, args...)
+}
+
+type heartbeatAuthorityFaultRow struct{}
+
+func (heartbeatAuthorityFaultRow) Scan(...any) error {
+	return errors.New("injected heartbeat authority outage")
+}
+
 func (d *readinessFaultDB) Ping(ctx context.Context) error {
 	if d.unavailable.Load() {
 		return errors.New("injected readiness outage")
 	}
 	return d.leaseDB.Ping(ctx)
+}
+
+func TestPostgresHeartbeatAuthorityLossRevokesBeforeReplacement(t *testing.T) {
+	pool := testkit.Postgres(t)
+	_, err := pool.Exec(t.Context(), `CREATE TABLE session_admission_leases(instance_id text NOT NULL,session_id text NOT NULL,tenant_id text NOT NULL,user_id text NOT NULL,expires_at timestamptz NOT NULL,heartbeat_at timestamptz NOT NULL,created_at timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,PRIMARY KEY(instance_id,session_id),CHECK(heartbeat_at>=created_at AND expires_at>=heartbeat_at))`)
+	require.NoError(t, err)
+	fault := &heartbeatAuthorityFaultDB{leaseDB: poolLeaseDB{pool}}
+	one, err := newPostgres(fault, PostgresConfig{InstanceID: "one", LeaseDuration: 240 * time.Millisecond, HeartbeatInterval: 60 * time.Millisecond, OperationTimeout: 20 * time.Millisecond})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, one.Close()) })
+	two, err := NewPostgres(pool, PostgresConfig{InstanceID: "two", LeaseDuration: 240 * time.Millisecond, HeartbeatInterval: 60 * time.Millisecond, OperationTimeout: 20 * time.Millisecond})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, two.Close()) })
+	subject := session.Subject{TenantID: "tenant", UserID: "user"}
+	limits := Limits{Global: 1, PerTenant: 1, PerUser: 1}
+	lease, err := one.AcquireMonitored(t.Context(), subject, limits)
+	require.NoError(t, err)
+	defer lease.Release()
+	var confirmedExpiry time.Time
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT expires_at FROM session_admission_leases WHERE instance_id='one'`).Scan(&confirmedExpiry))
+	fault.unavailable.Store(true)
+	require.Eventually(t, func() bool { return errors.Is(one.Ready(t.Context()), ErrUnavailable) }, 150*time.Millisecond, 5*time.Millisecond)
+	select {
+	case <-lease.Lost:
+		assert.True(t, time.Now().Before(confirmedExpiry), "loss must be delivered before another replica can observe the lease expired")
+	case <-time.After(260 * time.Millisecond):
+		t.Fatal("heartbeat authority loss did not revoke the monitored lease")
+	}
+	_, err = two.Acquire(t.Context(), subject, limits)
+	assert.ErrorIs(t, err, ErrLimited, "replacement must remain blocked until the revoked socket releases its exact row")
+	lease.Release()
+	replacement, err := two.Acquire(t.Context(), subject, limits)
+	require.NoError(t, err)
+	replacement()
 }
 
 func (d *commitFaultDB) BeginTx(ctx context.Context) (leaseTx, error) {

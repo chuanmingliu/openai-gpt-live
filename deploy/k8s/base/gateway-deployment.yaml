@@ -76,6 +76,8 @@ spec:
               valueFrom: {secretKeyRef: {name: live-secrets, key: LIVE_PRIVACY_HMAC_KEY}}
             - name: LIVE_RETENTION_HMAC_KEY
               valueFrom: {secretKeyRef: {name: live-secrets, key: LIVE_RETENTION_HMAC_KEY}}
+            - name: LIVE_RECONNECT_HMAC_KEY
+              valueFrom: {secretKeyRef: {name: live-secrets, key: LIVE_RECONNECT_HMAC_KEY}}
             - name: LIVE_TOOL_ENCRYPTION_KEY
               valueFrom: {secretKeyRef: {name: live-secrets, key: LIVE_TOOL_ENCRYPTION_KEY}}
           volumeMounts:

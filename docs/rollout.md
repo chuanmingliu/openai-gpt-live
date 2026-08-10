@@ -2,6 +2,12 @@
 
 Every rollout is selected by immutable image digest and immutable configuration hash. Never mix an unreviewed hash into an existing canary cohort.
 
+Before unsigned release evidence is collected, the protected candidate-canary
+edge deploys the exact proposed digests/config, observes them for at least 30
+minutes, evaluates the fixed halt policy, and rolls them back. Its verified
+content-free platform receipt is part of the signed evidence bundle. This
+pre-release proof does not replace the progressive cohort windows below.
+
 1. Enable implemented shadow mode. It performs durable acceptance and policy/accounting paths while suppressing provider and client handoff presentation.
 2. Internal cohort: observe for 30 minutes.
 3. 1% canary: observe for 30 minutes.

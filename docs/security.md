@@ -14,6 +14,11 @@ The release canary's no-persistence exception is server-side and exact: both con
 
 Logs and telemetry contain stable classes, counts, durations, bounded allowlisted labels, and HMAC-derived identifiers. They must never contain audio, transcript text, model reasoning, executable tool inputs/results, bearer values, database credentials, provider credentials, private keys, or secret material. Release evidence follows the same content-free rule.
 
+Reconnect credentials are sent only in the bounded authenticated WebSocket
+control frame after upgrade; they are never query parameters or HTTP headers.
+Production ingress access logging is disabled so neither supported reconnect
+metadata nor future request-target extensions can enter the proxy access log.
+
 ## Secrets and rotation
 
 Configuration names secret-bearing environment variables but never embeds their values. Kubernetes Secrets are created out of band and excluded from Git. Rotate OIDC/admin credentials, provider credentials, privacy/retention HMAC keys, and tool-encryption keys through the external secret manager. Key IDs are immutable configuration; keep old decryption material for the bounded retention window, then remove it after data expiry.

@@ -11,6 +11,13 @@ gateway:
     api_key_env: S2S_API_KEY
   audio: {sample_rate: 24000, channels: 1, bytes_per_sample: 2}
   storage_grace: 30s
+  reconnect:
+    max_retries: 2
+    retry_base: 100ms
+    retry_max: 1s
+    hmac_key_env: LIVE_RECONNECT_HMAC_KEY
+    hmac_key_id: chaos-reconnect-v1
+    credential_ttl: 5m
   behind_ingress: true
   trusted_proxies: [0.0.0.0/0]
 store:

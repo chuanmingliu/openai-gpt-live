@@ -58,16 +58,17 @@ func normalizeMetrics(h MetricsHooks) MetricsHooks {
 }
 
 type Runner struct {
-	Store         Store
-	Reasoner      reasoner.Streamer
-	Safety        safety.Policy
-	Tools         ToolRegistry
-	Clock         clock.Clock
-	Jitter        clock.JitterSource
-	Retry         RetryPolicy
-	WorkerID      string
-	LeaseDuration time.Duration
-	Concurrency   int
+	Store             Store
+	Reasoner          reasoner.Streamer
+	Safety            safety.Policy
+	Tools             ToolRegistry
+	Clock             clock.Clock
+	Jitter            clock.JitterSource
+	Retry             RetryPolicy
+	WorkerID          string
+	LeaseDuration     time.Duration
+	HeartbeatInterval time.Duration
+	Concurrency       int
 
 	PollInterval         time.Duration
 	MaxOutputBytes       int
@@ -89,7 +90,7 @@ func NewRunner(config Runner) (*Runner, error) {
 	if nilValue(config.Store) || nilValue(config.Reasoner) || nilValue(config.Safety) || nilValue(config.Tools) || nilValue(config.Clock) || nilValue(config.Jitter) || config.ProviderSafetyID == nil {
 		return nil, errors.New("worker runner dependencies are required")
 	}
-	if strings.TrimSpace(config.WorkerID) == "" || len(config.WorkerID) > 256 || !utf8.ValidString(config.WorkerID) || config.Concurrency <= 0 || config.Concurrency > 4096 || config.LeaseDuration < 3*time.Millisecond {
+	if strings.TrimSpace(config.WorkerID) == "" || len(config.WorkerID) > 256 || !utf8.ValidString(config.WorkerID) || config.Concurrency <= 0 || config.Concurrency > 4096 || config.LeaseDuration < 3*time.Millisecond || config.HeartbeatInterval <= 0 || config.HeartbeatInterval >= config.LeaseDuration-config.HeartbeatInterval {
 		return nil, errors.New("worker runner identity or lease bounds are invalid")
 	}
 	if err := config.Retry.Validate(); err != nil {

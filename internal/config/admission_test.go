@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -43,7 +44,7 @@ auth:
 		if name == "DATABASE_URL" {
 			return "postgres://db.example/live?sslmode=require", true
 		}
-		return "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", name == "RETENTION_HMAC_KEY"
+		return "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", name == "RETENTION_HMAC_KEY" || name == "RECONNECT_HMAC_KEY"
 	}
 	tests := []struct {
 		name, transport string
@@ -60,7 +61,8 @@ auth:
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := loadFixture(t, fmt.Sprintf(base, test.transport), lookup)
+			yaml := strings.Replace(fmt.Sprintf(base, test.transport), "gateway:\n", "gateway:\n  reconnect: {hmac_key_env: RECONNECT_HMAC_KEY, hmac_key_id: reconnect-v1}\n", 1)
+			_, err := loadFixture(t, yaml, lookup)
 			if test.ok {
 				require.NoError(t, err)
 			} else {
@@ -75,6 +77,7 @@ func TestProductionRequiresOIDCOriginAndPostgres(t *testing.T) {
 	assert.ErrorContains(t, err, "direct mode")
 	yaml := `mode: production
 gateway:
+  reconnect: {hmac_key_env: RECONNECT_HMAC_KEY, hmac_key_id: reconnect-v1}
   tls:
     cert_file: server.crt
     key_file: server.key
@@ -93,7 +96,7 @@ auth:
 		if name == "DATABASE_URL" {
 			return "postgres://db.example/live?sslmode=require", true
 		}
-		return "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", name == "RETENTION_HMAC_KEY"
+		return "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", name == "RETENTION_HMAC_KEY" || name == "RECONNECT_HMAC_KEY"
 	})
 	require.NoError(t, err)
 	assert.Equal(t, "tenant_id", cfg.Auth.OIDCTenantClaim)
@@ -102,6 +105,7 @@ auth:
 func TestProductionRetentionHMACRequiresBothReferenceAndValidResolvedKey(t *testing.T) {
 	base := `mode: production
 gateway:
+  reconnect: {hmac_key_env: RECONNECT_HMAC_KEY, hmac_key_id: reconnect-v1}
   tls:
     cert_file: server.crt
     key_file: server.key
@@ -119,6 +123,8 @@ auth:
 		case "DATABASE_URL":
 			return "postgres://db.example/live?sslmode=require", true
 		case "RETENTION_HMAC_KEY":
+			return "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", true
+		case "RECONNECT_HMAC_KEY":
 			return "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", true
 		default:
 			return "", false

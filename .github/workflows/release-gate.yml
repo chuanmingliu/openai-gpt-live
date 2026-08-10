@@ -62,10 +62,89 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  collect-unsigned-evidence:
+  deploy-observe-candidate-canary:
     if: inputs.evidence_run_id == ''
     needs: candidate-manifest
-    runs-on: [self-hosted, linux, x64, gpt-live-load-profile-v1]
+    environment: release-candidate-canary
+    permissions:
+      contents: read
+    runs-on: [self-hosted, macOS, ARM64, gpt-live-candidate-canary]
+    timeout-minutes: 60
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32
+        with:
+          go-version: 1.26.2
+          cache: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-image-gateway-${{ github.sha }}
+          path: candidate/gateway
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-image-worker-${{ github.sha }}
+          path: candidate/worker
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-image-migrate-${{ github.sha }}
+          path: candidate/migrate
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-manifest-${{ github.sha }}
+          path: candidate/manifest
+      - name: Materialize trusted platform receipt key
+        shell: bash
+        env:
+          PUBLIC_KEY_BASE64: ${{ secrets.RELEASE_CANARY_RECEIPT_PUBLIC_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          test -n "$PUBLIC_KEY_BASE64"
+          test "${#PUBLIC_KEY_BASE64}" -le 4096
+          umask 077
+          printf '%s\n' "$PUBLIC_KEY_BASE64" > "$RUNNER_TEMP/candidate-canary-ed25519.pub.base64"
+          public_key_sha256="$(base64 -D < "$RUNNER_TEMP/candidate-canary-ed25519.pub.base64" | shasum -a 256 | cut -d' ' -f1)"
+          [[ "$public_key_sha256" =~ ^[0-9a-f]{64}$ ]]
+          echo "CANDIDATE_CANARY_PUBLIC_KEY=$RUNNER_TEMP/candidate-canary-ed25519.pub.base64" >> "$GITHUB_ENV"
+          echo "CANDIDATE_CANARY_PUBLIC_KEY_SHA256=$public_key_sha256" >> "$GITHUB_ENV"
+      - name: Deploy, observe for thirty minutes, and roll back candidate
+        shell: bash
+        env:
+          INPUT_CONFIG_HASH: ${{ inputs.config_hash }}
+          INPUT_DEPLOYMENT_REGION: ${{ inputs.deployment_region }}
+        run: |
+          set -euo pipefail
+          for target in gateway worker migrate; do ./deploy/scripts/verify-candidate-artifact-layout.sh "$target" "candidate/$target"; done
+          test "$(find candidate/manifest -mindepth 1 -maxdepth 1 -type f -print | wc -l)" -eq 2
+          [[ "$(<candidate/manifest/config-hash.txt)" == "$INPUT_CONFIG_HASH" ]]
+          manifest_sha256="$(shasum -a 256 candidate/manifest/production.yaml | cut -d' ' -f1)"
+          ./deploy/scripts/run-candidate-canary-edge.sh \
+            --commit "$GITHUB_SHA" --config-hash "$INPUT_CONFIG_HASH" \
+            --manifest "$GITHUB_WORKSPACE/candidate/manifest/production.yaml" --manifest-sha256 "$manifest_sha256" \
+            --region "$INPUT_DEPLOYMENT_REGION" \
+            --gateway-image "$(<candidate/gateway/gateway.digest)" \
+            --worker-image "$(<candidate/worker/worker.digest)" \
+            --migrate-image "$(<candidate/migrate/migrate.digest)" \
+            --public-key "$CANDIDATE_CANARY_PUBLIC_KEY" --public-key-sha256 "$CANDIDATE_CANARY_PUBLIC_KEY_SHA256" \
+            --envelope-out "$RUNNER_TEMP/candidate-canary-receipt.json" \
+            --minimum-observation-seconds 1800
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: candidate-canary-receipt-${{ github.sha }}
+          path: ${{ runner.temp }}/candidate-canary-receipt.json
+          if-no-files-found: error
+          retention-days: 30
+      - name: Clean platform receipt material
+        if: always()
+        run: rm -f -- "$RUNNER_TEMP/candidate-canary-ed25519.pub.base64" "$RUNNER_TEMP/candidate-canary-receipt.json"
+
+  collect-unsigned-evidence:
+    if: inputs.evidence_run_id == ''
+    needs: [candidate-manifest, deploy-observe-candidate-canary]
+    runs-on: [self-hosted, macOS, ARM64, gpt-live-apple-m3-max]
     timeout-minutes: 210
     env:
       GOTOOLCHAIN: local
@@ -105,6 +184,7 @@ jobs:
       LIVE_ADMIN_BEARER_TOKEN: formal-synthetic-admin-token
       LIVE_PRIVACY_HMAC_KEY: Zm9ybWFsLXByaXZhY3kta2V5LTMyLWJ5dGVzLTAwMDA=
       LIVE_RETENTION_HMAC_KEY: Zm9ybWFsLXJldGVudGlvbi1rZXktMzItYnl0ZS0wMDA=
+      LIVE_RECONNECT_HMAC_KEY: cmVjb25uZWN0LWtleS0zMi1ieXRlLTAwMDAwMDAwMDA=
       LIVE_TOOL_ENCRYPTION_KEY: Zm9ybWFsLXRvb2wta2V5LTMyLWJ5dGVzLTAwMDAwMDA=
       RELEASE_UNSIGNED_ARCHIVE_OUT: ${{ runner.temp }}/unsigned-release-evidence.tar
     steps:
@@ -113,21 +193,18 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32
         with:
-          go-version: 1.26.0
+          go-version: 1.26.2
           cache: true
+      - name: Verify exact content-safe pinned runner
+        run: |
+          go run ./cmd/live-runner-preflight -profile test/load/pinned-profile.json
       - name: Install pinned release tools
         shell: bash
         run: |
           set -euo pipefail
           go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
-          curl --fail --location --proto '=https' --tlsv1.2 -o /tmp/kubeconform.tar.gz \
-            https://github.com/yannh/kubeconform/releases/download/v0.7.0/kubeconform-linux-amd64.tar.gz
-          printf '%s  %s\n' c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3 /tmp/kubeconform.tar.gz | sha256sum --check --strict
-          tar -xzf /tmp/kubeconform.tar.gz -C "$(go env GOPATH)/bin" kubeconform
-          curl --fail --location --proto '=https' --tlsv1.2 -o "$(go env GOPATH)/bin/kind" \
-            https://kind.sigs.k8s.io/dl/v0.30.0/kind-linux-amd64
-          printf '%s  %s\n' 517ab7fc89ddeed5fa65abf71530d90648d9638ef0c4cde22c2c11f8097b8889 "$(go env GOPATH)/bin/kind" | sha256sum --check --strict
-          chmod 0755 "$(go env GOPATH)/bin/kind"
+          go install github.com/yannh/kubeconform/cmd/kubeconform@v0.7.0
+          go install sigs.k8s.io/kind@v0.30.0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: candidate-image-gateway-${{ github.sha }}
@@ -144,6 +221,10 @@ jobs:
         with:
           name: candidate-manifest-${{ github.sha }}
           path: candidate/manifest
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-canary-receipt-${{ github.sha }}
+          path: candidate/canary
       - name: Bind candidate manifest, computed hash, and reviewed inputs
         shell: bash
         env:
@@ -174,6 +255,7 @@ jobs:
           echo "RELEASE_INPUT_candidate_gateway_image=$LIVE_PRODUCTION_GATEWAY_IMAGE" >> "$GITHUB_ENV"
           echo "RELEASE_INPUT_candidate_worker_image=$LIVE_PRODUCTION_WORKER_IMAGE" >> "$GITHUB_ENV"
           echo "RELEASE_INPUT_candidate_migrate_image=$LIVE_PRODUCTION_MIGRATE_IMAGE" >> "$GITHUB_ENV"
+          echo "RELEASE_INPUT_candidate_canary_halt_policy_sha256=$(shasum -a 256 deploy/release/candidate-canary-halt-policy-v1.json | cut -d' ' -f1)" >> "$GITHUB_ENV"
           echo "RELEASE_INPUT_manifest_sha256=$(shasum -a 256 candidate/manifest/production.yaml | cut -d' ' -f1)" >> "$GITHUB_ENV"
           echo "GATEWAY_IMAGE=$LIVE_PRODUCTION_GATEWAY_IMAGE" >> "$GITHUB_ENV"
           echo "WORKER_IMAGE=$LIVE_PRODUCTION_WORKER_IMAGE" >> "$GITHUB_ENV"
@@ -181,6 +263,29 @@ jobs:
           formal_hash="$(go run ./cmd/live-gateway config-hash -config deploy/config/chaos.yaml)"
           [[ "$formal_hash" =~ ^v1:[0-9a-f]{64}$ ]]
           echo "LIVE_EXPECTED_CONFIG_HASH=$formal_hash" >> "$GITHUB_ENV"
+      - name: Reverify protected candidate canary receipt
+        shell: bash
+        env:
+          PUBLIC_KEY_BASE64: ${{ secrets.RELEASE_CANARY_RECEIPT_PUBLIC_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          test -n "$PUBLIC_KEY_BASE64"
+          umask 077
+          printf '%s\n' "$PUBLIC_KEY_BASE64" > "$RUNNER_TEMP/candidate-canary-ed25519.pub.base64"
+          public_key_sha256="$(base64 -D < "$RUNNER_TEMP/candidate-canary-ed25519.pub.base64" | shasum -a 256 | cut -d' ' -f1)"
+          [[ "$public_key_sha256" =~ ^[0-9a-f]{64}$ ]]
+          echo "RELEASE_INPUT_candidate_canary_public_key_sha256=$public_key_sha256" >> "$GITHUB_ENV"
+          go run ./cmd/live-canary-receipt \
+            --envelope "$GITHUB_WORKSPACE/candidate/canary/candidate-canary-receipt.json" \
+            --public-key "$RUNNER_TEMP/candidate-canary-ed25519.pub.base64" --public-key-sha256 "$public_key_sha256" \
+            --commit "$GITHUB_SHA" --config-hash "$RELEASE_CONFIG_HASH" \
+            --manifest-sha256 "$RELEASE_INPUT_manifest_sha256" \
+            --halt-policy-sha256 "$RELEASE_INPUT_candidate_canary_halt_policy_sha256" \
+            --region "$RELEASE_INPUT_deployment_region" \
+            --gateway-image "$RELEASE_INPUT_candidate_gateway_image" \
+            --worker-image "$RELEASE_INPUT_candidate_worker_image" \
+            --migrate-image "$RELEASE_INPUT_candidate_migrate_image"
+          echo "RELEASE_CANDIDATE_CANARY_RECEIPT=$GITHUB_WORKSPACE/candidate/canary/candidate-canary-receipt.json" >> "$GITHUB_ENV"
       - name: Run requested optional provider suite before evidence collection
         if: inputs.run_provider_tests
         env:
@@ -219,24 +324,6 @@ jobs:
           echo "RELEASE_FORMAL_RUNTIME_CONFIG_HASH=$LIVE_EXPECTED_CONFIG_HASH" >> "$GITHUB_ENV"
           echo "RELEASE_FORMAL_CONFIG_SHA256=$(shasum -a 256 deploy/config/chaos.yaml | cut -d' ' -f1)" >> "$GITHUB_ENV"
           echo "RELEASE_FORMAL_CONFIG_SOURCE=$GITHUB_WORKSPACE/deploy/config/chaos.yaml" >> "$GITHUB_ENV"
-      - name: Observe deployed production canary with rotated identity
-        shell: bash
-        env:
-          CANARY_OIDC_TOKEN: ${{ secrets.RELEASE_CANARY_OIDC_TOKEN }}
-          LIVE_CANARY_GATEWAY_URL: wss://${{ inputs.production_host }}/v1/realtime
-          LIVE_CANARY_ORIGIN: https://${{ inputs.production_host }}
-          LIVE_CANARY_RETENTION: none
-          LIVE_CANARY_BEARER_TOKEN_FILE: ${{ runner.temp }}/release-canary.oidc
-          LIVE_EXPECTED_CONFIG_HASH: ${{ inputs.config_hash }}
-          LIVE_EXPECTED_GATEWAY_IMAGE: ${{ needs.candidate-manifest.outputs.gateway_image }}
-        run: |
-          set -euo pipefail
-          test -n "$CANARY_OIDC_TOKEN"
-          umask 077
-          printf '%s' "$CANARY_OIDC_TOKEN" > "$LIVE_CANARY_BEARER_TOKEN_FILE"
-          go build -trimpath -o "$RUNNER_TEMP/live-synthetic-canary" ./cmd/live-synthetic-canary
-          ./deploy/scripts/run-release-canary.sh "$RUNNER_TEMP/live-synthetic-canary" "$RUNNER_TEMP/canary-snapshot.json"
-          echo "RELEASE_CANARY_SNAPSHOT=$RUNNER_TEMP/canary-snapshot.json" >> "$GITHUB_ENV"
       - name: Run all producers including the formal two-hour soak
         shell: bash
         run: |
@@ -274,9 +361,7 @@ jobs:
           expected_evidence="$GITHUB_WORKSPACE/artifacts/task24-formal"
           [[ "$LIVE_EVIDENCE_DIR" == "$expected_evidence" ]]
           rm -rf -- "$expected_evidence"
-          rm -f -- "$RUNNER_TEMP/release-canary.oidc" \
-            "$RUNNER_TEMP/canary-snapshot.json" \
-            "$RUNNER_TEMP/live-synthetic-canary" \
+          rm -f -- "$RUNNER_TEMP/candidate-canary-ed25519.pub.base64" \
             "$RUNNER_TEMP/unsigned-release-evidence.tar"
 
   verify-signed-evidence:
@@ -327,6 +412,12 @@ jobs:
           path: candidate/manifest
           run-id: ${{ inputs.evidence_run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-canary-receipt-${{ github.sha }}
+          path: candidate/canary
+          run-id: ${{ inputs.evidence_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Require successful source collection run
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -345,15 +436,18 @@ jobs:
         env:
           ATTESTATION_BASE64: ${{ inputs.privacy_attestation_base64 }}
           PUBLIC_KEY_BASE64: ${{ secrets.RELEASE_ATTESTATION_PUBLIC_KEY_BASE64 }}
+          CANARY_PUBLIC_KEY_BASE64: ${{ secrets.RELEASE_CANARY_RECEIPT_PUBLIC_KEY_BASE64 }}
         run: |
           set -euo pipefail
           test -n "$ATTESTATION_BASE64"
           test -n "$PUBLIC_KEY_BASE64"
+          test -n "$CANARY_PUBLIC_KEY_BASE64"
           test "${#ATTESTATION_BASE64}" -le 87384
           test "${#PUBLIC_KEY_BASE64}" -le 4096
           umask 077
           printf '%s' "$ATTESTATION_BASE64" | base64 --decode > "$RUNNER_TEMP/privacy-attestation.json"
           printf '%s\n' "$PUBLIC_KEY_BASE64" > "$RUNNER_TEMP/release-ed25519.pub.base64"
+          printf '%s\n' "$CANARY_PUBLIC_KEY_BASE64" > "$RUNNER_TEMP/candidate-canary-ed25519.pub.base64"
           echo "RELEASE_ATTESTATION_FILE=$RUNNER_TEMP/privacy-attestation.json" >> "$GITHUB_ENV"
           echo "RELEASE_ATTESTATION_KEY=release-operator=$RUNNER_TEMP/release-ed25519.pub.base64" >> "$GITHUB_ENV"
       - id: reviewed_inputs
@@ -379,14 +473,32 @@ jobs:
           echo "RELEASE_INPUT_candidate_gateway_image=$(<candidate/gateway/gateway.digest)" >> "$GITHUB_ENV"
           echo "RELEASE_INPUT_candidate_migrate_image=$(<candidate/migrate/migrate.digest)" >> "$GITHUB_ENV"
           echo "RELEASE_INPUT_candidate_worker_image=$(<candidate/worker/worker.digest)" >> "$GITHUB_ENV"
+          echo "RELEASE_INPUT_candidate_canary_halt_policy_sha256=$(shasum -a 256 deploy/release/candidate-canary-halt-policy-v1.json | cut -d' ' -f1)" >> "$GITHUB_ENV"
+          echo "RELEASE_INPUT_candidate_canary_public_key_sha256=$(base64 --decode < "$RUNNER_TEMP/candidate-canary-ed25519.pub.base64" | shasum -a 256 | cut -d' ' -f1)" >> "$GITHUB_ENV"
           echo "RELEASE_INPUT_manifest_sha256=$(shasum -a 256 candidate/manifest/production.yaml | cut -d' ' -f1)" >> "$GITHUB_ENV"
           if [[ "$INPUT_RUN_PROVIDER_TESTS" == true ]]; then result=passed; else result=not-requested; fi
           echo "RELEASE_INPUT_optional_provider_result=$result" >> "$GITHUB_ENV"
+      - name: Reverify source candidate canary receipt
+        run: |
+          set -euo pipefail
+          go run ./cmd/live-canary-receipt \
+            --envelope "$GITHUB_WORKSPACE/candidate/canary/candidate-canary-receipt.json" \
+            --public-key "$RUNNER_TEMP/candidate-canary-ed25519.pub.base64" \
+            --public-key-sha256 "$RELEASE_INPUT_candidate_canary_public_key_sha256" \
+            --commit "$GITHUB_SHA" --config-hash "$RELEASE_CONFIG_HASH" \
+            --manifest-sha256 "$RELEASE_INPUT_manifest_sha256" \
+            --halt-policy-sha256 "$RELEASE_INPUT_candidate_canary_halt_policy_sha256" \
+            --region "$RELEASE_INPUT_deployment_region" \
+            --gateway-image "$RELEASE_INPUT_candidate_gateway_image" \
+            --worker-image "$RELEASE_INPUT_candidate_worker_image" \
+            --migrate-image "$RELEASE_INPUT_candidate_migrate_image"
       - name: Derive and verify signed canonical archive from reviewed bytes
         run: |
           set -euo pipefail
           go build -trimpath -o "$RUNNER_TEMP/live-release-gate" ./cmd/live-release-gate
           inputs=(
+            --release-input "candidate_canary_halt_policy_sha256=$RELEASE_INPUT_candidate_canary_halt_policy_sha256"
+            --release-input "candidate_canary_public_key_sha256=$RELEASE_INPUT_candidate_canary_public_key_sha256"
             --release-input "candidate_gateway_image=$RELEASE_INPUT_candidate_gateway_image"
             --release-input "candidate_migrate_image=$RELEASE_INPUT_candidate_migrate_image"
             --release-input "candidate_worker_image=$RELEASE_INPUT_candidate_worker_image"
@@ -618,6 +730,12 @@ jobs:
         with:
           name: signed-release-evidence-${{ github.sha }}-${{ needs.verify-signed-evidence.outputs.signed_bundle_config_key }}
           path: ${{ runner.temp }}/signed-release
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-canary-receipt-${{ github.sha }}
+          path: candidate/canary
+          run-id: ${{ inputs.evidence_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Revalidate reviewed inputs for promotion
         env:
           INPUT_CONFIG_HASH: ${{ inputs.config_hash }}
@@ -630,6 +748,7 @@ jobs:
           INPUT_TRUSTED_PROXY_CIDR: ${{ inputs.trusted_proxy_cidr }}
           INPUT_VOICE_URL: ${{ inputs.voice_url }}
           PUBLIC_KEY_BASE64: ${{ secrets.RELEASE_ATTESTATION_PUBLIC_KEY_BASE64 }}
+          CANARY_PUBLIC_KEY_BASE64: ${{ secrets.RELEASE_CANARY_RECEIPT_PUBLIC_KEY_BASE64 }}
         run: |
           set -euo pipefail
           ./deploy/scripts/bind-release-inputs.sh
@@ -637,11 +756,28 @@ jobs:
           echo "RELEASE_INPUT_candidate_gateway_image=$(<candidate/gateway/gateway.digest)" >> "$GITHUB_ENV"
           echo "RELEASE_INPUT_candidate_migrate_image=$(<candidate/migrate/migrate.digest)" >> "$GITHUB_ENV"
           echo "RELEASE_INPUT_candidate_worker_image=$(<candidate/worker/worker.digest)" >> "$GITHUB_ENV"
+          echo "RELEASE_INPUT_candidate_canary_halt_policy_sha256=$(sha256sum deploy/release/candidate-canary-halt-policy-v1.json | cut -d' ' -f1)" >> "$GITHUB_ENV"
           echo "RELEASE_INPUT_manifest_sha256=$(sha256sum candidate/manifest/production.yaml | cut -d' ' -f1)" >> "$GITHUB_ENV"
           if [[ "$INPUT_RUN_PROVIDER_TESTS" == true ]]; then result=passed; else result=not-requested; fi
           echo "RELEASE_INPUT_optional_provider_result=$result" >> "$GITHUB_ENV"
           umask 077
           printf '%s\n' "$PUBLIC_KEY_BASE64" > "$RUNNER_TEMP/release-ed25519.pub.base64"
+          printf '%s\n' "$CANARY_PUBLIC_KEY_BASE64" > "$RUNNER_TEMP/candidate-canary-ed25519.pub.base64"
+          echo "RELEASE_INPUT_candidate_canary_public_key_sha256=$(base64 --decode < "$RUNNER_TEMP/candidate-canary-ed25519.pub.base64" | sha256sum | cut -d' ' -f1)" >> "$GITHUB_ENV"
+      - name: Reverify candidate canary receipt before promotion
+        run: |
+          set -euo pipefail
+          go run ./cmd/live-canary-receipt \
+            --envelope "$GITHUB_WORKSPACE/candidate/canary/candidate-canary-receipt.json" \
+            --public-key "$RUNNER_TEMP/candidate-canary-ed25519.pub.base64" \
+            --public-key-sha256 "$RELEASE_INPUT_candidate_canary_public_key_sha256" \
+            --commit "$GITHUB_SHA" --config-hash "${{ inputs.config_hash }}" \
+            --manifest-sha256 "$RELEASE_INPUT_manifest_sha256" \
+            --halt-policy-sha256 "$RELEASE_INPUT_candidate_canary_halt_policy_sha256" \
+            --region "$RELEASE_INPUT_deployment_region" \
+            --gateway-image "$RELEASE_INPUT_candidate_gateway_image" \
+            --worker-image "$RELEASE_INPUT_candidate_worker_image" \
+            --migrate-image "$RELEASE_INPUT_candidate_migrate_image"
       - name: Reverify immutable signed bundle before package authority
         env:
           INPUT_CONFIG_HASH: ${{ inputs.config_hash }}
@@ -653,6 +789,8 @@ jobs:
           "$RUNNER_TEMP/live-release-gate" verify-archive \
             --archive "$RUNNER_TEMP/signed-release/signed-release-evidence.tar" \
             --commit "$GITHUB_SHA" --config-hash "$INPUT_CONFIG_HASH" \
+            --release-input "candidate_canary_halt_policy_sha256=$RELEASE_INPUT_candidate_canary_halt_policy_sha256" \
+            --release-input "candidate_canary_public_key_sha256=$RELEASE_INPUT_candidate_canary_public_key_sha256" \
             --release-input "candidate_gateway_image=$RELEASE_INPUT_candidate_gateway_image" \
             --release-input "candidate_migrate_image=$RELEASE_INPUT_candidate_migrate_image" \
             --release-input "candidate_worker_image=$RELEASE_INPUT_candidate_worker_image" \

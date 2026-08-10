@@ -62,6 +62,32 @@ func TestTask21MigrationEmbeddedChecksums(t *testing.T) {
 	}
 }
 
+func TestReconnectOwnerMigrationEmbeddedChecksums(t *testing.T) {
+	want := map[string]string{
+		"000006_reconnect_owners.up.sql":   "981f22d9f314f8074d65115b3d47ae51addf1aa26ceb953d1bf38ef6ec786cc6",
+		"000006_reconnect_owners.down.sql": "65398f2e482b2fb26ac91522adf499deb2cbb07f5e1b535c26b655ffb16ba64f",
+	}
+	for name, checksum := range want {
+		contents, err := files.ReadFile(name)
+		require.NoError(t, err)
+		digest := sha256.Sum256(contents)
+		assert.Equal(t, checksum, hex.EncodeToString(digest[:]), name)
+	}
+}
+
+func TestCoordinatorDeliveryShardMigrationEmbeddedChecksums(t *testing.T) {
+	want := map[string]string{
+		"000007_coordinator_delivery_shards.up.sql":   "260e46deeaa6aa6e5044e28177d08b9c1fc2ae29189d121c51c335243fb4d116",
+		"000007_coordinator_delivery_shards.down.sql": "d6e67928b51ddceb4363706a187302e057ca32ee2baef17d8282b68f9382cf7d",
+	}
+	for name, checksum := range want {
+		contents, err := files.ReadFile(name)
+		require.NoError(t, err)
+		digest := sha256.Sum256(contents)
+		assert.Equal(t, checksum, hex.EncodeToString(digest[:]), name)
+	}
+}
+
 func TestCoordinatorPendingRefusalClassificationIsExact(t *testing.T) {
 	assert.True(t, isCoordinatorPendingRefusal(&pgconn.PgError{Code: "55000", Message: ErrCoordinatorPendingWork.Error()}))
 	assert.False(t, isCoordinatorPendingRefusal(&pgconn.PgError{Code: "57014", Message: ErrCoordinatorPendingWork.Error()}))

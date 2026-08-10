@@ -851,7 +851,7 @@ func TestSessionUpdatedIsSynthesizedOnlyForMatchingCommandCompletion(t *testing.
 	assert.Equal(t, 24_000, command.Session.OutputFormat.SampleRate)
 	assert.Equal(t, 1, command.Session.OutputFormat.Channels)
 	assert.Equal(t, "alloy", command.Session.Voice)
-	require.Len(t, command.Session.Tools, 1)
+	require.Len(t, command.Session.Tools, 4)
 	assert.Equal(t, "function", command.Session.Tools[0].Type)
 	assert.Equal(t, "lookup", command.Session.Tools[0].Name)
 	assert.Equal(t, "find it", command.Session.Tools[0].Description)
@@ -1026,12 +1026,108 @@ func TestSessionToolsRequireSupportedFunctionShapeAtomically(t *testing.T) {
 		},
 	}})
 	require.Len(t, effects, 1)
-	require.Len(t, effects[0].VoiceCommand.Session.Tools, 1)
+	require.Len(t, effects[0].VoiceCommand.Session.Tools, 4)
 	tool := effects[0].VoiceCommand.Session.Tools[0]
 	assert.Equal(t, "function", tool.Type)
 	assert.Equal(t, "lookup", tool.Name)
 	assert.Equal(t, "find it", tool.Description)
 	assert.JSONEq(t, `{}`, string(tool.Parameters))
+}
+
+func TestSessionUpdatePreservesOrdinaryToolsAndInjectsReservedSchemas(t *testing.T) {
+	reactor, _ := testReactor(5)
+	effects := applyOK(t, reactor, ClientInput{Event: protocol.SessionUpdateEvent{
+		Type: "session.update",
+		Session: protocol.SessionUpdate{
+			Type:       "realtime",
+			Tools:      json.RawMessage(`[{"type":"function","name":"lookup","parameters":{"type":"object"}}]`),
+			ToolChoice: json.RawMessage(`{"type":"function","name":"lookup"}`),
+		},
+	}})
+	require.Len(t, effects, 1)
+	command := effects[0].VoiceCommand
+	require.NotNil(t, command)
+	require.Len(t, command.Session.Tools, 4)
+	assert.Equal(t, "lookup", command.Session.Tools[0].Name)
+	assert.Equal(t, []string{
+		handoff.ToolStartBackgroundTask,
+		handoff.ToolSteerBackgroundTask,
+		handoff.ToolCancelBackgroundTask,
+	}, []string{command.Session.Tools[1].Name, command.Session.Tools[2].Name, command.Session.Tools[3].Name})
+	assert.JSONEq(t, `{"type":"function","name":"lookup"}`, string(command.Session.ToolChoice))
+}
+
+func TestSessionUpdateDoesNotInjectReservedToolsWhenHandoffCapabilityIsDisabled(t *testing.T) {
+	freeze := NewEpochFence(5)
+	reactor := newReactorWithHandoffTools(testIDs(), freeze, false)
+	effects := applyOK(t, reactor, ClientInput{Event: protocol.SessionUpdateEvent{
+		Type: "session.update",
+		Session: protocol.SessionUpdate{
+			Type:       "realtime",
+			Tools:      json.RawMessage(`[{"type":"function","name":"lookup","parameters":{"type":"object"}}]`),
+			ToolChoice: json.RawMessage(`{"type":"function","name":"lookup"}`),
+		},
+	}})
+	require.Len(t, effects, 1)
+	command := effects[0].VoiceCommand
+	require.NotNil(t, command)
+	require.Len(t, command.Session.Tools, 1)
+	assert.Equal(t, "lookup", command.Session.Tools[0].Name)
+}
+
+func TestDisabledHandoffCapabilityStillRejectsClientReservedToolCollision(t *testing.T) {
+	reactor := newReactorWithHandoffTools(testIDs(), NewEpochFence(5), false)
+	effects, err := reactor.Apply(ClientInput{Event: protocol.SessionUpdateEvent{
+		Type: "session.update",
+		Session: protocol.SessionUpdate{
+			Type:  "realtime",
+			Tools: json.RawMessage(`[{"type":"function","name":"start_background_task","parameters":{}}]`),
+		},
+	}})
+	require.ErrorIs(t, err, ErrInvalidSessionTool)
+	assert.Empty(t, effects)
+}
+
+func TestReservedProviderCallRemainsOrdinaryWhenHandoffCapabilityIsDisabled(t *testing.T) {
+	reactor := newReactorWithHandoffTools(testIDs(), NewEpochFence(1), false)
+	epoch := startStreaming(t, reactor, "response-disabled-handoff")
+	effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventFunctionCallDone, Epoch: epoch, ResponseID: "response-disabled-handoff",
+		ItemID: "tool-disabled-handoff", CallID: "call-disabled-handoff", Name: StartBackgroundTaskTool,
+		Arguments: json.RawMessage(`{"objective":"ordinary provider-owned function"}`),
+	}))
+	require.Len(t, effects, 1)
+	assert.IsType(t, protocol.ResponseFunctionCallArgumentsDoneEvent{}, effects[0].ClientEvent)
+	assert.Nil(t, effects[0].Handoff)
+	assert.Nil(t, effects[0].Async)
+	assert.Equal(t, ResponseStreaming, reactor.Snapshot().Response)
+}
+
+func TestClientCannotShadowOrForceReservedTools(t *testing.T) {
+	tests := []protocol.SessionUpdate{
+		{Type: "realtime", Tools: json.RawMessage(`[{"type":"function","name":"start_background_task","parameters":{}}]`)},
+		{Type: "realtime", Tools: json.RawMessage(`[{"type":"function","name":"steer_background_task","parameters":{}}]`)},
+		{Type: "realtime", Tools: json.RawMessage(`[{"type":"function","name":"cancel_background_task","parameters":{}}]`)},
+		{Type: "realtime", ToolChoice: json.RawMessage(`{"type":"function","name":"start_background_task"}`)},
+		{Type: "realtime", ToolChoice: json.RawMessage(`{"type":"function","function":{"name":"cancel_background_task"}}`)},
+	}
+	for _, update := range tests {
+		reactor, _ := testReactor(5)
+		before := mutationView(reactor)
+		effects, err := reactor.Apply(ClientInput{Event: protocol.SessionUpdateEvent{Type: "session.update", Session: update}})
+		require.Error(t, err)
+		assert.Empty(t, effects)
+		assert.Equal(t, before, mutationView(reactor))
+	}
+
+	reactor, _ := testReactor(5)
+	before := mutationView(reactor)
+	effects, err := reactor.Apply(ClientInput{Event: protocol.ResponseCreateEvent{Type: "response.create", Response: &protocol.ResponseConfig{
+		ToolChoice: json.RawMessage(`{"type":"function","name":"steer_background_task"}`),
+	}}})
+	require.Error(t, err)
+	assert.Empty(t, effects)
+	assert.Equal(t, before, mutationView(reactor))
 }
 
 func TestPendingSessionUpdateCountLimitPrecedesNormalizationAndRecovers(t *testing.T) {

@@ -554,7 +554,7 @@ func exactStringMap(got map[string]any, want map[string]string) bool {
 
 func validateEnvironment(workload string, container map[string]any, overlay string) error {
 	expectedSecrets := map[string][]string{
-		"live-gateway": {"DATABASE_URL", "S2S_API_KEY", "DEEPSEEK_API_KEY", "LIVE_ADMIN_BEARER_TOKEN", "LIVE_PRIVACY_HMAC_KEY", "LIVE_RETENTION_HMAC_KEY", "LIVE_TOOL_ENCRYPTION_KEY"},
+		"live-gateway": {"DATABASE_URL", "S2S_API_KEY", "DEEPSEEK_API_KEY", "LIVE_ADMIN_BEARER_TOKEN", "LIVE_PRIVACY_HMAC_KEY", "LIVE_RETENTION_HMAC_KEY", "LIVE_RECONNECT_HMAC_KEY", "LIVE_TOOL_ENCRYPTION_KEY"},
 		"live-worker":  {"DATABASE_URL", "DEEPSEEK_API_KEY", "LIVE_ADMIN_BEARER_TOKEN", "LIVE_PRIVACY_HMAC_KEY", "LIVE_RETENTION_HMAC_KEY", "LIVE_TOOL_ENCRYPTION_KEY"},
 		"live-migrate": {"DATABASE_URL"},
 	}
@@ -1419,6 +1419,7 @@ func validateProduction(docs []document, metadata map[string]any, images map[str
 
 func validateIngressGraph(ingress document, host, tlsSecret string) error {
 	wantAnnotations := map[string]string{
+		"nginx.ingress.kubernetes.io/enable-access-log":     "false",
 		"nginx.ingress.kubernetes.io/proxy-read-timeout":    "3600",
 		"nginx.ingress.kubernetes.io/proxy-send-timeout":    "3600",
 		"nginx.ingress.kubernetes.io/proxy-connect-timeout": "10",

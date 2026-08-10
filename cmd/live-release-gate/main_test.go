@@ -96,7 +96,7 @@ func TestTwoPhaseBundleBindsExactReviewedInputs(t *testing.T) {
 		gatesByID[gateID] = gate
 		gateArgs = append(gateArgs, "--gate-evidence", gatePath)
 	}
-	artifactNames := []string{"canary_snapshot", "dashboard_snapshot", "gateway_provenance", "gateway_sbom", "migrate_provenance", "migrate_sbom", "migration_rollback", "production_manifest", "vulnerability_report", "worker_provenance", "worker_sbom"}
+	artifactNames := []string{"candidate_canary_receipt", "dashboard_snapshot", "gateway_provenance", "gateway_sbom", "migrate_provenance", "migrate_sbom", "migration_rollback", "production_manifest", "vulnerability_report", "worker_provenance", "worker_sbom"}
 	artifactNames = append(artifactNames, releasegate.RequiredFormalArtifactNames...)
 	sort.Strings(artifactNames)
 	if err := os.Mkdir(filepath.Join(root, "artifacts"), 0o700); err != nil {
@@ -346,6 +346,9 @@ var cliFormalContracts = map[string]cliFormalContract{
 
 func validCLIArtifact(t *testing.T, name string, context cliArtifactContext) []byte {
 	t.Helper()
+	if name == "candidate_canary_receipt" {
+		return validCLICandidateCanaryReceipt(t, context.CanaryObservedAt)
+	}
 	digest := strings.Repeat("a", 64)
 	base := map[string]any{"schema_version": "release-artifact-v2", "artifact_type": name, "status": "passed"}
 	switch name {
@@ -435,6 +438,8 @@ func validCLIArtifact(t *testing.T, name string, context cliArtifactContext) []b
 
 func cliReleaseInputArgs() []string {
 	values := []string{
+		"candidate_canary_halt_policy_sha256=" + strings.Repeat("8", 64),
+		"candidate_canary_public_key_sha256=" + cliCandidateCanaryPublicKeySHA256(),
 		"candidate_gateway_image=" + cliGatewayRef,
 		"candidate_migrate_image=" + cliMigrateRef,
 		"candidate_worker_image=" + cliWorkerRef,
@@ -454,6 +459,52 @@ func cliReleaseInputArgs() []string {
 		arguments = append(arguments, "--release-input", value)
 	}
 	return arguments
+}
+
+func validCLICandidateCanaryReceipt(t *testing.T, cleanupAt time.Time) []byte {
+	t.Helper()
+	privateKey := cliCandidateCanaryPrivateKey()
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+	expected := releasegate.CandidateCanaryExpected{
+		Commit: strings.Repeat("a", 40), ConfigHash: "v1:" + strings.Repeat("a", 64),
+		ManifestSHA256: strings.Repeat("b", 64), HaltPolicySHA256: strings.Repeat("8", 64),
+		PublicKeySHA256: cliCandidateCanaryPublicKeySHA256(), Region: "us-east-1",
+		GatewayImage: cliGatewayRef, WorkerImage: cliWorkerRef, MigrateImage: cliMigrateRef,
+	}
+	receipt := releasegate.CandidateCanaryReceipt{
+		SchemaVersion: releasegate.CandidateCanaryReceiptSchemaVersion, Authority: releasegate.CandidateCanaryAuthority,
+		Status: "passed", CleanupStatus: "rolled_back", DeploymentID: "canary-run-123",
+		Commit: expected.Commit, ConfigHash: expected.ConfigHash, ManifestSHA256: expected.ManifestSHA256,
+		HaltPolicySHA256: expected.HaltPolicySHA256, Region: expected.Region,
+		GatewayImage: expected.GatewayImage, WorkerImage: expected.WorkerImage, MigrateImage: expected.MigrateImage,
+		ObservationStartedAt: cleanupAt.Add(-31 * time.Minute), ObservationFinishedAt: cleanupAt.Add(-time.Minute),
+		CleanupCompletedAt: cleanupAt, ObservationSeconds: 1800, ProbesTotal: 30,
+	}
+	receiptDocument, err := releasegate.CanonicalJSON(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := releasegate.VerifyCandidateCanaryReceipt(receiptDocument,
+		[]byte(base64.StdEncoding.EncodeToString(ed25519.Sign(privateKey, receiptDocument))),
+		[]byte(base64.StdEncoding.EncodeToString(publicKey)), expected, cleanupAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, err := releasegate.CanonicalJSON(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return document
+}
+
+func cliCandidateCanaryPrivateKey() ed25519.PrivateKey {
+	seed := sha256.Sum256([]byte("gpt-live-candidate-canary-test-only-ed25519-seed"))
+	return ed25519.NewKeyFromSeed(seed[:])
+}
+
+func cliCandidateCanaryPublicKeySHA256() string {
+	digest := sha256.Sum256(cliCandidateCanaryPrivateKey().Public().(ed25519.PublicKey))
+	return hex.EncodeToString(digest[:])
 }
 
 func TestStatementHashRejectsIncompleteBundle(t *testing.T) {

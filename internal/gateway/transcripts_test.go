@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -59,41 +58,81 @@ func (s *blockingSubmitter) Submit(ctx context.Context, _ identity.SessionID, _ 
 }
 
 type coordinatorJournalFake struct {
-	mu              sync.Mutex
-	records         map[string]postgres.CoordinatorJournalRecord
-	delivered       map[string]bool
-	claimOwner      map[string]string
-	claimUntil      map[string]time.Time
-	claimGeneration map[string]uint64
-	nextStorage     uint64
-	ackErr          error
-	renewCount      int
-	renewErr        error
-	affinityErr     error
-	affinityLock    io.Closer
-	affinityNil     bool
-	claimErr        error
-	claimCalls      int
+	mu                 sync.Mutex
+	records            map[string]postgres.CoordinatorJournalRecord
+	delivered          map[string]bool
+	claimOwner         map[string]string
+	claimUntil         map[string]time.Time
+	claimGeneration    map[string]uint64
+	nextStorage        uint64
+	ackErr             error
+	renewCount         int
+	renewErr           error
+	affinityErr        error
+	affinityRenewErr   error
+	affinityOwner      map[string]string
+	affinityGeneration map[string]uint64
+	affinityRenewCount int
+	affinityRenewStart chan struct{}
+	affinityRenewBlock <-chan struct{}
+	claimErr           error
+	claimCalls         int
 }
 
 func newCoordinatorJournalFake() *coordinatorJournalFake {
 	return &coordinatorJournalFake{
 		records: make(map[string]postgres.CoordinatorJournalRecord), delivered: make(map[string]bool),
 		claimOwner: make(map[string]string), claimUntil: make(map[string]time.Time), claimGeneration: make(map[string]uint64),
+		affinityOwner: make(map[string]string), affinityGeneration: make(map[string]uint64),
 	}
 }
 
-func (f *coordinatorJournalFake) AcquireCoordinatorAffinity(context.Context, string) (io.Closer, error) {
+func (f *coordinatorJournalFake) AcquireCoordinatorAffinity(_ context.Context, affinity, owner string, _ time.Duration) (uint64, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.affinityErr != nil {
-		return nil, f.affinityErr
+		return 0, false, f.affinityErr
 	}
-	if f.affinityNil {
-		return nil, nil
+	if current := f.affinityOwner[affinity]; current != "" && current != owner {
+		return 0, false, nil
 	}
-	if f.affinityLock != nil {
-		return f.affinityLock, nil
+	if f.affinityGeneration[affinity] == 0 {
+		f.affinityGeneration[affinity] = 1
 	}
-	return io.NopCloser(strings.NewReader("")), nil
+	f.affinityOwner[affinity] = owner
+	return f.affinityGeneration[affinity], true, nil
+}
+
+func (f *coordinatorJournalFake) RenewCoordinatorAffinity(_ context.Context, affinity, owner string, generation uint64, _ time.Duration) error {
+	f.mu.Lock()
+	f.affinityRenewCount++
+	if f.affinityRenewErr != nil {
+		err := f.affinityRenewErr
+		f.mu.Unlock()
+		return err
+	}
+	if f.affinityOwner[affinity] != owner || f.affinityGeneration[affinity] != generation {
+		f.mu.Unlock()
+		return handoff.ErrNotFound
+	}
+	started, blocked := f.affinityRenewStart, f.affinityRenewBlock
+	f.mu.Unlock()
+	if started != nil {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+	}
+	if blocked != nil {
+		<-blocked
+	}
+	return nil
+}
+
+func (f *coordinatorJournalFake) affinityRenewals() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.affinityRenewCount
 }
 
 func (f *coordinatorJournalFake) AdmitCoordinatorWork(_ context.Context, record postgres.CoordinatorJournalRecord) (postgres.CoordinatorJournalRecord, error) {
@@ -191,6 +230,54 @@ func (f *coordinatorJournalFake) isDelivered(key string) bool {
 }
 
 func repositoryTestTime() time.Time { return time.Date(2026, 8, 7, 1, 0, 0, 0, time.UTC) }
+
+func TestCoordinatorAffinityAuthorityRenewsWithoutJournalWork(t *testing.T) {
+	journal := newCoordinatorJournalFake()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- runCoordinatorAffinityAuthority(ctx, journal, "stable-shard", "pod-a", 30*time.Millisecond)
+	}()
+	require.Eventually(t, func() bool { return journal.affinityRenewals() >= 2 }, time.Second, time.Millisecond)
+	cancel()
+	require.NoError(t, <-done)
+}
+
+func TestCoordinatorAffinityAuthorityCancelsAtConfirmedLeaseWhenRenewBlocks(t *testing.T) {
+	journal := newCoordinatorJournalFake()
+	renewStarted := make(chan struct{}, 1)
+	renewRelease := make(chan struct{})
+	journal.affinityRenewStart = renewStarted
+	journal.affinityRenewBlock = renewRelease
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	const lease = 30 * time.Millisecond
+	go func() {
+		done <- runCoordinatorAffinityAuthority(ctx, journal, "stable-shard", "pod-a", lease)
+	}()
+
+	select {
+	case <-renewStarted:
+	case <-time.After(time.Second):
+		cancel()
+		close(renewRelease)
+		<-done
+		t.Fatal("coordinator-affinity renewal did not start")
+	}
+	select {
+	case err := <-done:
+		close(renewRelease)
+		cancel()
+		require.ErrorIs(t, err, ErrCoordinatorAffinityLost)
+		assert.Equal(t, 1, journal.affinityRenewals(), "one guard must have at most one abandoned authority operation")
+	case <-time.After(3 * lease):
+		cancel()
+		close(renewRelease)
+		<-done
+		t.Fatal("blocked renewal outlived the last confirmed coordinator-affinity lease")
+	}
+}
 
 func (f *submitterFake) Submit(_ context.Context, _ identity.SessionID, _ identity.Incarnation, input session.Input) error {
 	if f.err != nil {

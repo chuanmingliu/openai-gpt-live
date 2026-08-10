@@ -177,7 +177,7 @@ done
   exit 1
 }
 [ ! -e "$formal_identity/gateway-inspect.json" ] && [ ! -e "$formal_identity/worker-inspect.json" ]
-jq -e --arg runtime "$formal_runtime_hash" --arg document ab81f6df2b04c372879fd691658388faf11ee24891afd2cd9a6a5cf227d48a0d \
+jq -e --arg runtime "$formal_runtime_hash" --arg document 8bf602e10803869ccd1d85f52be0de81eb052c99b946f5485577450967d99326 \
   --arg source "$root/deploy/config/chaos.yaml" \
   '.runtime_config_hash == $runtime and .formal_config_sha256 == $document and .gateway == {container_id:"3333333333333333333333333333333333333333333333333333333333333333",runtime_config_hash:$runtime,formal_config_source:$source,formal_config_read_only:true} and .worker == {container_id:"4444444444444444444444444444444444444444444444444444444444444444",runtime_config_hash:$runtime,formal_config_source:$source,formal_config_read_only:true}' \
   "$formal_identity/topology-identity.json" >/dev/null
@@ -290,11 +290,13 @@ abort "release cleanup must follow the required unsigned archive upload" unless 
 step = steps.fetch(cleanup)
 abort "release cleanup must run unconditionally" unless step["if"] == "always()"
 run = step.fetch("run")
-%w[artifacts/task24-formal release-canary.oidc unsigned-release-evidence.tar canary-snapshot.json live-synthetic-canary].each do |material|
+%w[artifacts/task24-formal candidate-canary-ed25519.pub.base64 unsigned-release-evidence.tar].each do |material|
   abort "release cleanup omits #{material}" unless run.include?(material)
 end
 RUBY
-rg -F 'LIVE_EXPECTED_GATEWAY_IMAGE: ${{ needs.candidate-manifest.outputs.gateway_image }}' "$workflow" >/dev/null
+rg -F 'environment: release-candidate-canary' "$workflow" >/dev/null
+rg -F 'run-candidate-canary-edge.sh' "$workflow" >/dev/null
+rg -F 'candidate-canary-receipt-${{ github.sha }}' "$workflow" >/dev/null
 rg -F 'snapshot-unsigned' "$wrapper" >/dev/null
 rg -F 'finalize-archive' "$workflow" >/dev/null
 [ "$(rg -c 'verify-archive' "$workflow")" -ge 2 ]

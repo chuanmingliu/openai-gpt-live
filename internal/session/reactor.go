@@ -118,11 +118,12 @@ type finalizedTranscript struct {
 }
 
 type Reactor struct {
-	ids     IDs
-	state   State
-	fence   *EpochFence
-	nextSeq uint64
-	initErr error
+	ids                 IDs
+	state               State
+	fence               *EpochFence
+	nextSeq             uint64
+	initErr             error
+	handoffToolsEnabled bool
 
 	activeResponseID          string
 	activeResponseEpoch       identity.ResponseEpoch
@@ -158,10 +159,18 @@ type Reactor struct {
 }
 
 func NewReactor(ids IDs, fence *EpochFence) *Reactor {
-	return NewReactorWithPresentation(ids, fence, presentation.NewPolicy(presentation.Config{}), safety.DenyAll{})
+	return newReactorWithHandoffTools(ids, fence, true)
 }
 
 func NewReactorWithPresentation(ids IDs, fence *EpochFence, policy presentation.Policy, safetyPolicy safety.Policy) *Reactor {
+	return newReactorWithPresentationAndHandoffTools(ids, fence, policy, safetyPolicy, true)
+}
+
+func newReactorWithHandoffTools(ids IDs, fence *EpochFence, enabled bool) *Reactor {
+	return newReactorWithPresentationAndHandoffTools(ids, fence, presentation.NewPolicy(presentation.Config{}), safety.DenyAll{}, enabled)
+}
+
+func newReactorWithPresentationAndHandoffTools(ids IDs, fence *EpochFence, policy presentation.Policy, safetyPolicy safety.Policy, enabled bool) *Reactor {
 	if fence == nil {
 		fence = NewEpochFence(0)
 	}
@@ -177,6 +186,7 @@ func NewReactorWithPresentation(ids IDs, fence *EpochFence, policy presentation.
 		resolvedHandoffs:        make(map[handoffToken]struct{}),
 		presentationPolicy:      policy,
 		safetyPolicy:            safetyPolicy,
+		handoffToolsEnabled:     enabled,
 	}
 	reactor.initErr = validateSessionIDs(ids)
 	return reactor
@@ -1184,9 +1194,10 @@ func (r *Reactor) applyConnected(input ConnectedInput) ([]Effect, error) {
 	}
 
 	created := protocol.SessionCreatedEvent{
-		Type:    "session.created",
-		EventID: r.providerOrSynthEventID(""),
-		Session: cloneRaw(providerSession),
+		Type:      "session.created",
+		EventID:   r.providerOrSynthEventID(""),
+		Session:   cloneRaw(providerSession),
+		Reconnect: cloneReconnectMetadata(input.Reconnect),
 	}
 	effects = append(effects, Effect{ClientEvent: created})
 	if terminalizedPending {
@@ -1199,11 +1210,19 @@ func (r *Reactor) applyConnected(input ConnectedInput) ([]Effect, error) {
 	return effects, nil
 }
 
+func cloneReconnectMetadata(value *protocol.ReconnectMetadata) *protocol.ReconnectMetadata {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
 func (r *Reactor) applySessionUpdate(event protocol.SessionUpdateEvent) ([]Effect, error) {
 	if len(r.pendingSessionUpdates) >= PendingSessionUpdateLimit {
 		return nil, ErrPendingSessionUpdateLimit
 	}
-	commandSession, err := normalizeSessionUpdate(event.Session)
+	commandSession, err := normalizeSessionUpdate(event.Session, r.handoffToolsEnabled)
 	if err != nil {
 		return nil, err
 	}
@@ -1670,7 +1689,7 @@ func (r *Reactor) applyFunctionCallDone(event realtime.Event) ([]Effect, error) 
 	if event.CallID == "" || event.Name == "" || len(event.Arguments) == 0 || !json.Valid(event.Arguments) {
 		return nil, errors.New("function call requires call ID, name, and valid arguments")
 	}
-	isReserved := isReservedHandoffTool(event.Name)
+	isReserved := r.handoffToolsEnabled && isReservedHandoffTool(event.Name)
 	if isReserved {
 		for name, value := range map[string]string{
 			"response ID":  event.ResponseID,
@@ -2149,7 +2168,7 @@ func normalizeResponseConfig(config *protocol.ResponseConfig) (realtime.Response
 	if len(config.Tools) > 0 {
 		return realtime.ResponseConfig{}, fmt.Errorf("%w: response tools", ErrUnsupportedField)
 	}
-	if err := validateOptionalJSON(config.ToolChoice, "response tool choice"); err != nil {
+	if err := validateClientToolChoice(config.ToolChoice, "response tool choice"); err != nil {
 		return realtime.ResponseConfig{}, err
 	}
 	if err := validateOptionalJSON(config.Input, "response input"); err != nil {
@@ -2200,7 +2219,7 @@ type sessionToolDTO struct {
 	Parameters  json.RawMessage `json:"parameters,omitempty"`
 }
 
-func normalizeSessionUpdate(update protocol.SessionUpdate) (realtime.SessionConfig, error) {
+func normalizeSessionUpdate(update protocol.SessionUpdate, handoffToolsEnabled bool) (realtime.SessionConfig, error) {
 	if update.Type != "realtime" {
 		return realtime.SessionConfig{}, fmt.Errorf("session type must be realtime, got %q", update.Type)
 	}
@@ -2226,7 +2245,7 @@ func normalizeSessionUpdate(update protocol.SessionUpdate) (realtime.SessionConf
 			return realtime.SessionConfig{}, fmt.Errorf("%w: output speed", ErrUnsupportedField)
 		}
 	}
-	if err := validateOptionalJSON(update.ToolChoice, "session tool choice"); err != nil {
+	if err := validateClientToolChoice(update.ToolChoice, "session tool choice"); err != nil {
 		return realtime.SessionConfig{}, err
 	}
 
@@ -2245,6 +2264,7 @@ func normalizeSessionUpdate(update protocol.SessionUpdate) (realtime.SessionConf
 			return realtime.SessionConfig{}, errors.New("session tools must be an array")
 		}
 		tools = make([]realtime.Tool, len(decoded))
+		seenNames := make(map[string]struct{}, len(decoded))
 		for index, tool := range decoded {
 			if tool.Type != "function" {
 				return realtime.SessionConfig{}, fmt.Errorf("%w: session tool %d type must be function", ErrInvalidSessionTool, index)
@@ -2252,6 +2272,13 @@ func normalizeSessionUpdate(update protocol.SessionUpdate) (realtime.SessionConf
 			if strings.TrimSpace(tool.Name) == "" {
 				return realtime.SessionConfig{}, fmt.Errorf("%w: session tool %d name is required", ErrInvalidSessionTool, index)
 			}
+			if isReservedToolName(tool.Name) {
+				return realtime.SessionConfig{}, fmt.Errorf("%w: session tool %d collides with a reserved server tool", ErrInvalidSessionTool, index)
+			}
+			if _, duplicate := seenNames[tool.Name]; duplicate {
+				return realtime.SessionConfig{}, fmt.Errorf("%w: session tool %d duplicates a function name", ErrInvalidSessionTool, index)
+			}
+			seenNames[tool.Name] = struct{}{}
 			trimmedParameters := bytes.TrimSpace(tool.Parameters)
 			if len(trimmedParameters) == 0 || trimmedParameters[0] != '{' || !json.Valid(trimmedParameters) {
 				return realtime.SessionConfig{}, fmt.Errorf("%w: session tool %d parameters must be a JSON object", ErrInvalidSessionTool, index)
@@ -2265,9 +2292,13 @@ func normalizeSessionUpdate(update protocol.SessionUpdate) (realtime.SessionConf
 		}
 	}
 
+	configTools := tools
+	if handoffToolsEnabled {
+		configTools = appendReservedHandoffTools(tools)
+	}
 	config := realtime.SessionConfig{
 		Instructions: update.Instructions,
-		Tools:        tools,
+		Tools:        configTools,
 		ToolChoice:   cloneRaw(update.ToolChoice),
 	}
 	if update.Audio != nil {

@@ -24,6 +24,45 @@ func TestToolEncryptionKeyRequiresImmutableConfiguredID(t *testing.T) {
 	assert.ErrorContains(t, err, "tool_encryption_key_id")
 }
 
+func TestProductionReconnectAuthorityIsExplicitAndSecretIsBounded(t *testing.T) {
+	const production = `
+mode: production
+gateway:
+  behind_ingress: true
+  trusted_proxies: [127.0.0.1/32]
+  voice: {url: wss://voice.example/v1/realtime}
+store:
+  url: postgres://db.example/live?sslmode=require
+  retention: {hmac_key_env: RETENTION_KEY, hmac_key_id: retention-v1}
+auth:
+  oidc_issuer: https://issuer.example
+  oidc_audience: live
+  oidc_required_scopes: [realtime]
+  allowed_origins: [https://app.example]
+admission: {instance_id: gateway-a}
+`
+	key := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	lookup := func(name string) (string, bool) { return key, name == "RETENTION_KEY" || name == "RECONNECT_KEY" }
+
+	_, err := loadFixture(t, production, lookup)
+	assert.ErrorContains(t, err, "reconnect HMAC")
+
+	withReconnect := strings.Replace(production, "  voice:", "  reconnect: {hmac_key_env: RECONNECT_KEY, hmac_key_id: reconnect-v1, credential_ttl: 5m}\n  voice:", 1)
+	cfg, err := loadFixture(t, withReconnect, lookup)
+	require.NoError(t, err)
+	assert.Equal(t, "reconnect-v1", cfg.Gateway.Reconnect.HMACKeyID)
+	assert.Equal(t, 5*time.Minute, cfg.Gateway.Reconnect.CredentialTTL)
+
+	short := base64.StdEncoding.EncodeToString(make([]byte, 31))
+	_, err = loadFixture(t, withReconnect, func(name string) (string, bool) {
+		if name == "RECONNECT_KEY" {
+			return short, true
+		}
+		return key, name == "RETENTION_KEY"
+	})
+	assert.ErrorContains(t, err, "RECONNECT_KEY")
+}
+
 func TestShutdownDrainTimeoutDefaultsAndIsBounded(t *testing.T) {
 	cfg, err := loadFixture(t, "mode: local\n", nil)
 	require.NoError(t, err)
@@ -60,6 +99,31 @@ func TestRejectsNonWebSocketVoiceURL(t *testing.T) {
 	_, err := loadFixture(t, "gateway:\n  voice:\n    url: https://voice.example/v1/realtime\n", nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "gateway.voice.url")
+}
+
+// TestRejectsNonCanonicalProviderEndpoints catches a trust-boundary regression
+// that lets credentials or un-hashed endpoint semantics hide in URL fields.
+func TestRejectsNonCanonicalProviderEndpoints(t *testing.T) {
+	tests := []struct {
+		name string
+		yaml string
+	}{
+		{"voice userinfo", "gateway:\n  voice:\n    url: ws://user@voice.example/v1/realtime\n"},
+		{"voice query", "gateway:\n  voice:\n    url: ws://voice.example/v1/realtime?tenant=other\n"},
+		{"voice fragment", "gateway:\n  voice:\n    url: ws://voice.example/v1/realtime#hidden\n"},
+		{"voice opaque", "gateway:\n  voice:\n    url: ws:provider-opaque\n"},
+		{"reasoner userinfo", "worker:\n  reasoner:\n    base_url: https://user@reasoner.example\n"},
+		{"reasoner query", "worker:\n  reasoner:\n    base_url: https://reasoner.example?region=other\n"},
+		{"reasoner fragment", "worker:\n  reasoner:\n    base_url: https://reasoner.example#hidden\n"},
+		{"oidc query", "auth:\n  oidc_issuer: https://issuer.example?tenant=other\n"},
+		{"otlp fragment", "telemetry:\n  otlp_endpoint: https://otlp.example#hidden\n"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := loadFixture(t, test.yaml, nil)
+			require.Error(t, err)
+		})
+	}
 }
 
 // TestRejectsNonFrameAlignedAudioLimits catches a validator regression that allows

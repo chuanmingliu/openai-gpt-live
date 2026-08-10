@@ -32,6 +32,7 @@ var clientEventTypes = [...]string{
 
 var serverEventTypes = [...]string{
 	"session.created",
+	"session.reconnect.updated",
 	"session.updated",
 	"error",
 	"input_audio_buffer.speech_started",
@@ -47,25 +48,41 @@ var serverEventTypes = [...]string{
 	"response.done",
 }
 
-var extensionEventTypes = [...]string{
+var handoffExtensionEventTypes = [...]string{
 	"live.handoff.created",
 	"live.handoff.progress",
 	"live.handoff.needs_input",
 	"live.handoff.completed",
 	"live.handoff.failed",
 	"live.handoff.cancelled",
+}
+
+var extensionEventTypes = [...]string{
 	"live.session.degraded",
 	"live.session.resumed",
 	"live.tool.approval.required",
 }
 
+type CapabilityFeatures struct {
+	Handoffs bool
+}
+
 func Capabilities(limits Limits) CapabilityDocument {
+	return CapabilitiesForFeatures(limits, CapabilityFeatures{Handoffs: true})
+}
+
+func CapabilitiesForFeatures(limits Limits, features CapabilityFeatures) CapabilityDocument {
+	extensions := make([]string, 0, len(handoffExtensionEventTypes)+len(extensionEventTypes))
+	if features.Handoffs {
+		extensions = append(extensions, handoffExtensionEventTypes[:]...)
+	}
+	extensions = append(extensions, extensionEventTypes[:]...)
 	return CapabilityDocument{
 		Protocol:     "openai-realtime-subset",
 		Version:      "1.0.0",
 		ClientEvents: append([]string(nil), clientEventTypes[:]...),
 		ServerEvents: append([]string(nil), serverEventTypes[:]...),
-		Extensions:   append([]string(nil), extensionEventTypes[:]...),
+		Extensions:   extensions,
 		Audio: PCMContract{
 			Encoding:        "pcm_s16le",
 			Transport:       "base64",

@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   protocol-chaos-load-soak:
-    runs-on: [self-hosted, linux, x64, gpt-live-load-profile-v1]
+    runs-on: [self-hosted, macOS, ARM64, gpt-live-apple-m3-max]
     timeout-minutes: 120
     env:
       GOTOOLCHAIN: local
@@ -42,6 +42,7 @@ jobs:
       LIVE_ADMIN_BEARER_TOKEN: unused-chaos-oidc
       LIVE_PRIVACY_HMAC_KEY: bmlnaHRseS1wcml2YWN5LWtleS0zMi1ieXRlcy0wMDA=
       LIVE_RETENTION_HMAC_KEY: bmlnaHRseS1yZXRlbnRpb24ta2V5LTMyLWJ5dGUtMDA=
+      LIVE_RECONNECT_HMAC_KEY: cmVjb25uZWN0LWtleS0zMi1ieXRlLTAwMDAwMDAwMDA=
       LIVE_TOOL_ENCRYPTION_KEY: bmlnaHRseS10b29sLWtleS0zMi1ieXRlcy0wMDAwMDA=
       S2S_API_KEY: nightly-synthetic-s2s-key
       FORMAL_DEEPSEEK_API_KEY: nightly-synthetic-deepseek-key
@@ -54,8 +55,11 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32
         with:
-          go-version: 1.26.0
+          go-version: 1.26.2
           cache: true
+      - name: Verify exact content-safe pinned runner
+        run: |
+          go run ./cmd/live-runner-preflight -profile test/load/pinned-profile.json
       - name: Protocol fuzzing
         run: go test -fuzz=Fuzz -fuzztime=10m ./internal/protocol
       - name: Bind exact formal config hash

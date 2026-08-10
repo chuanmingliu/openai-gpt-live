@@ -146,26 +146,26 @@ func (r *Repository) LoadRecovery(ctx context.Context, scope handoff.Scope, item
 		items[len(newest)-1-index] = newest[index]
 	}
 
-	handoffRows, err := tx.Query(ctx, `SELECT id,tenant_id,conversation_id,user_id,state,objective,objective_revision,
-		attempt,retry_count,presentation_hint,created_at,updated_at FROM handoffs
-		WHERE tenant_id=$1 AND conversation_id=$2 AND user_id=$3
-		  AND state IN ('pending','leased','running','needs_input')
-		ORDER BY created_at,id LIMIT $4`, scope.TenantID, scope.ConversationID, scope.UserID, maximumRecoveryHandoffs+1)
+	handoffRows, err := tx.Query(ctx, `SELECT h.id,h.tenant_id,h.conversation_id,h.user_id,h.state,h.objective,h.objective_revision,
+		h.attempt,h.retry_count,h.presentation_hint,h.created_at,h.updated_at FROM handoffs h
+		WHERE h.tenant_id=$1 AND h.conversation_id=$2 AND h.user_id=$3
+		  AND h.state IN ('pending','leased','running','needs_input')
+		ORDER BY h.created_at,h.id LIMIT $4`, scope.TenantID, scope.ConversationID, scope.UserID, maximumRecoveryHandoffs+1)
 	if err != nil {
 		return session.RecoverySnapshot{}, err
 	}
-	active := make([]handoff.Snapshot, 0)
+	active := make([]session.RecoveryActiveHandoff, 0)
 	for handoffRows.Next() {
 		if len(active) == maximumRecoveryHandoffs {
 			handoffRows.Close()
 			return session.RecoverySnapshot{}, session.ErrRecoveryExhausted
 		}
-		snapshot, err := loadRecoveryHandoffRow(handoffRows)
+		recovery, err := loadRecoveryHandoffRow(handoffRows)
 		if err != nil {
 			handoffRows.Close()
 			return session.RecoverySnapshot{}, err
 		}
-		active = append(active, snapshot)
+		active = append(active, recovery)
 	}
 	if err := handoffRows.Err(); err != nil {
 		handoffRows.Close()
@@ -225,28 +225,34 @@ func (r *Repository) LoadRecovery(ctx context.Context, scope handoff.Scope, item
 	}, nil
 }
 
-func loadRecoveryHandoffRow(row pgx.Row) (handoff.Snapshot, error) {
-	var snapshot handoff.Snapshot
+func loadRecoveryHandoffRow(row pgx.Row) (session.RecoveryActiveHandoff, error) {
+	var recovery session.RecoveryActiveHandoff
+	snapshot := &recovery.Snapshot
 	var tenant, conversation, user, state string
 	var objectiveRevision, attempt, retryCount int64
 	if err := row.Scan(&snapshot.ID, &tenant, &conversation, &user, &state, &snapshot.Request.Objective,
 		&objectiveRevision, &attempt, &retryCount, &snapshot.Request.PresentationHint,
 		&snapshot.CreatedAt, &snapshot.UpdatedAt); err != nil {
-		return handoff.Snapshot{}, err
+		return session.RecoveryActiveHandoff{}, err
 	}
 	for _, value := range []int64{objectiveRevision, attempt, retryCount} {
 		if value < 0 || value > math.MaxUint32 {
-			return handoff.Snapshot{}, session.ErrRecoveryUnavailable
+			return session.RecoveryActiveHandoff{}, session.ErrRecoveryUnavailable
 		}
 	}
 	snapshot.Request.Scope = handoff.Scope{
 		TenantID: tenant, UserID: user, ConversationID: identity.ConversationID(conversation),
 	}
 	snapshot.State = handoff.State(state)
+	eventID, err := session.RecoveryEventIDForActiveHandoff(snapshot.Request.Scope, snapshot.ID, snapshot.State)
+	if err != nil {
+		return session.RecoveryActiveHandoff{}, err
+	}
+	recovery.EventID = eventID
 	snapshot.ObjectiveRevision = uint32(objectiveRevision)
 	snapshot.Attempt, snapshot.RetryCount = uint32(attempt), uint32(retryCount)
 	snapshot.CreatedAt, snapshot.UpdatedAt = snapshot.CreatedAt.UTC(), snapshot.UpdatedAt.UTC()
-	return snapshot, nil
+	return recovery, nil
 }
 
 var _ session.RecoveryStore = (*Repository)(nil)
