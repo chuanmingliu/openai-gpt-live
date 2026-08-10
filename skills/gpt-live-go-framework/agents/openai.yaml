@@ -1,0 +1,4 @@
+interface:
+  display_name: "GPT Live Go Framework"
+  short_description: "Configure and operate GPT Live Go safely"
+  default_prompt: "Use $gpt-live-go-framework to configure speech-to-speech and asynchronous reasoning services for this repository."
