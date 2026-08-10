@@ -69,6 +69,10 @@ func (handler *demoHandler) ServeHTTP(writer http.ResponseWriter, request *http.
 		handler.serveAsset(writer, "web/styles.css", "text/css; charset=utf-8")
 	case "/audio-core.mjs":
 		handler.serveAsset(writer, "web/audio-core.mjs", "text/javascript; charset=utf-8")
+	case "/protocol-state.mjs":
+		handler.serveAsset(writer, "web/protocol-state.mjs", "text/javascript; charset=utf-8")
+	case "/app.js":
+		handler.serveAsset(writer, "web/app.js", "text/javascript; charset=utf-8")
 	case "/capture-worklet.js":
 		handler.serveAsset(writer, "web/capture-worklet.js", "text/javascript; charset=utf-8")
 	case "/playback-worklet.js":
@@ -120,7 +124,7 @@ func (handler *demoHandler) serveWebSocket(writer http.ResponseWriter, request *
 
 func setBrowserHeaders(header http.Header, websocketOrigin string) {
 	header.Set("Cache-Control", "no-store")
-	header.Set("Content-Security-Policy", "default-src 'self'; connect-src 'self' "+websocketOrigin+"; media-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
+	header.Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; worker-src 'self'; connect-src 'self' "+websocketOrigin+"; media-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'")
 	header.Set("Cross-Origin-Opener-Policy", "same-origin")
 	header.Set("Permissions-Policy", "microphone=(self)")
 	header.Set("Referrer-Policy", "no-referrer")

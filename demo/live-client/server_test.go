@@ -33,7 +33,7 @@ func TestStaticAssetsCarryStrictHeadersWithoutBearer(t *testing.T) {
 
 func TestAudioModulesAreServedAsNoStoreJavaScript(t *testing.T) {
 	handler := mustTestHandler(t, nil, []byte("sentinel"))
-	for _, path := range []string{"/audio-core.mjs", "/capture-worklet.js", "/playback-worklet.js"} {
+	for _, path := range []string{"/audio-core.mjs", "/protocol-state.mjs", "/app.js", "/capture-worklet.js", "/playback-worklet.js"} {
 		path := path
 		t.Run(path, func(t *testing.T) {
 			response := httptest.NewRecorder()
