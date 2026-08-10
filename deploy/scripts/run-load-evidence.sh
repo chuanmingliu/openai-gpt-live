@@ -1,6 +1,7 @@
 #!/bin/sh
 set -eu
 
+root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 mode=${1:-}
 case "$mode" in
   formal|smoke) ;;
@@ -33,57 +34,83 @@ fi
 
 mkdir -p "$LIVE_EVIDENCE_DIR"
 bundle=$(mktemp -d "$LIVE_EVIDENCE_DIR/task24-$mode.XXXXXXXX")
-manifest="$bundle/manifest.jsonl"
-printf '{"schema_version":"task24-evidence-v1","evidence_class":"%s","status":"running"}\n' "$mode" >"$manifest"
+reports=$bundle/.reports.jsonl
+: >"$reports"
+
+write_manifest() {
+  result=$1
+  jq -s --arg status "$result" \
+    '{schema_version:"formal-source-manifest-v1",status:$status,reports:.}' \
+    "$reports" >"$bundle/.manifest.json"
+  mv "$bundle/.manifest.json" "$bundle/manifest.json"
+}
 status=failed
 finish_manifest() {
-  printf '{"status":"%s"}\n' "$status" >>"$manifest"
+  write_manifest "$status" || true
+  rm -f "$reports"
 }
 trap finish_manifest EXIT HUP INT TERM
-
-digest_file() {
-  if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$1" | awk '{print $1}'
-  else
-    sha256sum "$1" | awk '{print $1}'
-  fi
-}
 
 record() {
   artifact=$1
   selector=$2
-  shift 2
+  duration_seconds=$3
+  sample_count=$4
+  chaos_case=$5
+  shift 5
+  started_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
   "$@" >"$bundle/$artifact" 2>&1
-  digest=$(digest_file "$bundle/$artifact")
-  printf '{"artifact":"%s","selector":"%s","sha256":"%s"}\n' "$artifact" "$selector" "$digest" >>"$manifest"
+  finished_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  metadata=$("$root/deploy/scripts/inspect-formal-artifact.sh" "$bundle/$artifact")
+  source_name=${metadata%% *}
+  source_sha256=${metadata#* }
+  [ "$source_name" = "$artifact" ]
+  jq -cn \
+    --arg name "$artifact" --arg selector "$selector" \
+    --arg started_at "$started_at" --arg finished_at "$finished_at" \
+    --arg source_sha256 "$source_sha256" --arg chaos_case "$chaos_case" \
+    --argjson duration_seconds "$duration_seconds" --argjson sample_count "$sample_count" \
+    '{name:$name,selector:$selector,started_at:$started_at,finished_at:$finished_at,source_sha256:$source_sha256,duration_seconds:$duration_seconds,sample_count:$sample_count,chaos_case:$chaos_case}' \
+    >>"$reports"
 }
 
-record unit-race.jsonl 'go test -race ./cmd/live-load ./internal/loadgen' \
+record unit-race.json 'go test -json -race -count=1 ./cmd/live-load ./internal/loadgen' 0 0 '' \
   go test -json -race -count=1 ./cmd/live-load ./internal/loadgen
 
 if [ "$mode" = formal ]; then
-  record capacity-profile-slo.jsonl '^TestGateway250Sessions$; capacity_10m; checked-in exact profile; SLO enforced' \
+  record capacity-profile-slo-10m.json 'go test -json -count=1 -tags=load -run ^TestGateway250Sessions$ -timeout=20m ./test/load/...' 600 0 '' \
     env LIVE_CAPACITY_DURATION=10m LIVE_ENFORCE_PINNED_SLO=1 \
     go test -json -count=1 -tags=load -run '^TestGateway250Sessions$' -timeout=20m ./test/load/...
-  record barge-in.jsonl '^TestBargeInAcknowledgedFenceSuppressesEveryStaleFrame$; 20 samples' \
+  record barge-in-20.json 'go test -json -count=1 -tags=load -run ^TestBargeInAcknowledgedFenceSuppressesEveryStaleFrame$ -timeout=2m ./test/load/...' 0 20 '' \
     go test -json -count=1 -tags=load -run '^TestBargeInAcknowledgedFenceSuppressesEveryStaleFrame$' -timeout=2m ./test/load/...
-  record chaos.jsonl 'six named application-path chaos scenarios' \
-    go test -json -count=1 -tags=chaos -run '^(TestPostgreSQLDisconnect|TestDeepSeek429HonorsBoundedRetryAfter|TestSlowClientBackpressure|TestStalledVoiceProvider|TestKilledWorkerLeaseRecovery|TestLostNotificationPollRepair)$' -timeout=30m ./test/chaos/...
-  record soak-2h.jsonl '^TestGatewaySoak$; soak_2h' \
+  record chaos-postgresql-disconnect.json 'go test -json -count=1 -tags=chaos -run ^TestPostgreSQLDisconnect$ -timeout=30m ./test/chaos/...' 0 0 postgresql_disconnect \
+    go test -json -count=1 -tags=chaos -run '^TestPostgreSQLDisconnect$' -timeout=30m ./test/chaos/...
+  record chaos-deepseek-429.json 'go test -json -count=1 -tags=chaos -run ^TestDeepSeek429HonorsBoundedRetryAfter$ -timeout=30m ./test/chaos/...' 0 0 deepseek_429 \
+    go test -json -count=1 -tags=chaos -run '^TestDeepSeek429HonorsBoundedRetryAfter$' -timeout=30m ./test/chaos/...
+  record chaos-slow-client-backpressure.json 'go test -json -count=1 -tags=chaos -run ^TestSlowClientBackpressure$ -timeout=30m ./test/chaos/...' 0 0 slow_client_backpressure \
+    go test -json -count=1 -tags=chaos -run '^TestSlowClientBackpressure$' -timeout=30m ./test/chaos/...
+  record chaos-stalled-voice-provider.json 'go test -json -count=1 -tags=chaos -run ^TestStalledVoiceProvider$ -timeout=30m ./test/chaos/...' 0 0 stalled_voice_provider \
+    go test -json -count=1 -tags=chaos -run '^TestStalledVoiceProvider$' -timeout=30m ./test/chaos/...
+  record chaos-killed-worker-lease-recovery.json 'go test -json -count=1 -tags=chaos -run ^TestKilledWorkerLeaseRecovery$ -timeout=30m ./test/chaos/...' 0 0 killed_worker_lease_recovery \
+    go test -json -count=1 -tags=chaos -run '^TestKilledWorkerLeaseRecovery$' -timeout=30m ./test/chaos/...
+  record chaos-lost-notification-poll-repair.json 'go test -json -count=1 -tags=chaos -run ^TestLostNotificationPollRepair$ -timeout=30m ./test/chaos/...' 0 0 lost_notification_poll_repair \
+    go test -json -count=1 -tags=chaos -run '^TestLostNotificationPollRepair$' -timeout=30m ./test/chaos/...
+  record soak-2h.json 'go test -json -count=1 -tags=soak -run ^TestGatewaySoak$ -timeout=150m ./test/load/...' 7200 0 '' \
     env LIVE_SOAK_DURATION=2h \
     go test -json -count=1 -tags=soak -run '^TestGatewaySoak$' -timeout=150m ./test/load/...
 else
-  record capacity-smoke.jsonl '^TestGateway250Sessions$; smoke only' \
+  record capacity-smoke.json 'smoke-only TestGateway250Sessions' 0 0 '' \
     env LIVE_CAPACITY_DURATION="${LIVE_SMOKE_CAPACITY_DURATION:-2s}" LIVE_ENFORCE_PINNED_SLO= \
     go test -json -count=1 -tags=load -run '^TestGateway250Sessions$' -timeout=2m ./test/load/...
-  record barge-in-smoke.jsonl '^TestBargeInAcknowledgedFenceSuppressesEveryStaleFrame$; 20 samples' \
+  record barge-in-smoke.json 'smoke-only TestBargeInAcknowledgedFenceSuppressesEveryStaleFrame' 0 20 '' \
     go test -json -count=1 -tags=load -run '^TestBargeInAcknowledgedFenceSuppressesEveryStaleFrame$' -timeout=2m ./test/load/...
-  record soak-smoke.jsonl '^TestGatewaySoak$; smoke only' \
+  record soak-smoke.json 'smoke-only TestGatewaySoak' 0 0 '' \
     env LIVE_SOAK_DURATION="${LIVE_SMOKE_SOAK_DURATION:-10s}" \
     go test -json -count=1 -tags=soak -run '^TestGatewaySoak$' -timeout=2m ./test/load/...
 fi
 
 status=passed
+write_manifest "$status"
+rm -f "$reports"
 trap - EXIT HUP INT TERM
-finish_manifest
 printf '%s\n' "$bundle"

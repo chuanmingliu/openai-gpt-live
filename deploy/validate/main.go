@@ -27,6 +27,7 @@ var (
 	digestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 	hostPattern   = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
 	namePattern   = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$`)
+	regionPattern = regexp.MustCompile(`^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$`)
 )
 
 type document = map[string]any
@@ -277,6 +278,12 @@ func validate(docs []document, overlay, readiness string) error {
 	if stringAt(data, "config-hash") != sharedHash {
 		return errors.New("metadata config hash differs from workload hash")
 	}
+	if err := validateSyntheticCanary(docs, overlay, sharedHash, images["live-gateway"]); err != nil {
+		return err
+	}
+	if err := validateRuntimeMonitoring(docs); err != nil {
+		return err
+	}
 	if err := validateSupportingResources(docs, overlay); err != nil {
 		return err
 	}
@@ -333,7 +340,11 @@ func validateObjectSet(docs []document, overlay string) error {
 		"v1|ConfigMap|gpt-live|live-config",
 		"v1|ConfigMap|gpt-live|live-deploy-metadata",
 		"v1|Service|gpt-live|live-gateway",
+		"v1|Service|gpt-live|live-synthetic-canary",
 		"apps/v1|Deployment|gpt-live|live-gateway",
+		"apps/v1|Deployment|gpt-live|live-synthetic-canary",
+		"monitoring.coreos.com/v1|ServiceMonitor|gpt-live|live-synthetic-canary",
+		"monitoring.coreos.com/v1|PodMonitor|gpt-live|live-runtime",
 		"apps/v1|Deployment|gpt-live|live-worker",
 		"policy/v1|PodDisruptionBudget|gpt-live|live-gateway",
 		"policy/v1|PodDisruptionBudget|gpt-live|live-worker",
@@ -344,6 +355,8 @@ func validateObjectSet(docs []document, overlay string) error {
 		"networking.k8s.io/v1|NetworkPolicy|gpt-live|default-deny",
 		"networking.k8s.io/v1|NetworkPolicy|gpt-live|gateway-ingress",
 		"networking.k8s.io/v1|NetworkPolicy|gpt-live|migrate-egress",
+		"networking.k8s.io/v1|NetworkPolicy|gpt-live|synthetic-canary",
+		"networking.k8s.io/v1|NetworkPolicy|gpt-live|runtime-metrics-ingress",
 	}
 	if overlay == "production" {
 		want = append(want, "networking.k8s.io/v1|Ingress|gpt-live|live-gateway")
@@ -367,9 +380,77 @@ func validateObjectSet(docs []document, overlay string) error {
 	return nil
 }
 
+func validateRuntimeMonitoring(docs []document) error {
+	monitor := find(docs, "PodMonitor", "live-runtime")
+	policy := find(docs, "NetworkPolicy", "runtime-metrics-ingress")
+	if monitor == nil || policy == nil {
+		return errors.New("runtime PodMonitor and metrics NetworkPolicy are required")
+	}
+	monitorSpec := mapAt(monitor, "spec")
+	if !exactKeys(monitorSpec, "selector", "podMetricsEndpoints") || !exactRuntimeSelector(mapAt(monitorSpec, "selector")) {
+		return errors.New("runtime PodMonitor selector is invalid")
+	}
+	endpoints := sliceAt(monitorSpec, "podMetricsEndpoints")
+	if len(endpoints) != 1 {
+		return errors.New("runtime PodMonitor endpoint is invalid")
+	}
+	endpoint, ok := endpoints[0].(map[string]any)
+	if !ok || !exactKeys(endpoint, "port", "path", "interval", "honorLabels") || stringAt(endpoint, "port") != "metrics" || stringAt(endpoint, "path") != "/metrics" || stringAt(endpoint, "interval") != "30s" || !boolAt(endpoint, "honorLabels", false) {
+		return errors.New("runtime PodMonitor endpoint is invalid")
+	}
+	policySpec := mapAt(policy, "spec")
+	if !exactKeys(policySpec, "podSelector", "policyTypes", "ingress") || !exactRuntimeSelector(mapAt(policySpec, "podSelector")) || !sameStrings(stringSlice(policySpec, "policyTypes"), []string{"Ingress"}) || len(sliceAt(policySpec, "egress")) != 0 {
+		return errors.New("runtime metrics ingress selector or policyTypes is invalid")
+	}
+	ingress := sliceAt(policySpec, "ingress")
+	if len(ingress) != 1 {
+		return errors.New("runtime metrics ingress must have exactly one source rule")
+	}
+	rule, ok := ingress[0].(map[string]any)
+	if !ok || !exactKeys(rule, "from", "ports") || portSet(rule) != "TCP/9091" {
+		return errors.New("runtime metrics ingress must allow only TCP/9091")
+	}
+	peers := sliceAt(rule, "from")
+	if len(peers) != 1 {
+		return errors.New("runtime metrics ingress must have exactly one source")
+	}
+	peer, ok := peers[0].(map[string]any)
+	if !ok || !exactLabels(mapAt(peer, "namespaceSelector"), "kubernetes.io/metadata.name", "observability") || !exactKeys(peer, "namespaceSelector") {
+		return errors.New("runtime metrics ingress source must be the observability namespace")
+	}
+	for _, workload := range []string{"live-gateway", "live-worker"} {
+		container := firstContainer(find(docs, "Deployment", workload))
+		found := false
+		for _, raw := range sliceAt(container, "ports") {
+			port := raw.(map[string]any)
+			if stringAt(port, "name") == "metrics" && intAt(port, "containerPort") == 9091 {
+				found = true
+			}
+		}
+		if !found {
+			return fmt.Errorf("%s does not expose the monitored metrics port", workload)
+		}
+	}
+	return nil
+}
+
+func exactRuntimeSelector(selector map[string]any) bool {
+	expressions := sliceAt(selector, "matchExpressions")
+	return exactKeys(selector, "matchLabels", "matchExpressions") &&
+		exactKeys(mapAt(selector, "matchLabels"), "app.kubernetes.io/part-of") &&
+		stringAt(mapAt(selector, "matchLabels"), "app.kubernetes.io/part-of") == "gpt-live" &&
+		len(expressions) == 1 && exactExpression(expressions[0], "app.kubernetes.io/component", "In", []string{"gateway", "worker"})
+}
+
 func validateWorkloadLabels(workload string, podMeta map[string]any) error {
 	labels := mapAt(podMeta, "labels")
 	want := map[string]string{"app.kubernetes.io/name": workload, "app.kubernetes.io/part-of": "gpt-live"}
+	if workload == "live-gateway" || workload == "live-worker" {
+		want["topology.kubernetes.io/region"] = stringAt(labels, "topology.kubernetes.io/region")
+		if want["topology.kubernetes.io/region"] == "" {
+			return errors.New("deployment region pod label is required")
+		}
+	}
 	if workload == "live-gateway" {
 		want["app.kubernetes.io/component"] = "gateway"
 	}
@@ -396,6 +477,9 @@ func validateWorkloadGraph(doc document, workload string, pod, podMeta map[strin
 		component = "worker"
 	}
 	wantLabels := map[string]string{"app.kubernetes.io/name": workload, "app.kubernetes.io/part-of": "gpt-live"}
+	if workload == "live-gateway" || workload == "live-worker" {
+		wantLabels["topology.kubernetes.io/region"] = stringAt(mapAt(podMeta, "labels"), "topology.kubernetes.io/region")
+	}
 	if component != "" {
 		wantLabels["app.kubernetes.io/component"] = component
 	}
@@ -441,15 +525,17 @@ func validateWorkloadGraph(doc document, workload string, pod, podMeta map[strin
 	}
 	ports := sliceAt(container, "ports")
 	if workload == "live-gateway" {
-		if len(ports) != 1 {
-			return errors.New("gateway must expose exactly one container port")
+		if len(ports) != 2 {
+			return errors.New("gateway must expose realtime and monitored metrics ports")
 		}
-		port := ports[0].(map[string]any)
-		if !exactKeys(port, "name", "protocol", "containerPort") || stringAt(port, "name") != "realtime" || stringAt(port, "protocol") != "TCP" || intAt(port, "containerPort") != 8080 {
+		realtime, metrics := ports[0].(map[string]any), ports[1].(map[string]any)
+		if !exactKeys(realtime, "name", "protocol", "containerPort") || stringAt(realtime, "name") != "realtime" || stringAt(realtime, "protocol") != "TCP" || intAt(realtime, "containerPort") != 8080 || !exactKeys(metrics, "name", "protocol", "containerPort") || stringAt(metrics, "name") != "metrics" || stringAt(metrics, "protocol") != "TCP" || intAt(metrics, "containerPort") != 9091 {
 			return errors.New("gateway realtime container port is invalid")
 		}
-	} else if len(ports) != 0 {
-		return errors.New("worker must not expose a service port")
+	} else if len(ports) != 1 {
+		return errors.New("worker must expose only the monitored metrics port")
+	} else if metrics, ok := ports[0].(map[string]any); !ok || !exactKeys(metrics, "name", "protocol", "containerPort") || stringAt(metrics, "name") != "metrics" || stringAt(metrics, "protocol") != "TCP" || intAt(metrics, "containerPort") != 9091 {
+		return errors.New("worker must expose only the monitored metrics port")
 	}
 	return nil
 }
@@ -475,7 +561,10 @@ func validateEnvironment(workload string, container map[string]any, overlay stri
 	secrets := expectedSecrets[workload]
 	literals := []string{}
 	if workload != "live-migrate" {
-		literals = append(literals, "LIVE_EXPECTED_CONFIG_HASH")
+		literals = append(literals, "LIVE_ALLOWED_REGIONS", "LIVE_EXPECTED_CONFIG_HASH")
+		if workload == "live-gateway" {
+			literals = append(literals, "LIVE_GATEWAY_IMAGE")
+		}
 		if overlay == "local" {
 			secrets = append(secrets, "LIVE_STATIC_BEARER_TOKEN")
 		} else {
@@ -484,6 +573,13 @@ func validateEnvironment(workload string, container map[string]any, overlay stri
 	}
 	wantSecret := make(map[string]bool, len(secrets))
 	wantLiteral := make(map[string]bool, len(literals))
+	wantField := map[string]string{}
+	if workload != "live-migrate" {
+		wantField["LIVE_DEPLOYMENT_REGION"] = "metadata.labels['topology.kubernetes.io/region']"
+	}
+	if workload == "live-gateway" {
+		wantField["LIVE_METRIC_INSTANCE"] = "metadata.name"
+	}
 	for _, name := range secrets {
 		wantSecret[name] = true
 	}
@@ -510,6 +606,11 @@ func validateEnvironment(workload string, container map[string]any, overlay stri
 			if len(env) != 2 || stringAt(env, "value") == "" {
 				return fmt.Errorf("%s literal env %s is malformed", workload, name)
 			}
+		} else if fieldPath, ok := wantField[name]; ok {
+			fieldRef := mapAt(mapAt(env, "valueFrom"), "fieldRef")
+			if len(env) != 2 || !exactKeys(mapAt(env, "valueFrom"), "fieldRef") || !exactKeys(fieldRef, "fieldPath") || stringAt(fieldRef, "fieldPath") != fieldPath {
+				return fmt.Errorf("%s env %s must use the exact downward API field", workload, name)
+			}
 		} else {
 			return fmt.Errorf("%s exposes unexpected env %s", workload, name)
 		}
@@ -518,6 +619,14 @@ func validateEnvironment(workload string, container map[string]any, overlay stri
 		if !seen[name] {
 			return fmt.Errorf("%s is missing required env %s", workload, name)
 		}
+	}
+	for name := range wantField {
+		if !seen[name] {
+			return fmt.Errorf("%s is missing required downward API env %s", workload, name)
+		}
+	}
+	if workload == "live-gateway" && envValue(container, "LIVE_GATEWAY_IMAGE") != stringAt(container, "image") {
+		return errors.New("live-gateway runtime image identity must equal its exact container image")
 	}
 	return nil
 }
@@ -543,6 +652,228 @@ func validateSupportingResources(docs []document, overlay string) error {
 		if err := validateHPA(hpa, name, overlay); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func validateSyntheticCanary(docs []document, overlay, configHash, gatewayImage string) error {
+	deployment := find(docs, "Deployment", "live-synthetic-canary")
+	if deployment == nil {
+		return errors.New("synthetic canary Deployment is missing")
+	}
+	pod, podMeta := podSpec(deployment)
+	region := stringAt(mapAt(podMeta, "labels"), "topology.kubernetes.io/region")
+	wantDeploymentLabels := map[string]string{"app.kubernetes.io/name": "live-synthetic-canary", "app.kubernetes.io/component": "synthetic-canary", "app.kubernetes.io/part-of": "gpt-live"}
+	wantPodLabels := map[string]string{"app.kubernetes.io/name": "live-synthetic-canary", "app.kubernetes.io/component": "synthetic-canary", "app.kubernetes.io/part-of": "gpt-live", "topology.kubernetes.io/region": region}
+	spec := mapAt(deployment, "spec")
+	if region == "" || !exactStringMap(mapAt(mapAt(deployment, "metadata"), "labels"), wantDeploymentLabels) || !exactStringMap(mapAt(podMeta, "labels"), wantPodLabels) || !exactKeys(mapAt(podMeta, "annotations"), "live.openai.com/config-hash") || stringAt(mapAt(podMeta, "annotations"), "live.openai.com/config-hash") != configHash {
+		return errors.New("synthetic canary labels or config hash are not release-bound")
+	}
+	if !exactKeys(spec, "replicas", "selector", "template") || intAt(spec, "replicas") != 1 || !exactLabels(mapAt(spec, "selector"), "app.kubernetes.io/name", "live-synthetic-canary") || !exactKeys(mapAt(spec, "template"), "metadata", "spec") {
+		return errors.New("synthetic canary replicas, selector, or template is invalid")
+	}
+	if !exactKeys(pod, "automountServiceAccountToken", "securityContext", "containers", "volumes") || boolAt(pod, "automountServiceAccountToken", true) || len(sliceAt(pod, "initContainers")) != 0 {
+		return errors.New("synthetic canary pod permissions or container inventory is invalid")
+	}
+	podSecurity := mapAt(pod, "securityContext")
+	if !exactKeys(podSecurity, "runAsNonRoot", "runAsUser", "runAsGroup", "fsGroup", "seccompProfile") || !boolAt(podSecurity, "runAsNonRoot", false) || intAt(podSecurity, "runAsUser") != 65532 || intAt(podSecurity, "runAsGroup") != 65532 || intAt(podSecurity, "fsGroup") != 65532 || !exactKeys(mapAt(podSecurity, "seccompProfile"), "type") || stringAt(mapAt(podSecurity, "seccompProfile"), "type") != "RuntimeDefault" {
+		return errors.New("synthetic canary pod hardening is invalid")
+	}
+	containers := sliceAt(pod, "containers")
+	if len(containers) != 1 {
+		return errors.New("synthetic canary must have exactly one container")
+	}
+	container, ok := containers[0].(map[string]any)
+	if !ok || !exactKeys(container, "name", "image", "imagePullPolicy", "command", "ports", "env", "volumeMounts", "readinessProbe", "securityContext", "resources") || stringAt(container, "name") != "canary" || stringAt(container, "image") != gatewayImage || stringAt(container, "imagePullPolicy") != "IfNotPresent" {
+		return errors.New("synthetic canary container identity or image is invalid")
+	}
+	if err := validateContainer("live-synthetic-canary", container, overlay == "production"); err != nil {
+		return err
+	}
+	containerSecurity := mapAt(container, "securityContext")
+	if !exactKeys(containerSecurity, "allowPrivilegeEscalation", "readOnlyRootFilesystem", "capabilities") || !exactKeys(mapAt(containerSecurity, "capabilities"), "drop") {
+		return errors.New("synthetic canary container hardening is not closed-world")
+	}
+	if !sameStrings(orderedStringSlice(container, "command"), []string{"/usr/local/bin/live-synthetic-canary"}) {
+		return errors.New("synthetic canary command is invalid")
+	}
+	if err := validateSyntheticCanaryEnvironment(docs, container, overlay, configHash, gatewayImage); err != nil {
+		return err
+	}
+	ports := sliceAt(container, "ports")
+	if len(ports) != 1 {
+		return errors.New("synthetic canary metrics port is invalid")
+	}
+	metricsPort, ok := ports[0].(map[string]any)
+	if !ok || !exactKeys(metricsPort, "name", "containerPort", "protocol") || stringAt(metricsPort, "name") != "metrics" || intAt(metricsPort, "containerPort") != 9090 || stringAt(metricsPort, "protocol") != "TCP" {
+		return errors.New("synthetic canary metrics port is invalid")
+	}
+	probe := mapAt(container, "readinessProbe")
+	httpGet := mapAt(probe, "httpGet")
+	if !exactKeys(probe, "httpGet", "periodSeconds", "timeoutSeconds", "failureThreshold") || !exactKeys(httpGet, "path", "port") || stringAt(httpGet, "path") != "/readyz" || stringAt(httpGet, "port") != "metrics" || intAt(probe, "periodSeconds") != 10 || intAt(probe, "timeoutSeconds") != 2 || intAt(probe, "failureThreshold") != 6 {
+		return errors.New("synthetic canary readiness probe is invalid")
+	}
+	if err := validateSyntheticIdentityVolume(pod, container); err != nil {
+		return err
+	}
+	service := find(docs, "Service", "live-synthetic-canary")
+	monitor := find(docs, "ServiceMonitor", "live-synthetic-canary")
+	policy := find(docs, "NetworkPolicy", "synthetic-canary")
+	if service == nil || monitor == nil || policy == nil {
+		return errors.New("synthetic canary Service, ServiceMonitor, or NetworkPolicy is missing")
+	}
+	serviceSpec := mapAt(service, "spec")
+	servicePorts := sliceAt(serviceSpec, "ports")
+	if !exactStringMap(mapAt(mapAt(service, "metadata"), "labels"), map[string]string{"app.kubernetes.io/name": "live-synthetic-canary", "app.kubernetes.io/component": "synthetic-canary"}) || !exactKeys(serviceSpec, "type", "selector", "ports") || stringAt(serviceSpec, "type") != "ClusterIP" || !exactStringMap(mapAt(serviceSpec, "selector"), map[string]string{"app.kubernetes.io/name": "live-synthetic-canary"}) || len(servicePorts) != 1 {
+		return errors.New("synthetic canary Service graph is invalid")
+	}
+	servicePort, ok := servicePorts[0].(map[string]any)
+	if !ok || !exactKeys(servicePort, "name", "protocol", "port", "targetPort") || stringAt(servicePort, "name") != "metrics" || stringAt(servicePort, "protocol") != "TCP" || intAt(servicePort, "port") != 9090 || stringAt(servicePort, "targetPort") != "metrics" {
+		return errors.New("synthetic canary Service metrics port is invalid")
+	}
+	monitorSpec := mapAt(monitor, "spec")
+	monitorEndpoints := sliceAt(monitorSpec, "endpoints")
+	if !exactKeys(monitorSpec, "selector", "endpoints") || !exactLabels(mapAt(monitorSpec, "selector"), "app.kubernetes.io/name", "live-synthetic-canary") || len(monitorEndpoints) != 1 {
+		return errors.New("synthetic canary ServiceMonitor selector is invalid")
+	}
+	monitorEndpoint, ok := monitorEndpoints[0].(map[string]any)
+	if !ok || !exactKeys(monitorEndpoint, "port", "interval", "path", "honorLabels") || stringAt(monitorEndpoint, "port") != "metrics" || stringAt(monitorEndpoint, "interval") != "30s" || stringAt(monitorEndpoint, "path") != "/metrics" || !boolAt(monitorEndpoint, "honorLabels", false) {
+		return errors.New("synthetic canary ServiceMonitor endpoint is invalid")
+	}
+	if err := validateSyntheticCanaryNetwork(policy, overlay); err != nil {
+		return err
+	}
+	if overlay == "production" && !strings.Contains(gatewayImage, "@sha256:") {
+		return errors.New("synthetic canary must consume the evidenced gateway digest")
+	}
+	return nil
+}
+
+func validateSyntheticCanaryEnvironment(docs []document, container map[string]any, overlay, configHash, gatewayImage string) error {
+	host := stringAt(mapAt(find(docs, "ConfigMap", "live-deploy-metadata"), "data"), "production-host")
+	want := map[string]string{
+		"LIVE_CANARY_RETENTION":         "none",
+		"LIVE_EXPECTED_CONFIG_HASH":     configHash,
+		"LIVE_EXPECTED_GATEWAY_IMAGE":   gatewayImage,
+		"LIVE_CANARY_BEARER_TOKEN_FILE": "/var/run/live-canary/token",
+	}
+	if overlay == "production" {
+		want["LIVE_CANARY_GATEWAY_URL"] = "wss://" + host + "/v1/realtime"
+		want["LIVE_CANARY_ORIGIN"] = "https://" + host
+	} else {
+		want["LIVE_CANARY_GATEWAY_URL"] = "ws://live-gateway.gpt-live.svc/v1/realtime"
+		want["LIVE_CANARY_ORIGIN"] = "http://localhost:3000"
+	}
+	seen := map[string]bool{}
+	for _, raw := range sliceAt(container, "env") {
+		env, ok := raw.(map[string]any)
+		if !ok {
+			return errors.New("synthetic canary has a malformed environment entry")
+		}
+		name := stringAt(env, "name")
+		if name == "" || seen[name] {
+			return errors.New("synthetic canary has duplicate or unnamed environment entries")
+		}
+		seen[name] = true
+		if value, ok := want[name]; ok {
+			if !exactKeys(env, "name", "value") || stringAt(env, "value") != value {
+				return fmt.Errorf("synthetic canary env %s is invalid", name)
+			}
+			continue
+		}
+		if name != "LIVE_DEPLOYMENT_REGION" {
+			return fmt.Errorf("synthetic canary exposes unexpected env %s", name)
+		}
+		fieldRef := mapAt(mapAt(env, "valueFrom"), "fieldRef")
+		if !exactKeys(env, "name", "valueFrom") || !exactKeys(mapAt(env, "valueFrom"), "fieldRef") || !exactKeys(fieldRef, "fieldPath") || stringAt(fieldRef, "fieldPath") != "metadata.labels['topology.kubernetes.io/region']" {
+			return errors.New("synthetic canary deployment region must use the exact downward API field")
+		}
+	}
+	if len(seen) != len(want)+1 || !seen["LIVE_DEPLOYMENT_REGION"] {
+		return errors.New("synthetic canary environment inventory is incomplete")
+	}
+	for name := range want {
+		if !seen[name] {
+			return fmt.Errorf("synthetic canary is missing env %s", name)
+		}
+	}
+	return nil
+}
+
+func validateSyntheticIdentityVolume(pod, container map[string]any) error {
+	volumes := sliceAt(pod, "volumes")
+	mounts := sliceAt(container, "volumeMounts")
+	if len(volumes) != 1 || len(mounts) != 1 {
+		return errors.New("synthetic identity must use exactly one Secret volume and mount")
+	}
+	volume, volumeOK := volumes[0].(map[string]any)
+	mount, mountOK := mounts[0].(map[string]any)
+	if !volumeOK || !mountOK || !exactKeys(volume, "name", "secret") || stringAt(volume, "name") != "synthetic-identity" || !exactKeys(mount, "name", "mountPath", "readOnly") || stringAt(mount, "name") != "synthetic-identity" || stringAt(mount, "mountPath") != "/var/run/live-canary" || !boolAt(mount, "readOnly", false) {
+		return errors.New("synthetic identity Secret mount is invalid")
+	}
+	secret := mapAt(volume, "secret")
+	items := sliceAt(secret, "items")
+	if !exactKeys(secret, "secretName", "defaultMode", "items") || stringAt(secret, "secretName") != "live-synthetic-identity" || intAt(secret, "defaultMode") != 288 || len(items) != 1 {
+		return errors.New("synthetic identity Secret name, mode, or item inventory is invalid")
+	}
+	item, ok := items[0].(map[string]any)
+	if !ok || !exactKeys(item, "key", "path") || stringAt(item, "key") != "token" || stringAt(item, "path") != "token" {
+		return errors.New("synthetic identity Secret must project only data.token")
+	}
+	return nil
+}
+
+func validateSyntheticCanaryNetwork(policy document, overlay string) error {
+	spec := mapAt(policy, "spec")
+	if !exactKeys(spec, "podSelector", "policyTypes", "ingress", "egress") || !exactLabels(mapAt(spec, "podSelector"), "app.kubernetes.io/name", "live-synthetic-canary") || !sameStrings(stringSlice(spec, "policyTypes"), []string{"Egress", "Ingress"}) {
+		return errors.New("synthetic canary NetworkPolicy selector or policyTypes is invalid")
+	}
+	ingress := sliceAt(spec, "ingress")
+	if len(ingress) != 1 {
+		return errors.New("synthetic canary NetworkPolicy must have one metrics ingress rule")
+	}
+	ingressRule, ok := ingress[0].(map[string]any)
+	if !ok || !exactKeys(ingressRule, "from", "ports") || portSet(ingressRule) != "TCP/9090" {
+		return errors.New("synthetic canary metrics ingress port is invalid")
+	}
+	ingressPeers := sliceAt(ingressRule, "from")
+	if len(ingressPeers) != 1 {
+		return errors.New("synthetic canary metrics ingress source is invalid")
+	}
+	ingressSignature, ok := peerSignature(ingressPeers[0].(map[string]any))
+	if !ok || ingressSignature != "ns:observability" {
+		return errors.New("synthetic canary metrics ingress source is invalid")
+	}
+	egress := sliceAt(spec, "egress")
+	if len(egress) != 2 {
+		return errors.New("synthetic canary must have exactly DNS and gateway egress")
+	}
+	wantGateway := "nspod:ingress-nginx:ingress-nginx|TCP/443"
+	if overlay == "local" {
+		wantGateway = "pod:live-gateway|TCP/80"
+	}
+	want := []string{"ns:kube-system|TCP/53,UDP/53", wantGateway}
+	got := make([]string, 0, len(egress))
+	for _, raw := range egress {
+		rule, ok := raw.(map[string]any)
+		if !ok || !exactKeys(rule, "to", "ports") || len(sliceAt(rule, "to")) != 1 {
+			return errors.New("synthetic canary egress rule is malformed")
+		}
+		peer, ok := sliceAt(rule, "to")[0].(map[string]any)
+		if !ok {
+			return errors.New("synthetic canary egress destination is malformed")
+		}
+		signature, ok := peerSignature(peer)
+		ports := portSet(rule)
+		if !ok || ports == "" {
+			return errors.New("synthetic canary egress destination or ports are malformed")
+		}
+		got = append(got, signature+"|"+ports)
+	}
+	sort.Strings(got)
+	sort.Strings(want)
+	if !sameStrings(got, want) {
+		return fmt.Errorf("synthetic canary egress rules are %v, want %v", got, want)
 	}
 	return nil
 }
@@ -789,7 +1120,7 @@ func validateDefaultDeny(docs []document) error {
 }
 
 func validateNetworkPolicies(docs []document, overlay, proxyCIDR string) error {
-	wantNames := []string{"application-egress", "default-deny", "gateway-ingress", "migrate-egress"}
+	wantNames := []string{"application-egress", "default-deny", "gateway-ingress", "migrate-egress", "runtime-metrics-ingress", "synthetic-canary"}
 	var gotNames []string
 	for _, doc := range docs {
 		if stringAt(doc, "kind") == "NetworkPolicy" {
@@ -1239,12 +1570,15 @@ func validateProductionInputs(readiness string) error {
 	if readiness != "deploy" && readiness != "fixture" {
 		return errors.New("input readiness must be deploy or fixture")
 	}
-	required := []string{"LIVE_PRODUCTION_HOST", "LIVE_PRODUCTION_TLS_SECRET", "LIVE_PRODUCTION_TRUSTED_PROXY_CIDR", "LIVE_PRODUCTION_EGRESS_PROXY_CIDR", "LIVE_PRODUCTION_VOICE_URL", "LIVE_PRODUCTION_OIDC_ISSUER", "LIVE_PRODUCTION_GATEWAY_IMAGE", "LIVE_PRODUCTION_WORKER_IMAGE", "LIVE_PRODUCTION_MIGRATE_IMAGE"}
+	required := []string{"LIVE_PRODUCTION_HOST", "LIVE_PRODUCTION_TLS_SECRET", "LIVE_PRODUCTION_TRUSTED_PROXY_CIDR", "LIVE_PRODUCTION_EGRESS_PROXY_CIDR", "LIVE_PRODUCTION_VOICE_URL", "LIVE_PRODUCTION_OIDC_ISSUER", "LIVE_DEPLOYMENT_REGION", "LIVE_PRODUCTION_GATEWAY_IMAGE", "LIVE_PRODUCTION_WORKER_IMAGE", "LIVE_PRODUCTION_MIGRATE_IMAGE"}
 	for _, name := range required {
 		value := os.Getenv(name)
 		if value == "" || strings.ContainsAny(value, "\r\n&\\|") {
 			return fmt.Errorf("%s is missing or contains unsafe characters", name)
 		}
+	}
+	if !regionPattern.MatchString(os.Getenv("LIVE_DEPLOYMENT_REGION")) {
+		return errors.New("LIVE_DEPLOYMENT_REGION is invalid")
 	}
 	if err := validateHost(os.Getenv("LIVE_PRODUCTION_HOST"), readiness == "fixture"); err != nil {
 		return err
@@ -1388,6 +1722,208 @@ func mutate(docs []document, mutation string) error {
 		return errors.New("mutation must be workload:invariant")
 	}
 	name, invariant := parts[0], parts[1]
+	if name == "canary" {
+		deployment := find(docs, "Deployment", "live-synthetic-canary")
+		pod, podMeta := podSpec(deployment)
+		container := firstContainer(deployment)
+		switch invariant {
+		case "replicas":
+			mapAt(deployment, "spec")["replicas"] = 2
+		case "selector":
+			mapAt(mapAt(mapAt(deployment, "spec"), "selector"), "matchLabels")["app.kubernetes.io/name"] = "other"
+		case "pod-label":
+			mapAt(podMeta, "labels")["app.kubernetes.io/component"] = "other"
+		case "config-hash":
+			mapAt(podMeta, "annotations")["live.openai.com/config-hash"] = "v1:" + strings.Repeat("0", 64)
+		case "automount":
+			pod["automountServiceAccountToken"] = true
+		case "non-root":
+			mapAt(pod, "securityContext")["runAsNonRoot"] = false
+		case "uid":
+			mapAt(pod, "securityContext")["runAsUser"] = 0
+		case "gid":
+			mapAt(pod, "securityContext")["runAsGroup"] = 0
+		case "fs-group":
+			mapAt(pod, "securityContext")["fsGroup"] = 0
+		case "seccomp":
+			mapAt(mapAt(pod, "securityContext"), "seccompProfile")["type"] = "Unconfined"
+		case "init-container":
+			pod["initContainers"] = []any{document{"name": "unsafe", "image": stringAt(container, "image")}}
+		case "image":
+			container["image"] = "other.invalid/canary@sha256:" + strings.Repeat("1", 64)
+		case "pull-policy":
+			container["imagePullPolicy"] = "Always"
+		case "command":
+			container["command"] = []any{"/bin/true"}
+		case "url":
+			setLiteralEnv(container, "LIVE_CANARY_GATEWAY_URL", "ws://wrong.invalid/v1/realtime")
+		case "origin":
+			setLiteralEnv(container, "LIVE_CANARY_ORIGIN", "https://wrong.invalid")
+		case "retention":
+			setLiteralEnv(container, "LIVE_CANARY_RETENTION", "durable")
+		case "expected-hash":
+			setLiteralEnv(container, "LIVE_EXPECTED_CONFIG_HASH", "v1:"+strings.Repeat("1", 64))
+		case "gateway-image":
+			setLiteralEnv(container, "LIVE_EXPECTED_GATEWAY_IMAGE", "live-gateway:wrong")
+		case "region-field":
+			setFieldEnv(container, "LIVE_DEPLOYMENT_REGION", "metadata.name")
+		case "token-file":
+			setLiteralEnv(container, "LIVE_CANARY_BEARER_TOKEN_FILE", "/tmp/token")
+		case "extra-env":
+			container["env"] = append(sliceAt(container, "env"), document{"name": "EXTRA", "value": "unsafe"})
+		case "metrics-port":
+			sliceAt(container, "ports")[0].(map[string]any)["containerPort"] = 9091
+		case "readiness-path":
+			mapAt(mapAt(container, "readinessProbe"), "httpGet")["path"] = "/metrics"
+		case "readiness-port":
+			mapAt(mapAt(container, "readinessProbe"), "httpGet")["port"] = "wrong"
+		case "readiness-timing":
+			mapAt(container, "readinessProbe")["failureThreshold"] = 1
+		case "writable":
+			mapAt(container, "securityContext")["readOnlyRootFilesystem"] = false
+		case "privilege":
+			mapAt(container, "securityContext")["allowPrivilegeEscalation"] = true
+		case "capabilities":
+			mapAt(mapAt(container, "securityContext"), "capabilities")["drop"] = []any{}
+		case "resources":
+			delete(container, "resources")
+		case "mount-path":
+			sliceAt(container, "volumeMounts")[0].(map[string]any)["mountPath"] = "/tmp"
+		case "mount-readonly":
+			sliceAt(container, "volumeMounts")[0].(map[string]any)["readOnly"] = false
+		case "secret-name":
+			mapAt(sliceAt(pod, "volumes")[0].(map[string]any), "secret")["secretName"] = "other"
+		case "secret-key":
+			sliceAt(mapAt(sliceAt(pod, "volumes")[0].(map[string]any), "secret"), "items")[0].(map[string]any)["key"] = "other"
+		case "secret-mode":
+			mapAt(sliceAt(pod, "volumes")[0].(map[string]any), "secret")["defaultMode"] = 420
+		case "extra-volume":
+			pod["volumes"] = append(sliceAt(pod, "volumes"), document{"name": "unsafe", "emptyDir": document{}})
+		default:
+			return errors.New("unknown canary mutation")
+		}
+		return nil
+	}
+	if name == "canary-service" {
+		service := find(docs, "Service", "live-synthetic-canary")
+		spec := mapAt(service, "spec")
+		port := sliceAt(spec, "ports")[0].(map[string]any)
+		switch invariant {
+		case "selector":
+			mapAt(spec, "selector")["app.kubernetes.io/name"] = "other"
+		case "type":
+			spec["type"] = "NodePort"
+		case "port":
+			port["port"] = 9091
+		case "target-port":
+			port["targetPort"] = "wrong"
+		case "protocol":
+			port["protocol"] = "UDP"
+		case "extra-port":
+			spec["ports"] = append(sliceAt(spec, "ports"), port)
+		default:
+			return errors.New("unknown canary Service mutation")
+		}
+		return nil
+	}
+	if name == "canary-monitor" {
+		monitor := find(docs, "ServiceMonitor", "live-synthetic-canary")
+		spec := mapAt(monitor, "spec")
+		endpoint := sliceAt(spec, "endpoints")[0].(map[string]any)
+		switch invariant {
+		case "selector":
+			mapAt(mapAt(spec, "selector"), "matchLabels")["app.kubernetes.io/name"] = "other"
+		case "port":
+			endpoint["port"] = "wrong"
+		case "path":
+			endpoint["path"] = "/readyz"
+		case "interval":
+			endpoint["interval"] = "5m"
+		case "honor-labels":
+			endpoint["honorLabels"] = false
+		case "extra-endpoint":
+			spec["endpoints"] = append(sliceAt(spec, "endpoints"), endpoint)
+		default:
+			return errors.New("unknown canary ServiceMonitor mutation")
+		}
+		return nil
+	}
+	if name == "canary-network" {
+		policy := find(docs, "NetworkPolicy", "synthetic-canary")
+		spec := mapAt(policy, "spec")
+		ingress := sliceAt(spec, "ingress")[0].(map[string]any)
+		egress := sliceAt(spec, "egress")
+		switch invariant {
+		case "selector":
+			mapAt(mapAt(spec, "podSelector"), "matchLabels")["app.kubernetes.io/name"] = "other"
+		case "policy-types":
+			spec["policyTypes"] = []any{"Ingress"}
+		case "ingress-source":
+			mapAt(mapAt(sliceAt(ingress, "from")[0].(map[string]any), "namespaceSelector"), "matchLabels")["kubernetes.io/metadata.name"] = "default"
+		case "ingress-port":
+			sliceAt(ingress, "ports")[0].(map[string]any)["port"] = 8080
+		case "dns-source":
+			mapAt(mapAt(sliceAt(egress[0].(map[string]any), "to")[0].(map[string]any), "namespaceSelector"), "matchLabels")["kubernetes.io/metadata.name"] = "default"
+		case "dns-port":
+			sliceAt(egress[0].(map[string]any), "ports")[0].(map[string]any)["port"] = 54
+		case "gateway-source":
+			peer := sliceAt(egress[1].(map[string]any), "to")[0].(map[string]any)
+			mapAt(mapAt(peer, "podSelector"), "matchLabels")["app.kubernetes.io/name"] = "other"
+		case "gateway-port":
+			sliceAt(egress[1].(map[string]any), "ports")[0].(map[string]any)["port"] = 8443
+		case "extra":
+			spec["egress"] = append(egress, document{"to": []any{document{"ipBlock": document{"cidr": "0.0.0.0/0"}}}, "ports": []any{document{"protocol": "TCP", "port": 443}}})
+		default:
+			return errors.New("unknown canary NetworkPolicy mutation")
+		}
+		return nil
+	}
+	if name == "runtime-monitor" {
+		monitor := find(docs, "PodMonitor", "live-runtime")
+		spec := mapAt(monitor, "spec")
+		endpoint := sliceAt(spec, "podMetricsEndpoints")[0].(map[string]any)
+		switch invariant {
+		case "selector":
+			sliceAt(mapAt(spec, "selector"), "matchExpressions")[0].(map[string]any)["values"] = []any{"gateway"}
+		case "part-of":
+			mapAt(mapAt(spec, "selector"), "matchLabels")["app.kubernetes.io/part-of"] = "other"
+		case "port":
+			endpoint["port"] = "realtime"
+		case "path":
+			endpoint["path"] = "/health/live"
+		case "interval":
+			endpoint["interval"] = "5m"
+		case "honor-labels":
+			endpoint["honorLabels"] = false
+		case "extra-endpoint":
+			spec["podMetricsEndpoints"] = append(sliceAt(spec, "podMetricsEndpoints"), endpoint)
+		default:
+			return errors.New("unknown runtime PodMonitor mutation")
+		}
+		return nil
+	}
+	if name == "runtime-network" {
+		policy := find(docs, "NetworkPolicy", "runtime-metrics-ingress")
+		spec := mapAt(policy, "spec")
+		rule := sliceAt(spec, "ingress")[0].(map[string]any)
+		switch invariant {
+		case "selector":
+			sliceAt(mapAt(spec, "podSelector"), "matchExpressions")[0].(map[string]any)["values"] = []any{"gateway"}
+		case "part-of":
+			mapAt(mapAt(spec, "podSelector"), "matchLabels")["app.kubernetes.io/part-of"] = "other"
+		case "policy-types":
+			spec["policyTypes"] = []any{"Egress"}
+		case "source":
+			mapAt(mapAt(sliceAt(rule, "from")[0].(map[string]any), "namespaceSelector"), "matchLabels")["kubernetes.io/metadata.name"] = "default"
+		case "port":
+			sliceAt(rule, "ports")[0].(map[string]any)["port"] = 9090
+		case "extra":
+			spec["ingress"] = append(sliceAt(spec, "ingress"), rule)
+		default:
+			return errors.New("unknown runtime NetworkPolicy mutation")
+		}
+		return nil
+	}
 	if name == "service" {
 		service := find(docs, "Service", "live-gateway")
 		spec := mapAt(service, "spec")
@@ -1717,6 +2253,12 @@ func mutate(docs []document, mutation string) error {
 		container["image"] = " registry.acme.com/mutated@sha256:4d1b72371c42a69bd949048883897aa673059f2e7b1cc992a650584132aae8f3"
 	case "image-255":
 		container["image"] = imageWithRepositoryLength(255)
+		if name == "live-gateway" {
+			setLiteralEnv(container, "LIVE_GATEWAY_IMAGE", stringAt(container, "image"))
+			canary := firstContainer(find(docs, "Deployment", "live-synthetic-canary"))
+			canary["image"] = container["image"]
+			setLiteralEnv(canary, "LIVE_EXPECTED_GATEWAY_IMAGE", stringAt(container, "image"))
+		}
 	case "image-256":
 		container["image"] = imageWithRepositoryLength(256)
 	case "resources":
@@ -1756,6 +2298,18 @@ func mutate(docs []document, mutation string) error {
 			}
 		}
 		container["env"] = kept
+	case "metric-instance":
+		var kept []any
+		for _, raw := range sliceAt(container, "env") {
+			if stringAt(raw.(map[string]any), "name") != "LIVE_METRIC_INSTANCE" {
+				kept = append(kept, raw)
+			}
+		}
+		container["env"] = kept
+	case "metric-instance-field":
+		setFieldEnv(container, "LIVE_METRIC_INSTANCE", "metadata.namespace")
+	case "runtime-image":
+		setLiteralEnv(container, "LIVE_GATEWAY_IMAGE", "live-gateway:wrong")
 	default:
 		return errors.New("unknown mutation invariant")
 	}
@@ -1892,6 +2446,30 @@ func envValue(container map[string]any, name string) string {
 		}
 	}
 	return ""
+}
+
+// setLiteralEnv and setFieldEnv are used only by the named negative-test
+// mutations emitted by this command.
+func setLiteralEnv(container map[string]any, name, value string) {
+	for _, raw := range sliceAt(container, "env") {
+		env := raw.(map[string]any)
+		if stringAt(env, "name") == name {
+			delete(env, "valueFrom")
+			env["value"] = value
+			return
+		}
+	}
+}
+
+func setFieldEnv(container map[string]any, name, fieldPath string) {
+	for _, raw := range sliceAt(container, "env") {
+		env := raw.(map[string]any)
+		if stringAt(env, "name") == name {
+			delete(env, "value")
+			env["valueFrom"] = document{"fieldRef": document{"fieldPath": fieldPath}}
+			return
+		}
+	}
 }
 
 func secretEnv(container map[string]any, name, secret, key string) bool {

@@ -33,6 +33,9 @@ for key in $required_keys; do
   present=$(kubectl get secret live-secrets -n gpt-live -o "go-template={{if index .data \"$key\"}}present{{end}}")
   [ "$present" = present ] || { echo "preflight failed: live-secrets key $key is missing" >&2; exit 1; }
 done
+kubectl get secret live-synthetic-identity -n gpt-live >/dev/null 2>&1 || { echo "preflight failed: renewable Secret gpt-live/live-synthetic-identity is missing" >&2; exit 1; }
+synthetic_identity_present=$(kubectl get secret live-synthetic-identity -n gpt-live -o 'go-template={{if and (eq (len .data) 1) (index .data "token")}}present{{end}}')
+[ "$synthetic_identity_present" = present ] || { echo "preflight failed: live-synthetic-identity must contain exactly the nonempty data.token key" >&2; exit 1; }
 if [ "$overlay" = production ]; then
   kubectl get secret "$LIVE_PRODUCTION_TLS_SECRET" -n gpt-live >/dev/null 2>&1 || { echo "preflight failed: production TLS Secret is missing" >&2; exit 1; }
   for key in tls.crt tls.key; do
@@ -51,3 +54,4 @@ kubectl delete job live-migrate -n gpt-live --ignore-not-found --wait=true
 kubectl apply -f "$scratch/migrate.yaml"
 kubectl wait --for=condition=complete --timeout=10m job/live-migrate -n gpt-live
 kubectl apply -f "$scratch/workloads.yaml"
+kubectl rollout status deployment/live-synthetic-canary -n gpt-live --timeout=5m

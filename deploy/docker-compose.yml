@@ -1,7 +1,7 @@
 name: gpt-live
 services:
   postgres:
-    image: postgres:16-alpine
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777}
     environment:
       - POSTGRES_DB=live
       - POSTGRES_USER=live
@@ -29,7 +29,7 @@ services:
     build:
       context: ..
       target: migrate
-    image: gpt-live-migrate:local
+    image: ${MIGRATE_IMAGE:-gpt-live-migrate:local}
     environment:
       - DATABASE_URL
     command: ["-direction", "up"]
@@ -46,18 +46,22 @@ services:
     build:
       context: ..
       target: gateway
-    image: gpt-live-gateway:local
+    image: ${GATEWAY_IMAGE:-gpt-live-gateway:local}
     command: ["-config", "/etc/live/config.yaml"]
     environment:
       - DATABASE_URL
       - S2S_API_KEY
-      - DEEPSEEK_API_KEY
+      - DEEPSEEK_API_KEY=${FORMAL_DEEPSEEK_API_KEY:-}
       - LIVE_STATIC_BEARER_TOKEN
       - LIVE_ADMIN_BEARER_TOKEN
       - LIVE_PRIVACY_HMAC_KEY
       - LIVE_RETENTION_HMAC_KEY
       - LIVE_TOOL_ENCRYPTION_KEY
       - LIVE_EXPECTED_CONFIG_HASH
+      - LIVE_DEPLOYMENT_REGION
+      - LIVE_ALLOWED_REGIONS
+      - LIVE_METRIC_INSTANCE=formal-gateway
+      - LIVE_GATEWAY_IMAGE=${GATEWAY_IMAGE:-gpt-live-gateway:local}
     volumes:
       - ./config/local.yaml:/etc/live/config.yaml:ro
     depends_on:
@@ -84,17 +88,19 @@ services:
     build:
       context: ..
       target: worker
-    image: gpt-live-worker:local
+    image: ${WORKER_IMAGE:-gpt-live-worker:local}
     command: ["-config", "/etc/live/config.yaml"]
     environment:
       - DATABASE_URL
-      - DEEPSEEK_API_KEY
+      - DEEPSEEK_API_KEY=${FORMAL_DEEPSEEK_API_KEY:-}
       - LIVE_STATIC_BEARER_TOKEN
       - LIVE_ADMIN_BEARER_TOKEN
       - LIVE_PRIVACY_HMAC_KEY
       - LIVE_RETENTION_HMAC_KEY
       - LIVE_TOOL_ENCRYPTION_KEY
       - LIVE_EXPECTED_CONFIG_HASH
+      - LIVE_DEPLOYMENT_REGION
+      - LIVE_ALLOWED_REGIONS
     volumes:
       - ./config/local.yaml:/etc/live/config.yaml:ro
     depends_on:

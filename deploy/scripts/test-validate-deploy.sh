@@ -13,6 +13,21 @@ LIVE_PRODUCTION_RENDER_MODE=fixture "$root/deploy/scripts/render-kustomize.sh" p
 "$root/deploy/scripts/validate-render.sh" local local "$scratch/local.yaml"
 "$root/deploy/scripts/validate-render.sh" production fixture "$scratch/production.yaml"
 
+for tool in docker jq; do
+  command -v "$tool" >/dev/null 2>&1 || { echo "missing deployment contract prerequisite: $tool" >&2; exit 127; }
+done
+compose_gateway_image=registry.acme.com/gateway@sha256:4d1b72371c42a69bd949048883897aa673059f2e7b1cc992a650584132aae8f3
+env -i PATH="$PATH" GATEWAY_IMAGE="$compose_gateway_image" FORMAL_DEEPSEEK_API_KEY= \
+  docker compose --env-file /dev/null -f "$root/deploy/docker-compose.yml" config --format json >"$scratch/compose.json"
+if ! jq -e --arg image "$compose_gateway_image" '
+  .services.gateway.image == $image and
+  .services.gateway.environment.LIVE_METRIC_INSTANCE == "formal-gateway" and
+  .services.gateway.environment.LIVE_GATEWAY_IMAGE == $image
+' "$scratch/compose.json" >/dev/null; then
+  echo "formal Compose gateway runtime identity is not bound to its exact candidate image" >&2
+  exit 1
+fi
+
 # All public deployment entrypoints must resolve the repository independently
 # of the caller's working directory.
 (cd "$scratch" && "$root/deploy/scripts/render-kustomize.sh" local >"$scratch/from-temp-local.yaml")
@@ -54,11 +69,22 @@ for mutation in \
   ingress:backend ingress:backend-port ingress:rule-host ingress:tls-host ingress:tls-secret ingress:path ingress:class ingress:annotation ingress:extra-path \
   live-config:missing live-config:extra live-config:content deploy-metadata:trusted deploy-metadata:extra \
   live-gateway:metadata-label live-gateway:selector live-gateway:config-volume live-gateway:config-subpath live-gateway:config-mount live-gateway:config-key live-gateway:config-path live-gateway:extra-volume live-gateway:args live-gateway:container-port live-gateway:container-port-name live-gateway:container-port-protocol \
-  live-worker:metadata-label live-worker:selector live-worker:config-volume live-worker:config-subpath live-worker:config-mount live-worker:config-key live-worker:config-path live-worker:extra-volume live-worker:args live-migrate:args \
+  live-worker:metadata-label live-worker:selector live-worker:config-volume live-worker:config-subpath live-worker:config-mount live-worker:config-key live-worker:config-path live-worker:extra-volume live-worker:args live-worker:container-port live-worker:container-port-name live-worker:container-port-protocol live-migrate:args \
   namespace:name default-deny:selector \
   gateway-ingress:selector gateway-ingress:source-namespace gateway-ingress:source-pod gateway-ingress:port gateway-ingress:extra \
   migrate-egress:selector migrate-egress:source migrate-egress:widen migrate-egress:cross-namespace migrate-egress:port migrate-egress:extra \
   application-egress:selector application-egress:widen application-egress:cross-namespace application-egress:oidc-port application-egress:extra application-egress:proxy-port \
+  live-gateway:metric-instance live-gateway:metric-instance-field live-gateway:runtime-image \
+  canary:replicas canary:selector canary:pod-label canary:config-hash \
+  canary:automount canary:non-root canary:uid canary:gid canary:fs-group canary:seccomp canary:init-container \
+  canary:image canary:pull-policy canary:command canary:url canary:origin canary:retention canary:expected-hash canary:gateway-image canary:region-field canary:token-file canary:extra-env \
+  canary:metrics-port canary:readiness-path canary:readiness-port canary:readiness-timing \
+  canary:writable canary:privilege canary:capabilities canary:resources canary:mount-path canary:mount-readonly canary:secret-name canary:secret-key canary:secret-mode canary:extra-volume \
+  canary-service:selector canary-service:type canary-service:port canary-service:target-port canary-service:protocol canary-service:extra-port \
+  canary-monitor:selector canary-monitor:port canary-monitor:path canary-monitor:interval canary-monitor:honor-labels canary-monitor:extra-endpoint \
+  canary-network:selector canary-network:policy-types canary-network:ingress-source canary-network:ingress-port canary-network:dns-source canary-network:dns-port canary-network:gateway-source canary-network:gateway-port canary-network:extra \
+  runtime-monitor:selector runtime-monitor:part-of runtime-monitor:port runtime-monitor:path runtime-monitor:interval runtime-monitor:honor-labels runtime-monitor:extra-endpoint \
+  runtime-network:selector runtime-network:part-of runtime-network:policy-types runtime-network:source runtime-network:port runtime-network:extra \
   identity:duplicate-safe identity:duplicate-namespace identity:duplicate-configmap identity:duplicate-service \
   identity:duplicate-deployment identity:duplicate-job identity:duplicate-pdb identity:duplicate-hpa \
   identity:duplicate-ingress identity:duplicate-policy
@@ -78,10 +104,21 @@ for mutation in \
   hpa-worker:target hpa-worker:replicas hpa-worker:behavior hpa-worker:metric-name hpa-worker:metric-value hpa-worker:metric-type hpa-worker:extra-metric \
   live-config:missing live-config:extra live-config:content deploy-metadata:trusted deploy-metadata:extra \
   live-gateway:metadata-label live-gateway:selector live-gateway:config-volume live-gateway:config-subpath live-gateway:config-mount live-gateway:config-key live-gateway:config-path live-gateway:extra-volume live-gateway:args live-gateway:container-port live-gateway:container-port-name live-gateway:container-port-protocol \
-  live-worker:metadata-label live-worker:selector live-worker:config-volume live-worker:config-subpath live-worker:config-mount live-worker:config-key live-worker:config-path live-worker:extra-volume live-worker:args live-migrate:args \
+  live-worker:metadata-label live-worker:selector live-worker:config-volume live-worker:config-subpath live-worker:config-mount live-worker:config-key live-worker:config-path live-worker:extra-volume live-worker:args live-worker:container-port live-worker:container-port-name live-worker:container-port-protocol live-migrate:args \
   gateway-ingress:selector gateway-ingress:source-namespace gateway-ingress:source-pod gateway-ingress:port gateway-ingress:extra \
   application-egress:selector application-egress:widen application-egress:cross-namespace application-egress:oidc-port application-egress:extra \
-  migrate-egress:widen migrate-egress:cross-namespace
+  migrate-egress:widen migrate-egress:cross-namespace \
+  live-gateway:metric-instance live-gateway:metric-instance-field live-gateway:runtime-image \
+  canary:replicas canary:selector canary:pod-label canary:config-hash \
+  canary:automount canary:non-root canary:uid canary:gid canary:fs-group canary:seccomp canary:init-container \
+  canary:image canary:pull-policy canary:command canary:url canary:origin canary:retention canary:expected-hash canary:gateway-image canary:region-field canary:token-file canary:extra-env \
+  canary:metrics-port canary:readiness-path canary:readiness-port canary:readiness-timing \
+  canary:writable canary:privilege canary:capabilities canary:resources canary:mount-path canary:mount-readonly canary:secret-name canary:secret-key canary:secret-mode canary:extra-volume \
+  canary-service:selector canary-service:type canary-service:port canary-service:target-port canary-service:protocol canary-service:extra-port \
+  canary-monitor:selector canary-monitor:port canary-monitor:path canary-monitor:interval canary-monitor:honor-labels canary-monitor:extra-endpoint \
+  canary-network:selector canary-network:policy-types canary-network:ingress-source canary-network:ingress-port canary-network:dns-source canary-network:dns-port canary-network:gateway-source canary-network:gateway-port canary-network:extra \
+  runtime-monitor:selector runtime-monitor:part-of runtime-monitor:port runtime-monitor:path runtime-monitor:interval runtime-monitor:honor-labels runtime-monitor:extra-endpoint \
+  runtime-network:selector runtime-network:part-of runtime-network:policy-types runtime-network:source runtime-network:port runtime-network:extra
 do
   "$validator" --overlay local --readiness local --mutate "$mutation" "$scratch/local.yaml" >"$scratch/mutated-local.yaml"
   if "$validator" --overlay local --readiness local "$scratch/mutated-local.yaml" >/dev/null 2>&1; then
@@ -113,5 +150,50 @@ workload_job_count=$(rg -c '^kind: Job$' "$scratch/split-workloads.yaml" || true
 kubectl kustomize "$root/deploy/k8s/overlays/production" >"$scratch/unrendered.yaml"
 if "$root/deploy/scripts/validate-render.sh" production deploy "$scratch/unrendered.yaml" >/dev/null 2>&1; then
   echo "validator accepted unrendered production inputs" >&2
+  exit 1
+fi
+
+# Exercise the real apply entrypoint with cluster operations replaced below
+# kubectl's kustomize boundary. The deploy must preflight the exact renewable
+# synthetic identity projection and wait until the continuously deployed probe
+# is Ready before returning success.
+real_kubectl=$(command -v kubectl)
+fake_bin=$scratch/fake-bin
+kubectl_log=$scratch/kubectl.log
+mkdir -p "$fake_bin"
+cat >"$fake_bin/kubectl" <<'EOF'
+#!/bin/sh
+set -eu
+if [ "${1:-}" = kustomize ]; then
+  exec "$REAL_KUBECTL" "$@"
+fi
+printf '%s\n' "$*" >>"$KUBECTL_LOG"
+case " $* " in
+  *" get secret live-synthetic-identity "*" -o go-template="*)
+    [ "${SYNTHETIC_IDENTITY_PRESENT:-true}" = true ] && printf '%s' present
+    ;;
+  *" -o go-template="*) printf '%s' present ;;
+esac
+EOF
+cat >"$fake_bin/kubeconform" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod 700 "$fake_bin/kubectl" "$fake_bin/kubeconform"
+PATH="$fake_bin:$PATH" REAL_KUBECTL="$real_kubectl" KUBECTL_LOG="$kubectl_log" \
+  "$root/deploy/scripts/deploy-k8s.sh" local
+if ! rg -F 'get secret live-synthetic-identity -n gpt-live' "$kubectl_log" >/dev/null || \
+   ! rg -F 'eq (len .data) 1' "$kubectl_log" >/dev/null || \
+   ! rg -F 'index .data "token"' "$kubectl_log" >/dev/null; then
+  echo "deploy preflight did not require exactly live-synthetic-identity/data.token" >&2
+  exit 1
+fi
+if ! rg -F 'rollout status deployment/live-synthetic-canary -n gpt-live --timeout=5m' "$kubectl_log" >/dev/null; then
+  echo "deploy did not wait for synthetic canary readiness" >&2
+  exit 1
+fi
+if PATH="$fake_bin:$PATH" REAL_KUBECTL="$real_kubectl" KUBECTL_LOG="$scratch/missing-identity.log" SYNTHETIC_IDENTITY_PRESENT=false \
+  "$root/deploy/scripts/deploy-k8s.sh" local >/dev/null 2>&1; then
+  echo "deploy accepted a synthetic identity Secret without exactly data.token" >&2
   exit 1
 fi

@@ -6,6 +6,7 @@ metadata:
     app.kubernetes.io/name: live-gateway
     app.kubernetes.io/component: gateway
     app.kubernetes.io/part-of: gpt-live
+    topology.kubernetes.io/region: PRODUCTION_DEPLOYMENT_REGION
 spec:
   replicas: 2
   selector:
@@ -17,6 +18,7 @@ spec:
         app.kubernetes.io/name: live-gateway
         app.kubernetes.io/component: gateway
         app.kubernetes.io/part-of: gpt-live
+        topology.kubernetes.io/region: PRODUCTION_DEPLOYMENT_REGION
       annotations:
         live.openai.com/config-hash: CONFIG_HASH_REPLACED_BY_KUSTOMIZE
     spec:
@@ -45,7 +47,18 @@ spec:
             - name: realtime
               protocol: TCP
               containerPort: 8080
+            - {name: metrics, protocol: TCP, containerPort: 9091}
           env:
+            - name: LIVE_METRIC_INSTANCE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - {name: LIVE_GATEWAY_IMAGE, value: live-gateway:dev}
+            - name: LIVE_DEPLOYMENT_REGION
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['topology.kubernetes.io/region']
+            - {name: LIVE_ALLOWED_REGIONS, value: PRODUCTION_DEPLOYMENT_REGION}
             - name: LIVE_EXPECTED_CONFIG_HASH
               value: CONFIG_HASH_REPLACED_BY_KUSTOMIZE
             - name: DATABASE_URL

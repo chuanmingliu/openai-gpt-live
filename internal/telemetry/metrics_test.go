@@ -2,10 +2,55 @@ package telemetry
 
 import (
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
+
+func TestRegisterRuntimeCollectorsEmitsBoundedDeploymentLabels(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	labels := MetricLabels{Component: "gateway", Provider: "speech", Region: "us-east-1", Instance: "gateway-1", ConfigHash: "v1:" + strings.Repeat("a", 64)}
+	if err := RegisterRuntimeCollectors(registry, labels); err != nil {
+		t.Fatal(err)
+	}
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"go_goroutines": false, "go_memstats_heap_alloc_bytes": false, "process_cpu_seconds_total": false}
+	for _, family := range families {
+		if _, ok := want[family.GetName()]; !ok {
+			continue
+		}
+		want[family.GetName()] = true
+		for _, metric := range family.Metric {
+			seen := map[string]string{}
+			for _, label := range metric.Label {
+				seen[label.GetName()] = label.GetValue()
+			}
+			for key, value := range map[string]string{"component": labels.Component, "provider": labels.Provider, "region": labels.Region, "instance": labels.Instance, "config_hash": labels.ConfigHash} {
+				if seen[key] != value {
+					t.Fatalf("%s label %s=%q, want %q", family.GetName(), key, seen[key], value)
+				}
+			}
+		}
+	}
+	for name, found := range want {
+		if !found {
+			t.Errorf("runtime metric %s was not emitted", name)
+		}
+	}
+}
+
+func TestResolveDeploymentRegionRequiresAllowlist(t *testing.T) {
+	if got, err := ResolveDeploymentRegion("us-east-1", "us-east-1,eu-west-1"); err != nil || got != "us-east-1" {
+		t.Fatalf("ResolveDeploymentRegion() = %q, %v", got, err)
+	}
+	if _, err := ResolveDeploymentRegion("attacker-region", "us-east-1,eu-west-1"); err == nil {
+		t.Fatal("non-allowlisted region was accepted")
+	}
+}
 
 func testMetrics(t testing.TB) (*Metrics, *prometheus.Registry) {
 	t.Helper()

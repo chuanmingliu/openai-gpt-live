@@ -68,6 +68,8 @@ type Config struct {
 	IPKeyTTL          time.Duration
 	MaxIPKeys         int
 	RequiredScopes    []string
+	EphemeralTenantID string
+	EphemeralUserID   string
 	Limits            Limits
 	RequireStore      bool
 	Now               func() time.Time
@@ -116,6 +118,9 @@ func New(authn auth.Authenticator, cfg Config, stores ...LeaseStore) (*Controlle
 		return nil, ErrInvalidConfig
 	}
 	if len(origins) == 0 && !cfg.AllowEmptyOrigin {
+		return nil, ErrInvalidConfig
+	}
+	if (cfg.EphemeralTenantID == "") != (cfg.EphemeralUserID == "") || len(cfg.EphemeralTenantID) > 256 || len(cfg.EphemeralUserID) > 256 || strings.ContainsAny(cfg.EphemeralTenantID+cfg.EphemeralUserID, "\x00\r\n") {
 		return nil, ErrInvalidConfig
 	}
 	trusted := make([]*net.IPNet, 0, len(cfg.TrustedProxyCIDRs))
@@ -184,6 +189,7 @@ func (c *Controller) Admit(ctx context.Context, request *http.Request) (session.
 		}
 	}
 	subject := session.Subject{TenantID: principal.TenantID, UserID: principal.UserID, Scopes: cloneScopes(principal.Scopes), ExpiresAt: principal.ExpiresAt}
+	subject.Ephemeral = c.cfg.EphemeralTenantID != "" && principal.TenantID == c.cfg.EphemeralTenantID && principal.UserID == c.cfg.EphemeralUserID
 	if c.store == nil {
 		result = "ok"
 		return subject, func() {}, nil

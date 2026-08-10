@@ -31,6 +31,8 @@ auth:
   oidc_audience: gpt-live
   oidc_required_scopes: [realtime]
   allowed_origins: [https://LIVE_PRODUCTION_HOST]
+  synthetic_ephemeral_tenant_id: gpt-live-synthetic
+  synthetic_ephemeral_user_id: release-canary
 admission:
   max_sessions: 1000
   max_sessions_per_tenant: 100

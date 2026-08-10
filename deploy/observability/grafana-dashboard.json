@@ -1,0 +1,102 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 0},
+      "id": 1,
+      "targets": [{"expr": "sum by (instance,provider,region,config_hash) (rate(live_stale_output_rejected_total{instance=~\"$instance\",provider=~\"$provider\",region=~\"$region\",config_hash=~\"$config_hash\"}[5m]))", "legendFormat": "{{instance}} {{provider}} {{region}} {{config_hash}}", "refId": "A"}],
+      "title": "Stale output rejected / second",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 0},
+      "id": 2,
+      "targets": [{"expr": "sum by (queue,instance,provider,region,config_hash) (rate(live_queue_overflows_total{instance=~\"$instance\",provider=~\"$provider\",region=~\"$region\",config_hash=~\"$config_hash\"}[5m]))", "legendFormat": "{{queue}} {{instance}} {{provider}} {{region}}", "refId": "A"}],
+      "title": "Queue overflows / second",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 0},
+      "id": 3,
+      "targets": [{"expr": "histogram_quantile(0.99, sum by (le,instance,provider,region,config_hash) (rate(live_audio_frame_transit_seconds_bucket{instance=~\"$instance\",provider=~\"$provider\",region=~\"$region\",config_hash=~\"$config_hash\"}[5m])))", "legendFormat": "{{instance}} {{provider}} {{region}}", "refId": "A"}],
+      "title": "Audio transit p99",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 8},
+      "id": 4,
+      "targets": [{"expr": "histogram_quantile(0.99, sum by (le,queue,instance,provider,region,config_hash) (rate(live_outbox_lag_seconds_bucket{instance=~\"$instance\",provider=~\"$provider\",region=~\"$region\",config_hash=~\"$config_hash\"}[5m])))", "legendFormat": "{{queue}} {{instance}} {{region}}", "refId": "A"}],
+      "title": "Outbox lag p99",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 8},
+      "id": 5,
+      "targets": [{"expr": "sum by (queue,instance,provider,region,config_hash) (increase(live_expired_leases_total{instance=~\"$instance\",provider=~\"$provider\",region=~\"$region\",config_hash=~\"$config_hash\"}[5m]))", "legendFormat": "{{queue}} {{instance}} {{provider}} {{region}}", "refId": "A"}],
+      "title": "Expired leases (5m)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 8},
+      "id": 6,
+      "targets": [
+        {"expr": "go_goroutines{instance=~\"$instance\",provider=~\"$provider\",region=~\"$region\",config_hash=~\"$config_hash\"}", "legendFormat": "goroutines {{instance}} {{provider}} {{region}}", "refId": "A"},
+        {"expr": "go_memstats_heap_alloc_bytes{instance=~\"$instance\",provider=~\"$provider\",region=~\"$region\",config_hash=~\"$config_hash\"}", "legendFormat": "heap {{instance}} {{provider}} {{region}}", "refId": "B"}
+      ],
+      "title": "Runtime growth",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "id": 7,
+      "targets": [{"expr": "kube_pod_status_ready{namespace=\"gpt-live\",condition=\"true\",pod=~\"live-(gateway|worker)-.*\"}", "legendFormat": "{{pod}}", "refId": "A"}],
+      "title": "Readiness",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "description": "This metric is emitted only by the deployed cross-session synthetic canary. Ordinary production audio is never watermarked.",
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "id": 8,
+      "targets": [{"expr": "sum by (instance,provider,region,config_hash) (increase(live_synthetic_cross_session_leaks_total{instance=~\"$instance\",provider=~\"$provider\",region=~\"$region\",config_hash=~\"$config_hash\"}[5m]))", "legendFormat": "{{instance}} {{provider}} {{region}} {{config_hash}}", "refId": "A"}],
+      "title": "Synthetic cross-session sentinel leaks",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 40,
+  "tags": ["gpt-live", "release"],
+  "templating": {
+    "list": [
+      {"name": "datasource", "type": "datasource", "query": "prometheus", "current": {}},
+      {"name": "instance", "type": "query", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "query": "label_values(live_sessions_active, instance)", "includeAll": true, "multi": true},
+      {"name": "provider", "type": "query", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "query": "label_values(live_sessions_active, provider)", "includeAll": true, "multi": true},
+      {"name": "region", "type": "query", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "query": "label_values(live_sessions_active, region)", "includeAll": true, "multi": true},
+      {"name": "config_hash", "type": "query", "datasource": {"type": "prometheus", "uid": "${datasource}"}, "query": "label_values(live_sessions_active, config_hash)", "includeAll": true, "multi": true}
+    ]
+  },
+  "time": {"from": "now-6h", "to": "now"},
+  "timezone": "utc",
+  "title": "GPT Live release operations",
+  "uid": "gpt-live-release",
+  "version": 1
+}

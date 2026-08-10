@@ -248,6 +248,23 @@ func TestDurableDispatcherBuildsScopeOnlyFromTrustedManagerContext(t *testing.T)
 	assert.Equal(t, snapshot, queued.Snapshot)
 }
 
+func TestDurableDispatcherDropsPersistenceOnlyForEphemeralSyntheticIdentity(t *testing.T) {
+	dispatcher := &durableDispatcher{}
+	trusted := session.TrustedSessionContext{Subject: session.Subject{TenantID: "synthetic-tenant", UserID: "synthetic-canary", Ephemeral: true}}
+	if err := dispatcher.DispatchTranscript(t.Context(), trusted, session.TranscriptRequestedEffect{}); err != nil {
+		t.Fatalf("ephemeral transcript dispatch error = %v", err)
+	}
+	if err := dispatcher.DispatchHandoff(t.Context(), trusted, session.HandoffRequestedEffect{}); err != nil {
+		t.Fatalf("ephemeral handoff dispatch error = %v", err)
+	}
+	ordinary := trusted
+	ordinary.Subject.UserID = "ordinary-user"
+	ordinary.Subject.Ephemeral = false
+	if err := dispatcher.DispatchTranscript(t.Context(), ordinary, session.TranscriptRequestedEffect{}); err == nil {
+		t.Fatal("ordinary identity bypassed durable transcript coordinator")
+	}
+}
+
 func TestRunPropagatesUnexpectedCoordinatorFailure(t *testing.T) {
 	sentinel := errors.New("transcript store failed")
 	cfg := validConfig()

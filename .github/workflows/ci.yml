@@ -1,0 +1,81 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:16.10-alpine3.22@sha256:029660641a0cfc575b14f336ba448fb8a75fd595d42e1fa316b9fb4378742297
+        env:
+          POSTGRES_DB: live
+          POSTGRES_USER: live
+          POSTGRES_PASSWORD: live
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U live -d live"
+          --health-interval 2s --health-timeout 2s --health-retries 30
+    env:
+      TEST_DATABASE_URL: postgres://live:live@127.0.0.1:5432/live?sslmode=disable
+      DATABASE_URL: postgres://live:live@127.0.0.1:5432/live?sslmode=disable
+      GOTOOLCHAIN: local
+      LIVE_PRODUCTION_HOST: gpt-live.ci.openai.internal
+      LIVE_PRODUCTION_TLS_SECRET: gpt-live-ci-tls
+      LIVE_PRODUCTION_TRUSTED_PROXY_CIDR: 10.40.0.0/24
+      LIVE_PRODUCTION_EGRESS_PROXY_CIDR: 10.41.0.0/24
+      LIVE_PRODUCTION_VOICE_URL: wss://voice.ci.openai.internal/v1/realtime
+      LIVE_PRODUCTION_OIDC_ISSUER: https://oidc.ci.openai.internal
+      LIVE_DEPLOYMENT_REGION: us-east-1
+      LIVE_PRODUCTION_GATEWAY_IMAGE: ghcr.io/chuanmingliu/openai-gpt-live/gateway@sha256:4d1b72371c42a69bd949048883897aa673059f2e7b1cc992a650584132aae8f3
+      LIVE_PRODUCTION_WORKER_IMAGE: ghcr.io/chuanmingliu/openai-gpt-live/worker@sha256:49e907719fa53f1b00e43d8721620f42979c31117ed46daa3fadf320aef94b4e
+      LIVE_PRODUCTION_MIGRATE_IMAGE: ghcr.io/chuanmingliu/openai-gpt-live/migrate@sha256:1488a529509b2d9d0135713e75afdd3b3730b2884add211c6267980c87275078
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32
+        with:
+          go-version: 1.26.0
+          cache: true
+      - name: Install pinned validation tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          curl --fail --location --proto '=https' --tlsv1.2 -o /tmp/kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/download/v0.7.0/kubeconform-linux-amd64.tar.gz
+          printf '%s  %s\n' c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3 /tmp/kubeconform.tar.gz | sha256sum --check --strict
+          tar -xzf /tmp/kubeconform.tar.gz -C "$(go env GOPATH)/bin" kubeconform
+          curl --fail --location --proto '=https' --tlsv1.2 -o "$(go env GOPATH)/bin/kind" \
+            https://kind.sigs.k8s.io/dl/v0.30.0/kind-linux-amd64
+          printf '%s  %s\n' 517ab7fc89ddeed5fa65abf71530d90648d9638ef0c4cde22c2c11f8097b8889 "$(go env GOPATH)/bin/kind" | sha256sum --check --strict
+          chmod 0755 "$(go env GOPATH)/bin/kind"
+      - name: Migration up down up
+        run: |
+          go run ./cmd/live-migrate -direction up
+          go run ./cmd/live-migrate -direction down
+          go run ./cmd/live-migrate -direction up
+          go run ./cmd/live-migrate -check
+      - name: Observability and workflow syntax
+        run: |
+          ruby -rjson -e 'JSON.parse(File.read("deploy/observability/grafana-dashboard.json"))'
+          ruby -ryaml -e 'ARGV.each { |path| YAML.safe_load(File.read(path), aliases: false) }' \
+            deploy/observability/alerts.yaml .github/workflows/ci.yml \
+            .github/workflows/nightly.yml .github/workflows/release-gate.yml
+      - name: Pull-request gate
+        run: |
+          go vet ./...
+          go test ./...
+          go test -race ./...
+          go test -tags=integration ./test/integration/...
+          govulncheck ./...
+          go build ./cmd/...
+          make verify-deploy

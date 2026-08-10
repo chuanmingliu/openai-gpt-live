@@ -55,6 +55,66 @@ func TestGatewayHandoffsRequireProductionDurabilityComposition(t *testing.T) {
 	assert.NoError(t, validateComposition(config.Config{}), "non-handoff local startup stays compatible")
 }
 
+func TestGatewayMetricInstanceRequiresDedicatedProductionPodIdentity(t *testing.T) {
+	lookup := func(name string) (string, bool) {
+		assert.Equal(t, "LIVE_METRIC_INSTANCE", name)
+		return "live-gateway-7d8b9c6f5d-x2k4m", true
+	}
+	instance, err := metricInstance("production", lookup)
+	require.NoError(t, err)
+	assert.Equal(t, "live-gateway-7d8b9c6f5d-x2k4m", instance)
+
+	_, err = metricInstance("production", func(string) (string, bool) { return "", false })
+	assert.EqualError(t, err, "production requires LIVE_METRIC_INSTANCE")
+
+	instance, err = metricInstance("local", func(string) (string, bool) { return "", false })
+	require.NoError(t, err)
+	assert.Equal(t, "local", instance)
+}
+
+func TestGatewayMetricLabelsIgnoreAdmissionOwnershipIdentity(t *testing.T) {
+	cfg := config.Config{
+		Mode:      "production",
+		Gateway:   config.GatewayConfig{Voice: config.VoiceConfig{Provider: "speech_to_speech"}},
+		Admission: config.AdmissionConfig{InstanceID: "shared-admission-owner"},
+	}
+	values := map[string]string{
+		"LIVE_METRIC_INSTANCE":   "live-gateway-7d8b9c6f5d-x2k4m",
+		"LIVE_DEPLOYMENT_REGION": "us-east-1",
+		"LIVE_ALLOWED_REGIONS":   "us-east-1",
+	}
+	labels, err := gatewayMetricLabels(cfg, "v1:"+strings.Repeat("1", 64), func(name string) (string, bool) {
+		value, ok := values[name]
+		return value, ok
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "live-gateway-7d8b9c6f5d-x2k4m", labels.Instance)
+	assert.NotEqual(t, cfg.Admission.InstanceID, labels.Instance)
+}
+
+func TestCanaryRuntimeIdentityComesFromImmutableProductionRuntime(t *testing.T) {
+	configHash := "v1:" + strings.Repeat("a", 64)
+	image := "ghcr.io/chuanmingliu/openai-gpt-live/gateway@sha256:" + strings.Repeat("b", 64)
+	identity, err := canaryRuntimeIdentity("production", configHash, "us-east-1", func(name string) (string, bool) {
+		assert.Equal(t, "LIVE_GATEWAY_IMAGE", name)
+		return image, true
+	})
+	require.NoError(t, err)
+	assert.Equal(t, configHash, identity.ConfigHash)
+	assert.Equal(t, "us-east-1", identity.Region)
+	assert.Equal(t, image, identity.GatewayImage)
+
+	for name, value := range map[string]string{"missing": "", "mutable": "gateway:latest", "wrong target": "ghcr.io/chuanmingliu/openai-gpt-live/worker@sha256:" + strings.Repeat("b", 64)} {
+		t.Run(name, func(t *testing.T) {
+			_, err := canaryRuntimeIdentity("production", configHash, "us-east-1", func(string) (string, bool) { return value, value != "" })
+			require.Error(t, err)
+		})
+	}
+	identity, err = canaryRuntimeIdentity("local", configHash, "local", func(string) (string, bool) { return "", false })
+	require.NoError(t, err)
+	assert.Empty(t, identity)
+}
+
 func TestRunRejectsHandoffsBeforeEverySecretLookup(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gateway.yaml")
 	require.NoError(t, os.WriteFile(path, []byte(`

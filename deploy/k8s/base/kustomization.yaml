@@ -14,6 +14,8 @@ resources:
   - default-deny.yaml
   - network-policy.yaml
   - migrate-network-policy.yaml
+  - synthetic-canary.yaml
+  - runtime-monitoring.yaml
 configMapGenerator:
   - name: live-config
     files:

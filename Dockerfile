@@ -20,6 +20,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags='-s -w' -o /out/live-worker ./cmd/live-worker && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags='-s -w' -o /out/live-migrate ./cmd/live-migrate && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags='-s -w' -o /out/live-load ./cmd/live-load && \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags='-s -w' -o /out/live-synthetic-canary ./cmd/live-synthetic-canary && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags='-s -w' -o /out/live-chaos-provider ./test/internal/chaosprovider && \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath -ldflags='-s -w' -o /out/live-prestop ./deploy/prestop
 
@@ -31,6 +32,7 @@ USER 65532:65532
 
 FROM runtime AS gateway
 COPY --from=build --chown=65532:65532 /out/live-gateway /usr/local/bin/live-gateway
+COPY --from=build --chown=65532:65532 /out/live-synthetic-canary /usr/local/bin/live-synthetic-canary
 COPY --from=build --chown=65532:65532 /out/live-prestop /usr/local/bin/live-prestop
 COPY --chown=65532:65532 deploy/config/local.yaml /etc/live/config.yaml
 EXPOSE 8080

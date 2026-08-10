@@ -142,6 +142,16 @@ func WithAdmission(admission transportws.Admission) Option {
 	}
 }
 
+func WithCanaryRuntimeIdentity(identity transportws.RuntimeIdentity) Option {
+	return func(app *App) error {
+		if err := identity.Validate(); err != nil {
+			return fmt.Errorf("configure synthetic canary runtime identity: %w", err)
+		}
+		app.wsOptions.CanaryRuntimeIdentity = identity
+		return nil
+	}
+}
+
 func WithDrainer(drainer *lifecycle.Drainer) Option {
 	return func(app *App) error {
 		if drainer == nil {
@@ -375,6 +385,9 @@ type durableDispatcher struct {
 }
 
 func (d *durableDispatcher) DispatchTranscript(_ context.Context, trusted session.TrustedSessionContext, effect session.TranscriptRequestedEffect) error {
+	if trusted.Subject.Ephemeral {
+		return nil
+	}
 	if d == nil || d.transcripts == nil {
 		return errors.New("transcript coordinator is unavailable")
 	}
@@ -386,6 +399,9 @@ func (d *durableDispatcher) DispatchTranscript(_ context.Context, trusted sessio
 }
 
 func (d *durableDispatcher) DispatchHandoff(_ context.Context, trusted session.TrustedSessionContext, effect session.HandoffRequestedEffect) error {
+	if trusted.Subject.Ephemeral {
+		return nil
+	}
 	if d == nil || d.handoffs == nil {
 		return errors.New("handoff coordinator is unavailable")
 	}

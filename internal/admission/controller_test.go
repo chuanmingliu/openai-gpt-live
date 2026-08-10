@@ -217,3 +217,28 @@ func TestControllerReadinessAndQuotaErrorsAreTyped(t *testing.T) {
 	require.NoError(t, err)
 	release()
 }
+
+func TestExactSyntheticIdentityIsEphemeralAndWrongIdentityRemainsDurable(t *testing.T) {
+	cfg := controllerConfig()
+	cfg.EphemeralTenantID = "synthetic-tenant"
+	cfg.EphemeralUserID = "synthetic-canary"
+	a := &recordingAuth{principal: auth.Principal{TenantID: "synthetic-tenant", UserID: "synthetic-canary", Scopes: map[string]struct{}{"realtime": {}}, ExpiresAt: time.Now().Add(time.Minute)}}
+	c, err := New(a, cfg)
+	require.NoError(t, err)
+	subject, release, err := c.Admit(t.Context(), validRequest())
+	require.NoError(t, err)
+	release()
+	assert.True(t, subject.Ephemeral)
+	a.principal.UserID = "ordinary-user"
+	subject, release, err = c.Admit(t.Context(), validRequest())
+	require.NoError(t, err)
+	release()
+	assert.False(t, subject.Ephemeral)
+}
+
+func TestSyntheticIdentityConfigurationFailsClosedWhenIncomplete(t *testing.T) {
+	cfg := controllerConfig()
+	cfg.EphemeralTenantID = "synthetic-tenant"
+	_, err := New(&recordingAuth{}, cfg)
+	assert.ErrorIs(t, err, ErrInvalidConfig)
+}

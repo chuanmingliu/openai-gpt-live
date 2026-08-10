@@ -47,6 +47,7 @@ type resolvedSecrets struct {
 	ToolEncryptionKey []byte
 	RetentionHMACKey  []byte
 	AdminBearer       string
+	DeploymentRegion  string
 	raw               []string
 }
 
@@ -199,6 +200,19 @@ func verifyExpectedHash(cfg config.Config, lookup func(string) (string, bool)) e
 
 func resolveSecrets(cfg config.Config, lookup func(string) (string, bool)) (resolvedSecrets, error) {
 	var secrets resolvedSecrets
+	region, regionOK := lookup("LIVE_DEPLOYMENT_REGION")
+	allowed, allowedOK := lookup("LIVE_ALLOWED_REGIONS")
+	if !regionOK && cfg.Mode != "production" {
+		secrets.DeploymentRegion = "local"
+	} else if !regionOK || !allowedOK {
+		return resolvedSecrets{}, errors.New("production requires LIVE_DEPLOYMENT_REGION and LIVE_ALLOWED_REGIONS")
+	} else {
+		var err error
+		secrets.DeploymentRegion, err = telemetry.ResolveDeploymentRegion(region, allowed)
+		if err != nil {
+			return resolvedSecrets{}, err
+		}
+	}
 	require := func(name, label string) (string, error) {
 		if name == "" {
 			return "", fmt.Errorf("%s environment variable is not configured", label)
@@ -315,6 +329,8 @@ type productionRuntime struct {
 	telemetry          *telemetry.Runtime
 	diagnostics        *http.Server
 	diagnosticListener net.Listener
+	metricsServer      *http.Server
+	metricsListener    net.Listener
 	gates              *feature.Gates
 	featureStore       *feature.PostgresStore
 	featureInterval    time.Duration
@@ -335,10 +351,14 @@ func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecret
 	var repo *postgres.Repository
 	var traceRuntime *telemetry.Runtime
 	var diagnosticListener net.Listener
+	var metricsListener net.Listener
 	defer func() {
 		if closeOnError {
 			if diagnosticListener != nil {
 				_ = diagnosticListener.Close()
+			}
+			if metricsListener != nil {
+				_ = metricsListener.Close()
 			}
 			if traceRuntime != nil {
 				closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -372,11 +392,16 @@ func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecret
 	}
 	instance := workerIdentity()
 	metricRegistry := prometheus.NewRegistry()
-	metrics, err := telemetry.NewMetrics(metricRegistry, telemetry.MetricsConfig{Labels: telemetry.MetricLabels{Component: "worker", Provider: provider, Region: "local", Instance: instance, ConfigHash: configHash}, AllowedComponents: []string{"worker"}, AllowedProviders: []string{provider}, AllowedRegions: []string{"local"}, AllowedInstances: []string{instance}, AllowedConfigHashes: []string{configHash}, AllowedQueues: []string{"worker", "outbox"}, AllowedResults: []string{"ok", "error", "scheduled", "expired", "shadow"}})
+	region := secrets.DeploymentRegion
+	metricLabels := telemetry.MetricLabels{Component: "worker", Provider: provider, Region: region, Instance: instance, ConfigHash: configHash}
+	if err := telemetry.RegisterRuntimeCollectors(metricRegistry, metricLabels); err != nil {
+		return nil, err
+	}
+	metrics, err := telemetry.NewMetrics(metricRegistry, telemetry.MetricsConfig{Labels: metricLabels, AllowedComponents: []string{"worker"}, AllowedProviders: []string{provider}, AllowedRegions: []string{region}, AllowedInstances: []string{instance}, AllowedConfigHashes: []string{configHash}, AllowedQueues: []string{"worker", "outbox"}, AllowedResults: []string{"ok", "error", "scheduled", "expired", "shadow"}})
 	if err != nil {
 		return nil, err
 	}
-	traceRuntime, err = telemetry.NewRuntime(ctx, telemetry.RuntimeConfig{Endpoint: cfg.Telemetry.OTLPEndpoint, Protocol: cfg.Telemetry.Protocol, Timeout: cfg.Telemetry.ExportTimeout, ServiceName: cfg.Telemetry.ServiceName, Component: "worker", Provider: provider, Region: "local", Instance: instance, ConfigHash: configHash, Production: cfg.Mode == "production"})
+	traceRuntime, err = telemetry.NewRuntime(ctx, telemetry.RuntimeConfig{Endpoint: cfg.Telemetry.OTLPEndpoint, Protocol: cfg.Telemetry.Protocol, Timeout: cfg.Telemetry.ExportTimeout, ServiceName: cfg.Telemetry.ServiceName, Component: "worker", Provider: provider, Region: region, Instance: instance, ConfigHash: configHash, Production: cfg.Mode == "production"})
 	if err != nil {
 		return nil, err
 	}
@@ -501,11 +526,21 @@ func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecret
 			return nil, errors.New("listen worker diagnostics")
 		}
 	}
+	var metricsServer *http.Server
+	if cfg.Mode == "production" {
+		metricsMux := http.NewServeMux()
+		metricsMux.Handle("/metrics", promhttp.HandlerFor(metricRegistry, promhttp.HandlerOpts{}))
+		metricsServer = &http.Server{Handler: metricsMux, ReadHeaderTimeout: 5 * time.Second}
+		metricsListener, err = net.Listen("tcp", ":9091")
+		if err != nil {
+			return nil, errors.New("listen worker metrics")
+		}
+	}
 	closeOnError = false
 	runtime := &productionRuntime{pool: pool, runner: runner, publisher: publisher, repo: repo, clock: realClock,
 		sweeper: sweeper, secretKey: privacyKey, sealer: argumentSealer, drainer: drainer, drainTimeout: cfg.Shutdown.WorkerDrainTimeout,
 		cleanupTimeout: cfg.Shutdown.CleanupTimeout, telemetry: traceRuntime, diagnostics: diagnostics,
-		diagnosticListener: diagnosticListener, gates: gates, featureStore: featureStore, featureInterval: cfg.Features.RefreshInterval}
+		diagnosticListener: diagnosticListener, metricsServer: metricsServer, metricsListener: metricsListener, gates: gates, featureStore: featureStore, featureInterval: cfg.Features.RefreshInterval}
 	return runtime, nil
 }
 
@@ -543,10 +578,19 @@ func (r *productionRuntime) Run(ctx context.Context) error {
 func (r *productionRuntime) runProduction(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancel()
-	diagnosticErrors := make(chan error, 1)
+	diagnosticErrors := make(chan error, 2)
 	if r.diagnostics != nil {
 		go func() {
 			err := r.diagnostics.Serve(r.diagnosticListener)
+			if errors.Is(err, http.ErrServerClosed) {
+				err = nil
+			}
+			diagnosticErrors <- err
+		}()
+	}
+	if r.metricsServer != nil {
+		go func() {
+			err := r.metricsServer.Serve(r.metricsListener)
 			if errors.Is(err, http.ErrServerClosed) {
 				err = nil
 			}
@@ -677,6 +721,14 @@ func (r *productionRuntime) shutdownDiagnostics() {
 	}
 	if r.diagnosticListener != nil {
 		_ = r.diagnosticListener.Close()
+	}
+	if r.metricsServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = r.metricsServer.Shutdown(ctx)
+		cancel()
+	}
+	if r.metricsListener != nil {
+		_ = r.metricsListener.Close()
 	}
 }
 

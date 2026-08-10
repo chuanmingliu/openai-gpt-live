@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: live-synthetic-canary
+  labels: {app.kubernetes.io/name: live-synthetic-canary, app.kubernetes.io/component: synthetic-canary, app.kubernetes.io/part-of: gpt-live}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: live-synthetic-canary}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: live-synthetic-canary, app.kubernetes.io/component: synthetic-canary, app.kubernetes.io/part-of: gpt-live, topology.kubernetes.io/region: PRODUCTION_DEPLOYMENT_REGION}
+      annotations: {live.openai.com/config-hash: CONFIG_HASH_REPLACED_BY_KUSTOMIZE}
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {runAsNonRoot: true, runAsUser: 65532, runAsGroup: 65532, fsGroup: 65532, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: canary
+          image: live-gateway:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/live-synthetic-canary"]
+          ports: [{name: metrics, containerPort: 9090, protocol: TCP}]
+          env:
+            - {name: LIVE_CANARY_GATEWAY_URL, value: "wss://LIVE_PRODUCTION_HOST/v1/realtime"}
+            - {name: LIVE_CANARY_ORIGIN, value: "https://LIVE_PRODUCTION_HOST"}
+            - {name: LIVE_CANARY_RETENTION, value: "none"}
+            - {name: LIVE_EXPECTED_CONFIG_HASH, value: CONFIG_HASH_REPLACED_BY_KUSTOMIZE}
+            - {name: LIVE_EXPECTED_GATEWAY_IMAGE, value: live-gateway:dev}
+            - name: LIVE_DEPLOYMENT_REGION
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['topology.kubernetes.io/region']
+            - {name: LIVE_CANARY_BEARER_TOKEN_FILE, value: /var/run/live-canary/token}
+          volumeMounts:
+            - {name: synthetic-identity, mountPath: /var/run/live-canary, readOnly: true}
+          readinessProbe: {httpGet: {path: /readyz, port: metrics}, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 6}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: ["ALL"]}}
+          resources: {requests: {cpu: 25m, memory: 32Mi}, limits: {cpu: 100m, memory: 64Mi}}
+      volumes:
+        - name: synthetic-identity
+          # The platform identity controller rotates this bounded OIDC token;
+          # the canary rereads the projected Secret before every probe.
+          secret:
+            secretName: live-synthetic-identity
+            defaultMode: 288
+            items: [{key: token, path: token}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: live-synthetic-canary
+  labels: {app.kubernetes.io/name: live-synthetic-canary, app.kubernetes.io/component: synthetic-canary}
+spec:
+  type: ClusterIP
+  selector: {app.kubernetes.io/name: live-synthetic-canary}
+  ports: [{name: metrics, protocol: TCP, port: 9090, targetPort: metrics}]
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: live-synthetic-canary
+spec:
+  selector:
+    matchLabels: {app.kubernetes.io/name: live-synthetic-canary}
+  endpoints: [{port: metrics, interval: 30s, path: /metrics, honorLabels: true}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: synthetic-canary
+spec:
+  podSelector:
+    matchLabels: {app.kubernetes.io/name: live-synthetic-canary}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: observability}}
+      ports: [{protocol: TCP, port: 9090}]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+      ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ingress-nginx}}
+          podSelector: {matchLabels: {app.kubernetes.io/name: ingress-nginx}}
+      ports: [{protocol: TCP, port: 443}]

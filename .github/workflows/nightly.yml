@@ -1,0 +1,73 @@
+name: nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  protocol-chaos-load-soak:
+    runs-on: [self-hosted, linux, x64, gpt-live-load-profile-v1]
+    timeout-minutes: 120
+    env:
+      GOTOOLCHAIN: local
+      LIVE_CAPACITY_DURATION: 10m
+      LIVE_ENFORCE_PINNED_SLO: "1"
+      LIVE_SOAK_DURATION: 30m
+      CHAOS_COMPOSE_PROJECT: gpt-live-nightly-${{ github.run_id }}
+      CHAOS_COMPOSE_BASE: deploy/docker-compose.yml
+      CHAOS_COMPOSE_OVERRIDE: deploy/compose.chaos.yml
+      CHAOS_TOXIPROXY_URL: http://127.0.0.1:18474
+      CHAOS_POSTGRES_PROXY: postgres
+      CHAOS_VOICE_PROXY: voice
+      CHAOS_DEEPSEEK_PROXY: deepseek
+      CHAOS_VOICE_CONTROL_URL: http://127.0.0.1:18101
+      CHAOS_DEEPSEEK_CONTROL_URL: http://127.0.0.1:18102
+      CHAOS_OIDC_CONTROL_URL: http://127.0.0.1:18103
+      CHAOS_GATEWAY_URL: ws://127.0.0.1:18080/v1/realtime
+      CHAOS_GATEWAY_HEALTH_URL: http://127.0.0.1:19092
+      CHAOS_WORKER_HEALTH_URL: http://127.0.0.1:19093
+      CHAOS_BEARER_TOKEN: fetched-by-test-from-disposable-oidc
+      CHAOS_DATABASE_URL: postgres://live@toxiproxy:15432/live?sslmode=disable
+      DATABASE_URL: postgres://live@toxiproxy:15432/live?sslmode=disable
+      POSTGRES_PASSWORD: unused-trust-auth
+      LIVE_STATIC_BEARER_TOKEN: unused-chaos-oidc
+      LIVE_ADMIN_BEARER_TOKEN: unused-chaos-oidc
+      LIVE_PRIVACY_HMAC_KEY: bmlnaHRseS1wcml2YWN5LWtleS0zMi1ieXRlcy0wMDA=
+      LIVE_RETENTION_HMAC_KEY: bmlnaHRseS1yZXRlbnRpb24ta2V5LTMyLWJ5dGUtMDA=
+      LIVE_TOOL_ENCRYPTION_KEY: bmlnaHRseS10b29sLWtleS0zMi1ieXRlcy0wMDAwMDA=
+      S2S_API_KEY: nightly-synthetic-s2s-key
+      FORMAL_DEEPSEEK_API_KEY: nightly-synthetic-deepseek-key
+      LIVE_DEPLOYMENT_REGION: nightly
+      LIVE_ALLOWED_REGIONS: nightly
+      POSTGRES_IMAGE: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32
+        with:
+          go-version: 1.26.0
+          cache: true
+      - name: Protocol fuzzing
+        run: go test -fuzz=Fuzz -fuzztime=10m ./internal/protocol
+      - name: Bind exact formal config hash
+        run: echo "LIVE_EXPECTED_CONFIG_HASH=$(go run ./cmd/live-gateway config-hash -config deploy/config/chaos.yaml)" >> "$GITHUB_ENV"
+      - name: Start disposable chaos topology
+        run: docker compose --env-file /dev/null -p "$CHAOS_COMPOSE_PROJECT" -f "$CHAOS_COMPOSE_BASE" -f "$CHAOS_COMPOSE_OVERRIDE" up -d --build --wait
+      - name: Six application-path chaos scenarios
+        run: make chaos
+      - name: 250-session pinned capacity
+        run: make capacity
+      - name: Thirty-minute soak
+        run: make soak
+      - name: Remove disposable topology
+        if: always()
+        run: docker compose --env-file /dev/null -p "$CHAOS_COMPOSE_PROJECT" -f "$CHAOS_COMPOSE_BASE" -f "$CHAOS_COMPOSE_OVERRIDE" down --volumes --remove-orphans

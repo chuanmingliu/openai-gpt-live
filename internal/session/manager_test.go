@@ -976,6 +976,27 @@ func TestManagerProvisionsAuthenticatedConversationBeforeProviderConnectAndFails
 	require.Nil(t, failed.runtime)
 }
 
+func TestManagerEphemeralSyntheticSessionUsesProviderWithoutConversationProvisioning(t *testing.T) {
+	provisioner := &conversationProvisionerFake{err: errors.New("must not be called")}
+	connector := testkit.NewFakeConnector(1)
+	manager := NewManager(Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second, ConversationProvisioner: provisioner, ConversationTTL: 24 * time.Hour}, connector, managerIDs{session: "synthetic-session", conversation: "synthetic-conversation"})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- manager.Run(ctx, OpenRequest{Subject: Subject{TenantID: "synthetic-tenant", UserID: "synthetic-canary", Ephemeral: true, ExpiresAt: time.Now().Add(time.Hour)}}, newChannelClient(4))
+	}()
+	providerCtx, stop := context.WithTimeout(context.Background(), time.Second)
+	defer stop()
+	if _, err := connector.NextSession(providerCtx); err != nil {
+		t.Fatalf("ephemeral session did not exercise provider path: %v", err)
+	}
+	cancel()
+	require.ErrorIs(t, <-result, context.Canceled)
+	scopes, ttls := provisioner.snapshot()
+	require.Empty(t, scopes)
+	require.Empty(t, ttls)
+}
+
 type channelClient struct {
 	reads  chan protocol.ClientEvent
 	writes chan protocol.ServerEvent

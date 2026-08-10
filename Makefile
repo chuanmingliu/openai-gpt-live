@@ -1,4 +1,4 @@
-.PHONY: test test-race vet fmt verify-deploy verify-deploy-static smoke-deploy load-unit chaos capacity barge soak load-smoke load-evidence
+.PHONY: test test-race vet fmt verify-deploy verify-deploy-static smoke-deploy load-unit chaos capacity barge soak load-smoke load-evidence release-gate release-gate-verify
 
 test:
 	go test ./...
@@ -61,3 +61,28 @@ load-smoke:
 load-evidence:
 	test -n "$$LIVE_EVIDENCE_DIR"
 	./deploy/scripts/run-load-evidence.sh formal
+
+RELEASE_COMMIT ?= $(shell git rev-parse HEAD)
+RELEASE_CONFIG_HASH ?=
+RELEASE_EVIDENCE_OUT ?= $(CURDIR)/artifacts/release/$(RELEASE_COMMIT)/$(RELEASE_CONFIG_HASH)/evidence.json
+
+release-gate:
+	test -n "$(RELEASE_CONFIG_HASH)"
+	./deploy/scripts/run-release-gate.sh \
+		--commit "$(RELEASE_COMMIT)" \
+		--config-hash "$(RELEASE_CONFIG_HASH)" \
+		--evidence-out "$(RELEASE_EVIDENCE_OUT)" \
+		$${RELEASE_ATTESTATION_FILE:+--attestation "$$RELEASE_ATTESTATION_FILE"} \
+		$${RELEASE_ATTESTATION_KEY:+--attestation-key "$$RELEASE_ATTESTATION_KEY"}
+
+release-gate-verify:
+	test -n "$(RELEASE_CONFIG_HASH)"
+	test -n "$$RELEASE_ATTESTATION_FILE"
+	test -n "$$RELEASE_ATTESTATION_KEY"
+	./deploy/scripts/run-release-gate.sh \
+		--verify-existing \
+		--commit "$(RELEASE_COMMIT)" \
+		--config-hash "$(RELEASE_CONFIG_HASH)" \
+		--evidence-out "$(RELEASE_EVIDENCE_OUT)" \
+		--attestation "$$RELEASE_ATTESTATION_FILE" \
+		--attestation-key "$$RELEASE_ATTESTATION_KEY"

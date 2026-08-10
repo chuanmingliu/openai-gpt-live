@@ -70,7 +70,7 @@ func TestGatewayExampleConfigHashGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = "v1:003ad3c01e20020bbe6e06a90a9c780113ccb5beba81f5666e3ed3ddbc7973cc"
+	const want = "v1:3360f5f98073e3e09f6b920492f26eba915db2a77e861556664f942094bf2a42"
 	if hash != want {
 		t.Fatalf("hash=%s want=%s", hash, want)
 	}

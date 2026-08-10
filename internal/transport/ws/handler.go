@@ -28,12 +28,21 @@ const (
 )
 
 type Options struct {
-	MaxFrameBytes int64
-	MaxJSONDepth  int
-	MaxAudioBytes int
-	ReadTimeout   time.Duration
-	WriteTimeout  time.Duration
+	MaxFrameBytes         int64
+	MaxJSONDepth          int
+	MaxAudioBytes         int
+	ReadTimeout           time.Duration
+	WriteTimeout          time.Duration
+	CanaryRuntimeIdentity RuntimeIdentity
 }
+
+type RuntimeIdentity struct {
+	ConfigHash   string
+	Region       string
+	GatewayImage string
+}
+
+func (identity RuntimeIdentity) Validate() error { return validateRuntimeIdentity(identity) }
 
 type Admission interface {
 	Admit(context.Context, *http.Request) (session.Subject, func(), error)
@@ -46,11 +55,13 @@ func (f AdmissionFunc) Admit(ctx context.Context, request *http.Request) (sessio
 }
 
 type handler struct {
-	opts      Options
-	limits    protocol.Limits
-	manager   *session.Manager
-	admission Admission
-	err       error
+	opts                     Options
+	limits                   protocol.Limits
+	manager                  *session.Manager
+	admission                Admission
+	canaryRuntimeIdentity    RuntimeIdentity
+	canaryRuntimeIdentityErr error
+	err                      error
 }
 
 func NewHandler(opts Options, manager *session.Manager, admission Admission) http.Handler {
@@ -61,7 +72,8 @@ func NewHandler(opts Options, manager *session.Manager, admission Admission) htt
 	if isNilAdmission(admission) {
 		err = errors.New("admission is required")
 	}
-	return &handler{opts: normalized, limits: limits, manager: manager, admission: admission, err: err}
+	identityErr := validateRuntimeIdentity(normalized.CanaryRuntimeIdentity)
+	return &handler{opts: normalized, limits: limits, manager: manager, admission: admission, canaryRuntimeIdentity: normalized.CanaryRuntimeIdentity, canaryRuntimeIdentityErr: identityErr, err: err}
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -124,6 +136,15 @@ func (h *handler) serveRealtime(w http.ResponseWriter, r *http.Request) {
 	if exactOrigin {
 		acceptOptions.InsecureSkipVerify = true
 	}
+	if subject.Ephemeral {
+		if h.canaryRuntimeIdentityErr != nil {
+			http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("X-Live-Config-Hash", h.canaryRuntimeIdentity.ConfigHash)
+		w.Header().Set("X-Live-Region", h.canaryRuntimeIdentity.Region)
+		w.Header().Set("X-Live-Gateway-Image", h.canaryRuntimeIdentity.GatewayImage)
+	}
 	conn, err := websocket.Accept(w, r, acceptOptions)
 	if err != nil {
 		return
@@ -134,6 +155,46 @@ func (h *handler) serveRealtime(w http.ResponseWriter, r *http.Request) {
 		RequestedModel: r.URL.Query().Get("model"),
 	}, client)
 	_ = client.finish(runErr)
+}
+
+func validateRuntimeIdentity(identity RuntimeIdentity) error {
+	if !exactConfigHash(identity.ConfigHash) || !exactRegion(identity.Region) || !exactGatewayImage(identity.GatewayImage) {
+		return errors.New("complete canonical synthetic canary runtime identity is required")
+	}
+	return nil
+}
+
+func exactConfigHash(value string) bool {
+	return len(value) == 67 && strings.HasPrefix(value, "v1:") && lowercaseHex(value[3:])
+}
+
+func exactRegion(value string) bool {
+	if value == "" || len(value) > 64 || value[0] == '-' || value[len(value)-1] == '-' {
+		return false
+	}
+	for _, character := range value {
+		if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '-' {
+			return false
+		}
+	}
+	return strings.Count(value, "-") >= 2
+}
+
+func exactGatewayImage(value string) bool {
+	const prefix = "ghcr.io/chuanmingliu/openai-gpt-live/gateway@sha256:"
+	return len(value) == len(prefix)+64 && strings.HasPrefix(value, prefix) && lowercaseHex(value[len(prefix):])
+}
+
+func lowercaseHex(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, character := range value {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func sameOrigin(r *http.Request) bool {

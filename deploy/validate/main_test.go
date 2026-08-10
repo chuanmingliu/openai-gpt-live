@@ -68,6 +68,7 @@ func setValidProductionInputs(t *testing.T) {
 		"LIVE_PRODUCTION_EGRESS_PROXY_CIDR":  "10.20.0.0/16",
 		"LIVE_PRODUCTION_VOICE_URL":          "wss://voice.acme.com/v1/realtime",
 		"LIVE_PRODUCTION_OIDC_ISSUER":        "https://oidc.acme.com",
+		"LIVE_DEPLOYMENT_REGION":             "us-east-1",
 		"LIVE_PRODUCTION_GATEWAY_IMAGE":      "registry.acme.com/gateway@sha256:4d1b72371c42a69bd949048883897aa673059f2e7b1cc992a650584132aae8f3",
 		"LIVE_PRODUCTION_WORKER_IMAGE":       "registry.acme.com/worker@sha256:49e907719fa53f1b00e43d8721620f42979c31117ed46daa3fadf320aef94b4e",
 		"LIVE_PRODUCTION_MIGRATE_IMAGE":      "registry.acme.com/migrate@sha256:1488a529509b2d9d0135713e75afdd3b3730b2884add211c6267980c87275078",

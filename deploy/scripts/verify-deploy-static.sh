@@ -29,10 +29,11 @@ LIVE_PRODUCTION_RENDER_MODE=fixture "$root/deploy/scripts/render-kustomize.sh" p
 (cd "$root" && GOCACHE="$cache" go test ./deploy/validate)
 (cd "$root" && GOCACHE="$cache" go test ./cmd/live-load ./internal/loadgen)
 "$root/deploy/scripts/test-validate-deploy.sh"
+"$root/deploy/scripts/test-release-gate-boundaries.sh"
 
 # Deploy readiness must fail closed when reviewed production inputs are absent.
 if (
-  unset LIVE_PRODUCTION_RENDER_MODE LIVE_PRODUCTION_HOST LIVE_PRODUCTION_TLS_SECRET LIVE_PRODUCTION_TRUSTED_PROXY_CIDR LIVE_PRODUCTION_EGRESS_PROXY_CIDR LIVE_PRODUCTION_VOICE_URL LIVE_PRODUCTION_OIDC_ISSUER LIVE_PRODUCTION_GATEWAY_IMAGE LIVE_PRODUCTION_WORKER_IMAGE LIVE_PRODUCTION_MIGRATE_IMAGE
+  unset LIVE_PRODUCTION_RENDER_MODE LIVE_PRODUCTION_HOST LIVE_PRODUCTION_TLS_SECRET LIVE_PRODUCTION_TRUSTED_PROXY_CIDR LIVE_PRODUCTION_EGRESS_PROXY_CIDR LIVE_PRODUCTION_VOICE_URL LIVE_PRODUCTION_OIDC_ISSUER LIVE_DEPLOYMENT_REGION LIVE_PRODUCTION_GATEWAY_IMAGE LIVE_PRODUCTION_WORKER_IMAGE LIVE_PRODUCTION_MIGRATE_IMAGE
   "$root/deploy/scripts/render-kustomize.sh" production >/dev/null 2>&1
 ); then
   echo "production render accepted absent operator inputs" >&2

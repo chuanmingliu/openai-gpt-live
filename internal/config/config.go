@@ -161,6 +161,8 @@ type AuthConfig struct {
 	StaticScopes       []string      `yaml:"static_scopes"`
 	AllowedOrigins     []string      `yaml:"allowed_origins"`
 	AllowNonBrowser    bool          `yaml:"allow_non_browser"`
+	EphemeralTenantID  string        `yaml:"synthetic_ephemeral_tenant_id"`
+	EphemeralUserID    string        `yaml:"synthetic_ephemeral_user_id"`
 }
 
 type AdmissionConfig struct {
@@ -574,6 +576,9 @@ func (c Config) Validate() error {
 				return errors.New("authentication values must be non-empty and bounded")
 			}
 		}
+	}
+	if (c.Auth.EphemeralTenantID == "") != (c.Auth.EphemeralUserID == "") || len(c.Auth.EphemeralTenantID) > 256 || len(c.Auth.EphemeralUserID) > 256 || strings.ContainsAny(c.Auth.EphemeralTenantID+c.Auth.EphemeralUserID, "\x00\r\n") {
+		return errors.New("auth synthetic ephemeral tenant and user must be configured together as bounded exact identities")
 	}
 	for _, origin := range c.Auth.AllowedOrigins {
 		u, err := url.Parse(origin)

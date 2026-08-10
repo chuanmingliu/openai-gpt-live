@@ -181,6 +181,9 @@ type Subject struct {
 	Scopes      map[string]struct{}
 	Permissions json.RawMessage
 	ExpiresAt   time.Time
+	// Ephemeral is assigned only by the authenticated admission boundary for
+	// the exact configured synthetic identity. It is never client-controlled.
+	Ephemeral bool
 }
 
 type OpenRequest struct {
@@ -740,7 +743,7 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	if err := sessionCtx.Err(); err != nil {
 		return fmt.Errorf("subject expired: %w", err)
 	}
-	if !isNilInterface(m.cfg.ConversationProvisioner) {
+	if !subject.Ephemeral && !isNilInterface(m.cfg.ConversationProvisioner) {
 		if err := m.cfg.ConversationProvisioner.ProvisionConversation(sessionCtx, scope, m.cfg.ConversationTTL); err != nil {
 			return fmt.Errorf("provision conversation: %w", err)
 		}

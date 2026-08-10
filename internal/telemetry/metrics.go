@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 )
 
 var MillisecondBucketsSeconds = []float64{.001, .003, .005, .010, .015, .030, .050, .100}
@@ -25,7 +26,39 @@ type MetricsConfig struct {
 	AllowedQueues, AllowedResults                                                              []string
 }
 
+func RegisterRuntimeCollectors(reg prometheus.Registerer, labels MetricLabels) error {
+	if reg == nil {
+		return errors.New("prometheus registry is required")
+	}
+	values := map[string]string{"component": labels.Component, "provider": labels.Provider, "region": labels.Region, "instance": labels.Instance, "config_hash": labels.ConfigHash}
+	for name, value := range values {
+		if value == "" || len(value) > 128 || strings.ContainsAny(value, "\r\n\x00") {
+			return fmt.Errorf("runtime metric label %s is invalid", name)
+		}
+	}
+	wrapped := prometheus.WrapRegistererWith(values, reg)
+	if err := wrapped.Register(collectors.NewGoCollector()); err != nil {
+		return fmt.Errorf("register Go runtime collector: %w", err)
+	}
+	if err := wrapped.Register(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{})); err != nil {
+		return fmt.Errorf("register process collector: %w", err)
+	}
+	return nil
+}
+
 type allowlist map[string]struct{}
+
+func ResolveDeploymentRegion(region, commaSeparatedAllowlist string) (string, error) {
+	if region == "" || len(region) > 63 || strings.ContainsAny(region, "\r\n\x00,") {
+		return "", errors.New("deployment region is invalid")
+	}
+	for _, allowed := range strings.Split(commaSeparatedAllowlist, ",") {
+		if allowed == region {
+			return region, nil
+		}
+	}
+	return "", fmt.Errorf("deployment region %q is not allowlisted", region)
+}
 
 func newAllowlist(values []string) (allowlist, error) {
 	if len(values) > 128 {

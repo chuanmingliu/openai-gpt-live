@@ -38,6 +38,18 @@ For local static authentication, `LIVE_ADMIN_BEARER_TOKEN` and
 `LIVE_STATIC_BEARER_TOKEN` must reference the same scoped value because preStop
 uses the former while the local admin handler validates the latter.
 
+The canary identity is a second, separately managed Secret named
+`gpt-live/live-synthetic-identity`. It must contain exactly one nonempty key,
+`data.token`. In production, the platform identity authority must continuously
+renew that short-lived OIDC bearer before expiry for audience `gpt-live`, scope
+`realtime`, tenant `gpt-live-synthetic`, and user `release-canary`; do not copy a
+long-lived token into this Secret. The projected file is mode `0440`, and the
+canary rereads it before every probe so rotation does not require a rollout. For
+local-only validation, `data.token` may contain the same scoped value supplied
+as `LIVE_STATIC_BEARER_TOKEN`. `deploy-k8s.sh` fails before migration when the
+Secret or its exact key inventory is absent, and it waits up to five minutes for
+the canary Deployment to become Ready after applying workloads.
+
 Production rendering fails closed unless all of these non-secret environment
 inputs are present and reviewed:
 
@@ -79,8 +91,18 @@ uses active sessions.
 
 Before apply, the same Go YAML parser validates unique decoded object identities,
 rejects duplicate keys, aliases/merge ambiguity, and any missing or extra graph
-edge. Its `--split job|workloads` mode then emits each validated object exactly
-once; no line-oriented YAML splitter is used.
+edge. That graph includes the canary WSS/origin, hardened Secret projection,
+readiness and metrics endpoints, overlay-specific network paths, and the exact
+runtime PodMonitor and metrics-ingress selectors. Its `--split job|workloads`
+mode then emits each validated object exactly once; no line-oriented YAML
+splitter is used.
+
+Gateway metric identity is deliberately separate from
+`admission.instance_id` and from the canonical configuration hash. Kubernetes
+projects each gateway pod's unique `metadata.name` into `LIVE_METRIC_INSTANCE`;
+the production binary fails closed if it is absent, and the PodMonitor preserves
+that exporter label with `honorLabels: true` so replica-local series do not
+collapse.
 
 Gateway pods have 45 seconds and workers 135 seconds to terminate. The preStop
 hook invokes a fixed image helper, which reads no secret argument: the helper

@@ -1,0 +1,716 @@
+name: manual-release-gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      config_hash:
+        description: Exact immutable deployed non-secret config hash
+        required: true
+        type: string
+      evidence_run_id:
+        description: Prior unsigned collection run ID; leave empty to collect
+        required: false
+        type: string
+      unsigned_archive_artifact_digest:
+        description: Bare upload-artifact digest printed by the reviewed unsigned collection run
+        required: false
+        type: string
+      privacy_attestation_base64:
+        description: Base64 signed attestation JSON; required only when verifying a prior run
+        required: false
+        type: string
+      run_provider_tests:
+        description: Run opt-in DeepSeek tests when its secret exists
+        required: true
+        type: boolean
+        default: false
+      production_host:
+        description: Reviewed production TLS host
+        required: true
+        type: string
+      production_tls_secret:
+        description: Preexisting production TLS Secret name
+        required: true
+        type: string
+      trusted_proxy_cidr:
+        description: Reviewed ingress proxy CIDR
+        required: true
+        type: string
+      egress_proxy_cidr:
+        description: Reviewed egress proxy CIDR
+        required: true
+        type: string
+      voice_url:
+        description: Reviewed speech provider WebSocket URL
+        required: true
+        type: string
+      oidc_issuer:
+        description: Reviewed OIDC issuer URL
+        required: true
+        type: string
+      deployment_region:
+        description: Allowlisted deployment region label
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: release-gate-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  collect-unsigned-evidence:
+    if: inputs.evidence_run_id == ''
+    needs: candidate-manifest
+    runs-on: [self-hosted, linux, x64, gpt-live-load-profile-v1]
+    timeout-minutes: 210
+    env:
+      GOTOOLCHAIN: local
+      RELEASE_CONFIG_HASH: ${{ inputs.config_hash }}
+      LIVE_EVIDENCE_DIR: ${{ github.workspace }}/artifacts/task24-formal
+      TEST_DATABASE_URL: ${{ secrets.RELEASE_TEST_DATABASE_URL }}
+      DATABASE_URL: ${{ secrets.RELEASE_TEST_DATABASE_URL }}
+      S2S_REALTIME_URL: ${{ vars.RELEASE_S2S_REALTIME_URL }}
+      CHAOS_TOXIPROXY_URL: ${{ vars.CHAOS_TOXIPROXY_URL }}
+      CHAOS_POSTGRES_PROXY: ${{ vars.CHAOS_POSTGRES_PROXY }}
+      CHAOS_VOICE_PROXY: ${{ vars.CHAOS_VOICE_PROXY }}
+      CHAOS_DEEPSEEK_PROXY: ${{ vars.CHAOS_DEEPSEEK_PROXY }}
+      CHAOS_VOICE_CONTROL_URL: ${{ vars.CHAOS_VOICE_CONTROL_URL }}
+      CHAOS_DEEPSEEK_CONTROL_URL: ${{ vars.CHAOS_DEEPSEEK_CONTROL_URL }}
+      CHAOS_GATEWAY_URL: ${{ vars.CHAOS_GATEWAY_URL }}
+      CHAOS_GATEWAY_HEALTH_URL: ${{ vars.CHAOS_GATEWAY_HEALTH_URL }}
+      CHAOS_WORKER_HEALTH_URL: ${{ vars.CHAOS_WORKER_HEALTH_URL }}
+      CHAOS_BEARER_TOKEN: ${{ secrets.CHAOS_BEARER_TOKEN }}
+      CHAOS_OIDC_CONTROL_URL: ${{ vars.CHAOS_OIDC_CONTROL_URL }}
+      CHAOS_COMPOSE_PROJECT: release-${{ github.run_id }}
+      CHAOS_COMPOSE_BASE: deploy/docker-compose.yml
+      CHAOS_COMPOSE_OVERRIDE: deploy/compose.chaos.yml
+      CHAOS_DATABASE_URL: ${{ secrets.CHAOS_DATABASE_URL }}
+      LIVE_PRODUCTION_HOST: ${{ inputs.production_host }}
+      LIVE_PRODUCTION_TLS_SECRET: ${{ inputs.production_tls_secret }}
+      LIVE_PRODUCTION_TRUSTED_PROXY_CIDR: ${{ inputs.trusted_proxy_cidr }}
+      LIVE_PRODUCTION_EGRESS_PROXY_CIDR: ${{ inputs.egress_proxy_cidr }}
+      LIVE_PRODUCTION_VOICE_URL: ${{ inputs.voice_url }}
+      LIVE_PRODUCTION_OIDC_ISSUER: ${{ inputs.oidc_issuer }}
+      LIVE_DEPLOYMENT_REGION: ${{ inputs.deployment_region }}
+      LIVE_ALLOWED_REGIONS: ${{ inputs.deployment_region }}
+      POSTGRES_IMAGE: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+      RELEASE_POSTGRES_IMAGE: postgres:16-alpine@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+      S2S_API_KEY: formal-synthetic-s2s-key
+      FORMAL_DEEPSEEK_API_KEY: formal-synthetic-deepseek-key
+      LIVE_STATIC_BEARER_TOKEN: formal-synthetic-static-token
+      LIVE_ADMIN_BEARER_TOKEN: formal-synthetic-admin-token
+      LIVE_PRIVACY_HMAC_KEY: Zm9ybWFsLXByaXZhY3kta2V5LTMyLWJ5dGVzLTAwMDA=
+      LIVE_RETENTION_HMAC_KEY: Zm9ybWFsLXJldGVudGlvbi1rZXktMzItYnl0ZS0wMDA=
+      LIVE_TOOL_ENCRYPTION_KEY: Zm9ybWFsLXRvb2wta2V5LTMyLWJ5dGVzLTAwMDAwMDA=
+      RELEASE_UNSIGNED_ARCHIVE_OUT: ${{ runner.temp }}/unsigned-release-evidence.tar
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32
+        with:
+          go-version: 1.26.0
+          cache: true
+      - name: Install pinned release tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          curl --fail --location --proto '=https' --tlsv1.2 -o /tmp/kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/download/v0.7.0/kubeconform-linux-amd64.tar.gz
+          printf '%s  %s\n' c31518ddd122663b3f3aa874cfe8178cb0988de944f29c74a0b9260920d115d3 /tmp/kubeconform.tar.gz | sha256sum --check --strict
+          tar -xzf /tmp/kubeconform.tar.gz -C "$(go env GOPATH)/bin" kubeconform
+          curl --fail --location --proto '=https' --tlsv1.2 -o "$(go env GOPATH)/bin/kind" \
+            https://kind.sigs.k8s.io/dl/v0.30.0/kind-linux-amd64
+          printf '%s  %s\n' 517ab7fc89ddeed5fa65abf71530d90648d9638ef0c4cde22c2c11f8097b8889 "$(go env GOPATH)/bin/kind" | sha256sum --check --strict
+          chmod 0755 "$(go env GOPATH)/bin/kind"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-image-gateway-${{ github.sha }}
+          path: candidate/gateway
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-image-worker-${{ github.sha }}
+          path: candidate/worker
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-image-migrate-${{ github.sha }}
+          path: candidate/migrate
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-manifest-${{ github.sha }}
+          path: candidate/manifest
+      - name: Bind candidate manifest, computed hash, and reviewed inputs
+        shell: bash
+        env:
+          INPUT_CONFIG_HASH: ${{ inputs.config_hash }}
+          INPUT_DEPLOYMENT_REGION: ${{ inputs.deployment_region }}
+          INPUT_EGRESS_PROXY_CIDR: ${{ inputs.egress_proxy_cidr }}
+          INPUT_OIDC_ISSUER: ${{ inputs.oidc_issuer }}
+          INPUT_PRODUCTION_HOST: ${{ inputs.production_host }}
+          INPUT_PRODUCTION_TLS_SECRET: ${{ inputs.production_tls_secret }}
+          INPUT_RUN_PROVIDER_TESTS: ${{ inputs.run_provider_tests }}
+          INPUT_TRUSTED_PROXY_CIDR: ${{ inputs.trusted_proxy_cidr }}
+          INPUT_VOICE_URL: ${{ inputs.voice_url }}
+        run: |
+          set -euo pipefail
+          ./deploy/scripts/bind-release-inputs.sh
+          for target in gateway worker migrate; do ./deploy/scripts/verify-candidate-artifact-layout.sh "$target" "candidate/$target"; done
+          test "$(find candidate/manifest -mindepth 1 -maxdepth 1 -type f -print | wc -l)" -eq 2
+          computed="$(<candidate/manifest/config-hash.txt)"
+          [[ "$computed" == "$RELEASE_CONFIG_HASH" ]] || { echo "requested config hash differs from rendered config" >&2; exit 1; }
+          export LIVE_PRODUCTION_GATEWAY_IMAGE="$(<candidate/gateway/gateway.digest)"
+          export LIVE_PRODUCTION_WORKER_IMAGE="$(<candidate/worker/worker.digest)"
+          export LIVE_PRODUCTION_MIGRATE_IMAGE="$(<candidate/migrate/migrate.digest)"
+          echo "LIVE_PRODUCTION_GATEWAY_IMAGE=$LIVE_PRODUCTION_GATEWAY_IMAGE" >> "$GITHUB_ENV"
+          echo "LIVE_PRODUCTION_WORKER_IMAGE=$LIVE_PRODUCTION_WORKER_IMAGE" >> "$GITHUB_ENV"
+          echo "LIVE_PRODUCTION_MIGRATE_IMAGE=$LIVE_PRODUCTION_MIGRATE_IMAGE" >> "$GITHUB_ENV"
+          echo "RELEASE_PRODUCTION_MANIFEST=$GITHUB_WORKSPACE/candidate/manifest/production.yaml" >> "$GITHUB_ENV"
+          echo "RELEASE_CANDIDATE_DIR=$GITHUB_WORKSPACE/candidate" >> "$GITHUB_ENV"
+          echo "RELEASE_INPUT_candidate_gateway_image=$LIVE_PRODUCTION_GATEWAY_IMAGE" >> "$GITHUB_ENV"
+          echo "RELEASE_INPUT_candidate_worker_image=$LIVE_PRODUCTION_WORKER_IMAGE" >> "$GITHUB_ENV"
+          echo "RELEASE_INPUT_candidate_migrate_image=$LIVE_PRODUCTION_MIGRATE_IMAGE" >> "$GITHUB_ENV"
+          echo "RELEASE_INPUT_manifest_sha256=$(shasum -a 256 candidate/manifest/production.yaml | cut -d' ' -f1)" >> "$GITHUB_ENV"
+          echo "GATEWAY_IMAGE=$LIVE_PRODUCTION_GATEWAY_IMAGE" >> "$GITHUB_ENV"
+          echo "WORKER_IMAGE=$LIVE_PRODUCTION_WORKER_IMAGE" >> "$GITHUB_ENV"
+          echo "MIGRATE_IMAGE=$LIVE_PRODUCTION_MIGRATE_IMAGE" >> "$GITHUB_ENV"
+          formal_hash="$(go run ./cmd/live-gateway config-hash -config deploy/config/chaos.yaml)"
+          [[ "$formal_hash" =~ ^v1:[0-9a-f]{64}$ ]]
+          echo "LIVE_EXPECTED_CONFIG_HASH=$formal_hash" >> "$GITHUB_ENV"
+      - name: Run requested optional provider suite before evidence collection
+        if: inputs.run_provider_tests
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          test -n "$DEEPSEEK_API_KEY"
+          go test -count=1 -tags=liveprovider ./test/liveprovider/...
+          echo 'RELEASE_INPUT_optional_provider_result=passed' >> "$GITHUB_ENV"
+      - name: Bind unrequested optional provider result
+        if: ${{ !inputs.run_provider_tests }}
+        run: echo 'RELEASE_INPUT_optional_provider_result=not-requested' >> "$GITHUB_ENV"
+      - name: Start unique formal chaos topology
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose --env-file /dev/null -p "$CHAOS_COMPOSE_PROJECT" -f "$CHAOS_COMPOSE_BASE" -f "$CHAOS_COMPOSE_OVERRIDE" build toxiproxy-init speech-to-speech fake-deepseek chaos-edge gateway-admin-proxy worker-admin-proxy
+          docker compose --env-file /dev/null -p "$CHAOS_COMPOSE_PROJECT" -f "$CHAOS_COMPOSE_BASE" -f "$CHAOS_COMPOSE_OVERRIDE" up -d --no-build --wait
+          for binding in gateway:GATEWAY_IMAGE worker:WORKER_IMAGE migrate:MIGRATE_IMAGE; do
+            service="${binding%%:*}"; variable="${binding#*:}"; expected="${!variable}"
+            container="$(docker compose --env-file /dev/null -p "$CHAOS_COMPOSE_PROJECT" -f "$CHAOS_COMPOSE_BASE" -f "$CHAOS_COMPOSE_OVERRIDE" ps -a -q "$service")"
+            test -n "$container"
+            actual="$(docker inspect --format '{{.Config.Image}}' "$container")"
+            [[ "$actual" == "$expected" ]] || { echo "$service resolved $actual, expected candidate $expected" >&2; exit 1; }
+          done
+          for binding in postgres:POSTGRES toxiproxy:TOXIPROXY gateway:GATEWAY worker:WORKER chaos-edge:OIDC speech-to-speech:VOICE fake-deepseek:DEEPSEEK; do
+            service="${binding%%:*}"; identity="${binding#*:}"
+            container="$(docker compose --env-file /dev/null -p "$CHAOS_COMPOSE_PROJECT" -f "$CHAOS_COMPOSE_BASE" -f "$CHAOS_COMPOSE_OVERRIDE" ps -a -q "$service")"
+            [[ "$container" =~ ^[0-9a-f]{64}$ ]] || { echo "missing formal $service container identity" >&2; exit 1; }
+            echo "RELEASE_FORMAL_${identity}_CONTAINER_ID=$container" >> "$GITHUB_ENV"
+          done
+          formal_gateway="$(docker compose --env-file /dev/null -p "$CHAOS_COMPOSE_PROJECT" -f "$CHAOS_COMPOSE_BASE" -f "$CHAOS_COMPOSE_OVERRIDE" ps -a -q gateway)"
+          formal_worker="$(docker compose --env-file /dev/null -p "$CHAOS_COMPOSE_PROJECT" -f "$CHAOS_COMPOSE_BASE" -f "$CHAOS_COMPOSE_OVERRIDE" ps -a -q worker)"
+          mkdir -p "$LIVE_EVIDENCE_DIR"
+          ./deploy/scripts/capture-formal-topology.sh "$LIVE_EVIDENCE_DIR/topology" \
+            "$GITHUB_WORKSPACE/deploy/config/chaos.yaml" "$LIVE_EXPECTED_CONFIG_HASH" "$formal_gateway" "$formal_worker"
+          echo "RELEASE_FORMAL_RUNTIME_CONFIG_HASH=$LIVE_EXPECTED_CONFIG_HASH" >> "$GITHUB_ENV"
+          echo "RELEASE_FORMAL_CONFIG_SHA256=$(shasum -a 256 deploy/config/chaos.yaml | cut -d' ' -f1)" >> "$GITHUB_ENV"
+          echo "RELEASE_FORMAL_CONFIG_SOURCE=$GITHUB_WORKSPACE/deploy/config/chaos.yaml" >> "$GITHUB_ENV"
+      - name: Observe deployed production canary with rotated identity
+        shell: bash
+        env:
+          CANARY_OIDC_TOKEN: ${{ secrets.RELEASE_CANARY_OIDC_TOKEN }}
+          LIVE_CANARY_GATEWAY_URL: wss://${{ inputs.production_host }}/v1/realtime
+          LIVE_CANARY_ORIGIN: https://${{ inputs.production_host }}
+          LIVE_CANARY_RETENTION: none
+          LIVE_CANARY_BEARER_TOKEN_FILE: ${{ runner.temp }}/release-canary.oidc
+          LIVE_EXPECTED_CONFIG_HASH: ${{ inputs.config_hash }}
+          LIVE_EXPECTED_GATEWAY_IMAGE: ${{ needs.candidate-manifest.outputs.gateway_image }}
+        run: |
+          set -euo pipefail
+          test -n "$CANARY_OIDC_TOKEN"
+          umask 077
+          printf '%s' "$CANARY_OIDC_TOKEN" > "$LIVE_CANARY_BEARER_TOKEN_FILE"
+          go build -trimpath -o "$RUNNER_TEMP/live-synthetic-canary" ./cmd/live-synthetic-canary
+          ./deploy/scripts/run-release-canary.sh "$RUNNER_TEMP/live-synthetic-canary" "$RUNNER_TEMP/canary-snapshot.json"
+          echo "RELEASE_CANARY_SNAPSHOT=$RUNNER_TEMP/canary-snapshot.json" >> "$GITHUB_ENV"
+      - name: Run all producers including the formal two-hour soak
+        shell: bash
+        run: |
+          set +e
+          make release-gate
+          code=$?
+          set -e
+          if [[ "$code" -ne 2 ]]; then
+            echo "release producers failed before human signing (exit=$code)" >&2
+            exit 1
+          fi
+          echo "Unsigned evidence collected. Download this run, review, and sign the emitted statement hash."
+      - name: Stop unique formal chaos topology
+        if: always()
+        shell: bash
+        run: docker compose --env-file /dev/null -p "$CHAOS_COMPOSE_PROJECT" -f "$CHAOS_COMPOSE_BASE" -f "$CHAOS_COMPOSE_OVERRIDE" down -v --remove-orphans
+      - id: upload-unsigned
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: unsigned-release-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/unsigned-release-evidence.tar
+          if-no-files-found: error
+          retention-days: 30
+      - name: Publish immutable unsigned archive binding for human review
+        env:
+          UNSIGNED_ARCHIVE_ARTIFACT_DIGEST: ${{ steps.upload-unsigned.outputs.artifact-digest }}
+        run: |
+          [[ "$UNSIGNED_ARCHIVE_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          echo "unsigned_archive_artifact_digest=$UNSIGNED_ARCHIVE_ARTIFACT_DIGEST"
+      - name: Clean release evidence workspace and token material
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_evidence="$GITHUB_WORKSPACE/artifacts/task24-formal"
+          [[ "$LIVE_EVIDENCE_DIR" == "$expected_evidence" ]]
+          rm -rf -- "$expected_evidence"
+          rm -f -- "$RUNNER_TEMP/release-canary.oidc" \
+            "$RUNNER_TEMP/canary-snapshot.json" \
+            "$RUNNER_TEMP/live-synthetic-canary" \
+            "$RUNNER_TEMP/unsigned-release-evidence.tar"
+
+  verify-signed-evidence:
+    if: inputs.evidence_run_id != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      signed_bundle_digest: ${{ steps.upload-signed.outputs.artifact-digest }}
+      signed_bundle_config_key: ${{ steps.reviewed_inputs.outputs.config_key }}
+    env:
+      GOTOOLCHAIN: local
+      RELEASE_CONFIG_HASH: ${{ inputs.config_hash }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32
+        with:
+          go-version: 1.26.0
+          cache: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: unsigned-release-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/unsigned-release
+          run-id: ${{ inputs.evidence_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-image-gateway-${{ github.sha }}
+          path: candidate/gateway
+          run-id: ${{ inputs.evidence_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-image-worker-${{ github.sha }}
+          path: candidate/worker
+          run-id: ${{ inputs.evidence_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-image-migrate-${{ github.sha }}
+          path: candidate/migrate
+          run-id: ${{ inputs.evidence_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-manifest-${{ github.sha }}
+          path: candidate/manifest
+          run-id: ${{ inputs.evidence_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Require successful source collection run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_RUN: ${{ inputs.evidence_run_id }}
+          UNSIGNED_ARCHIVE_ARTIFACT_DIGEST: ${{ inputs.unsigned_archive_artifact_digest }}
+        run: |
+          [[ "$UNSIGNED_ARCHIVE_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN}" > "$RUNNER_TEMP/source-run.json"
+          jq -e --arg sha "$GITHUB_SHA" '.name == "manual-release-gate" and .event == "workflow_dispatch" and .head_sha == $sha and .conclusion == "success"' "$RUNNER_TEMP/source-run.json"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN}/artifacts" > "$RUNNER_TEMP/source-artifacts.json"
+          jq -e --arg name "unsigned-release-evidence-$GITHUB_SHA" --arg digest "sha256:$UNSIGNED_ARCHIVE_ARTIFACT_DIGEST" \
+            '[.artifacts[] | select(.name == $name and .expired == false and .digest == $digest)] | length == 1' \
+            "$RUNNER_TEMP/source-artifacts.json" >/dev/null
+      - name: Materialize public signature inputs
+        shell: bash
+        env:
+          ATTESTATION_BASE64: ${{ inputs.privacy_attestation_base64 }}
+          PUBLIC_KEY_BASE64: ${{ secrets.RELEASE_ATTESTATION_PUBLIC_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          test -n "$ATTESTATION_BASE64"
+          test -n "$PUBLIC_KEY_BASE64"
+          test "${#ATTESTATION_BASE64}" -le 87384
+          test "${#PUBLIC_KEY_BASE64}" -le 4096
+          umask 077
+          printf '%s' "$ATTESTATION_BASE64" | base64 --decode > "$RUNNER_TEMP/privacy-attestation.json"
+          printf '%s\n' "$PUBLIC_KEY_BASE64" > "$RUNNER_TEMP/release-ed25519.pub.base64"
+          echo "RELEASE_ATTESTATION_FILE=$RUNNER_TEMP/privacy-attestation.json" >> "$GITHUB_ENV"
+          echo "RELEASE_ATTESTATION_KEY=release-operator=$RUNNER_TEMP/release-ed25519.pub.base64" >> "$GITHUB_ENV"
+      - id: reviewed_inputs
+        name: Reconstruct exact source-run reviewed inputs
+        shell: bash
+        env:
+          INPUT_CONFIG_HASH: ${{ inputs.config_hash }}
+          INPUT_DEPLOYMENT_REGION: ${{ inputs.deployment_region }}
+          INPUT_EGRESS_PROXY_CIDR: ${{ inputs.egress_proxy_cidr }}
+          INPUT_OIDC_ISSUER: ${{ inputs.oidc_issuer }}
+          INPUT_PRODUCTION_HOST: ${{ inputs.production_host }}
+          INPUT_PRODUCTION_TLS_SECRET: ${{ inputs.production_tls_secret }}
+          INPUT_RUN_PROVIDER_TESTS: ${{ inputs.run_provider_tests }}
+          INPUT_TRUSTED_PROXY_CIDR: ${{ inputs.trusted_proxy_cidr }}
+          INPUT_VOICE_URL: ${{ inputs.voice_url }}
+        run: |
+          set -euo pipefail
+          ./deploy/scripts/bind-release-inputs.sh
+          config_key="${INPUT_CONFIG_HASH#v1:}"
+          [[ "$config_key" =~ ^[0-9a-f]{64}$ ]]
+          echo "config_key=$config_key" >> "$GITHUB_OUTPUT"
+          for target in gateway worker migrate; do ./deploy/scripts/verify-candidate-artifact-layout.sh "$target" "candidate/$target"; done
+          echo "RELEASE_INPUT_candidate_gateway_image=$(<candidate/gateway/gateway.digest)" >> "$GITHUB_ENV"
+          echo "RELEASE_INPUT_candidate_migrate_image=$(<candidate/migrate/migrate.digest)" >> "$GITHUB_ENV"
+          echo "RELEASE_INPUT_candidate_worker_image=$(<candidate/worker/worker.digest)" >> "$GITHUB_ENV"
+          echo "RELEASE_INPUT_manifest_sha256=$(shasum -a 256 candidate/manifest/production.yaml | cut -d' ' -f1)" >> "$GITHUB_ENV"
+          if [[ "$INPUT_RUN_PROVIDER_TESTS" == true ]]; then result=passed; else result=not-requested; fi
+          echo "RELEASE_INPUT_optional_provider_result=$result" >> "$GITHUB_ENV"
+      - name: Derive and verify signed canonical archive from reviewed bytes
+        run: |
+          set -euo pipefail
+          go build -trimpath -o "$RUNNER_TEMP/live-release-gate" ./cmd/live-release-gate
+          inputs=(
+            --release-input "candidate_gateway_image=$RELEASE_INPUT_candidate_gateway_image"
+            --release-input "candidate_migrate_image=$RELEASE_INPUT_candidate_migrate_image"
+            --release-input "candidate_worker_image=$RELEASE_INPUT_candidate_worker_image"
+            --release-input "deployment_region=$RELEASE_INPUT_deployment_region"
+            --release-input "egress_proxy_cidr=$RELEASE_INPUT_egress_proxy_cidr"
+            --release-input "manifest_sha256=$RELEASE_INPUT_manifest_sha256"
+            --release-input "oidc_issuer=$RELEASE_INPUT_oidc_issuer"
+            --release-input "optional_provider_result=$RELEASE_INPUT_optional_provider_result"
+            --release-input "production_host=$RELEASE_INPUT_production_host"
+            --release-input "production_tls_secret=$RELEASE_INPUT_production_tls_secret"
+            --release-input "run_provider_tests=$RELEASE_INPUT_run_provider_tests"
+            --release-input "trusted_proxy_cidr=$RELEASE_INPUT_trusted_proxy_cidr"
+            --release-input "voice_url=$RELEASE_INPUT_voice_url"
+          )
+          "$RUNNER_TEMP/live-release-gate" finalize-archive \
+            --unsigned-archive "$RUNNER_TEMP/unsigned-release/unsigned-release-evidence.tar" \
+            --attestation "$RELEASE_ATTESTATION_FILE" \
+            --archive-out "$RUNNER_TEMP/signed-release-evidence.tar" \
+            --commit "$GITHUB_SHA" --config-hash "$RELEASE_CONFIG_HASH" \
+            --attestation-key "$RELEASE_ATTESTATION_KEY" "${inputs[@]}"
+          "$RUNNER_TEMP/live-release-gate" verify-archive \
+            --archive "$RUNNER_TEMP/signed-release-evidence.tar" \
+            --commit "$GITHUB_SHA" --config-hash "$RELEASE_CONFIG_HASH" \
+            --attestation-key "$RELEASE_ATTESTATION_KEY" "${inputs[@]}"
+      - id: upload-signed
+        name: Archive exact verified signed evidence bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: signed-release-evidence-${{ github.sha }}-${{ steps.reviewed_inputs.outputs.config_key }}
+          path: ${{ runner.temp }}/signed-release-evidence.tar
+          if-no-files-found: error
+          retention-days: 90
+
+  build-candidates:
+    if: inputs.evidence_run_id == ''
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [gateway, worker, migrate]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
+      - uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create exclusive per-target candidate workspace
+        run: mkdir -m 700 -p "candidate-artifacts/${{ matrix.target }}"
+      - id: build
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          platforms: linux/amd64,linux/arm64
+          tags: ghcr.io/chuanmingliu/openai-gpt-live/${{ matrix.target }}:candidate-${{ github.run_id }}-${{ github.sha }}
+          outputs: |
+            type=registry
+            type=oci,dest=${{ github.workspace }}/candidate-artifacts/${{ matrix.target }}/${{ matrix.target }}.oci.tar
+          provenance: mode=max,builder-id=https://github.com/docker/build-push-action
+          sbom: true
+      - name: Record immutable image reference
+        env:
+          IMAGE: ghcr.io/chuanmingliu/openai-gpt-live/${{ matrix.target }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          OCI_ARCHIVE: ${{ github.workspace }}/candidate-artifacts/${{ matrix.target }}/${{ matrix.target }}.oci.tar
+        run: |
+          set -euo pipefail
+          workspace="$GITHUB_WORKSPACE/candidate-artifacts/${{ matrix.target }}"
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf '%s@%s\n' "$IMAGE" "$DIGEST" > "$workspace/${{ matrix.target }}.digest"
+          docker buildx imagetools inspect "$IMAGE@$DIGEST" --raw > "$workspace/${{ matrix.target }}.index.json"
+          python3 deploy/scripts/validate-supply-evidence.py \
+            --oci-archive "$OCI_ARCHIVE" \
+            --registry-index "$workspace/${{ matrix.target }}.index.json" \
+            --image "$IMAGE" \
+            --digest "$DIGEST" \
+            --source-repository "https://github.com/$GITHUB_REPOSITORY" \
+            --source-sha "$GITHUB_SHA" \
+            --target "${{ matrix.target }}" \
+            --output "$workspace/${{ matrix.target }}.supply-validation.json"
+          jq -c '{schema_version:"buildx-spdx-descriptors-v1",subject,source_repository,source_sha,platforms:[.platforms[]|{platform,runtime_digest,attestation_manifest_digest,statement_sha256:.spdx.statement_sha256,statement_type:.spdx.statement_type}]}' \
+            "$workspace/${{ matrix.target }}.supply-validation.json" > "$workspace/${{ matrix.target }}.sbom.json"
+          jq -c '{schema_version:"buildx-slsa-descriptors-v1",subject,source_repository,source_sha,builder_id,build_type,target,platforms:[.platforms[]|{platform,runtime_digest,attestation_manifest_digest,statement_sha256:.provenance.statement_sha256,statement_type:.provenance.statement_type}]}' \
+            "$workspace/${{ matrix.target }}.supply-validation.json" > "$workspace/${{ matrix.target }}.provenance.json"
+          sbom_sha="$(sha256sum "$workspace/${{ matrix.target }}.sbom.json" | cut -d' ' -f1)"
+          provenance_sha="$(sha256sum "$workspace/${{ matrix.target }}.provenance.json" | cut -d' ' -f1)"
+          jq -cn --arg type "${{ matrix.target }}_sbom" --arg subject "$IMAGE@$DIGEST" --arg source "$GITHUB_SHA" --arg document "$sbom_sha" '{schema_version:"release-artifact-v2",artifact_type:$type,status:"passed",subject:$subject,source_sha:$source,document_sha256:$document}' > "$workspace/${{ matrix.target }}.sbom-summary.json"
+          jq -cn --arg type "${{ matrix.target }}_provenance" --arg subject "$IMAGE@$DIGEST" --arg source "$GITHUB_SHA" --arg document "$provenance_sha" '{schema_version:"release-artifact-v2",artifact_type:$type,status:"passed",subject:$subject,source_sha:$source,document_sha256:$document,platforms:["linux/amd64","linux/arm64"]}' > "$workspace/${{ matrix.target }}.provenance-summary.json"
+          for artifact in "$workspace/${{ matrix.target }}.digest" "$workspace/${{ matrix.target }}.index.json" "$workspace/${{ matrix.target }}.supply-validation.json" "$workspace/${{ matrix.target }}.sbom.json" "$workspace/${{ matrix.target }}.provenance.json" "$workspace/${{ matrix.target }}.sbom-summary.json" "$workspace/${{ matrix.target }}.provenance-summary.json"; do
+            test "$(wc -c < "$artifact")" -le 1048576
+          done
+          if rg -n -i '(audio_base64|raw_audio|reasoning_content|tool_arguments|"transcript"[[:space:]]*:|"pcm"[[:space:]]*:|-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----)' "$workspace/${{ matrix.target }}.digest" "$workspace/${{ matrix.target }}.supply-validation.json" "$workspace/${{ matrix.target }}.sbom.json" "$workspace/${{ matrix.target }}.provenance.json"; then
+            echo 'candidate artifact contains prohibited release evidence content' >&2
+            exit 1
+          fi
+          ./deploy/scripts/verify-candidate-artifact-layout.sh "${{ matrix.target }}" "$workspace"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: candidate-image-${{ matrix.target }}-${{ github.sha }}
+          path: candidate-artifacts/${{ matrix.target }}/
+          if-no-files-found: error
+          retention-days: 30
+
+  candidate-manifest:
+    if: inputs.evidence_run_id == ''
+    needs: build-candidates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      gateway_image: ${{ steps.render.outputs.gateway_image }}
+    env:
+      GOTOOLCHAIN: local
+      LIVE_PRODUCTION_HOST: ${{ inputs.production_host }}
+      LIVE_PRODUCTION_TLS_SECRET: ${{ inputs.production_tls_secret }}
+      LIVE_PRODUCTION_TRUSTED_PROXY_CIDR: ${{ inputs.trusted_proxy_cidr }}
+      LIVE_PRODUCTION_EGRESS_PROXY_CIDR: ${{ inputs.egress_proxy_cidr }}
+      LIVE_PRODUCTION_VOICE_URL: ${{ inputs.voice_url }}
+      LIVE_PRODUCTION_OIDC_ISSUER: ${{ inputs.oidc_issuer }}
+      LIVE_DEPLOYMENT_REGION: ${{ inputs.deployment_region }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32
+        with:
+          go-version: 1.26.0
+          cache: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-image-gateway-${{ github.sha }}
+          path: image-digests/gateway
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-image-worker-${{ github.sha }}
+          path: image-digests/worker
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-image-migrate-${{ github.sha }}
+          path: image-digests/migrate
+      - id: render
+        name: Render manifests from immutable digests
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in gateway worker migrate; do ./deploy/scripts/verify-candidate-artifact-layout.sh "$target" "image-digests/$target"; done
+          export LIVE_PRODUCTION_GATEWAY_IMAGE="$(<image-digests/gateway/gateway.digest)"
+          export LIVE_PRODUCTION_WORKER_IMAGE="$(<image-digests/worker/worker.digest)"
+          export LIVE_PRODUCTION_MIGRATE_IMAGE="$(<image-digests/migrate/migrate.digest)"
+          workspace="$GITHUB_WORKSPACE/candidate-manifest"
+          mkdir -m 700 "$workspace"
+          ./deploy/scripts/render-kustomize.sh production > "$workspace/production.yaml"
+          awk '/config-hash: v1:/{print $2; exit}' "$workspace/production.yaml" > "$workspace/config-hash.txt"
+          test -s "$workspace/config-hash.txt"
+          grep -Eq '^v1:[0-9a-f]{64}$' "$workspace/config-hash.txt"
+          test "$(wc -c < "$workspace/production.yaml")" -le 1048576
+          if rg -n -i '(audio_base64|raw_audio|reasoning_content|tool_arguments|"transcript"[[:space:]]*:|"pcm"[[:space:]]*:|-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----)' "$workspace/production.yaml" "$workspace/config-hash.txt"; then
+            echo 'candidate manifest artifact contains prohibited release evidence content' >&2
+            exit 1
+          fi
+          go run ./deploy/validate -overlay production -readiness deploy "$workspace/production.yaml"
+          echo "gateway_image=$LIVE_PRODUCTION_GATEWAY_IMAGE" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: candidate-manifest-${{ github.sha }}
+          path: candidate-manifest/
+          if-no-files-found: error
+          retention-days: 30
+
+  promote-reviewed-digests:
+    if: inputs.evidence_run_id != ''
+    needs: verify-signed-evidence
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+      id-token: write
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32
+        with:
+          go-version: 1.26.0
+          cache: true
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435
+      - uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: sigstore/cosign-installer@d7543c93d881b35a8faa02e8e3605f69b7a1ce62
+        with: {cosign-release: v2.5.3}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-image-gateway-${{ github.sha }}
+          path: candidate/gateway
+          run-id: ${{ inputs.evidence_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-image-worker-${{ github.sha }}
+          path: candidate/worker
+          run-id: ${{ inputs.evidence_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-image-migrate-${{ github.sha }}
+          path: candidate/migrate
+          run-id: ${{ inputs.evidence_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate-manifest-${{ github.sha }}
+          path: candidate/manifest
+          run-id: ${{ inputs.evidence_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: signed-release-evidence-${{ github.sha }}-${{ needs.verify-signed-evidence.outputs.signed_bundle_config_key }}
+          path: ${{ runner.temp }}/signed-release
+      - name: Revalidate reviewed inputs for promotion
+        env:
+          INPUT_CONFIG_HASH: ${{ inputs.config_hash }}
+          INPUT_DEPLOYMENT_REGION: ${{ inputs.deployment_region }}
+          INPUT_EGRESS_PROXY_CIDR: ${{ inputs.egress_proxy_cidr }}
+          INPUT_OIDC_ISSUER: ${{ inputs.oidc_issuer }}
+          INPUT_PRODUCTION_HOST: ${{ inputs.production_host }}
+          INPUT_PRODUCTION_TLS_SECRET: ${{ inputs.production_tls_secret }}
+          INPUT_RUN_PROVIDER_TESTS: ${{ inputs.run_provider_tests }}
+          INPUT_TRUSTED_PROXY_CIDR: ${{ inputs.trusted_proxy_cidr }}
+          INPUT_VOICE_URL: ${{ inputs.voice_url }}
+          PUBLIC_KEY_BASE64: ${{ secrets.RELEASE_ATTESTATION_PUBLIC_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          ./deploy/scripts/bind-release-inputs.sh
+          for target in gateway worker migrate; do ./deploy/scripts/verify-candidate-artifact-layout.sh "$target" "candidate/$target"; done
+          echo "RELEASE_INPUT_candidate_gateway_image=$(<candidate/gateway/gateway.digest)" >> "$GITHUB_ENV"
+          echo "RELEASE_INPUT_candidate_migrate_image=$(<candidate/migrate/migrate.digest)" >> "$GITHUB_ENV"
+          echo "RELEASE_INPUT_candidate_worker_image=$(<candidate/worker/worker.digest)" >> "$GITHUB_ENV"
+          echo "RELEASE_INPUT_manifest_sha256=$(sha256sum candidate/manifest/production.yaml | cut -d' ' -f1)" >> "$GITHUB_ENV"
+          if [[ "$INPUT_RUN_PROVIDER_TESTS" == true ]]; then result=passed; else result=not-requested; fi
+          echo "RELEASE_INPUT_optional_provider_result=$result" >> "$GITHUB_ENV"
+          umask 077
+          printf '%s\n' "$PUBLIC_KEY_BASE64" > "$RUNNER_TEMP/release-ed25519.pub.base64"
+      - name: Reverify immutable signed bundle before package authority
+        env:
+          INPUT_CONFIG_HASH: ${{ inputs.config_hash }}
+          SIGNED_BUNDLE_ARTIFACT_DIGEST: ${{ needs.verify-signed-evidence.outputs.signed_bundle_digest }}
+        run: |
+          set -euo pipefail
+          [[ "$SIGNED_BUNDLE_ARTIFACT_DIGEST" =~ ^[0-9a-f]{64}$ ]]
+          go build -trimpath -o "$RUNNER_TEMP/live-release-gate" ./cmd/live-release-gate
+          "$RUNNER_TEMP/live-release-gate" verify-archive \
+            --archive "$RUNNER_TEMP/signed-release/signed-release-evidence.tar" \
+            --commit "$GITHUB_SHA" --config-hash "$INPUT_CONFIG_HASH" \
+            --release-input "candidate_gateway_image=$RELEASE_INPUT_candidate_gateway_image" \
+            --release-input "candidate_migrate_image=$RELEASE_INPUT_candidate_migrate_image" \
+            --release-input "candidate_worker_image=$RELEASE_INPUT_candidate_worker_image" \
+            --release-input "deployment_region=$RELEASE_INPUT_deployment_region" \
+            --release-input "egress_proxy_cidr=$RELEASE_INPUT_egress_proxy_cidr" \
+            --release-input "manifest_sha256=$RELEASE_INPUT_manifest_sha256" \
+            --release-input "oidc_issuer=$RELEASE_INPUT_oidc_issuer" \
+            --release-input "optional_provider_result=$RELEASE_INPUT_optional_provider_result" \
+            --release-input "production_host=$RELEASE_INPUT_production_host" \
+            --release-input "production_tls_secret=$RELEASE_INPUT_production_tls_secret" \
+            --release-input "run_provider_tests=$RELEASE_INPUT_run_provider_tests" \
+            --release-input "trusted_proxy_cidr=$RELEASE_INPUT_trusted_proxy_cidr" \
+            --release-input "voice_url=$RELEASE_INPUT_voice_url" \
+            --attestation-key "release-operator=$RUNNER_TEMP/release-ed25519.pub.base64"
+      - name: Sign and promote only evidenced immutable indexes
+        shell: bash
+        run: |
+          set -euo pipefail
+          predicate_type="https://github.com/chuanmingliu/openai-gpt-live/attestations/buildx-supply-validation/v1"
+          for target in gateway worker migrate; do
+            candidate="candidate/$target"
+            ./deploy/scripts/verify-candidate-artifact-layout.sh "$target" "$candidate"
+            ref="$(<"$candidate/$target.digest")"
+            image="${ref%@sha256:*}"
+            digest="sha256:${ref##*@sha256:}"
+            python3 deploy/scripts/validate-supply-evidence.py \
+              --oci-archive "$candidate/$target.oci.tar" \
+              --registry-index "$candidate/$target.index.json" \
+              --image "$image" --digest "$digest" \
+              --source-repository "https://github.com/$GITHUB_REPOSITORY" \
+              --source-sha "$GITHUB_SHA" --target "$target" \
+              --output "$RUNNER_TEMP/$target.supply-validation.json"
+            cmp -- "$candidate/$target.supply-validation.json" "$RUNNER_TEMP/$target.supply-validation.json"
+            [[ "$(sha256sum "$candidate/$target.sbom.json" | cut -d' ' -f1)" == "$(jq -er .document_sha256 "$candidate/$target.sbom-summary.json")" ]]
+            [[ "$(sha256sum "$candidate/$target.provenance.json" | cut -d' ' -f1)" == "$(jq -er .document_sha256 "$candidate/$target.provenance-summary.json")" ]]
+            cosign sign --yes "$ref"
+            cosign verify --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release-gate.yml@${GITHUB_REF}" \
+              "$ref" > "$candidate/$target-keyless-verification.json"
+            cosign attest --yes --type "$predicate_type" \
+              --predicate "$candidate/$target.supply-validation.json" "$ref"
+            cosign verify-attestation --type "$predicate_type" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release-gate.yml@${GITHUB_REF}" \
+              "$ref" > "$candidate/$target-attestation-keyless-verification.json"
+            jq -e --arg digest "${digest#sha256:}" --arg predicate_type "$predicate_type" \
+              --slurpfile expected "$candidate/$target.supply-validation.json" '
+                (.payload | @base64d | fromjson) as $statement |
+                $statement.predicateType == $predicate_type and
+                $statement.subject == [{name:("ghcr.io/chuanmingliu/openai-gpt-live/" + $expected[0].target),digest:{sha256:$digest}}] and
+                $statement.predicate == $expected[0]
+              ' "$candidate/$target-attestation-keyless-verification.json" >/dev/null
+            docker buildx imagetools create --tag "ghcr.io/chuanmingliu/openai-gpt-live/$target:release-${GITHUB_SHA}" "$ref"
+          done
+      - name: Archive keyless identity verification summaries
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: keyless-verification-${{ github.sha }}
+          path: candidate/*/*-keyless-verification.json
+          if-no-files-found: error
+          retention-days: 90

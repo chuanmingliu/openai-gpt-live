@@ -9,6 +9,8 @@ spec:
         - name: live-gateway
           image: LIVE_PRODUCTION_GATEWAY_IMAGE
           env:
+            - name: LIVE_GATEWAY_IMAGE
+              value: LIVE_PRODUCTION_GATEWAY_IMAGE
             - name: HTTPS_PROXY
               value: http://egress-proxy.platform.svc:3128
 ---
@@ -25,6 +27,20 @@ spec:
           env:
             - name: HTTPS_PROXY
               value: http://egress-proxy.platform.svc:3128
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: live-synthetic-canary
+spec:
+  template:
+    spec:
+      containers:
+        - name: canary
+          image: LIVE_PRODUCTION_GATEWAY_IMAGE
+          env:
+            - name: LIVE_EXPECTED_GATEWAY_IMAGE
+              value: LIVE_PRODUCTION_GATEWAY_IMAGE
 ---
 apiVersion: batch/v1
 kind: Job

@@ -2,6 +2,7 @@ package ws
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -118,6 +119,15 @@ func readServerType(t *testing.T, conn *websocket.Conn) string {
 	}
 	require.NoError(t, json.Unmarshal(raw, &envelope))
 	return envelope.Type
+}
+
+func validUpgradeRequest() *http.Request {
+	request := httptest.NewRequest(http.MethodGet, "http://example.test/v1/realtime", nil)
+	request.Header.Set("Connection", "Upgrade")
+	request.Header.Set("Upgrade", "websocket")
+	request.Header.Set("Sec-WebSocket-Version", "13")
+	request.Header.Set("Sec-WebSocket-Key", base64.StdEncoding.EncodeToString(make([]byte, 16)))
+	return request
 }
 
 func TestHandlerCapabilitiesAreExactAndDoNotUpgrade(t *testing.T) {
@@ -487,6 +497,79 @@ func TestHandlerDoesNotTrustClientIdentityParameters(t *testing.T) {
 	case <-time.After(testTimeout):
 		t.Fatal("connector did not receive open request")
 	}
+}
+
+func TestCanaryRuntimeHeadersRequireAuthenticatedEphemeralSubject(t *testing.T) {
+	identity := RuntimeIdentity{
+		ConfigHash:   "v1:" + strings.Repeat("a", 64),
+		Region:       "us-east-1",
+		GatewayImage: "ghcr.io/chuanmingliu/openai-gpt-live/gateway@sha256:" + strings.Repeat("b", 64),
+	}
+	for name, ephemeral := range map[string]bool{"exact ephemeral canary": true, "ordinary authenticated user": false} {
+		t.Run(name, func(t *testing.T) {
+			admission := AdmissionFunc(func(context.Context, *http.Request) (session.Subject, func(), error) {
+				return session.Subject{TenantID: "trusted", UserID: "trusted-user", Ephemeral: ephemeral, ExpiresAt: time.Now().Add(time.Minute)}, func() {}, nil
+			})
+			server := httptest.NewServer(NewHandler(Options{MaxFrameBytes: 4096, CanaryRuntimeIdentity: identity}, validManager(testkit.NewFakeConnector(4)), admission))
+			defer server.Close()
+			ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+			defer cancel()
+			conn, response, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/v1/realtime", nil)
+			if response != nil && response.Body != nil {
+				defer response.Body.Close()
+			}
+			require.NoError(t, err)
+			defer conn.CloseNow()
+			if ephemeral {
+				require.Equal(t, identity.ConfigHash, response.Header.Get("X-Live-Config-Hash"))
+				require.Equal(t, identity.Region, response.Header.Get("X-Live-Region"))
+				require.Equal(t, identity.GatewayImage, response.Header.Get("X-Live-Gateway-Image"))
+			} else {
+				require.Empty(t, response.Header.Get("X-Live-Config-Hash"))
+				require.Empty(t, response.Header.Get("X-Live-Region"))
+				require.Empty(t, response.Header.Get("X-Live-Gateway-Image"))
+			}
+		})
+	}
+}
+
+func TestCanaryRuntimeHeadersFailClosedAndNeverLeakBeforeAdmission(t *testing.T) {
+	for name, identity := range map[string]RuntimeIdentity{
+		"missing":         {},
+		"partial":         {ConfigHash: "v1:" + strings.Repeat("a", 64)},
+		"malformed image": {ConfigHash: "v1:" + strings.Repeat("a", 64), Region: "us-east-1", GatewayImage: "gateway:mutable"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			admission := AdmissionFunc(func(context.Context, *http.Request) (session.Subject, func(), error) {
+				return session.Subject{TenantID: "synthetic", UserID: "canary", Ephemeral: true, ExpiresAt: time.Now().Add(time.Minute)}, func() {}, nil
+			})
+			server := httptest.NewServer(NewHandler(Options{CanaryRuntimeIdentity: identity}, validManager(testkit.NewFakeConnector(2)), admission))
+			defer server.Close()
+			ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+			defer cancel()
+			conn, response, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/v1/realtime", nil)
+			if conn != nil {
+				_ = conn.CloseNow()
+			}
+			require.Error(t, err)
+			require.NotNil(t, response)
+			require.Empty(t, response.Header.Get("X-Live-Config-Hash"))
+			require.Empty(t, response.Header.Get("X-Live-Region"))
+			require.Empty(t, response.Header.Get("X-Live-Gateway-Image"))
+		})
+	}
+
+	identity := RuntimeIdentity{ConfigHash: "v1:" + strings.Repeat("a", 64), Region: "us-east-1", GatewayImage: "ghcr.io/chuanmingliu/openai-gpt-live/gateway@sha256:" + strings.Repeat("b", 64)}
+	denied := AdmissionFunc(func(context.Context, *http.Request) (session.Subject, func(), error) {
+		return session.Subject{}, nil, admissionpkg.ErrUnauthorized
+	})
+	recorder := httptest.NewRecorder()
+	request := validUpgradeRequest()
+	NewHandler(Options{CanaryRuntimeIdentity: identity}, validManager(testkit.NewFakeConnector(2)), denied).ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusUnauthorized, recorder.Code)
+	require.Empty(t, recorder.Header().Get("X-Live-Config-Hash"))
+	require.Empty(t, recorder.Header().Get("X-Live-Region"))
+	require.Empty(t, recorder.Header().Get("X-Live-Gateway-Image"))
 }
 
 type recordingConnector struct {

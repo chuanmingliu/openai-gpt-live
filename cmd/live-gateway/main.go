@@ -38,6 +38,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/session"
 	"github.com/chuanmingliu/openai-gpt-live/internal/store/postgres"
 	"github.com/chuanmingliu/openai-gpt-live/internal/telemetry"
+	transportws "github.com/chuanmingliu/openai-gpt-live/internal/transport/ws"
 	"github.com/chuanmingliu/openai-gpt-live/migrations"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
@@ -56,6 +57,60 @@ func main() {
 		slog.Error("live gateway stopped", "error", err)
 		os.Exit(1)
 	}
+}
+
+func deploymentRegion(mode string, lookup func(string) (string, bool)) (string, error) {
+	region, regionOK := lookup("LIVE_DEPLOYMENT_REGION")
+	allowed, allowedOK := lookup("LIVE_ALLOWED_REGIONS")
+	if !regionOK && mode != "production" {
+		return "local", nil
+	}
+	if !regionOK || !allowedOK {
+		return "", errors.New("production requires LIVE_DEPLOYMENT_REGION and LIVE_ALLOWED_REGIONS")
+	}
+	return telemetry.ResolveDeploymentRegion(region, allowed)
+}
+
+func metricInstance(mode string, lookup func(string) (string, bool)) (string, error) {
+	instance, ok := lookup("LIVE_METRIC_INSTANCE")
+	if !ok || instance == "" {
+		if mode == "production" {
+			return "", errors.New("production requires LIVE_METRIC_INSTANCE")
+		}
+		return "local", nil
+	}
+	return instance, nil
+}
+
+func gatewayMetricLabels(cfg config.Config, configHash string, lookup func(string) (string, bool)) (telemetry.MetricLabels, error) {
+	provider := cfg.Gateway.Voice.Provider
+	if provider == "" {
+		provider = "other"
+	}
+	instance, err := metricInstance(cfg.Mode, lookup)
+	if err != nil {
+		return telemetry.MetricLabels{}, err
+	}
+	region, err := deploymentRegion(cfg.Mode, lookup)
+	if err != nil {
+		return telemetry.MetricLabels{}, err
+	}
+	return telemetry.MetricLabels{Component: "gateway", Provider: provider, Region: region, Instance: instance, ConfigHash: configHash}, nil
+}
+
+func canaryRuntimeIdentity(mode, configHash, region string, lookup func(string) (string, bool)) (transportws.RuntimeIdentity, error) {
+	if mode != "production" {
+		return transportws.RuntimeIdentity{}, nil
+	}
+	image, ok := lookup("LIVE_GATEWAY_IMAGE")
+	if !ok || image == "" {
+		return transportws.RuntimeIdentity{}, errors.New("production requires LIVE_GATEWAY_IMAGE")
+	}
+	identity := transportws.RuntimeIdentity{ConfigHash: configHash, Region: region, GatewayImage: image}
+	if err := identity.Validate(); err != nil {
+		return transportws.RuntimeIdentity{}, fmt.Errorf("production canary runtime identity: %w", err)
+	}
+	return identity, nil
 }
 
 func run(ctx context.Context, args []string, lookup func(string) (string, bool)) (runErr error) {
@@ -127,19 +182,23 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 		return err
 	}
 	registry := prometheus.NewRegistry()
-	provider := cfg.Gateway.Voice.Provider
-	if provider == "" {
-		provider = "other"
+	metricLabels, err := gatewayMetricLabels(cfg, configHash, lookup)
+	if err != nil {
+		return err
 	}
-	instance := cfg.Admission.InstanceID
-	if instance == "" {
-		instance = "local"
+	provider, region, instance := metricLabels.Provider, metricLabels.Region, metricLabels.Instance
+	canaryIdentity, err := canaryRuntimeIdentity(cfg.Mode, configHash, region, lookup)
+	if err != nil {
+		return err
 	}
-	metrics, err := telemetry.NewMetrics(registry, telemetry.MetricsConfig{Labels: telemetry.MetricLabels{Component: "gateway", Provider: provider, Region: "local", Instance: instance, ConfigHash: configHash}, AllowedComponents: []string{"gateway"}, AllowedProviders: []string{provider}, AllowedRegions: []string{"local"}, AllowedInstances: []string{instance}, AllowedConfigHashes: []string{configHash}, AllowedQueues: []string{"ingress", "egress", "reactor", "voice_control", "client_control", "handoff", "outbox"}, AllowedResults: []string{"ok", "error", "rejected", "dropped", "timeout", "suppressed", "replay", "shadow"}})
+	if err := telemetry.RegisterRuntimeCollectors(registry, metricLabels); err != nil {
+		return fmt.Errorf("configure gateway runtime metrics: %w", err)
+	}
+	metrics, err := telemetry.NewMetrics(registry, telemetry.MetricsConfig{Labels: metricLabels, AllowedComponents: []string{"gateway"}, AllowedProviders: []string{provider}, AllowedRegions: []string{region}, AllowedInstances: []string{instance}, AllowedConfigHashes: []string{configHash}, AllowedQueues: []string{"ingress", "egress", "reactor", "voice_control", "client_control", "handoff", "outbox"}, AllowedResults: []string{"ok", "error", "rejected", "dropped", "timeout", "suppressed", "replay", "shadow"}})
 	if err != nil {
 		return fmt.Errorf("configure gateway metrics: %w", err)
 	}
-	traceRuntime, err := telemetry.NewRuntime(ctx, telemetry.RuntimeConfig{Endpoint: cfg.Telemetry.OTLPEndpoint, Protocol: cfg.Telemetry.Protocol, Timeout: cfg.Telemetry.ExportTimeout, ServiceName: cfg.Telemetry.ServiceName, Component: "gateway", Provider: provider, Region: "local", Instance: instance, ConfigHash: configHash, Production: cfg.Mode == "production"})
+	traceRuntime, err := telemetry.NewRuntime(ctx, telemetry.RuntimeConfig{Endpoint: cfg.Telemetry.OTLPEndpoint, Protocol: cfg.Telemetry.Protocol, Timeout: cfg.Telemetry.ExportTimeout, ServiceName: cfg.Telemetry.ServiceName, Component: "gateway", Provider: provider, Region: region, Instance: instance, ConfigHash: configHash, Production: cfg.Mode == "production"})
 	if err != nil {
 		return fmt.Errorf("configure gateway telemetry: %w", err)
 	}
@@ -182,6 +241,9 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 	}, QueueState: func(name string, depth, bytes int, buffered time.Duration) {
 		queueObserver(name).Set(depth, bytes, buffered)
 	}, QueueBlocked: func(name string, d time.Duration) { queueObserver(name).ObserveBlocked(d) }, QueueOldest: func(name string, d time.Duration) { queueObserver(name).ObserveOldest(d) }, BargeinSuppression: func(d time.Duration) { bargeObserver.Observe(d.Seconds()) }})}
+	if cfg.Mode == "production" {
+		appOptions = append(appOptions, gateway.WithCanaryRuntimeIdentity(canaryIdentity))
+	}
 	if featureRuntime != nil {
 		appOptions = append(appOptions, gateway.WithFeatureGates(featureRuntime.gates))
 		appOptions = append(appOptions, gateway.WithApprovalStore(featureRuntime.repo))
@@ -326,9 +388,11 @@ func (c gatewayCapacity) Capacity() admin.Capacity {
 }
 
 type diagnosticsServer struct {
-	server   *http.Server
-	listener net.Listener
-	errors   chan error
+	server          *http.Server
+	listener        net.Listener
+	metricsServer   *http.Server
+	metricsListener net.Listener
+	errors          chan error
 }
 
 func startGatewayDiagnostics(ctx context.Context, cfg config.Config, authenticator auth.Authenticator, app *gateway.App, drainer *lifecycle.Drainer, ready *health.Registry, registry *prometheus.Registry, features *gatewayFeatureRuntime) (*diagnosticsServer, error) {
@@ -360,7 +424,7 @@ func startGatewayDiagnostics(ctx context.Context, cfg config.Config, authenticat
 	if err != nil {
 		return nil, errors.New("listen diagnostics")
 	}
-	d := &diagnosticsServer{server: server, listener: listener, errors: make(chan error, 1)}
+	d := &diagnosticsServer{server: server, listener: listener, errors: make(chan error, 2)}
 	go func() {
 		err := server.Serve(listener)
 		if errors.Is(err, http.ErrServerClosed) {
@@ -368,6 +432,23 @@ func startGatewayDiagnostics(ctx context.Context, cfg config.Config, authenticat
 		}
 		d.errors <- err
 	}()
+	if cfg.Mode == "production" {
+		metricsMux := http.NewServeMux()
+		metricsMux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+		d.metricsServer = &http.Server{Handler: metricsMux, ReadHeaderTimeout: 5 * time.Second}
+		d.metricsListener, err = net.Listen("tcp", ":9091")
+		if err != nil {
+			d.close()
+			return nil, errors.New("listen gateway metrics")
+		}
+		go func() {
+			err := d.metricsServer.Serve(d.metricsListener)
+			if errors.Is(err, http.ErrServerClosed) {
+				err = nil
+			}
+			d.errors <- err
+		}()
+	}
 	return d, nil
 }
 func (d *diagnosticsServer) close() {
@@ -378,6 +459,12 @@ func (d *diagnosticsServer) close() {
 	defer cancel()
 	_ = d.server.Shutdown(ctx)
 	_ = d.listener.Close()
+	if d.metricsServer != nil {
+		_ = d.metricsServer.Shutdown(ctx)
+	}
+	if d.metricsListener != nil {
+		_ = d.metricsListener.Close()
+	}
 }
 func runGateway(ctx context.Context, app *gateway.App, d *diagnosticsServer) error {
 	if d == nil {
@@ -496,7 +583,7 @@ func composeAdmission(ctx context.Context, cfg config.Config, lookup func(string
 	} else {
 		return nil, nil, errors.New("production authentication is unavailable")
 	}
-	controllerConfig := admission.Config{RequireTLS: cfg.Mode == "production", BehindIngress: cfg.Gateway.BehindIngress, TrustedProxyCIDRs: cfg.Gateway.TrustedProxies, AllowedOrigins: cfg.Auth.AllowedOrigins, AllowEmptyOrigin: cfg.Auth.AllowNonBrowser, GlobalRate: cfg.Admission.GlobalRate, GlobalBurst: cfg.Admission.GlobalBurst, IPRate: cfg.Admission.IPRate, IPBurst: cfg.Admission.IPBurst, IPKeyTTL: cfg.Admission.IPKeyTTL, MaxIPKeys: cfg.Admission.MaxIPKeys, RequiredScopes: requiredScopes, Limits: admission.Limits{Global: cfg.Admission.MaxSessions, PerTenant: cfg.Admission.MaxSessionsPerTenant, PerUser: cfg.Admission.MaxSessionsPerUser}, RequireStore: cfg.Mode == "production"}
+	controllerConfig := admission.Config{RequireTLS: cfg.Mode == "production", BehindIngress: cfg.Gateway.BehindIngress, TrustedProxyCIDRs: cfg.Gateway.TrustedProxies, AllowedOrigins: cfg.Auth.AllowedOrigins, AllowEmptyOrigin: cfg.Auth.AllowNonBrowser, GlobalRate: cfg.Admission.GlobalRate, GlobalBurst: cfg.Admission.GlobalBurst, IPRate: cfg.Admission.IPRate, IPBurst: cfg.Admission.IPBurst, IPKeyTTL: cfg.Admission.IPKeyTTL, MaxIPKeys: cfg.Admission.MaxIPKeys, RequiredScopes: requiredScopes, EphemeralTenantID: cfg.Auth.EphemeralTenantID, EphemeralUserID: cfg.Auth.EphemeralUserID, Limits: admission.Limits{Global: cfg.Admission.MaxSessions, PerTenant: cfg.Admission.MaxSessionsPerTenant, PerUser: cfg.Admission.MaxSessionsPerUser}, RequireStore: cfg.Mode == "production"}
 	if cfg.Mode != "production" {
 		controller, err := admission.New(authenticator, controllerConfig)
 		if err != nil {

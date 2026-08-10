@@ -1,0 +1,86 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: gpt-live-release-alerts
+  namespace: gpt-live
+spec:
+  groups:
+    - name: gpt-live.safety
+      interval: 30s
+      rules:
+        - alert: GPTLiveStaleOutputObserved
+          expr: sum by (region, instance, provider, config_hash) (increase(live_stale_output_rejected_total[5m])) > 0
+          for: 0m
+          labels: {severity: critical}
+          annotations:
+            summary: Stale provider output reached the gateway fence
+            runbook_url: docs/runbooks/rollback.md
+        - alert: GPTLiveCrossSessionLeak
+          expr: sum by (region, instance, provider, config_hash) (increase(live_synthetic_cross_session_leaks_total[5m])) > 0
+          for: 0m
+          labels: {severity: critical}
+          annotations:
+            summary: Dedicated synthetic canary detected cross-session leakage
+            runbook_url: docs/runbooks/rollback.md
+        - alert: GPTLiveSyntheticCanaryMissing
+          expr: time() - max by (region, instance, provider, config_hash) (live_synthetic_canary_last_success_timestamp_seconds) > 120 or absent(live_synthetic_canary_last_success_timestamp_seconds)
+          for: 2m
+          labels: {severity: critical}
+          annotations:
+            summary: Cross-session synthetic canary is not publishing
+            runbook_url: docs/runbooks/rollback.md
+    - name: gpt-live.capacity
+      interval: 30s
+      rules:
+        - alert: GPTLiveQueueOverflow
+          expr: sum by (component, region, instance, provider, config_hash, queue) (increase(live_queue_overflows_total[5m])) > 0
+          for: 0m
+          labels: {severity: critical}
+          annotations:
+            summary: A bounded live queue overflowed
+            runbook_url: docs/runbooks/queue-overload.md
+        - alert: GPTLiveLatencySLOBurn
+          expr: 1 - (sum by (region, instance, provider, config_hash) (rate(live_audio_frame_transit_seconds_bucket{le="0.030"}[5m])) / sum by (region, instance, provider, config_hash) (rate(live_audio_frame_transit_seconds_count[5m]))) > 0.01
+          for: 10m
+          labels: {severity: critical}
+          annotations:
+            summary: Audio transit SLO burned for two consecutive five-minute windows
+            runbook_url: docs/runbooks/rollback.md
+        - alert: GPTLiveOutboxLag
+          expr: histogram_quantile(0.99, sum by (le, region, instance, provider, config_hash, queue) (rate(live_outbox_lag_seconds_bucket[5m]))) > 3
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: Durable outbox publication is delayed
+            runbook_url: docs/runbooks/database-outage.md
+        - alert: GPTLiveExpiredLeases
+          expr: sum by (region, instance, provider, config_hash, queue) (increase(live_expired_leases_total[5m])) > 0
+          for: 5m
+          labels: {severity: warning}
+          annotations:
+            summary: Worker leases are expiring
+            runbook_url: docs/runbooks/database-outage.md
+    - name: gpt-live.runtime
+      interval: 30s
+      rules:
+        - alert: GPTLiveNotReady
+          expr: kube_pod_status_ready{namespace="gpt-live",condition="true",pod=~"live-(gateway|worker)-.*"} == 0
+          for: 2m
+          labels: {severity: critical}
+          annotations:
+            summary: Gateway or worker readiness probe is failing
+            runbook_url: docs/runbooks/voice-provider-outage.md
+        - alert: GPTLiveUnexpectedGoroutineGrowth
+          expr: deriv(go_goroutines{component=~"gateway|worker"}[30m]) > 0.2
+          for: 15m
+          labels: {severity: warning}
+          annotations:
+            summary: Process goroutines are growing unexpectedly
+            runbook_url: docs/runbooks/rollback.md
+        - alert: GPTLiveUnexpectedHeapGrowth
+          expr: deriv(go_memstats_heap_alloc_bytes{component=~"gateway|worker"}[30m]) > 65536
+          for: 15m
+          labels: {severity: warning}
+          annotations:
+            summary: Process heap is growing unexpectedly
+            runbook_url: docs/runbooks/rollback.md

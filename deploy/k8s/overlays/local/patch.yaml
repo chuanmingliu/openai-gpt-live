@@ -3,7 +3,7 @@ kind: ConfigMap
 metadata:
   name: live-deploy-metadata
 data:
-  config-hash: v1:8f21bafd1b3e32637ed79ef7ddbc67b44fa367b909012fd6030ed5507182a1f7
+  config-hash: v1:01325caae8753b2a548e8ee9cd4b228bacdb13995b69a626109ca0f71b4690e3
   render-readiness: local
   production-host: ""
   tls-secret: ""
@@ -110,6 +110,32 @@ spec:
                 secretKeyRef:
                   name: live-secrets
                   key: LIVE_STATIC_BEARER_TOKEN
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: live-synthetic-canary
+spec:
+  template:
+    spec:
+      containers:
+        - name: canary
+          env:
+            - {name: LIVE_CANARY_GATEWAY_URL, value: "ws://live-gateway.gpt-live.svc/v1/realtime"}
+            - {name: LIVE_CANARY_ORIGIN, value: "http://localhost:3000"}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: synthetic-canary
+spec:
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+      ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]
+    - to:
+        - podSelector: {matchLabels: {app.kubernetes.io/name: live-gateway}}
+      ports: [{protocol: TCP, port: 80}]
 ---
 apiVersion: apps/v1
 kind: Deployment
