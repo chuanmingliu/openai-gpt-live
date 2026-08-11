@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -73,9 +74,7 @@ func TestProxyRejectsUpstreamBinaryFrames(t *testing.T) {
 	t.Cleanup(func() { _ = conn.CloseNow() })
 
 	_, _, err := conn.Read(t.Context())
-	require.Error(t, err)
-	assert.Equal(t, websocket.StatusUnsupportedData, websocket.CloseStatus(err))
-	assert.Contains(t, err.Error(), "text frames required")
+	requireBrowserClose(t, err, websocket.StatusUnsupportedData, "text frames required")
 }
 
 func TestProxyRejectsOversizedUpstreamTextFrames(t *testing.T) {
@@ -85,9 +84,7 @@ func TestProxyRejectsOversizedUpstreamTextFrames(t *testing.T) {
 	t.Cleanup(func() { _ = conn.CloseNow() })
 
 	_, _, err := conn.Read(t.Context())
-	require.Error(t, err)
-	assert.Equal(t, websocket.StatusMessageTooBig, websocket.CloseStatus(err))
-	assert.Contains(t, err.Error(), "frame too large")
+	requireBrowserClose(t, err, websocket.StatusMessageTooBig, "frame too large")
 }
 
 func TestProxyRelaysNormalUpstreamClosure(t *testing.T) {
@@ -95,9 +92,7 @@ func TestProxyRelaysNormalUpstreamClosure(t *testing.T) {
 	t.Cleanup(func() { _ = conn.CloseNow() })
 
 	_, _, err := conn.Read(t.Context())
-	require.Error(t, err)
-	assert.Equal(t, websocket.StatusNormalClosure, websocket.CloseStatus(err))
-	assert.Contains(t, err.Error(), "peer closed")
+	requireBrowserClose(t, err, websocket.StatusNormalClosure, "peer closed")
 }
 
 func TestProxyBoundsAbnormalUpstreamFailure(t *testing.T) {
@@ -105,10 +100,16 @@ func TestProxyBoundsAbnormalUpstreamFailure(t *testing.T) {
 	t.Cleanup(func() { _ = conn.CloseNow() })
 
 	_, _, err := conn.Read(t.Context())
+	requireBrowserClose(t, err, websocket.StatusInternalError, "relay unavailable")
+}
+
+func requireBrowserClose(t *testing.T, err error, code websocket.StatusCode, reason string) {
+	t.Helper()
 	require.Error(t, err)
-	assert.Equal(t, websocket.StatusInternalError, websocket.CloseStatus(err))
-	assert.Contains(t, err.Error(), "relay unavailable")
-	assert.NotContains(t, err.Error(), "upstream failure")
+	var closeError websocket.CloseError
+	require.True(t, errors.As(err, &closeError))
+	assert.Equal(t, code, closeError.Code)
+	assert.Equal(t, reason, closeError.Reason)
 }
 
 type upstreamAction struct {
