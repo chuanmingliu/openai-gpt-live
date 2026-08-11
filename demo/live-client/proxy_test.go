@@ -54,6 +54,99 @@ func TestProxyRejectsOversizedTextFrames(t *testing.T) {
 	assert.Equal(t, websocket.StatusMessageTooBig, websocket.CloseStatus(err))
 }
 
+func TestProxyRelaysUpstreamTextToBrowser(t *testing.T) {
+	conn := dialDemoWithUpstreamAction(t, upstreamAction{
+		kind: websocket.MessageText, payload: []byte(`{"type":"session.created"}`),
+	})
+	t.Cleanup(func() { _ = conn.CloseNow() })
+
+	kind, payload, err := conn.Read(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, websocket.MessageText, kind)
+	assert.JSONEq(t, `{"type":"session.created"}`, string(payload))
+}
+
+func TestProxyRejectsUpstreamBinaryFrames(t *testing.T) {
+	conn := dialDemoWithUpstreamAction(t, upstreamAction{
+		kind: websocket.MessageBinary, payload: []byte{1},
+	})
+	t.Cleanup(func() { _ = conn.CloseNow() })
+
+	_, _, err := conn.Read(t.Context())
+	require.Error(t, err)
+	assert.Equal(t, websocket.StatusUnsupportedData, websocket.CloseStatus(err))
+	assert.Contains(t, err.Error(), "text frames required")
+}
+
+func TestProxyRejectsOversizedUpstreamTextFrames(t *testing.T) {
+	conn := dialDemoWithUpstreamAction(t, upstreamAction{
+		kind: websocket.MessageText, payload: []byte(strings.Repeat("x", 1025)),
+	})
+	t.Cleanup(func() { _ = conn.CloseNow() })
+
+	_, _, err := conn.Read(t.Context())
+	require.Error(t, err)
+	assert.Equal(t, websocket.StatusMessageTooBig, websocket.CloseStatus(err))
+	assert.Contains(t, err.Error(), "frame too large")
+}
+
+func TestProxyRelaysNormalUpstreamClosure(t *testing.T) {
+	conn := dialDemoWithUpstreamAction(t, upstreamAction{close: websocket.StatusNormalClosure})
+	t.Cleanup(func() { _ = conn.CloseNow() })
+
+	_, _, err := conn.Read(t.Context())
+	require.Error(t, err)
+	assert.Equal(t, websocket.StatusNormalClosure, websocket.CloseStatus(err))
+	assert.Contains(t, err.Error(), "peer closed")
+}
+
+func TestProxyBoundsAbnormalUpstreamFailure(t *testing.T) {
+	conn := dialDemoWithUpstreamAction(t, upstreamAction{close: websocket.StatusAbnormalClosure})
+	t.Cleanup(func() { _ = conn.CloseNow() })
+
+	_, _, err := conn.Read(t.Context())
+	require.Error(t, err)
+	assert.Equal(t, websocket.StatusInternalError, websocket.CloseStatus(err))
+	assert.Contains(t, err.Error(), "relay unavailable")
+	assert.NotContains(t, err.Error(), "upstream failure")
+}
+
+type upstreamAction struct {
+	kind    websocket.MessageType
+	payload []byte
+	close   websocket.StatusCode
+}
+
+func dialDemoWithUpstreamAction(t *testing.T, action upstreamAction) *websocket.Conn {
+	t.Helper()
+	upstream := newActionUpstream(t, action)
+	demo := newDemoTestServer(t, upstream, []byte("sentinel"), 1024)
+	conn, _ := dialDemo(t, demo.URL)
+	return conn
+}
+
+func newActionUpstream(t *testing.T, action upstreamAction) string {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		conn, err := websocket.Accept(writer, request, &websocket.AcceptOptions{InsecureSkipVerify: true})
+		if err != nil {
+			return
+		}
+		defer conn.CloseNow()
+		if action.close != 0 {
+			if action.close == websocket.StatusAbnormalClosure {
+				return
+			}
+			_ = conn.Close(action.close, "upstream failure")
+			return
+		}
+		_ = conn.Write(request.Context(), action.kind, action.payload)
+		_, _, _ = conn.Read(request.Context())
+	}))
+	t.Cleanup(server.Close)
+	return wsURL(server.URL) + "/v1/realtime"
+}
+
 func newEchoUpstream(t *testing.T, expectedAuthorization string) (string, <-chan bool) {
 	t.Helper()
 	authorized := make(chan bool, 4)

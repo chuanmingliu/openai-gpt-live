@@ -24,10 +24,10 @@ func proxyWebSocket(ctx context.Context, browser, upstream *websocket.Conn, maxB
 	go func() { results <- relayResult{err: copyText(relayContext, browser, upstream, maxBytes)} }()
 
 	first := <-results
-	cancel()
 	code, reason := safeBrowserClose(first.err)
 	_ = browser.Close(code, reason)
 	_ = upstream.Close(websocket.StatusNormalClosure, "relay closed")
+	cancel()
 	<-results
 	return first.err
 }
@@ -55,7 +55,7 @@ func safeBrowserClose(err error) (websocket.StatusCode, string) {
 	if errors.Is(err, errBinaryFrame) {
 		return websocket.StatusUnsupportedData, "text frames required"
 	}
-	if errors.Is(err, errFrameTooLarge) || websocket.CloseStatus(err) == websocket.StatusMessageTooBig {
+	if errors.Is(err, errFrameTooLarge) || errors.Is(err, websocket.ErrMessageTooBig) || websocket.CloseStatus(err) == websocket.StatusMessageTooBig {
 		return websocket.StatusMessageTooBig, "frame too large"
 	}
 	code := websocket.CloseStatus(err)
