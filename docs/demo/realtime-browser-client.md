@@ -36,6 +36,10 @@ path below follows the public
 [`speech-to-speech` quickstart](https://github.com/huggingface/speech-to-speech#quickstart),
 which serves `ws://127.0.0.1:8765/v1/realtime` and accepts the Realtime model
 name `local`. Install `speech-to-speech` as described there before continuing.
+The exact launch command here is verified against the supplied local checkout:
+its `pyproject.toml` maps `speech-to-speech` directly to
+`speech_to_speech.s2s_pipeline:main`, and its local `--help` exposes flags at
+the top level. It has no `serve` subcommand.
 
 Prompt for the reference service's own LLM credential without putting its
 value in shell history, then start only that service:
@@ -82,6 +86,27 @@ environment-variable names for credentials; the values never enter YAML.
 DEMO_RUNTIME_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gpt-live-browser.XXXXXX")"
 GATEWAY_CONFIG="$DEMO_RUNTIME_DIR/gateway.yaml"
 
+wait_for_ready() {
+  local service_name="$1"
+  local owned_pid="$2"
+  local ready_url="$3"
+  local attempt
+
+  for attempt in {1..50}; do
+    if curl --fail --silent --output /dev/null "$ready_url"; then
+      printf '%s\n' "$service_name ready"
+      return 0
+    fi
+    if ! kill -0 "$owned_pid" 2>/dev/null; then
+      printf '%s\n' "$service_name exited before readiness" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+  printf '%s\n' "$service_name readiness timed out" >&2
+  return 1
+}
+
 cat >"$GATEWAY_CONFIG" <<YAML
 mode: local
 gateway:
@@ -119,12 +144,14 @@ go build -o "$DEMO_RUNTIME_DIR/live-gateway" ./cmd/live-gateway
 "$DEMO_RUNTIME_DIR/live-gateway" -config "$GATEWAY_CONFIG" &
 GATEWAY_PID=$!
 
-curl --fail --silent --show-error http://127.0.0.1:19090/health/ready
+wait_for_ready gateway "$GATEWAY_PID" http://127.0.0.1:19090/health/ready
 ```
 
-`check-config` validates structure without reading secret values. A `ready`
-response proves only the local gateway process is ready; it does not prove
-provider authentication, a successful speech turn, or audible playback.
+`check-config` validates structure without reading secret values. The readiness
+helper makes at most 50 content-free attempts, 0.1 seconds apart, and fails if
+the owned process exits or the five-second bound expires. A successful check
+proves only the local gateway process is ready; it does not prove provider
+authentication, a successful speech turn, or audible playback.
 
 ## 3. Start the browser BFF
 
@@ -143,7 +170,7 @@ go build -o "$DEMO_RUNTIME_DIR/live-client" ./demo/live-client
   -bearer-env LIVE_DEMO_BEARER &
 BFF_PID=$!
 
-curl --fail --silent --show-error http://127.0.0.1:3000/health/ready
+wait_for_ready browser-bff "$BFF_PID" http://127.0.0.1:3000/health/ready
 ```
 
 Open [http://127.0.0.1:3000](http://127.0.0.1:3000) in a browser on the same
