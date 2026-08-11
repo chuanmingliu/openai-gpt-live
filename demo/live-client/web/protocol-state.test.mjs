@@ -31,7 +31,7 @@ test('user transcript deltas finalize once despite a duplicate terminal event', 
   );
 });
 
-test('assistant transcript deltas and terminal text are classified once', () => {
+test('assistant transcript chunks remain one turn and finalize at response.done', () => {
   const state = new ProtocolState();
   assert.deepEqual(
     state.consume({type: 'response.output_audio_transcript.delta', response_id: 'resp_1', delta: 'hi'}),
@@ -39,11 +39,23 @@ test('assistant transcript deltas and terminal text are classified once', () => 
   );
   assert.deepEqual(
     state.consume({type: 'response.output_audio_transcript.done', response_id: 'resp_1', transcript: 'hi there'}),
-    [{type: 'assistant-done', text: 'hi there'}],
+    [{type: 'assistant-delta', text: ' there'}],
+  );
+  assert.deepEqual(
+    state.consume({type: 'response.output_audio_transcript.done', response_id: 'resp_1', transcript: 'changed'}),
+    [{type: 'assistant-delta', text: 'changed'}],
   );
   assert.deepEqual(
     state.consume({type: 'response.output_audio_transcript.done', response_id: 'resp_1', transcript: 'changed'}),
     [],
+  );
+  assert.deepEqual(
+    state.consume({type: 'response.done', response: {id: 'resp_1', status: 'completed'}}),
+    [{type: 'assistant-done', text: 'hi therechanged'}, {type: 'status', value: 'listening'}],
+  );
+  assert.deepEqual(
+    state.consume({type: 'response.done', response: {id: 'resp_1', status: 'completed'}}),
+    [{type: 'status', value: 'listening'}],
   );
 });
 

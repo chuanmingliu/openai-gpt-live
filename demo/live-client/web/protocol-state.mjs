@@ -74,14 +74,14 @@ export class ProtocolState {
       case 'response.output_audio_transcript.delta':
         return this.transcriptDelta(this.assistants, event.response_id, event.delta, 'assistant-delta');
       case 'response.output_audio_transcript.done':
-        return this.transcriptDone(this.assistants, event.response_id, event.transcript, 'assistant-done');
+        return this.assistantTranscriptPart(event.response_id, event.transcript);
       case 'response.output_audio.delta':
         if (typeof event.delta !== 'string' || event.delta.length === 0 || event.delta.length > MAX_TEXT_BYTES) {
           return [{type: 'error', code: 'invalid-audio'}];
         }
         return [{type: 'audio', encoded: event.delta}];
       case 'response.done':
-        return this.userSpeaking ? [] : [{type: 'status', value: 'listening'}];
+        return this.responseDone(event.response?.id);
       case 'error': {
         const code = event.error?.code;
         return [{type: 'error', code: typeof code === 'string' && ERROR_CODE_PATTERN.test(code) ? code : 'gateway-error'}];
@@ -106,6 +106,38 @@ export class ProtocolState {
     if (store.get(id)?.done) return [];
     insertBounded(store, id, {text, done: true});
     return [{type: effectType, text}];
+  }
+
+  assistantTranscriptPart(id, text) {
+    if (!validID(id) || !validText(text)) return [{type: 'error', code: 'invalid-transcript'}];
+    const current = this.assistants.get(id);
+    if (current?.done) return [];
+    if (current?.lastPart === text) return [];
+    let combined = text;
+    let delta = text;
+    if (current) {
+      if (text === current.text) delta = '';
+      else if (text.startsWith(current.text)) delta = text.slice(current.text.length);
+      else {
+        combined = current.text + text;
+        if (!validText(combined)) return [{type: 'error', code: 'invalid-transcript'}];
+      }
+    }
+    insertBounded(this.assistants, id, {text: combined, done: false, lastPart: text});
+    return delta.length === 0 ? [] : [{type: 'assistant-delta', text: delta}];
+  }
+
+  responseDone(id) {
+    const effects = [];
+    if (validID(id)) {
+      const transcript = this.assistants.get(id);
+      if (transcript && !transcript.done) {
+        insertBounded(this.assistants, id, {text: transcript.text, done: true, lastPart: transcript.lastPart});
+        effects.push({type: 'assistant-done', text: transcript.text});
+      }
+    }
+    if (!this.userSpeaking) effects.push({type: 'status', value: 'listening'});
+    return effects;
   }
 }
 import {encodeBytesBase64} from './audio-core.mjs';

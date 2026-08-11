@@ -616,7 +616,13 @@ func (s *voiceSession) handleMapped(mapped mappedServerEvent) error {
 	}
 	correlation, exists := s.responses[mapped.event.ResponseID]
 	if !exists {
-		return fmt.Errorf("%w: %q", ErrUnknownResponseEpoch, mapped.event.ResponseID)
+		if len(s.pending) != 0 || mapped.event.Kind != realtime.EventTranscriptDone {
+			return fmt.Errorf("%w: %q", ErrUnknownResponseEpoch, mapped.event.ResponseID)
+		}
+		if err := s.beginImplicitResponseFromOutput(mapped.event.ResponseID); err != nil {
+			return err
+		}
+		correlation = s.responses[mapped.event.ResponseID]
 	}
 	if correlation.bound {
 		mapped.event.Epoch = correlation.epoch
@@ -641,6 +647,32 @@ func (s *voiceSession) handleMapped(mapped mappedServerEvent) error {
 	s.implicitBufferedEvents++
 	s.implicitBufferedBytes += buffered.ownedBytes
 	return nil
+}
+
+// beginImplicitResponseFromOutput normalizes the known server-VAD variant that
+// starts with a terminal transcript chunk and omits response.created. All
+// other response-scoped first events remain strict above, and a pending
+// response.create may never use this compatibility path because its
+// live_epoch must be echoed by the provider.
+func (s *voiceSession) beginImplicitResponseFromOutput(responseID string) error {
+	if responseID == "" {
+		return errors.New("implicit provider output response.id is required")
+	}
+	if s.implicitUnbound == implicitUnboundLimit {
+		return ErrImplicitResponseLimit
+	}
+	s.responses[responseID] = &responseCorrelation{unbound: true}
+	s.responseOrder = append(s.responseOrder, responseID)
+	s.implicitUnbound++
+	if err := s.trimResponseHistory(); err != nil {
+		return err
+	}
+	return s.deliver(s.ctx, realtime.Event{
+		Kind:              realtime.EventResponseCreated,
+		ResponseID:        responseID,
+		Status:            "in_progress",
+		NeedsEpochBinding: true,
+	})
 }
 
 func (s *voiceSession) markCancelled(request correlationRequest) error {

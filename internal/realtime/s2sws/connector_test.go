@@ -864,6 +864,38 @@ func TestImplicitResponseWaitsForReactorEpochBinding(t *testing.T) {
 	assert.Equal(t, pcm, audio.Audio)
 }
 
+// TestImplicitResponseCanStartWithResponseScopedOutput covers providers whose
+// server-VAD path omits response.created and starts with a terminal transcript.
+// The adapter must establish one implicit response before releasing output so
+// the reactor, downstream client, and stale-output fence all share an epoch.
+func TestImplicitResponseCanStartWithResponseScopedOutput(t *testing.T) {
+	server := newTestVoiceServer(t)
+	session := connectTestSession(t, server.URL, nil, realtime.OpenRequest{Model: "model"})
+
+	server.sendEvent(t, map[string]any{
+		"type":        "response.output_audio_transcript.done",
+		"event_id":    "provider-transcript-chunk",
+		"response_id": "implicit-without-created",
+		"item_id":     "assistant-item",
+		"transcript":  "bounded assistant text",
+	})
+	created := receiveEvent(t, session)
+	assert.Equal(t, realtime.EventResponseCreated, created.Kind)
+	assert.Equal(t, "implicit-without-created", created.ResponseID)
+	assert.Equal(t, "in_progress", created.Status)
+	assert.True(t, created.NeedsEpochBinding)
+
+	require.NoError(t, session.Send(t.Context(), realtime.Command{
+		Kind:       realtime.CommandBindResponseEpoch,
+		ResponseID: "implicit-without-created",
+		Epoch:      identity.ResponseEpoch(92),
+	}))
+	transcript := receiveEvent(t, session)
+	assert.Equal(t, realtime.EventTranscriptDone, transcript.Kind)
+	assert.Equal(t, identity.ResponseEpoch(92), transcript.Epoch)
+	assert.Equal(t, "provider-transcript-chunk", transcript.ProviderEventID)
+}
+
 // TestImplicitResponseBufferCountBoundary catches off-by-one logic around the
 // exact sixteen-event allowance and proves FIFO release.
 func TestImplicitResponseBufferCountBoundary(t *testing.T) {
