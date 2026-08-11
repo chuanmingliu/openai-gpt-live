@@ -4,6 +4,8 @@ import assert from 'node:assert/strict';
 import {createBrowserRuntime} from './browser-runtime.mjs';
 import {ClientPresentation} from './client-state.mjs';
 
+const SCHEDULED_PCM_BASE64 = Buffer.alloc(16000).toString('base64');
+
 class FakeGraphNode {
   constructor() {
     this.connections = [];
@@ -44,6 +46,7 @@ class BrowserHarness {
     this.contexts = [];
     this.getUserMediaCalls = 0;
     this.gains = [];
+    this.mediaSources = [];
     this.mediaStreams = [];
     this.notices = [];
     this.oscillators = [];
@@ -51,6 +54,7 @@ class BrowserHarness {
     this.snapshots = [];
     this.sockets = [];
     this.timeline = [];
+    this.timers = [];
     this.workletNodes = [];
     this.getUserMedia = getUserMedia ?? (() => this.makeMediaStream());
     this.presentation = new ClientPresentation();
@@ -79,6 +83,7 @@ class BrowserHarness {
       createMediaStreamSource(stream) {
         const source = new FakeGraphNode();
         source.stream = stream;
+        harness.mediaSources.push(source);
         return source;
       }
 
@@ -192,6 +197,32 @@ class BrowserHarness {
     return stream;
   }
 
+  installFakeTimers() {
+    this.originalSetTimeout = globalThis.setTimeout;
+    this.originalClearTimeout = globalThis.clearTimeout;
+    globalThis.setTimeout = (callback, delay) => {
+      const timer = {callback, delay, cleared: false, fired: false};
+      this.timers.push(timer);
+      return timer;
+    };
+    globalThis.clearTimeout = (timer) => {
+      timer.cleared = true;
+    };
+  }
+
+  restoreTimers() {
+    globalThis.setTimeout = this.originalSetTimeout;
+    globalThis.clearTimeout = this.originalClearTimeout;
+  }
+
+  fireTimers({includeCleared = false} = {}) {
+    for (const timer of [...this.timers]) {
+      if (timer.fired || (timer.cleared && !includeCleared)) continue;
+      timer.fired = true;
+      timer.callback();
+    }
+  }
+
   server(event, socket = this.socket) {
     socket.emit('message', {data: JSON.stringify(event)});
   }
@@ -219,37 +250,83 @@ class BrowserHarness {
   get sentSessionUpdates() {
     return this.sent.filter(({type}) => type === 'session.update').length;
   }
+
+  get activeTimers() {
+    return this.timers.filter(({cleared, fired}) => !cleared && !fired);
+  }
 }
 
-test('start, server acknowledgement, PCM, playback, barge-in, and stop release every boundary', async () => {
+test('start gates configuration and PCM, playback acknowledgement, barge-in, and stop release every boundary', async (t) => {
   const harness = new BrowserHarness();
+  harness.installFakeTimers();
+  t.after(() => harness.restoreTimers());
   const runtime = createBrowserRuntime(harness.dependencies());
 
   await runtime.start();
+  assert.equal(harness.sentSessionUpdates, 0);
+
   harness.server({type: 'session.created'});
+  assert.equal(harness.sentSessionUpdates, 1);
+
+  harness.capture({type: 'frame', pcm: new ArrayBuffer(960)});
+  assert.equal(harness.sent.filter(({type}) => type === 'input_audio_buffer.append').length, 0);
+
   harness.server({type: 'session.updated'});
   harness.capture({type: 'frame', pcm: new ArrayBuffer(960)});
-  harness.server({type: 'response.output_audio.delta', delta: 'AAABAA=='});
+  assert.equal(harness.sent.filter(({type}) => type === 'input_audio_buffer.append').length, 1);
+
+  const playbackGeneration = harness.presentation.snapshot().playbackGeneration;
+  harness.server({type: 'response.output_audio.delta', delta: SCHEDULED_PCM_BASE64});
+  assert.equal(harness.snapshots.at(-1).status, 'assistant-buffering');
+  assert.equal(harness.snapshots.some(({status}) => status === 'assistant-speaking'), false);
+  const appendMessage = harness.playbackNode.port.messages.find(({type}) => type === 'append');
+  assert.equal(appendMessage.generation, playbackGeneration);
+  assert.equal(harness.activeTimers.length, 1);
+
   harness.playback({type: 'playing'});
+  assert.equal(harness.snapshots.at(-1).status, 'assistant-speaking');
+
   const beforeBarge = harness.timeline.length;
   harness.server({type: 'input_audio_buffer.speech_started'});
 
   assert.equal(harness.sentSessionUpdates, 1);
-  assert.equal(harness.sent.filter(({type}) => type === 'input_audio_buffer.append').length, 1);
-  assert.ok(harness.messages.some((message) => message.type === 'append'));
   const bargeTimeline = harness.timeline.slice(beforeBarge);
   const clearIndex = bargeTimeline.findIndex(({kind, message}) => kind === 'worklet-message' && message.type === 'clear');
   const speakingIndex = bargeTimeline.findIndex(({kind, snapshot}) => kind === 'snapshot' && snapshot.status === 'user-speaking');
   assert.ok(clearIndex >= 0 && clearIndex < speakingIndex);
-  assert.ok(harness.snapshots.some(({status}) => status === 'assistant-speaking'));
+  const clearMessage = harness.playbackNode.port.messages.find(({type}) => type === 'clear');
+  assert.equal(clearMessage.generation, harness.presentation.snapshot().playbackGeneration);
+  assert.equal(harness.activeTimers.length, 0);
+
+  harness.server({type: 'response.output_audio.delta', delta: SCHEDULED_PCM_BASE64});
+  assert.equal(harness.playbackNode.port.messages.filter(({type}) => type === 'append').at(-1).generation, harness.presentation.snapshot().playbackGeneration);
+  assert.equal(harness.activeTimers.length, 1);
+
+  const captureNode = harness.captureNode;
+  const playbackNode = harness.playbackNode;
+  const mediaSource = harness.mediaSources[0];
+  const silentGain = harness.gains[0];
+  const socket = harness.socket;
 
   await runtime.stop();
 
   assert.equal(harness.microphoneTrack.stopped, true);
   assert.equal(harness.captureContext.closed, true);
   assert.equal(harness.playbackContext.closed, true);
-  assert.equal(harness.socket.closeCode, 1000);
+  assert.equal(socket.closeCode, 1000);
+  assert.ok(new TextEncoder().encode(socket.closeReason).byteLength <= 123);
+  assert.equal(socket.readyState, 3);
+  assert.ok(captureNode.port.messages.some(({type, value}) => type === 'mute' && value === true));
+  assert.equal(captureNode.disconnected, true);
+  assert.equal(playbackNode.disconnected, true);
+  assert.equal(mediaSource.disconnected, true);
+  assert.equal(silentGain.disconnected, true);
+  assert.equal(harness.activeTimers.length, 0);
   assert.equal(harness.snapshots.at(-1).status, 'stopped');
+
+  const messageCount = harness.messages.length;
+  harness.fireTimers({includeCleared: true});
+  assert.equal(harness.messages.length, messageCount);
 });
 
 test('resumeAudio resumes suspended playback with one local 200 ms low-volume tone and no socket event', async () => {
@@ -296,16 +373,44 @@ test('microphone failure releases the failed generation and permits a retry', as
   await runtime.stop();
 });
 
-test('provider-specific errors retain the generic gateway notice contract', async () => {
+test('allocated resources and scheduled playback are released after a provider error', async (t) => {
   const harness = new BrowserHarness();
+  harness.installFakeTimers();
+  t.after(() => harness.restoreTimers());
   const runtime = createBrowserRuntime(harness.dependencies());
   await runtime.start();
+  harness.server({type: 'session.created'});
+  harness.server({type: 'session.updated'});
+  harness.server({type: 'response.output_audio.delta', delta: SCHEDULED_PCM_BASE64});
+  assert.equal(harness.activeTimers.length, 1);
+
+  const captureNode = harness.captureNode;
+  const playbackNode = harness.playbackNode;
+  const mediaSource = harness.mediaSources[0];
+  const silentGain = harness.gains[0];
+  const socket = harness.socket;
 
   harness.server({type: 'error', error: {code: 'rate_limit', message: 'provider detail'}});
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(harness.notices.at(-1), 'gateway-error');
   assert.equal(harness.snapshots.at(-1).status, 'error');
+  assert.equal(harness.microphoneTrack.stopped, true);
+  assert.equal(harness.captureContext.closed, true);
+  assert.equal(harness.playbackContext.closed, true);
+  assert.equal(socket.closeCode, 1000);
+  assert.ok(new TextEncoder().encode(socket.closeReason).byteLength <= 123);
+  assert.equal(socket.readyState, 3);
+  assert.ok(captureNode.port.messages.some(({type, value}) => type === 'mute' && value === true));
+  assert.equal(captureNode.disconnected, true);
+  assert.equal(playbackNode.disconnected, true);
+  assert.equal(mediaSource.disconnected, true);
+  assert.equal(silentGain.disconnected, true);
+  assert.equal(harness.activeTimers.length, 0);
+
+  const messageCount = harness.messages.length;
+  harness.fireTimers({includeCleared: true});
+  assert.equal(harness.messages.length, messageCount);
 });
 
 test('callbacks from a released generation cannot mutate a retried session', async () => {
