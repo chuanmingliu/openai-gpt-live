@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+import * as audioCore from './audio-core.mjs';
 import {
   PCM16Framer,
   PCMPlaybackQueue,
@@ -9,6 +10,83 @@ import {
   encodeBytesBase64,
   floatToPCM16,
 } from './audio-core.mjs';
+
+test('playback reservoir preserves FIFO audio across partial reads', () => {
+  assert.equal(typeof audioCore.PCMChunkBuffer, 'function');
+  const reservoir = new audioCore.PCMChunkBuffer(0.01);
+  const first = Int16Array.from([1, 2, 3, 4]);
+  assert.equal(reservoir.append(first), true);
+  assert.equal(reservoir.append(Int16Array.from([5, 6])), true);
+  first.fill(99);
+
+  assert.deepEqual([...reservoir.take(3)], [1, 2, 3]);
+  assert.deepEqual([...reservoir.take(3)], [4, 5, 6]);
+  assert.equal(reservoir.queuedSamples, 0);
+});
+
+test('playback reservoir refuses audio beyond its fixed duration and clears immediately', () => {
+  assert.equal(typeof audioCore.PCMChunkBuffer, 'function');
+  const reservoir = new audioCore.PCMChunkBuffer(0.01);
+  assert.equal(reservoir.append(new Int16Array(240)), true);
+  assert.equal(reservoir.append(new Int16Array(1)), false);
+  assert.equal(reservoir.queuedSamples, 240);
+  reservoir.clear();
+  assert.equal(reservoir.queuedSamples, 0);
+  assert.equal(reservoir.take(10).length, 0);
+});
+
+test('playback pacer feeds only a short real-time window ahead', () => {
+  assert.equal(typeof audioCore.PCMPlaybackPacer, 'function');
+  const pacer = new audioCore.PCMPlaybackPacer();
+  assert.equal(pacer.append(Int16Array.from({length: 12000}, (_, index) => index)), true);
+  const delivered = [];
+
+  assert.equal(pacer.refill(10, (samples) => delivered.push(...samples)), 0.15);
+  assert.equal(delivered.length, 6000);
+  assert.equal(pacer.queuedSamples, 6000);
+
+  assert.equal(pacer.refill(10.15, (samples) => delivered.push(...samples)), 0.15);
+  assert.equal(delivered.length, 9600);
+  assert.equal(pacer.queuedSamples, 2400);
+
+  assert.equal(pacer.refill(10.25, (samples) => delivered.push(...samples)), null);
+  assert.deepEqual(delivered, Array.from({length: 12000}, (_, index) => index));
+});
+
+test('playback pacer clears buffered speech and resets its playback clock', () => {
+  assert.equal(typeof audioCore.PCMPlaybackPacer, 'function');
+  const pacer = new audioCore.PCMPlaybackPacer();
+  pacer.append(new Int16Array(12000));
+  pacer.refill(4, () => {});
+  pacer.clear(20);
+  assert.equal(pacer.queuedSamples, 0);
+  assert.equal(pacer.bufferedUntil, 20);
+  assert.equal(pacer.refill(20, () => {}), null);
+});
+
+test('playback feed timer keeps only one pending refill', () => {
+  assert.equal(typeof audioCore.SinglePendingTimer, 'function');
+  const scheduled = [];
+  const cancelled = [];
+  const timer = new audioCore.SinglePendingTimer(
+    (callback, delay) => {
+      scheduled.push({callback, delay});
+      return scheduled.length;
+    },
+    (handle) => cancelled.push(handle),
+  );
+  const fired = [];
+
+  assert.equal(timer.request(() => fired.push('first'), 150), true);
+  assert.equal(timer.request(() => fired.push('duplicate'), 50), false);
+  assert.equal(scheduled.length, 1);
+  scheduled[0].callback();
+  assert.deepEqual(fired, ['first']);
+
+  assert.equal(timer.request(() => fired.push('second'), 25), true);
+  timer.clear();
+  assert.deepEqual(cancelled, [2]);
+});
 
 test('48 kHz input remains contiguous when chunked into 24 kHz PCM16', () => {
   const resampler = new StreamingLinearResampler(48000, 24000);

@@ -94,6 +94,127 @@ export class PCM16Framer {
   }
 }
 
+export class PCMChunkBuffer {
+  constructor(maximumSeconds = 120) {
+    if (!Number.isFinite(maximumSeconds) || maximumSeconds <= 0 || maximumSeconds > 120) {
+      throw new RangeError('invalid PCM buffer bound');
+    }
+    this.maximumSamples = Math.floor(24000 * maximumSeconds);
+    this.segments = [];
+    this.headOffset = 0;
+    this.queuedSamples = 0;
+  }
+
+  append(samples) {
+    if (!(samples instanceof Int16Array)) throw new TypeError('samples must be Int16Array');
+    if (samples.length === 0) return true;
+    if (this.queuedSamples + samples.length > this.maximumSamples) return false;
+    this.segments.push(samples.slice());
+    this.queuedSamples += samples.length;
+    return true;
+  }
+
+  take(maximumSamples) {
+    if (!Number.isInteger(maximumSamples) || maximumSamples <= 0 || maximumSamples > (64 << 10)) {
+      throw new RangeError('invalid PCM take size');
+    }
+    const count = Math.min(maximumSamples, this.queuedSamples);
+    const output = new Int16Array(count);
+    let written = 0;
+    while (written < count) {
+      const segment = this.segments[0];
+      const available = segment.length - this.headOffset;
+      const copied = Math.min(available, count - written);
+      output.set(segment.subarray(this.headOffset, this.headOffset + copied), written);
+      written += copied;
+      this.headOffset += copied;
+      if (this.headOffset === segment.length) {
+        this.segments.shift();
+        this.headOffset = 0;
+      }
+    }
+    this.queuedSamples -= count;
+    return output;
+  }
+
+  clear() {
+    this.segments = [];
+    this.headOffset = 0;
+    this.queuedSamples = 0;
+  }
+}
+
+export class PCMPlaybackPacer {
+  constructor(maximumSeconds = 120) {
+    this.buffer = new PCMChunkBuffer(maximumSeconds);
+    this.bufferedUntil = 0;
+    this.targetSeconds = 0.25;
+    this.lowWaterSeconds = 0.1;
+  }
+
+  get queuedSamples() {
+    return this.buffer.queuedSamples;
+  }
+
+  append(samples) {
+    return this.buffer.append(samples);
+  }
+
+  refill(currentTime, consume) {
+    if (!Number.isFinite(currentTime) || currentTime < 0) throw new RangeError('invalid playback time');
+    if (typeof consume !== 'function') throw new TypeError('consume must be a function');
+    this.bufferedUntil = Math.max(this.bufferedUntil, currentTime);
+    while (this.buffer.queuedSamples > 0) {
+      const aheadSeconds = this.bufferedUntil - currentTime;
+      if (aheadSeconds >= this.targetSeconds) break;
+      const requiredSamples = Math.max(1, Math.round((this.targetSeconds - aheadSeconds) * 24000));
+      const samples = this.buffer.take(Math.min(requiredSamples, 64 << 10));
+      consume(samples);
+      this.bufferedUntil += samples.length / 24000;
+    }
+    if (this.buffer.queuedSamples === 0) return null;
+    const delaySeconds = Math.max(0.005, (this.bufferedUntil - currentTime) - this.lowWaterSeconds);
+    return delaySeconds;
+  }
+
+  clear(currentTime = 0) {
+    if (!Number.isFinite(currentTime) || currentTime < 0) throw new RangeError('invalid playback time');
+    this.buffer.clear();
+    this.bufferedUntil = currentTime;
+  }
+}
+
+export class SinglePendingTimer {
+  constructor(
+    schedule = (callback, delay) => setTimeout(callback, delay),
+    cancel = (handle) => clearTimeout(handle),
+  ) {
+    if (typeof schedule !== 'function' || typeof cancel !== 'function') throw new TypeError('timer functions are required');
+    this.schedule = schedule;
+    this.cancel = cancel;
+    this.handle = null;
+  }
+
+  request(callback, delayMilliseconds) {
+    if (typeof callback !== 'function') throw new TypeError('timer callback is required');
+    if (!Number.isFinite(delayMilliseconds) || delayMilliseconds < 0 || delayMilliseconds > 120000) {
+      throw new RangeError('invalid timer delay');
+    }
+    if (this.handle !== null) return false;
+    this.handle = this.schedule(() => {
+      this.handle = null;
+      callback();
+    }, delayMilliseconds);
+    return true;
+  }
+
+  clear() {
+    if (this.handle === null) return;
+    this.cancel(this.handle);
+    this.handle = null;
+  }
+}
+
 export class PCMPlaybackQueue {
   constructor(outputRate, maximumSeconds = 10) {
     if (!Number.isFinite(outputRate) || outputRate < 8000 || outputRate > 192000) throw new RangeError('unsupported sample rate');

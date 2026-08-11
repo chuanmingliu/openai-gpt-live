@@ -1,4 +1,4 @@
-import {decodePCM16Base64} from './audio-core.mjs';
+import {decodePCM16Base64, PCMPlaybackPacer, SinglePendingTimer} from './audio-core.mjs';
 import {ProtocolState, buildAudioAppend, buildSessionUpdate} from './protocol-state.mjs';
 
 const elements = {
@@ -48,6 +48,8 @@ let streamReady = false;
 let sessionUpdateSent = false;
 let muted = false;
 let playbackActive = false;
+const playbackPacer = new PCMPlaybackPacer(120);
+const playbackFeedTimer = new SinglePendingTimer();
 let intentionalStop = false;
 const activeTurns = {user: null, assistant: null};
 
@@ -91,14 +93,30 @@ function renderTranscript(role, text, done) {
   elements.transcript.scrollTop = elements.transcript.scrollHeight;
 }
 
+function clearPlayback() {
+  playbackFeedTimer.clear();
+  playbackPacer.clear(playbackContext?.currentTime ?? 0);
+  playbackActive = false;
+  playbackNode?.port.postMessage({type: 'clear'});
+}
+
+function pumpPlayback() {
+  if (!playbackContext || !playbackNode) return;
+  const delaySeconds = playbackPacer.refill(playbackContext.currentTime, (samples) => {
+    playbackNode.port.postMessage({type: 'append', pcm: samples.buffer}, [samples.buffer]);
+  });
+  if (delaySeconds !== null) {
+    playbackFeedTimer.request(pumpPlayback, Math.max(5, Math.ceil(delaySeconds * 1000)));
+  }
+}
+
 function applyEffect(effect) {
   switch (effect.type) {
     case 'status':
       setStatus(effect.value === 'listening' && playbackActive ? 'assistant-speaking' : effect.value);
       break;
     case 'clear-playback':
-      playbackActive = false;
-      playbackNode?.port.postMessage({type: 'clear'});
+      clearPlayback();
       break;
     case 'user-delta':
       renderTranscript('user', effect.text, false);
@@ -115,8 +133,12 @@ function applyEffect(effect) {
     case 'audio': {
       try {
         const samples = decodePCM16Base64(effect.encoded);
+        if (!playbackPacer.append(samples)) {
+          void failSession('audio-overflow');
+          break;
+        }
         playbackActive = true;
-        playbackNode?.port.postMessage({type: 'append', pcm: samples.buffer}, [samples.buffer]);
+        pumpPlayback();
         setStatus('assistant-speaking');
       } catch {
         void failSession('invalid-audio');
@@ -227,12 +249,11 @@ async function startSession() {
 async function releaseResources(closeSocket) {
   streamReady = false;
   sessionUpdateSent = false;
-  playbackActive = false;
+  clearPlayback();
   const ownedSocket = socket;
   socket = null;
   if (closeSocket && ownedSocket && ownedSocket.readyState <= WebSocket.OPEN) ownedSocket.close(1000, 'demo stopped');
   captureNode?.port.postMessage({type: 'mute', value: true});
-  playbackNode?.port.postMessage({type: 'clear'});
   try { mediaSource?.disconnect(); } catch {}
   try { captureNode?.disconnect(); } catch {}
   try { silentGain?.disconnect(); } catch {}
@@ -285,6 +306,7 @@ elements.stop.addEventListener('click', () => { void stopSession(); });
 elements.mute.addEventListener('click', () => { setMuted(!muted); });
 window.addEventListener('beforeunload', () => {
   intentionalStop = true;
+  playbackFeedTimer.clear();
   if (socket?.readyState <= WebSocket.OPEN) socket.close(1000, 'page closed');
   if (mediaStream) for (const track of mediaStream.getTracks()) track.stop();
 });
