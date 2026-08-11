@@ -207,7 +207,7 @@ async function startSession() {
     mediaSource.connect(captureNode).connect(silentGain).connect(captureContext.destination);
     playbackNode.connect(playbackContext.destination);
     captureNode.port.onmessage = ({data}) => {
-      if (!streamReady || presentation.snapshot().muted || socket?.readyState !== WebSocket.OPEN || data?.type !== 'frame' || !(data.pcm instanceof ArrayBuffer)) return;
+      if (!streamReady || presentation.isMuted() || socket?.readyState !== WebSocket.OPEN || data?.type !== 'frame' || !(data.pcm instanceof ArrayBuffer)) return;
       try {
         socket.send(JSON.stringify(buildAudioAppend(new Uint8Array(data.pcm))));
       } catch {
@@ -291,7 +291,7 @@ function setMuted(value) {
 
 elements.start.addEventListener('click', () => { void startSession(); });
 elements.stop.addEventListener('click', () => { void stopSession(); });
-elements.mute.addEventListener('click', () => { setMuted(!presentation.snapshot().muted); });
+elements.mute.addEventListener('click', () => { setMuted(!presentation.isMuted()); });
 window.addEventListener('beforeunload', () => {
   intentionalStop = true;
   playbackFeedTimer.clear();

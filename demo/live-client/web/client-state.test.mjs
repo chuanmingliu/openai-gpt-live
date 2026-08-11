@@ -30,6 +30,16 @@ test('incoming audio buffers before playback acknowledgement', () => {
   assert.equal(state.snapshot().status, 'assistant-speaking');
 });
 
+test('listening does not hide acknowledged playback until playback is idle', () => {
+  const state = new ClientPresentation();
+  state.apply({type: 'audio-buffered'});
+  state.apply({type: 'audio-playing'});
+  state.apply({type: 'status', value: 'listening'});
+  assert.equal(state.snapshot().status, 'assistant-speaking');
+  state.apply({type: 'audio-idle'});
+  assert.equal(state.snapshot().status, 'listening');
+});
+
 test('finalized transcript history evicts the oldest turn', () => {
   const state = new ClientPresentation({maximumTurns: 2});
   state.beginSession();
@@ -47,6 +57,15 @@ test('muting updates the pressed state without storing audio', () => {
   assert.equal(snapshot.turns.length, 0);
 });
 
+test('mute can be read as content-free scalar state', () => {
+  const state = new ClientPresentation();
+  state.apply({type: 'user-done', text: 'a retained transcript turn'});
+  state.setMuted(true);
+  assert.equal(state.isMuted(), true);
+  state.setMuted(false);
+  assert.equal(state.isMuted(), false);
+});
+
 test('only finalized transcript turns are announced', () => {
   const state = new ClientPresentation();
   state.apply({type: 'assistant-delta', text: 'partial'});
@@ -56,6 +75,14 @@ test('only finalized transcript turns are announced', () => {
   assert.equal(state.snapshot().announcement, 'Assistant: final answer');
   assert.deepEqual(state.drainAnnouncements(), ['Assistant: final answer']);
   assert.equal(state.snapshot().announcement, '');
+});
+
+test('pending announcements retain no more than the transcript bound', () => {
+  const state = new ClientPresentation({maximumTurns: 2});
+  for (const text of ['one', 'two', 'three', 'four', 'five']) {
+    state.apply({type: 'user-done', text});
+  }
+  assert.deepEqual(state.drainAnnouncements(), ['You: four', 'You: five']);
 });
 
 test('clearing playback happens before user speech and invalidates queued playback', () => {

@@ -37,6 +37,10 @@ export class ClientPresentation {
     this.muted = Boolean(value);
   }
 
+  isMuted() {
+    return this.muted;
+  }
+
   apply(effect) {
     if (!effect || typeof effect !== 'object') return;
     const role = transcriptRole(effect.type);
@@ -49,7 +53,9 @@ export class ClientPresentation {
 
     switch (effect.type) {
       case 'status':
-        if (typeof effect.value === 'string') this.status = effect.value;
+        if (typeof effect.value === 'string' && !(effect.value === 'listening' && this.playbackIsActive())) {
+          this.status = effect.value;
+        }
         break;
       case 'audio-buffered':
         this.status = 'assistant-buffering';
@@ -125,6 +131,11 @@ export class ClientPresentation {
     const announcement = `${turn.role === 'user' ? 'You' : 'Assistant'}: ${turn.text}`;
     this.announcement = announcement;
     this.announcements.push(announcement);
+    if (this.announcements.length > this.maximumTurns) this.announcements.shift();
+  }
+
+  playbackIsActive() {
+    return this.status === 'assistant-buffering' || this.status === 'assistant-speaking';
   }
 
   trimCompletedTurns() {
