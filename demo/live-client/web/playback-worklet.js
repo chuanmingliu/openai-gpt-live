@@ -19,7 +19,6 @@ class LivePlaybackProcessor extends AudioWorkletProcessor {
         this.port.postMessage({type: 'overflow'});
         return;
       }
-      this.setPlaying(true);
     };
   }
 
@@ -32,9 +31,9 @@ class LivePlaybackProcessor extends AudioWorkletProcessor {
   process(_inputs, outputs) {
     const channels = outputs[0];
     if (!channels || channels.length === 0) return true;
-    const generated = this.queue.pull(channels[0].length);
-    channels[0].set(generated);
+    const written = this.queue.pullInto(channels[0]);
     for (let index = 1; index < channels.length; index += 1) channels[index].fill(0);
+    if (written > 0) this.setPlaying(true);
     if (this.queue.queuedSourceSamples < 2) this.setPlaying(false);
     return true;
   }

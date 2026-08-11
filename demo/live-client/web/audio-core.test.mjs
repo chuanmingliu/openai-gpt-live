@@ -5,6 +5,7 @@ import * as audioCore from './audio-core.mjs';
 import {
   PCM16Framer,
   PCMPlaybackQueue,
+  StreamingPCM16Capture,
   StreamingLinearResampler,
   decodePCM16Base64,
   encodeBytesBase64,
@@ -95,6 +96,43 @@ test('48 kHz input remains contiguous when chunked into 24 kHz PCM16', () => {
   assert.deepEqual([...left, ...right], [0, 16384, 32767]);
 });
 
+test('44.1 kHz irregular capture stays within one output sample over sixty seconds', () => {
+  const pipeline = new StreamingPCM16Capture(44100, 24000, 960);
+  let outputBytes = 0;
+  let offset = 0;
+  const inputSamples = 44100 * 60;
+  while (offset < inputSamples) {
+    const count = Math.min([127, 128, 129, 257][offset % 4], inputSamples - offset);
+    for (const frame of pipeline.push(new Float32Array(count))) outputBytes += frame.byteLength;
+    offset += count;
+  }
+  assert.ok(Math.abs((outputBytes / 2) - (24000 * 60)) <= 1);
+});
+
+test('48 kHz irregular capture stays within one output sample over sixty seconds', () => {
+  const pipeline = new StreamingPCM16Capture(48000, 24000, 960);
+  let outputBytes = 0;
+  let offset = 0;
+  const inputSamples = 48000 * 60;
+  while (offset < inputSamples) {
+    const count = Math.min([127, 128, 129, 257][offset % 4], inputSamples - offset);
+    for (const frame of pipeline.push(new Float32Array(count))) outputBytes += frame.byteLength;
+    offset += count;
+  }
+  assert.ok(Math.abs((outputBytes / 2) - (24000 * 60)) <= 1);
+});
+
+test('capture reset discards a partial frame before unmuted audio resumes', () => {
+  const pipeline = new StreamingPCM16Capture(48000, 24000, 960);
+  assert.equal(pipeline.push(new Float32Array(959).fill(1)).length, 0);
+
+  pipeline.reset();
+
+  const frames = pipeline.push(new Float32Array(960));
+  assert.equal(frames.length, 1);
+  assert.deepEqual(frames[0], new Uint8Array(960));
+});
+
 test('framer emits only exact little-endian 960-byte frames and retains the suffix', () => {
   const framer = new PCM16Framer(960);
   assert.equal(framer.push(new Int16Array(479).fill(1)).length, 0);
@@ -132,13 +170,41 @@ test('byte base64 encoding is lossless across chunk boundaries', () => {
 test('playback queue resamples continuously and clears queued speech immediately', () => {
   const queue = new PCMPlaybackQueue(48000, 1);
   assert.equal(queue.append(Int16Array.from([0, 32767, 0])), true);
-  const output = queue.pull(4);
+  const output = new Float32Array(4);
+  assert.equal(queue.pullInto(output), 4);
   assert.equal(output[0], 0);
   assert.ok(Math.abs(output[1] - 0.5) < 0.001);
   assert.ok(Math.abs(output[2] - 1) < 0.001);
   assert.ok(Math.abs(output[3] - 0.5) < 0.001);
   queue.clear();
-  assert.deepEqual([...queue.pull(8)], [...new Float32Array(8)]);
+  assert.equal(queue.pullInto(output), 0);
+  assert.deepEqual(output, new Float32Array(4));
+});
+
+test('playback writes into the provided browser quantum', () => {
+  const queue = new PCMPlaybackQueue(48000, 1);
+  queue.append(Int16Array.from([0, 32767, 0]), 1);
+  const output = new Float32Array(4);
+  assert.equal(queue.pullInto(output), 4);
+  assert.ok(Math.abs(output[1] - 0.5) < 0.001);
+});
+
+test('late audio from a cleared generation is rejected', () => {
+  const queue = new PCMPlaybackQueue(24000, 1);
+  queue.clear(2);
+  assert.equal(queue.append(new Int16Array(240), 1), false);
+  assert.equal(queue.queuedSourceSamples, 0);
+});
+
+test('playback retains source position when a low-rate output underruns', () => {
+  const queue = new PCMPlaybackQueue(8000, 1);
+  queue.append(Int16Array.from([0, 8192]));
+  assert.equal(queue.pullInto(new Float32Array(1)), 1);
+
+  queue.append(Int16Array.from([16384, 24576, 32767]));
+  const resumed = new Float32Array(1);
+  assert.equal(queue.pullInto(resumed), 1);
+  assert.ok(Math.abs(resumed[0] - 0.75) < 0.001);
 });
 
 test('playback queue refuses audio beyond its fixed ten-second-style bound', () => {

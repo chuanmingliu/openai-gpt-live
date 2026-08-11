@@ -1,4 +1,5 @@
 const MAX_AUDIO_BYTES = 64 << 10;
+const QUEUE_COMPACTION_THRESHOLD = 32;
 const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
 function sampleToPCM16(value) {
@@ -56,6 +57,63 @@ export class StreamingLinearResampler {
   }
 }
 
+export class StreamingPCM16Capture {
+  constructor(inputRate, outputRate, frameBytes = 960) {
+    if (!Number.isFinite(inputRate) || !Number.isFinite(outputRate) || inputRate < 8000 || inputRate > 192000 || outputRate < 8000 || outputRate > 192000) {
+      throw new RangeError('unsupported sample rate');
+    }
+    if (!Number.isInteger(frameBytes) || frameBytes <= 0 || frameBytes > MAX_AUDIO_BYTES || frameBytes % 2 !== 0) {
+      throw new RangeError('invalid PCM frame size');
+    }
+    this.inputRate = inputRate;
+    this.outputRate = outputRate;
+    this.frameBytes = frameBytes;
+    this.frame = new Uint8Array(frameBytes);
+    this.completedFrames = [];
+    this.reset();
+  }
+
+  push(samples) {
+    if (!(samples instanceof Float32Array)) throw new TypeError('samples must be Float32Array');
+    this.completedFrames.length = 0;
+    for (let index = 0; index < samples.length; index += 1) {
+      const currentSample = samples[index];
+      if (!this.hasPreviousSample) {
+        this.previousSample = currentSample;
+        this.hasPreviousSample = true;
+        continue;
+      }
+      while (this.phase < this.outputRate) {
+        const fraction = this.phase / this.outputRate;
+        const sample = this.previousSample + ((currentSample - this.previousSample) * fraction);
+        this.writeSample(sampleToPCM16(sample));
+        this.phase += this.inputRate;
+      }
+      this.phase -= this.outputRate;
+      this.previousSample = currentSample;
+    }
+    return this.completedFrames;
+  }
+
+  reset() {
+    this.completedFrames.length = 0;
+    this.frameOffset = 0;
+    this.phase = 0;
+    this.previousSample = 0;
+    this.hasPreviousSample = false;
+  }
+
+  writeSample(sample) {
+    this.frame[this.frameOffset] = sample & 0xff;
+    this.frame[this.frameOffset + 1] = (sample >>> 8) & 0xff;
+    this.frameOffset += 2;
+    if (this.frameOffset !== this.frameBytes) return;
+    this.completedFrames.push(this.frame);
+    this.frame = new Uint8Array(this.frameBytes);
+    this.frameOffset = 0;
+  }
+}
+
 export class PCM16Framer {
   constructor(frameBytes = 960) {
     if (!Number.isInteger(frameBytes) || frameBytes <= 0 || frameBytes > MAX_AUDIO_BYTES || frameBytes % 2 !== 0) {
@@ -101,6 +159,7 @@ export class PCMChunkBuffer {
     }
     this.maximumSamples = Math.floor(24000 * maximumSeconds);
     this.segments = [];
+    this.headIndex = 0;
     this.headOffset = 0;
     this.queuedSamples = 0;
   }
@@ -122,23 +181,32 @@ export class PCMChunkBuffer {
     const output = new Int16Array(count);
     let written = 0;
     while (written < count) {
-      const segment = this.segments[0];
+      const segment = this.segments[this.headIndex];
       const available = segment.length - this.headOffset;
       const copied = Math.min(available, count - written);
       output.set(segment.subarray(this.headOffset, this.headOffset + copied), written);
       written += copied;
       this.headOffset += copied;
       if (this.headOffset === segment.length) {
-        this.segments.shift();
+        this.headIndex += 1;
         this.headOffset = 0;
       }
     }
     this.queuedSamples -= count;
+    if (this.headIndex === this.segments.length) {
+      this.segments.length = 0;
+      this.headIndex = 0;
+    } else if (this.headIndex >= QUEUE_COMPACTION_THRESHOLD) {
+      this.segments.copyWithin(0, this.headIndex);
+      this.segments.length -= this.headIndex;
+      this.headIndex = 0;
+    }
     return output;
   }
 
   clear() {
-    this.segments = [];
+    this.segments.length = 0;
+    this.headIndex = 0;
     this.headOffset = 0;
     this.queuedSamples = 0;
   }
@@ -222,13 +290,18 @@ export class PCMPlaybackQueue {
     this.sourceStep = 24000 / outputRate;
     this.maximumSourceSamples = Math.floor(24000 * maximumSeconds);
     this.segments = [];
+    this.headIndex = 0;
     this.headOffset = 0;
     this.sourcePosition = 0;
     this.queuedSourceSamples = 0;
+    this.generation = null;
   }
 
-  append(samples) {
+  append(samples, generation = this.generation ?? 0) {
     if (!(samples instanceof Int16Array)) throw new TypeError('samples must be Int16Array');
+    if (!Number.isSafeInteger(generation) || generation < 0) throw new RangeError('invalid playback generation');
+    if (this.generation === null) this.generation = generation;
+    if (generation !== this.generation) return false;
     if (samples.length === 0) return true;
     if (this.queuedSourceSamples + samples.length > this.maximumSourceSamples) return false;
     this.segments.push(samples.slice());
@@ -239,23 +312,35 @@ export class PCMPlaybackQueue {
   pull(frameCount) {
     if (!Number.isInteger(frameCount) || frameCount < 0 || frameCount > 16384) throw new RangeError('invalid playback frame count');
     const output = new Float32Array(frameCount);
-    for (let index = 0; index < output.length; index += 1) {
-      const consumed = Math.floor(this.sourcePosition);
-      if (consumed > 0) {
-        this.consume(consumed);
-        this.sourcePosition -= consumed;
-      }
-      if (this.queuedSourceSamples < 2) break;
-      const first = this.peek(0) / 32768;
-      const second = this.peek(1) / 32768;
-      output[index] = first + ((second - first) * this.sourcePosition);
-      this.sourcePosition += this.sourceStep;
-    }
+    this.pullInto(output);
     return output;
   }
 
-  clear() {
-    this.segments = [];
+  pullInto(output) {
+    if (!(output instanceof Float32Array)) throw new TypeError('output must be Float32Array');
+    if (output.length > 16384) throw new RangeError('invalid playback frame count');
+    output.fill(0);
+    let written = 0;
+    while (written < output.length && this.queuedSourceSamples >= 2) {
+      const first = this.peek(0) / 32768;
+      const second = this.peek(1) / 32768;
+      output[written] = first + ((second - first) * this.sourcePosition);
+      written += 1;
+      this.sourcePosition += this.sourceStep;
+      const consumed = Math.floor(this.sourcePosition);
+      if (consumed > 0) {
+        this.sourcePosition -= this.consume(consumed);
+      }
+    }
+    return written;
+  }
+
+  clear(generation = (this.generation ?? -1) + 1) {
+    if (!Number.isSafeInteger(generation) || generation < 0) throw new RangeError('invalid playback generation');
+    if (this.generation !== null && generation < this.generation) return;
+    this.generation = generation;
+    this.segments.length = 0;
+    this.headIndex = 0;
     this.headOffset = 0;
     this.sourcePosition = 0;
     this.queuedSourceSamples = 0;
@@ -263,7 +348,8 @@ export class PCMPlaybackQueue {
 
   peek(offset) {
     let remaining = this.headOffset + offset;
-    for (const segment of this.segments) {
+    for (let index = this.headIndex; index < this.segments.length; index += 1) {
+      const segment = this.segments[index];
       if (remaining < segment.length) return segment[remaining];
       remaining -= segment.length;
     }
@@ -271,18 +357,29 @@ export class PCMPlaybackQueue {
   }
 
   consume(count) {
-    let remaining = Math.min(count, this.queuedSourceSamples);
+    const consumed = Math.min(count, this.queuedSourceSamples);
+    let remaining = consumed;
     this.queuedSourceSamples -= remaining;
-    while (remaining > 0 && this.segments.length > 0) {
-      const available = this.segments[0].length - this.headOffset;
+    while (remaining > 0 && this.headIndex < this.segments.length) {
+      const available = this.segments[this.headIndex].length - this.headOffset;
       if (remaining < available) {
         this.headOffset += remaining;
-        return;
+        remaining = 0;
+        break;
       }
       remaining -= available;
-      this.segments.shift();
+      this.headIndex += 1;
       this.headOffset = 0;
     }
+    if (this.headIndex === this.segments.length) {
+      this.segments.length = 0;
+      this.headIndex = 0;
+    } else if (this.headIndex >= QUEUE_COMPACTION_THRESHOLD) {
+      this.segments.copyWithin(0, this.headIndex);
+      this.segments.length -= this.headIndex;
+      this.headIndex = 0;
+    }
+    return consumed;
   }
 }
 
