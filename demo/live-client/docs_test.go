@@ -34,6 +34,7 @@ func TestCredentialLiteralAssignmentDetector(t *testing.T) {
 		{name: "indented OpenAI secret", text: "  OPENAI_API_KEY=real-secret", want: true},
 		{name: "double quoted gateway secret", text: `LIVE_STATIC_BEARER_TOKEN="real-secret"`, want: true},
 		{name: "single quoted demo secret", text: `export LIVE_DEMO_BEARER='real-secret'`, want: true},
+		{name: "future phase DeepSeek secret", text: `DEEPSEEK_API_KEY="real-secret"`, want: true},
 		{name: "symbolic gateway bearer copy", text: `export LIVE_DEMO_BEARER="$LIVE_STATIC_BEARER_TOKEN"`, want: false},
 		{name: "braced symbolic gateway bearer copy", text: `LIVE_DEMO_BEARER="${LIVE_STATIC_BEARER_TOKEN}"`, want: false},
 		{name: "hidden read and name-only export", text: "read -r -s \"S2S_API_KEY?Speech bearer: \"\nexport S2S_API_KEY", want: false},
@@ -48,12 +49,33 @@ func TestCredentialLiteralAssignmentDetector(t *testing.T) {
 
 func TestRealtimeBrowserOperatorGuideUsesBoundedContentFreeReadinessChecks(t *testing.T) {
 	text := readOperatorGuide(t)
-	assert.Contains(t, text, "for attempt in {1..50}; do")
+	assert.Contains(t, text, "for attempt in {1..20}; do")
 	assert.Contains(t, text, "sleep 0.1")
+	assert.Contains(t, text, "20 attempts x (0.1-second curl maximum + 0.1-second sleep) = 4.0 seconds")
 	assert.Contains(t, text, `wait_for_ready gateway "$GATEWAY_PID" http://127.0.0.1:19090/health/ready`)
 	assert.Contains(t, text, `wait_for_ready browser-bff "$BFF_PID" http://127.0.0.1:3000/health/ready`)
 	assert.Contains(t, text, "--output /dev/null")
 	assert.NotRegexp(t, `(?m)^curl .*http://127\.0\.0\.1:(19090|3000)/health/ready$`, text)
+	var readinessCurls []string
+	lines := strings.Split(text, "\n")
+	for index := 0; index < len(lines); index++ {
+		command := strings.TrimSpace(lines[index])
+		if strings.HasPrefix(command, "if curl ") {
+			command = strings.TrimPrefix(command, "if ")
+		} else if !strings.HasPrefix(command, "curl ") {
+			continue
+		}
+		for strings.HasSuffix(command, `\`) && index+1 < len(lines) {
+			index++
+			command = strings.TrimSuffix(command, `\`) + strings.TrimSpace(lines[index])
+		}
+		readinessCurls = append(readinessCurls, command)
+	}
+	require.NotEmpty(t, readinessCurls)
+	for _, command := range readinessCurls {
+		assert.Contains(t, command, "--connect-timeout 0.05")
+		assert.Contains(t, command, "--max-time 0.1")
+	}
 }
 
 func readOperatorGuide(t *testing.T) string {
@@ -63,7 +85,7 @@ func readOperatorGuide(t *testing.T) string {
 	return string(content)
 }
 
-var credentialAssignmentPattern = regexp.MustCompile(`^[ \t]*(export[ \t]+)?(S2S_API_KEY|OPENAI_API_KEY|LIVE_STATIC_BEARER_TOKEN|LIVE_DEMO_BEARER)[ \t]*=[ \t]*(.*)[ \t]*$`)
+var credentialAssignmentPattern = regexp.MustCompile(`^[ \t]*(export[ \t]+)?(S2S_API_KEY|OPENAI_API_KEY|LIVE_STATIC_BEARER_TOKEN|LIVE_DEMO_BEARER|DEEPSEEK_API_KEY)[ \t]*=[ \t]*(.*)[ \t]*$`)
 
 func hasCredentialLiteralAssignment(text string) bool {
 	for _, line := range strings.Split(text, "\n") {

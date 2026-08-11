@@ -92,8 +92,9 @@ wait_for_ready() {
   local ready_url="$3"
   local attempt
 
-  for attempt in {1..50}; do
-    if curl --fail --silent --output /dev/null "$ready_url"; then
+  for attempt in {1..20}; do
+    if curl --fail --silent --output /dev/null \
+      --connect-timeout 0.05 --max-time 0.1 "$ready_url"; then
       printf '%s\n' "$service_name ready"
       return 0
     fi
@@ -148,10 +149,12 @@ wait_for_ready gateway "$GATEWAY_PID" http://127.0.0.1:19090/health/ready
 ```
 
 `check-config` validates structure without reading secret values. The readiness
-helper makes at most 50 content-free attempts, 0.1 seconds apart, and fails if
-the owned process exits or the five-second bound expires. A successful check
-proves only the local gateway process is ready; it does not prove provider
-authentication, a successful speech turn, or audible playback.
+helper uses a 0.05-second connect timeout and a 0.1-second total timeout on
+every content-free request. Its configured worst-case total is
+20 attempts x (0.1-second curl maximum + 0.1-second sleep) = 4.0 seconds. It
+fails sooner if the owned process exits. A successful check proves only the
+local gateway process is ready; it does not prove provider authentication, a
+successful speech turn, or audible playback.
 
 ## 3. Start the browser BFF
 
