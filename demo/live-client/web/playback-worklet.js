@@ -4,16 +4,22 @@ class LivePlaybackProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
     this.queue = new PCMPlaybackQueue(sampleRate, 10);
+    this.generation = null;
     this.playing = false;
     this.port.onmessage = ({data}) => {
       if (!data || typeof data.type !== 'string') return;
       if (data.type === 'clear') {
-        this.queue.clear();
+        if (!Number.isSafeInteger(data.generation) || data.generation < 0) return;
+        if (this.generation !== null && data.generation < this.generation) return;
+        this.generation = data.generation;
+        this.queue.clear(data.generation);
         this.setPlaying(false);
         return;
       }
-      if (data.type !== 'append' || !(data.pcm instanceof ArrayBuffer) || data.pcm.byteLength === 0 || data.pcm.byteLength > (64 << 10) || data.pcm.byteLength % 2 !== 0) return;
-      if (!this.queue.append(new Int16Array(data.pcm))) {
+      if (data.type !== 'append' || !Number.isSafeInteger(data.generation) || data.generation < 0 || !(data.pcm instanceof ArrayBuffer) || data.pcm.byteLength === 0 || data.pcm.byteLength > (64 << 10) || data.pcm.byteLength % 2 !== 0) return;
+      if (this.generation === null) this.generation = data.generation;
+      if (data.generation !== this.generation) return;
+      if (!this.queue.append(new Int16Array(data.pcm), data.generation)) {
         this.queue.clear();
         this.setPlaying(false);
         this.port.postMessage({type: 'overflow'});

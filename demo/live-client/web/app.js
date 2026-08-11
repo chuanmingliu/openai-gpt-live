@@ -104,15 +104,20 @@ function setNotice(code = '') {
 }
 
 function clearPlayback() {
+  const playbackGeneration = presentation.snapshot().playbackGeneration;
   playbackFeedTimer.clear();
   playbackPacer.clear(playbackContext?.currentTime ?? 0);
-  playbackNode?.port.postMessage({type: 'clear'});
+  playbackNode?.port.postMessage({type: 'clear', generation: playbackGeneration});
 }
 
 function pumpPlayback() {
   if (!playbackContext || !playbackNode) return;
   const delaySeconds = playbackPacer.refill(playbackContext.currentTime, (samples) => {
-    playbackNode.port.postMessage({type: 'append', pcm: samples.buffer}, [samples.buffer]);
+    playbackNode.port.postMessage({
+      type: 'append',
+      generation: presentation.snapshot().playbackGeneration,
+      pcm: samples.buffer,
+    }, [samples.buffer]);
   });
   if (delaySeconds !== null) {
     playbackFeedTimer.request(pumpPlayback, Math.max(5, Math.ceil(delaySeconds * 1000)));

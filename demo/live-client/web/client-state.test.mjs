@@ -96,6 +96,17 @@ test('clearing playback happens before user speech and invalidates queued playba
   assert.equal(snapshot.status, 'user-speaking');
 });
 
+test('speech start advances playback generation before user-speaking', () => {
+  const state = new ClientPresentation();
+  state.beginSession();
+  const before = state.snapshot().playbackGeneration;
+  state.apply({type: 'clear-playback'});
+  state.apply({type: 'status', value: 'user-speaking'});
+  const after = state.snapshot();
+  assert.equal(after.playbackGeneration, before + 1);
+  assert.equal(after.status, 'user-speaking');
+});
+
 test('a stale playback acknowledgement cannot override user speech after playback is cleared', () => {
   const state = new ClientPresentation();
   state.apply({type: 'audio-buffered'});

@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {readFile} from 'node:fs/promises';
 
 import * as audioCore from './audio-core.mjs';
 import {
@@ -210,9 +211,50 @@ test('playback writes into the provided browser quantum', () => {
 
 test('late audio from a cleared generation is rejected', () => {
   const queue = new PCMPlaybackQueue(24000, 1);
-  queue.clear(2);
-  assert.equal(queue.append(new Int16Array(240), 1), false);
+  assert.equal(queue.append(new Int16Array(240), 7), true);
+  queue.clear(8);
+  assert.equal(queue.append(new Int16Array(240), 7), false);
   assert.equal(queue.queuedSourceSamples, 0);
+});
+
+test('playback worklet fences delayed append messages after a newer clear', async () => {
+  const source = await readFile(new URL('./playback-worklet.js', import.meta.url), 'utf8');
+  const calls = [];
+  let Processor;
+  class AudioWorkletProcessor {
+    constructor() {
+      this.port = {postMessage() {}, onmessage: null};
+    }
+  }
+  class Queue {
+    append(samples, generation) {
+      calls.push({type: 'append', samples, generation});
+      return true;
+    }
+
+    clear(generation) {
+      calls.push({type: 'clear', generation});
+    }
+
+    pullInto() {
+      return 0;
+    }
+
+    get queuedSourceSamples() {
+      return 0;
+    }
+  }
+  const runWorklet = new Function('PCMPlaybackQueue', 'AudioWorkletProcessor', 'sampleRate', 'registerProcessor', source.replace("import {PCMPlaybackQueue} from './audio-core.mjs';", ''));
+  runWorklet(Queue, AudioWorkletProcessor, 24000, (_name, value) => { Processor = value; });
+  const processor = new Processor();
+  processor.port.onmessage({data: {type: 'append', generation: 7, pcm: new Int16Array([1]).buffer}});
+  processor.port.onmessage({data: {type: 'clear', generation: 8}});
+  processor.port.onmessage({data: {type: 'append', generation: 7, pcm: new Int16Array([2]).buffer}});
+
+  assert.deepEqual(calls.map(({type, generation}) => ({type, generation})), [
+    {type: 'append', generation: 7},
+    {type: 'clear', generation: 8},
+  ]);
 });
 
 test('playback retains source position when a low-rate output underruns', () => {
