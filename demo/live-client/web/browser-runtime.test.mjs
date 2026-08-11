@@ -572,6 +572,33 @@ test('playback acknowledgements are fenced by generation and newest queue revisi
   await runtime.stop();
 });
 
+test('current idle acknowledgement keeps buffering and repumps a delayed reservoir', async (t) => {
+  const harness = new BrowserHarness();
+  harness.installFakeTimers();
+  t.after(() => harness.restoreTimers());
+  const runtime = createBrowserRuntime(harness.dependencies());
+  await runtime.start();
+  harness.server({type: 'session.created'});
+  harness.server({type: 'session.updated'});
+  harness.server({type: 'response.output_audio.delta', delta: SCHEDULED_PCM_BASE64});
+
+  const first = harness.playbackNode.port.messages.filter(({type}) => type === 'append').at(-1);
+  const delayedRefill = harness.activeTimers[0];
+  assert.ok(delayedRefill);
+  harness.playbackContext.currentTime += 0.2;
+
+  harness.playback({type: 'idle', generation: first.generation, revision: first.revision});
+
+  const appends = harness.playbackNode.port.messages.filter(({type}) => type === 'append');
+  assert.equal(harness.presentation.snapshot().status, 'assistant-buffering');
+  assert.equal(delayedRefill.cleared, true);
+  assert.equal(appends.length, 2);
+  assert.equal(appends[1].generation, first.generation);
+  assert.ok(appends[1].revision > first.revision);
+  assert.equal(harness.activeTimers.length, 0);
+  await runtime.stop();
+});
+
 test('open socket without session.created hits its fenced establishment deadline', async (t) => {
   const harness = new BrowserHarness();
   harness.installFakeTimers();

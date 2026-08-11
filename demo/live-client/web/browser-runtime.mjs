@@ -269,7 +269,15 @@ export function createBrowserRuntime(dependencies) {
         if (data?.generation !== playbackGeneration || data?.revision !== playbackRevision) return;
         if (data?.type === 'overflow') void failSession('audio-overflow', currentGeneration);
         if (data?.type === 'playing') presentation.apply({type: 'audio-playing'});
-        if (data?.type === 'idle') presentation.apply({type: 'audio-idle'});
+        if (data?.type === 'idle') {
+          if (playbackPacer.queuedSamples > 0) {
+            presentation.apply({type: 'audio-buffered'});
+            playbackFeedTimer.clear();
+            pumpPlayback(currentGeneration);
+          } else {
+            presentation.apply({type: 'audio-idle'});
+          }
+        }
         publishSnapshot();
       };
       await Promise.all([captureContext.resume(), playbackContext.resume()]);
