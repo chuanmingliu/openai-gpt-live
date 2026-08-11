@@ -27,7 +27,12 @@ func TestStaticAssetsCarryStrictHeadersWithoutBearer(t *testing.T) {
 	assert.Contains(t, response.Header().Get("Content-Security-Policy"), "connect-src 'self' ws://127.0.0.1:3000")
 	assert.Equal(t, "nosniff", response.Header().Get("X-Content-Type-Options"))
 	assert.Equal(t, "no-store", response.Header().Get("Cache-Control"))
-	assert.NotContains(t, response.Body.String(), "sentinel-browser-secret")
+	body := response.Body.String()
+	assert.Less(t, strings.Index(body, `class="controls"`), strings.Index(body, `id="transcript"`))
+	assert.Contains(t, body, "Audio is forwarded to your configured providers")
+	assert.Contains(t, body, `id="final-announcement"`)
+	assert.Contains(t, body, `id="resume-audio"`)
+	assert.NotContains(t, body, "sentinel-browser-secret")
 	assert.NotContains(t, fmtHeaders(response.Header()), "sentinel-browser-secret")
 }
 

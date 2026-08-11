@@ -42,6 +42,13 @@ export function createBrowserRuntime(dependencies) {
     onSnapshot(presentation.snapshot());
   }
 
+  function reflectPlaybackState(currentGeneration, ownedPlaybackContext) {
+    if (generation !== currentGeneration || playbackContext !== ownedPlaybackContext) return;
+    if (ownedPlaybackContext.state === 'suspended') presentation.apply({type: 'audio-suspended'});
+    if (ownedPlaybackContext.state === 'running') presentation.apply({type: 'audio-resumed'});
+    publishSnapshot();
+  }
+
   function clearPlayback() {
     const playbackGeneration = presentation.snapshot().playbackGeneration;
     playbackFeedTimer.clear();
@@ -139,6 +146,11 @@ export function createBrowserRuntime(dependencies) {
       ]);
       if (generation !== currentGeneration) return;
 
+      const ownedPlaybackContext = playbackContext;
+      ownedPlaybackContext.addEventListener?.('statechange', () => {
+        reflectPlaybackState(currentGeneration, ownedPlaybackContext);
+      });
+
       const ownedCaptureNode = new AudioWorkletNode(captureContext, 'live-capture', {
         numberOfInputs: 1,
         numberOfOutputs: 1,
@@ -174,6 +186,7 @@ export function createBrowserRuntime(dependencies) {
       };
       await Promise.all([captureContext.resume(), playbackContext.resume()]);
       if (generation !== currentGeneration) return;
+      reflectPlaybackState(currentGeneration, ownedPlaybackContext);
 
       const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
       const ownedSocket = new WebSocket(`${scheme}//${location.host}/ws`);
@@ -284,6 +297,8 @@ export function createBrowserRuntime(dependencies) {
     if (!ownedPlaybackContext) return;
     await ownedPlaybackContext.resume();
     if (playbackContext !== ownedPlaybackContext) return;
+    reflectPlaybackState(generation, ownedPlaybackContext);
+    if (ownedPlaybackContext.state !== 'running') return;
     const oscillator = ownedPlaybackContext.createOscillator();
     const gain = ownedPlaybackContext.createGain();
     gain.gain.value = 0.03;

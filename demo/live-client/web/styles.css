@@ -114,8 +114,7 @@ h2 { margin: 0; font-size: 1.15rem; font-weight: 620; }
 .connection[data-state="error"] .status-dot { background: #ff6b72; }
 
 .transcript {
-  height: min(50vh, 31rem);
-  min-height: 22rem;
+  height: min(42vh, 26rem);
   overflow-y: auto;
   padding: 1.5rem;
   scroll-behavior: smooth;
@@ -150,13 +149,19 @@ h2 { margin: 0; font-size: 1.15rem; font-weight: 620; }
 @keyframes blink { 50% { opacity: 0; } }
 
 .controls {
+  position: sticky;
+  top: 0;
+  z-index: 2;
   display: flex;
   flex-wrap: wrap;
   gap: 0.7rem;
   padding: 1.2rem 1.5rem;
-  border-top: 1px solid #202832;
+  border-bottom: 1px solid #202832;
   background: #0f141b;
 }
+
+.connection[data-state="audio-suspended"] .status-dot { background: #ffcb66; box-shadow: 0 0 0.7rem rgba(255, 203, 102, 0.7); }
+.button[aria-pressed="true"] { border-color: #ffcb66; color: #ffe0a3; }
 
 .button {
   min-height: 2.9rem;
@@ -177,7 +182,19 @@ h2 { margin: 0; font-size: 1.15rem; font-weight: 620; }
 
 .notice { min-height: 1.3rem; margin: 0; padding: 0 1.5rem 1.2rem; color: #ff9ba0; font-size: 0.82rem; }
 
-footer { display: flex; justify-content: space-between; gap: 1rem; padding: 1.2rem 0; color: #687581; font-size: 0.72rem; }
+footer { display: flex; justify-content: space-between; gap: 1rem; padding: 1.2rem 0; color: #a8b2bd; font-size: 0.75rem; }
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
 
 @media (max-width: 42rem) {
   .shell { width: min(100% - 1rem, 72rem); padding-top: 2rem; }
@@ -185,7 +202,7 @@ footer { display: flex; justify-content: space-between; gap: 1rem; padding: 1.2r
   .privacy-badge { justify-self: start; }
   .console-header { align-items: flex-start; flex-direction: column; }
   .turn { grid-template-columns: 1fr; gap: 0.25rem; }
-  .transcript { min-height: 20rem; }
+  .transcript { height: min(36vh, 20rem); }
   footer { flex-direction: column; }
 }
 

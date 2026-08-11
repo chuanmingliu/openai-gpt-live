@@ -70,6 +70,7 @@ class BrowserHarness {
         this.destination = new FakeGraphNode();
         this.closed = false;
         this.resumeCalls = 0;
+        this.listeners = new Map();
         this.audioWorklet = {
           addModule: async (path) => {
             this.modulePath = path;
@@ -112,12 +113,23 @@ class BrowserHarness {
 
       async resume() {
         this.resumeCalls += 1;
-        this.state = 'running';
+        this.setState('running');
+      }
+
+      addEventListener(type, callback) {
+        const listeners = this.listeners.get(type) ?? [];
+        listeners.push(callback);
+        this.listeners.set(type, listeners);
+      }
+
+      setState(state) {
+        this.state = state;
+        for (const callback of this.listeners.get('statechange') ?? []) callback();
       }
 
       async close() {
         this.closed = true;
-        this.state = 'closed';
+        this.setState('closed');
       }
     };
 
@@ -333,7 +345,12 @@ test('resumeAudio resumes suspended playback with one local 200 ms low-volume to
   const harness = new BrowserHarness();
   const runtime = createBrowserRuntime(harness.dependencies());
   await runtime.start();
-  harness.playbackContext.state = 'suspended';
+  harness.server({type: 'session.created'});
+  harness.server({type: 'session.updated'});
+  harness.server({type: 'response.output_audio.delta', delta: SCHEDULED_PCM_BASE64});
+  assert.equal(harness.presentation.snapshot().status, 'assistant-buffering');
+  harness.playbackContext.setState('suspended');
+  assert.equal(harness.presentation.snapshot().status, 'audio-suspended');
   const resumeCalls = harness.playbackContext.resumeCalls;
   const sentEvents = harness.sent.length;
 
@@ -347,6 +364,7 @@ test('resumeAudio resumes suspended playback with one local 200 ms low-volume to
   assert.ok(harness.oscillators[0].stopTime <= harness.oscillators[0].startTime + 0.2);
   assert.equal(harness.gains.at(-1).gain.value, 0.03);
   assert.equal(harness.sent.length, sentEvents);
+  assert.equal(harness.presentation.snapshot().status, 'assistant-buffering');
   await runtime.stop();
 });
 

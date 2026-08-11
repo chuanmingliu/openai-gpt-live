@@ -20,6 +20,7 @@ export class ClientPresentation {
 
   beginSession() {
     this.status = 'connecting';
+    this.audioSuspended = false;
     this.muted = false;
     this.active = {user: null, assistant: null};
     this.playbackGeneration += 1;
@@ -30,6 +31,7 @@ export class ClientPresentation {
   endSession(status = 'stopped') {
     for (const role of ROLES) this.finishActive(role);
     this.status = status;
+    this.audioSuspended = false;
     this.playbackGeneration += 1;
   }
 
@@ -68,6 +70,12 @@ export class ClientPresentation {
       case 'audio-idle':
         if (this.status === 'assistant-buffering' || this.status === 'assistant-speaking') this.status = 'listening';
         break;
+      case 'audio-suspended':
+        this.audioSuspended = true;
+        break;
+      case 'audio-resumed':
+        this.audioSuspended = false;
+        break;
       case 'clear-playback':
         this.playbackGeneration += 1;
         break;
@@ -79,7 +87,7 @@ export class ClientPresentation {
 
   snapshot() {
     return {
-      status: this.status,
+      status: this.audioSuspended ? 'audio-suspended' : this.status,
       muted: this.muted,
       turns: this.turns.map(({role, text, final}) => ({role, text, final})),
       announcement: this.announcement,

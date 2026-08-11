@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+import {presentationUI} from './app.js';
 import {ClientPresentation} from './client-state.mjs';
 
 test('a retry cannot append to the failed session partial turn', () => {
@@ -55,6 +56,37 @@ test('muting updates the pressed state without storing audio', () => {
   const snapshot = state.snapshot();
   assert.equal(snapshot.muted, true);
   assert.equal(snapshot.turns.length, 0);
+});
+
+test('truthful presentation states name controls that remain enabled', () => {
+  const state = new ClientPresentation();
+  state.beginSession();
+
+  state.setMuted(true);
+  let ui = presentationUI(state.snapshot());
+  assert.match(ui.statusText, /Select Unmute/);
+  assert.equal(ui.muteDisabled, false);
+
+  state.setMuted(false);
+  state.apply({type: 'audio-buffered'});
+  ui = presentationUI(state.snapshot());
+  assert.match(ui.statusText, /Assistant audio is buffered/);
+  assert.equal(ui.stopDisabled, false);
+
+  state.apply({type: 'audio-suspended'});
+  ui = presentationUI(state.snapshot());
+  assert.equal(state.snapshot().status, 'audio-suspended');
+  assert.match(ui.statusText, /Select Enable audio/);
+  assert.equal(ui.resumeAudioHidden, false);
+  assert.equal(ui.resumeAudioDisabled, false);
+
+  state.apply({type: 'audio-resumed'});
+  assert.equal(state.snapshot().status, 'assistant-buffering');
+
+  state.endSession('error');
+  ui = presentationUI(state.snapshot(), 'transport-closed');
+  assert.match(ui.noticeText, /Select Start listening to reconnect/);
+  assert.equal(ui.startDisabled, false);
 });
 
 test('mute can be read as content-free scalar state', () => {

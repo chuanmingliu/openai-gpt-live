@@ -14,9 +14,9 @@
       <div>
         <p class="eyebrow">LOCAL REALTIME SESSION</p>
         <h1>Talk naturally.<br><span>Interrupt freely.</span></h1>
-        <p class="lede">Your microphone streams to the local GPT Live gateway. Server voice activity detection controls each turn and barge-in clears queued assistant audio.</p>
+        <p class="lede">Your microphone streams to the local GPT Live gateway. Audio is forwarded to your configured providers to produce responses. Server voice activity detection controls each turn and barge-in clears queued assistant audio.</p>
       </div>
-      <div class="privacy-badge"><span aria-hidden="true"></span>Loopback only</div>
+      <div class="privacy-badge"><span aria-hidden="true"></span>Local gateway</div>
     </header>
 
     <section class="console" aria-labelledby="conversation-title">
@@ -31,7 +31,24 @@
         </div>
       </div>
 
-      <div id="transcript" class="transcript" role="log" aria-live="polite" aria-relevant="additions text">
+      <div class="controls" aria-label="Voice session controls">
+        <button id="start" class="button button-primary" type="button">
+          <span class="button-icon" aria-hidden="true">●</span> Start listening
+        </button>
+        <button id="mute" class="button button-secondary" type="button" disabled aria-pressed="false">
+          <span aria-hidden="true">⌁</span> Mute
+        </button>
+        <button id="stop" class="button button-secondary danger" type="button" disabled>
+          <span aria-hidden="true">■</span> Stop
+        </button>
+        <button id="resume-audio" class="button button-secondary" type="button" hidden>
+          Enable audio
+        </button>
+      </div>
+      <p id="notice" class="notice" aria-live="assertive"></p>
+      <p id="final-announcement" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
+
+      <div id="transcript" class="transcript" role="region" aria-label="Live transcript">
         <div id="empty-transcript" class="empty-transcript">
           <div class="orb" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
           <p>Your live transcript will appear here.</p>
@@ -39,23 +56,11 @@
         </div>
       </div>
 
-      <div class="controls" aria-label="Voice session controls">
-        <button id="start" class="button button-primary" type="button">
-          <span class="button-icon" aria-hidden="true">●</span> Start listening
-        </button>
-        <button id="mute" class="button button-secondary" type="button" disabled>
-          <span aria-hidden="true">⌁</span> Mute
-        </button>
-        <button id="stop" class="button button-secondary danger" type="button" disabled>
-          <span aria-hidden="true">■</span> Stop
-        </button>
-      </div>
-      <p id="notice" class="notice" aria-live="assertive"></p>
     </section>
 
     <footer>
       <span>24 kHz PCM16 · 20 ms frames</span>
-      <span>Audio and transcripts stay in page memory</span>
+      <span>This page keeps no saved conversation history</span>
     </footer>
   </main>
 </body>
