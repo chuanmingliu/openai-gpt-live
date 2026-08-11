@@ -42,3 +42,40 @@ The runtime now mirrors playback AudioContext `suspended`/`running` state change
 ## Concerns
 
 - Physical mobile viewport, browser permission, and audible speaker-check behavior remain manual operator acceptance checks; the automated suite deliberately uses fakes rather than a device.
+
+## Fix Round 1: Privacy Copy and Static Regression Coverage
+
+### Changes
+
+- Visible copy now states that the page connects to a loopback BFF, forwards audio to configured providers, and does not persist audio or transcripts. It does not imply that providers are local.
+- Static coverage now proves both required elements exist before comparing their order, checks each exact privacy/non-persistence statement, verifies the streaming transcript tag has no `aria-live`, verifies the final announcement is polite and atomic, and verifies Mute exposes `aria-pressed`.
+
+### RED to GREEN Evidence
+
+Before the copy update, the new focused assertion failed with all three missing requirements:
+
+```text
+$ GOCACHE=/private/tmp/openai-gpt-live-go-cache go test ./demo/live-client -run '^TestStaticAssets' -count=1
+--- FAIL: TestStaticAssetsCarryStrictHeadersWithoutBearer
+does not contain "This page connects to a loopback BFF"
+does not contain "Audio is forwarded to configured providers"
+does not contain "This demo does not persist audio or transcripts"
+FAIL
+```
+
+After updating the visible copy:
+
+```text
+$ GOCACHE=/private/tmp/openai-gpt-live-go-cache go test ./demo/live-client -run '^TestStaticAssets' -count=1
+ok  github.com/chuanmingliu/openai-gpt-live/demo/live-client  0.449s
+```
+
+### Verification
+
+- `GOCACHE=/private/tmp/openai-gpt-live-go-cache make test-demo-live-client` — PASS: Go race suite plus 53/53 Node tests.
+- `node --check demo/live-client/web/app.js`, `node --check demo/live-client/web/browser-runtime.mjs`, `node --check demo/live-client/web/client-state.mjs`, and `git diff --check` — PASS.
+
+### Self-Review
+
+- The assertions guard against missing-element false positives before performing order checks.
+- Privacy statements describe the BFF, providers, and demo retention boundary separately, avoiding a claim that a configured provider is local.
