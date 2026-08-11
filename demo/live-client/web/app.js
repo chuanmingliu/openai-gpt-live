@@ -1,4 +1,5 @@
 import {decodePCM16Base64, PCMPlaybackPacer, SinglePendingTimer} from './audio-core.mjs';
+import {ClientPresentation} from './client-state.mjs';
 import {ProtocolState, buildAudioAppend, buildSessionUpdate} from './protocol-state.mjs';
 
 const elements = {
@@ -12,6 +13,12 @@ const elements = {
   transcript: document.querySelector('#transcript'),
 };
 
+const announcement = document.createElement('p');
+announcement.setAttribute('aria-live', 'polite');
+announcement.style.cssText = 'position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0';
+elements.transcript.before(announcement);
+elements.transcript.setAttribute('aria-live', 'off');
+
 const statusLabels = {
   idle: 'Ready to start',
   connecting: 'Connecting microphone…',
@@ -19,6 +26,7 @@ const statusLabels = {
   listening: 'Listening',
   'user-speaking': 'You are speaking',
   'assistant-thinking': 'Assistant is thinking',
+  'assistant-buffering': 'Assistant is preparing to speak',
   'assistant-speaking': 'Assistant is speaking',
   stopped: 'Stopped',
   error: 'Session needs attention',
@@ -36,6 +44,8 @@ const errorLabels = {
 
 let generation = 0;
 let protocol = new ProtocolState();
+const presentation = new ClientPresentation();
+presentation.endSession('idle');
 let mediaStream = null;
 let captureContext = null;
 let playbackContext = null;
@@ -46,57 +56,56 @@ let silentGain = null;
 let socket = null;
 let streamReady = false;
 let sessionUpdateSent = false;
-let muted = false;
-let playbackActive = false;
 const playbackPacer = new PCMPlaybackPacer(120);
 const playbackFeedTimer = new SinglePendingTimer();
 let intentionalStop = false;
-const activeTurns = {user: null, assistant: null};
+let noticeCode = '';
+let renderFrame = null;
 
-function setStatus(value) {
-  elements.connection.dataset.state = value;
-  elements.status.textContent = statusLabels[value] ?? statusLabels.error;
-}
-
-function setControls(active) {
+function renderPresentation(snapshot) {
+  const active = !['idle', 'stopped', 'error'].includes(snapshot.status);
+  elements.connection.dataset.state = snapshot.status;
+  elements.status.textContent = statusLabels[snapshot.status] ?? statusLabels.error;
   elements.start.disabled = active;
   elements.stop.disabled = !active;
   elements.mute.disabled = !active;
+  elements.mute.setAttribute('aria-pressed', String(snapshot.muted));
+  elements.mute.innerHTML = `<span aria-hidden="true">⌁</span> ${snapshot.muted ? 'Unmute' : 'Mute'}`;
+  elements.notice.textContent = noticeCode ? (errorLabels[noticeCode] ?? 'The session stopped safely. Try again.') : '';
+  elements.empty.hidden = snapshot.turns.length > 0;
+  for (const turn of elements.transcript.querySelectorAll('article.turn')) turn.remove();
+  for (const item of snapshot.turns) {
+    const turn = document.createElement('article');
+    turn.className = `turn ${item.role}${item.final ? ' final' : ''}`;
+    const label = document.createElement('div');
+    label.className = 'turn-role';
+    label.textContent = item.role === 'user' ? 'You' : 'Assistant';
+    const text = document.createElement('p');
+    text.className = 'turn-text';
+    text.textContent = item.text;
+    turn.append(label, text);
+    elements.transcript.append(turn);
+  }
+  elements.transcript.scrollTop = elements.transcript.scrollHeight;
+  announcement.textContent = presentation.drainAnnouncements().join(' ');
+}
+
+function scheduleRender() {
+  if (renderFrame !== null) return;
+  renderFrame = requestAnimationFrame(() => {
+    renderFrame = null;
+    renderPresentation(presentation.snapshot());
+  });
 }
 
 function setNotice(code = '') {
-  elements.notice.textContent = code ? (errorLabels[code] ?? 'The session stopped safely. Try again.') : '';
-}
-
-function createTurn(role) {
-  elements.empty.hidden = true;
-  const turn = document.createElement('article');
-  turn.className = `turn ${role}`;
-  const label = document.createElement('div');
-  label.className = 'turn-role';
-  label.textContent = role === 'user' ? 'You' : 'Assistant';
-  const text = document.createElement('p');
-  text.className = 'turn-text';
-  turn.append(label, text);
-  elements.transcript.append(turn);
-  activeTurns[role] = {turn, text};
-  return activeTurns[role];
-}
-
-function renderTranscript(role, text, done) {
-  const entry = activeTurns[role] ?? createTurn(role);
-  entry.text.textContent = done ? text : entry.text.textContent + text;
-  if (done) {
-    entry.turn.classList.add('final');
-    activeTurns[role] = null;
-  }
-  elements.transcript.scrollTop = elements.transcript.scrollHeight;
+  noticeCode = code;
+  scheduleRender();
 }
 
 function clearPlayback() {
   playbackFeedTimer.clear();
   playbackPacer.clear(playbackContext?.currentTime ?? 0);
-  playbackActive = false;
   playbackNode?.port.postMessage({type: 'clear'});
 }
 
@@ -111,35 +120,20 @@ function pumpPlayback() {
 }
 
 function applyEffect(effect) {
+  presentation.apply(effect);
   switch (effect.type) {
-    case 'status':
-      setStatus(effect.value === 'listening' && playbackActive ? 'assistant-speaking' : effect.value);
-      break;
     case 'clear-playback':
       clearPlayback();
       break;
-    case 'user-delta':
-      renderTranscript('user', effect.text, false);
-      break;
-    case 'user-done':
-      renderTranscript('user', effect.text, true);
-      break;
-    case 'assistant-delta':
-      renderTranscript('assistant', effect.text, false);
-      break;
-    case 'assistant-done':
-      renderTranscript('assistant', effect.text, true);
-      break;
     case 'audio': {
+      presentation.apply({type: 'audio-buffered'});
       try {
         const samples = decodePCM16Base64(effect.encoded);
         if (!playbackPacer.append(samples)) {
           void failSession('audio-overflow');
           break;
         }
-        playbackActive = true;
         pumpPlayback();
-        setStatus('assistant-speaking');
       } catch {
         void failSession('invalid-audio');
       }
@@ -149,6 +143,7 @@ function applyEffect(effect) {
       void failSession(errorLabels[effect.code] ? effect.code : 'gateway-error');
       break;
   }
+  scheduleRender();
 }
 
 function handleServerMessage(raw) {
@@ -182,13 +177,10 @@ async function startSession() {
   intentionalStop = false;
   streamReady = false;
   sessionUpdateSent = false;
-  playbackActive = false;
-  muted = false;
   protocol = new ProtocolState();
+  presentation.beginSession();
   setNotice();
-  setControls(true);
-  setStatus('connecting');
-  elements.mute.textContent = '⌁ Mute';
+  scheduleRender();
 
   try {
     const acquired = await navigator.mediaDevices.getUserMedia({
@@ -215,7 +207,7 @@ async function startSession() {
     mediaSource.connect(captureNode).connect(silentGain).connect(captureContext.destination);
     playbackNode.connect(playbackContext.destination);
     captureNode.port.onmessage = ({data}) => {
-      if (!streamReady || muted || socket?.readyState !== WebSocket.OPEN || data?.type !== 'frame' || !(data.pcm instanceof ArrayBuffer)) return;
+      if (!streamReady || presentation.snapshot().muted || socket?.readyState !== WebSocket.OPEN || data?.type !== 'frame' || !(data.pcm instanceof ArrayBuffer)) return;
       try {
         socket.send(JSON.stringify(buildAudioAppend(new Uint8Array(data.pcm))));
       } catch {
@@ -224,11 +216,9 @@ async function startSession() {
     };
     playbackNode.port.onmessage = ({data}) => {
       if (data?.type === 'overflow') void failSession('audio-overflow');
-      if (data?.type === 'playing') playbackActive = true;
-      if (data?.type === 'idle') {
-        playbackActive = false;
-        if (elements.connection.dataset.state === 'assistant-speaking') setStatus('listening');
-      }
+      if (data?.type === 'playing') presentation.apply({type: 'audio-playing'});
+      if (data?.type === 'idle') presentation.apply({type: 'audio-idle'});
+      scheduleRender();
     };
     await Promise.all([captureContext.resume(), playbackContext.resume()]);
 
@@ -278,35 +268,35 @@ async function stopSession() {
   generation += 1;
   intentionalStop = true;
   await releaseResources(true);
-  muted = false;
-  setControls(false);
+  presentation.endSession('stopped');
   setNotice();
-  setStatus('stopped');
+  scheduleRender();
 }
 
 async function failSession(code) {
   generation += 1;
   intentionalStop = true;
   await releaseResources(true);
-  setControls(false);
-  setStatus('error');
+  presentation.endSession('error');
   setNotice(code);
+  scheduleRender();
 }
 
 function setMuted(value) {
   if (!captureNode) return;
-  muted = value;
+  presentation.setMuted(value);
   captureNode.port.postMessage({type: 'mute', value});
-  elements.mute.textContent = value ? '⌁ Unmute' : '⌁ Mute';
-  if (value) setStatus('listening');
+  scheduleRender();
 }
 
 elements.start.addEventListener('click', () => { void startSession(); });
 elements.stop.addEventListener('click', () => { void stopSession(); });
-elements.mute.addEventListener('click', () => { setMuted(!muted); });
+elements.mute.addEventListener('click', () => { setMuted(!presentation.snapshot().muted); });
 window.addEventListener('beforeunload', () => {
   intentionalStop = true;
   playbackFeedTimer.clear();
   if (socket?.readyState <= WebSocket.OPEN) socket.close(1000, 'page closed');
   if (mediaStream) for (const track of mediaStream.getTracks()) track.stop();
 });
+
+scheduleRender();
