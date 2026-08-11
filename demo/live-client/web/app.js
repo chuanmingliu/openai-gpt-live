@@ -19,11 +19,18 @@ const statusLabels = {
 
 const errorLabels = {
   'audio-overflow': 'Playback could not keep up. Select Start listening to reconnect.',
+  'audio-initialization-failed': 'Browser audio could not start. Check audio permissions, then select Start listening to reconnect.',
   'gateway-error': 'The gateway ended this turn. Select Start listening to reconnect.',
   'invalid-audio': 'The gateway returned invalid audio. Select Start listening to reconnect.',
   'invalid-event': 'The gateway returned an invalid event. Select Start listening to reconnect.',
   'invalid-transcript': 'The gateway returned an invalid transcript event. Select Start listening to reconnect.',
   'microphone-unavailable': 'Microphone access is required. Check browser permission, then select Start listening to reconnect.',
+  'microphone-backpressure': 'The local connection could not keep up with microphone audio. Select Start listening to reconnect.',
+  'microphone-ended': 'Microphone access ended. Check the selected device and browser permission, then select Start listening to reconnect.',
+  'microphone-suspended': 'Microphone capture paused and could not resume. Select Start listening to reconnect.',
+  'session-created-timeout': 'The gateway did not create a voice session in time. Select Start listening to reconnect.',
+  'session-updated-timeout': 'The gateway did not confirm voice configuration in time. Select Start listening to reconnect.',
+  'socket-open-timeout': 'The local voice connection did not open in time. Select Start listening to reconnect.',
   'transport-closed': 'The local voice connection closed. Select Start listening to reconnect.',
 };
 

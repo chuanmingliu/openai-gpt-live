@@ -78,6 +78,29 @@ func TestRealtimeBrowserOperatorGuideUsesBoundedContentFreeReadinessChecks(t *te
 	}
 }
 
+func TestRealtimeBrowserOperatorGuideChecksIdleStateAndBrowserBearerSurfaces(t *testing.T) {
+	text := readOperatorGuide(t)
+	for _, exact := range []string{
+		`http://127.0.0.1:8765/v1/pool`,
+		`.in_use == 0`,
+		`all(.units[]; .state == "idle")`,
+		`http://127.0.0.1:19090/admin/v1/sessions`,
+		`.active == 0`,
+		`Authorization: Bearer $LIVE_STATIC_BEARER_TOKEN`,
+		`Address bar`,
+		`Sources`,
+		`Network`,
+		`Application`,
+		`Console`,
+		`LIVE_STATIC_BEARER_TOKEN`,
+		`LIVE_DEMO_BEARER`,
+	} {
+		assert.Contains(t, text, exact)
+	}
+	assert.Contains(t, text, `>/dev/null`)
+	assert.Contains(t, text, "Do not paste the bearer value into DevTools")
+}
+
 func readOperatorGuide(t *testing.T) string {
 	t.Helper()
 	content, err := os.ReadFile("../../docs/demo/realtime-browser-client.md")

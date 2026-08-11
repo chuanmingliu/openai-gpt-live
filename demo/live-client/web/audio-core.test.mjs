@@ -247,13 +247,104 @@ test('playback worklet fences delayed append messages after a newer clear', asyn
   const runWorklet = new Function('PCMPlaybackQueue', 'AudioWorkletProcessor', 'sampleRate', 'registerProcessor', source.replace("import {PCMPlaybackQueue} from './audio-core.mjs';", ''));
   runWorklet(Queue, AudioWorkletProcessor, 24000, (_name, value) => { Processor = value; });
   const processor = new Processor();
-  processor.port.onmessage({data: {type: 'append', generation: 7, pcm: new Int16Array([1]).buffer}});
-  processor.port.onmessage({data: {type: 'clear', generation: 8}});
-  processor.port.onmessage({data: {type: 'append', generation: 7, pcm: new Int16Array([2]).buffer}});
+  processor.port.onmessage({data: {type: 'append', generation: 7, revision: 1, pcm: new Int16Array([1]).buffer}});
+  processor.port.onmessage({data: {type: 'clear', generation: 8, revision: 2}});
+  processor.port.onmessage({data: {type: 'append', generation: 7, revision: 3, pcm: new Int16Array([2]).buffer}});
 
   assert.deepEqual(calls.map(({type, generation}) => ({type, generation})), [
     {type: 'append', generation: 7},
     {type: 'clear', generation: 8},
+  ]);
+});
+
+test('playback worklet acknowledgements carry generation and newest queue revision', async () => {
+  const source = await readFile(new URL('./playback-worklet.js', import.meta.url), 'utf8');
+  let Processor;
+  class AudioWorkletProcessor {
+    constructor() {
+      this.messages = [];
+      this.port = {postMessage: (message) => this.messages.push(message), onmessage: null};
+    }
+  }
+  class Queue {
+    constructor() {
+      this.queuedSourceSamples = 0;
+    }
+
+    append(_samples, _generation) {
+      this.queuedSourceSamples = 2;
+      return true;
+    }
+
+    clear() {
+      this.queuedSourceSamples = 0;
+    }
+
+    pullInto(output) {
+      if (this.queuedSourceSamples === 0) return 0;
+      output[0] = 0.5;
+      this.queuedSourceSamples = 0;
+      return 1;
+    }
+  }
+  const runWorklet = new Function('PCMPlaybackQueue', 'AudioWorkletProcessor', 'sampleRate', 'registerProcessor', source.replace("import {PCMPlaybackQueue} from './audio-core.mjs';", ''));
+  runWorklet(Queue, AudioWorkletProcessor, 24000, (_name, value) => { Processor = value; });
+  const processor = new Processor();
+
+  processor.port.onmessage({data: {type: 'append', generation: 7, revision: 11, pcm: new Int16Array([1, 2]).buffer}});
+  processor.process([], [[new Float32Array(128)]]);
+  processor.port.onmessage({data: {type: 'clear', generation: 8, revision: 12}});
+
+  assert.deepEqual(processor.messages, [
+    {type: 'playing', generation: 7, revision: 11},
+    {type: 'idle', generation: 7, revision: 11},
+  ]);
+  assert.equal(processor.generation, 8);
+  assert.equal(processor.revision, 12);
+});
+
+test('playback worklet re-acknowledges playing after a newer append revision is consumed', async () => {
+  const source = await readFile(new URL('./playback-worklet.js', import.meta.url), 'utf8');
+  let Processor;
+  class AudioWorkletProcessor {
+    constructor() {
+      this.messages = [];
+      this.port = {postMessage: (message) => this.messages.push(message), onmessage: null};
+    }
+  }
+  class Queue {
+    constructor() {
+      this.queuedSourceSamples = 0;
+    }
+
+    append() {
+      this.queuedSourceSamples += 4;
+      return true;
+    }
+
+    clear() {
+      this.queuedSourceSamples = 0;
+    }
+
+    pullInto(output) {
+      if (this.queuedSourceSamples === 0) return 0;
+      output[0] = 0.5;
+      this.queuedSourceSamples -= 1;
+      return 1;
+    }
+  }
+  const runWorklet = new Function('PCMPlaybackQueue', 'AudioWorkletProcessor', 'sampleRate', 'registerProcessor', source.replace("import {PCMPlaybackQueue} from './audio-core.mjs';", ''));
+  runWorklet(Queue, AudioWorkletProcessor, 24000, (_name, value) => { Processor = value; });
+  const processor = new Processor();
+
+  processor.port.onmessage({data: {type: 'append', generation: 4, revision: 21, pcm: new Int16Array([1, 2]).buffer}});
+  processor.process([], [[new Float32Array(128)]]);
+  processor.port.onmessage({data: {type: 'append', generation: 4, revision: 22, pcm: new Int16Array([3, 4]).buffer}});
+  processor.process([], [[new Float32Array(128)]]);
+
+  assert.deepEqual(processor.messages.filter(({type}) => type === 'playing'), [
+    {type: 'playing', generation: 4, revision: 21},
+    {type: 'playing', generation: 4, revision: 22},
   ]);
 });
 

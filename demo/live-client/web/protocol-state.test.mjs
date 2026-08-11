@@ -19,11 +19,11 @@ test('user transcript deltas finalize once despite a duplicate terminal event', 
   const state = new ProtocolState();
   assert.deepEqual(
     state.consume({type: 'conversation.item.input_audio_transcription.delta', item_id: 'msg_1', delta: 'hel'}),
-    [{type: 'user-delta', text: 'hel'}],
+    [{type: 'user-delta', item_id: 'msg_1', text: 'hel'}],
   );
   assert.deepEqual(
     state.consume({type: 'conversation.item.input_audio_transcription.completed', item_id: 'msg_1', transcript: 'hello'}),
-    [{type: 'user-done', text: 'hello'}],
+    [{type: 'user-done', item_id: 'msg_1', text: 'hello'}],
   );
   assert.deepEqual(
     state.consume({type: 'conversation.item.input_audio_transcription.completed', item_id: 'msg_1', transcript: 'hello'}),
@@ -35,15 +35,15 @@ test('assistant transcript chunks remain one turn and finalize at response.done'
   const state = new ProtocolState();
   assert.deepEqual(
     state.consume({type: 'response.output_audio_transcript.delta', response_id: 'resp_1', delta: 'hi'}),
-    [{type: 'assistant-delta', text: 'hi'}],
+    [{type: 'assistant-delta', response_id: 'resp_1', text: 'hi'}],
   );
   assert.deepEqual(
     state.consume({type: 'response.output_audio_transcript.done', response_id: 'resp_1', transcript: 'hi there'}),
-    [{type: 'assistant-delta', text: ' there'}],
+    [{type: 'assistant-delta', response_id: 'resp_1', text: ' there'}],
   );
   assert.deepEqual(
     state.consume({type: 'response.output_audio_transcript.done', response_id: 'resp_1', transcript: 'changed'}),
-    [{type: 'assistant-delta', text: 'changed'}],
+    [{type: 'assistant-delta', response_id: 'resp_1', text: 'changed'}],
   );
   assert.deepEqual(
     state.consume({type: 'response.output_audio_transcript.done', response_id: 'resp_1', transcript: 'changed'}),
@@ -51,7 +51,7 @@ test('assistant transcript chunks remain one turn and finalize at response.done'
   );
   assert.deepEqual(
     state.consume({type: 'response.done', response: {id: 'resp_1', status: 'completed'}}),
-    [{type: 'assistant-done', text: 'hi therechanged'}, {type: 'status', value: 'listening'}],
+    [{type: 'assistant-done', response_id: 'resp_1', text: 'hi therechanged'}, {type: 'status', value: 'listening'}],
   );
   assert.deepEqual(
     state.consume({type: 'response.done', response: {id: 'resp_1', status: 'completed'}}),
@@ -121,4 +121,37 @@ test('audio append accepts only one exact 20 ms PCM frame', () => {
   assert.equal(event.event_id, undefined);
   assert.deepEqual(Uint8Array.from(Buffer.from(event.audio, 'base64')), frame);
   assert.throws(() => buildAudioAppend(new Uint8Array(958)), /960-byte/);
+});
+
+test('transcript identifier stores stay bounded after more than 64 interleaved IDs', () => {
+  const state = new ProtocolState();
+  for (let index = 0; index < 65; index += 1) {
+    assert.deepEqual(
+      state.consume({type: 'conversation.item.input_audio_transcription.delta', item_id: `msg_${index}`, delta: `${index}`}),
+      [{type: 'user-delta', item_id: `msg_${index}`, text: `${index}`}],
+    );
+  }
+  assert.equal(state.users.size, 64);
+  assert.equal(state.users.has('msg_0'), false);
+  assert.equal(state.users.has('msg_64'), true);
+});
+
+test('interleaved assistant transcript effects retain response attribution', () => {
+  const state = new ProtocolState();
+  assert.deepEqual(
+    state.consume({type: 'response.output_audio_transcript.delta', response_id: 'resp_a', delta: 'alpha'}),
+    [{type: 'assistant-delta', response_id: 'resp_a', text: 'alpha'}],
+  );
+  assert.deepEqual(
+    state.consume({type: 'response.output_audio_transcript.delta', response_id: 'resp_b', delta: 'beta'}),
+    [{type: 'assistant-delta', response_id: 'resp_b', text: 'beta'}],
+  );
+  assert.deepEqual(
+    state.consume({type: 'response.done', response: {id: 'resp_b', status: 'cancelled'}}),
+    [{type: 'assistant-done', response_id: 'resp_b', text: 'beta'}, {type: 'status', value: 'listening'}],
+  );
+  assert.deepEqual(
+    state.consume({type: 'response.done', response: {id: 'resp_a', status: 'completed'}}),
+    [{type: 'assistant-done', response_id: 'resp_a', text: 'alpha'}, {type: 'status', value: 'listening'}],
+  );
 });

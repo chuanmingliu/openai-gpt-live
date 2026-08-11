@@ -136,7 +136,15 @@ func setBrowserHeaders(header http.Header, websocketOrigin string) {
 }
 
 func defaultDialUpstream(ctx context.Context, endpoint *url.URL, header http.Header) (*websocket.Conn, error) {
-	conn, response, err := websocket.Dial(ctx, endpoint.String(), &websocket.DialOptions{HTTPHeader: header})
+	httpClient := &http.Client{
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	conn, response, err := websocket.Dial(ctx, endpoint.String(), &websocket.DialOptions{
+		HTTPClient: httpClient,
+		HTTPHeader: header,
+	})
 	if response != nil && response.Body != nil {
 		_ = response.Body.Close()
 	}

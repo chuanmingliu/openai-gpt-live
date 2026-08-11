@@ -204,6 +204,18 @@ audio, or credentials) for each item:
 - Select the page's **Stop** control and confirm the page reports **Stopped**.
   This releases browser-owned microphone/audio/WebSocket resources but does
   not terminate the three local processes.
+- With DevTools open, complete this bearer-absence inspection. Do not paste the bearer value into DevTools:
+  - **Address bar**: confirm the page URL is exactly the loopback origin/path
+    and contains no query token or fragment.
+  - **Sources**: search loaded page assets for `LIVE_STATIC_BEARER_TOKEN`,
+    `LIVE_DEMO_BEARER`, `Authorization`, and `Bearer`; expect no match.
+  - **Network**: inspect the `/ws` browser request and response. Confirm its
+    URL, query, cookies, subprotocols, and browser-visible headers contain no
+    bearer or `Authorization` header.
+  - **Application**: inspect Local Storage, Session Storage, Cookies, IndexedDB,
+    and Cache Storage for the loopback origin; expect no demo credential.
+  - **Console**: search browser-visible logs for `Authorization`, `Bearer`,
+    `LIVE_STATIC_BEARER_TOKEN`, and `LIVE_DEMO_BEARER`; expect no match.
 
 The content-free automated gate remains separate:
 
@@ -214,8 +226,27 @@ make test-demo-live-client
 ## 5. Stop only the demo processes
 
 Run these commands promptly in the same shell that captured the PIDs. They
-signal only the BFF, gateway, and optional reference speech process started by
-this guide, in dependency order:
+first prove the browser Stop returned both the gateway session count and the
+reference provider pool to idle without printing either JSON response. The
+provider check applies to the reference service from Step 1; for a managed
+speech service, use its reviewed content-free idle signal instead. `jq` is
+required for these exact assertions.
+
+```zsh
+curl --fail --silent --show-error \
+  --connect-timeout 0.05 --max-time 0.1 \
+  http://127.0.0.1:8765/v1/pool \
+  | jq -e '.in_use == 0 and all(.units[]; .state == "idle")' >/dev/null
+
+curl --fail --silent --show-error \
+  --connect-timeout 0.05 --max-time 0.1 \
+  --header "Authorization: Bearer $LIVE_STATIC_BEARER_TOKEN" \
+  http://127.0.0.1:19090/admin/v1/sessions \
+  | jq -e '.active == 0' >/dev/null
+```
+
+Only after both checks pass, signal the BFF, gateway, and optional reference
+speech process started by this guide, in dependency order:
 
 ```zsh
 kill -INT "$BFF_PID"

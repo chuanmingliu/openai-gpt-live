@@ -1,13 +1,24 @@
 import {decodePCM16Base64, PCMPlaybackPacer, SinglePendingTimer} from './audio-core.mjs';
 import {ProtocolState, buildAudioAppend, buildSessionUpdate} from './protocol-state.mjs';
 
+const ESTABLISHMENT_TIMEOUT_MS = 5000;
+const CAPTURE_RESUME_TIMEOUT_MS = 1000;
+const MAXIMUM_SOCKET_BUFFERED_BYTES = 32 << 10;
+
 const NOTICE_CODES = new Set([
   'audio-overflow',
+  'audio-initialization-failed',
   'gateway-error',
   'invalid-audio',
   'invalid-event',
   'invalid-transcript',
   'microphone-unavailable',
+  'microphone-backpressure',
+  'microphone-ended',
+  'microphone-suspended',
+  'session-created-timeout',
+  'session-updated-timeout',
+  'socket-open-timeout',
   'transport-closed',
 ]);
 
@@ -34,9 +45,14 @@ export function createBrowserRuntime(dependencies) {
   let socket = null;
   let streamReady = false;
   let sessionUpdateSent = false;
+  let socketOpenObserved = false;
   let startPromise = null;
+  let playbackRevision = 0;
+  let captureResumePending = false;
   const playbackPacer = new PCMPlaybackPacer(120);
   const playbackFeedTimer = new SinglePendingTimer();
+  const establishmentTimer = new SinglePendingTimer();
+  const captureResumeTimer = new SinglePendingTimer();
 
   function publishSnapshot() {
     onSnapshot(presentation.snapshot());
@@ -53,15 +69,18 @@ export function createBrowserRuntime(dependencies) {
     const playbackGeneration = presentation.snapshot().playbackGeneration;
     playbackFeedTimer.clear();
     playbackPacer.clear(playbackContext?.currentTime ?? 0);
-    playbackNode?.port.postMessage({type: 'clear', generation: playbackGeneration});
+    playbackRevision += 1;
+    playbackNode?.port.postMessage({type: 'clear', generation: playbackGeneration, revision: playbackRevision});
   }
 
   function pumpPlayback(currentGeneration) {
     if (generation !== currentGeneration || !playbackContext || !playbackNode) return;
     const delaySeconds = playbackPacer.refill(playbackContext.currentTime, (samples) => {
+      playbackRevision += 1;
       playbackNode.port.postMessage({
         type: 'append',
         generation: presentation.snapshot().playbackGeneration,
+        revision: playbackRevision,
         pcm: samples.buffer,
       }, [samples.buffer]);
     });
@@ -75,7 +94,10 @@ export function createBrowserRuntime(dependencies) {
 
   function applyEffect(effect, currentGeneration) {
     if (generation !== currentGeneration) return;
-    presentation.apply(effect);
+    if (!presentation.apply(effect)) {
+      void failSession('invalid-transcript', currentGeneration);
+      return;
+    }
     switch (effect.type) {
       case 'clear-playback':
         clearPlayback();
@@ -101,6 +123,21 @@ export function createBrowserRuntime(dependencies) {
     publishSnapshot();
   }
 
+  function armEstablishmentDeadline(code, currentGeneration, ownedSocket) {
+    establishmentTimer.clear();
+    establishmentTimer.request(() => {
+      if (generation === currentGeneration && socket === ownedSocket) {
+        void failSession(code, currentGeneration);
+      }
+    }, ESTABLISHMENT_TIMEOUT_MS);
+  }
+
+  function handleSocketOpen(currentGeneration, ownedSocket) {
+    if (generation !== currentGeneration || socket !== ownedSocket || socketOpenObserved) return;
+    socketOpenObserved = true;
+    armEstablishmentDeadline('session-created-timeout', currentGeneration, ownedSocket);
+  }
+
   function handleServerMessage(raw, currentGeneration, ownedSocket) {
     if (generation !== currentGeneration || socket !== ownedSocket) return;
     if (typeof raw !== 'string' || raw.length > (64 << 10)) {
@@ -115,29 +152,51 @@ export function createBrowserRuntime(dependencies) {
       return;
     }
     if (event?.type === 'session.created') {
-      if (ownedSocket.readyState !== WebSocket.OPEN || sessionUpdateSent) {
+      if (!socketOpenObserved || ownedSocket.readyState !== WebSocket.OPEN || sessionUpdateSent) {
         void failSession('invalid-event', currentGeneration);
         return;
       }
+      establishmentTimer.clear();
       ownedSocket.send(JSON.stringify(buildSessionUpdate()));
       sessionUpdateSent = true;
+      armEstablishmentDeadline('session-updated-timeout', currentGeneration, ownedSocket);
     } else if (event?.type === 'session.updated') {
+      if (!sessionUpdateSent) {
+        void failSession('invalid-event', currentGeneration);
+        return;
+      }
+      establishmentTimer.clear();
       streamReady = true;
     }
     for (const effect of protocol.consume(event)) applyEffect(effect, currentGeneration);
   }
 
   async function initialize(currentGeneration) {
+    let acquired;
     try {
-      const acquired = await mediaDevices.getUserMedia({
+      acquired = await mediaDevices.getUserMedia({
         audio: {channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true},
       });
-      if (generation !== currentGeneration) {
-        for (const track of acquired.getTracks()) track.stop();
-        return;
-      }
+    } catch {
+      if (generation === currentGeneration) await failSession('microphone-unavailable', currentGeneration);
+      return;
+    }
+    if (generation !== currentGeneration) {
+      for (const track of acquired.getTracks()) track.stop();
+      return;
+    }
 
-      mediaStream = acquired;
+    mediaStream = acquired;
+    const ownedMediaStream = acquired;
+    for (const track of acquired.getTracks()) {
+      track.addEventListener?.('ended', () => {
+        if (generation === currentGeneration && mediaStream === ownedMediaStream) {
+          void failSession('microphone-ended', currentGeneration);
+        }
+      }, {once: true});
+    }
+
+    try {
       captureContext = new AudioContext({latencyHint: 'interactive'});
       playbackContext = new AudioContext({sampleRate: 24000, latencyHint: 'interactive'});
       await Promise.all([
@@ -147,8 +206,30 @@ export function createBrowserRuntime(dependencies) {
       if (generation !== currentGeneration) return;
 
       const ownedPlaybackContext = playbackContext;
+      const ownedCaptureContext = captureContext;
       ownedPlaybackContext.addEventListener?.('statechange', () => {
         reflectPlaybackState(currentGeneration, ownedPlaybackContext);
+      });
+      ownedCaptureContext.addEventListener?.('statechange', () => {
+        if (generation !== currentGeneration || captureContext !== ownedCaptureContext || ownedCaptureContext.state !== 'suspended' || captureResumePending) return;
+        captureResumePending = true;
+        captureResumeTimer.request(() => {
+          if (generation === currentGeneration && captureContext === ownedCaptureContext && ownedCaptureContext.state !== 'running') {
+            void failSession('microphone-suspended', currentGeneration);
+          }
+        }, CAPTURE_RESUME_TIMEOUT_MS);
+        void ownedCaptureContext.resume().then(() => {
+          captureResumeTimer.clear();
+          if (generation === currentGeneration && captureContext === ownedCaptureContext && ownedCaptureContext.state !== 'running') {
+            return failSession('microphone-suspended', currentGeneration);
+          }
+          return undefined;
+        }).catch(() => {
+          captureResumeTimer.clear();
+          return failSession('microphone-suspended', currentGeneration);
+        }).finally(() => {
+          captureResumePending = false;
+        });
       });
 
       const ownedCaptureNode = new AudioWorkletNode(captureContext, 'live-capture', {
@@ -172,13 +253,20 @@ export function createBrowserRuntime(dependencies) {
         if (generation !== currentGeneration || captureNode !== ownedCaptureNode) return;
         if (!streamReady || presentation.isMuted() || socket?.readyState !== WebSocket.OPEN || data?.type !== 'frame' || !(data.pcm instanceof ArrayBuffer)) return;
         try {
-          socket.send(JSON.stringify(buildAudioAppend(new Uint8Array(data.pcm))));
+          const encoded = JSON.stringify(buildAudioAppend(new Uint8Array(data.pcm)));
+          if (!Number.isFinite(socket.bufferedAmount) || socket.bufferedAmount + encoded.length > MAXIMUM_SOCKET_BUFFERED_BYTES) {
+            void failSession('microphone-backpressure', currentGeneration);
+            return;
+          }
+          socket.send(encoded);
         } catch {
           void failSession('invalid-audio', currentGeneration);
         }
       };
       playbackNode.port.onmessage = ({data}) => {
         if (generation !== currentGeneration || playbackNode !== ownedPlaybackNode) return;
+        const playbackGeneration = presentation.snapshot().playbackGeneration;
+        if (data?.generation !== playbackGeneration || data?.revision !== playbackRevision) return;
         if (data?.type === 'overflow') void failSession('audio-overflow', currentGeneration);
         if (data?.type === 'playing') presentation.apply({type: 'audio-playing'});
         if (data?.type === 'idle') presentation.apply({type: 'audio-idle'});
@@ -187,10 +275,18 @@ export function createBrowserRuntime(dependencies) {
       await Promise.all([captureContext.resume(), playbackContext.resume()]);
       if (generation !== currentGeneration) return;
       reflectPlaybackState(currentGeneration, ownedPlaybackContext);
+    } catch {
+      if (generation === currentGeneration) await failSession('audio-initialization-failed', currentGeneration);
+      return;
+    }
 
+    try {
       const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
       const ownedSocket = new WebSocket(`${scheme}//${location.host}/ws`);
       socket = ownedSocket;
+      ownedSocket.addEventListener('open', () => {
+        handleSocketOpen(currentGeneration, ownedSocket);
+      }, {once: true});
       ownedSocket.addEventListener('message', ({data}) => {
         handleServerMessage(data, currentGeneration, ownedSocket);
       });
@@ -204,8 +300,10 @@ export function createBrowserRuntime(dependencies) {
           void failSession('transport-closed', currentGeneration);
         }
       }, {once: true});
+      if (ownedSocket.readyState === WebSocket.OPEN) handleSocketOpen(currentGeneration, ownedSocket);
+      else armEstablishmentDeadline('socket-open-timeout', currentGeneration, ownedSocket);
     } catch {
-      if (generation === currentGeneration) await failSession('microphone-unavailable', currentGeneration);
+      if (generation === currentGeneration) await failSession('transport-closed', currentGeneration);
     }
   }
 
@@ -216,6 +314,7 @@ export function createBrowserRuntime(dependencies) {
     const currentGeneration = ++generation;
     streamReady = false;
     sessionUpdateSent = false;
+    socketOpenObserved = false;
     protocol = new ProtocolState();
     presentation.beginSession();
     onNotice('');
@@ -232,6 +331,10 @@ export function createBrowserRuntime(dependencies) {
   async function releaseResources(closeSocket) {
     streamReady = false;
     sessionUpdateSent = false;
+    socketOpenObserved = false;
+    captureResumePending = false;
+    establishmentTimer.clear();
+    captureResumeTimer.clear();
     clearPlayback();
 
     const ownedSocket = socket;

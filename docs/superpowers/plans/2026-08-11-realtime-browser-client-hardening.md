@@ -893,3 +893,38 @@ Do not claim items 3, 4, or 8 until the operator reports them.
 - [ ] **Step 6: Record the verified outcome without an empty commit**
 
 If Steps 1--5 expose a new defect, stop this verification task, add a new named RED→GREEN task to this plan with exact files and commands, and execute it before repeating Task 10. If no defect is found, leave the branch unchanged and report the exact command results plus the operator's pending or completed physical checks.
+
+---
+
+### Task 11: Close Independent Final-Review Realtime Gaps
+
+**Files:**
+- Modify: `demo/live-client/server.go`, `demo/live-client/server_test.go`
+- Modify: `demo/live-client/web/browser-runtime.mjs`, `demo/live-client/web/browser-runtime.test.mjs`
+- Modify: `demo/live-client/web/client-state.mjs`, `demo/live-client/web/client-state.test.mjs`
+- Modify: `demo/live-client/web/protocol-state.mjs`, `demo/live-client/web/protocol-state.test.mjs`
+- Modify: `demo/live-client/web/playback-worklet.js`, `demo/live-client/web/audio-core.test.mjs`
+- Modify: `docs/demo/realtime-browser-client.md`, `demo/live-client/docs_test.go`
+
+**Interfaces:**
+- Produces a no-redirect upstream WebSocket dialer that cannot forward the bearer beyond the validated literal-loopback endpoint.
+- Produces bounded browser microphone egress, stable-ID transcript attribution with per-turn and aggregate byte limits, sequenced playback acknowledgements, generation-fenced establishment deadlines, and capture-device/context lifecycle failure handling.
+- Produces exact content-free provider-pool/session-idle and browser bearer-inspection operator checks.
+
+- [x] **Step 1: Add focused RED regressions**
+
+Add tests proving: a loopback redirect target is never contacted or given the bearer; a permanently backed-up browser socket fails closed; interleaved transcript IDs remain separate and bounded after more than 64 IDs; stale playback acknowledgements cannot cross barge-in or a newer append revision; open/`session.created`/`session.updated` deadlines tear down every resource with distinct notices; capture suspension, microphone removal, and permission revocation are generation-fenced and release resources; non-microphone initialization failures are not mislabeled; and the operator guide contains exact content-free pool/idle and DevTools bearer checks.
+
+Run the focused Go and Node selectors and confirm every new assertion fails for the missing behavior before modifying production code.
+
+- [x] **Step 2: Implement the smallest bounded security and realtime corrections**
+
+Use a dedicated no-redirect HTTP client for `websocket.Dial`; enforce a small explicit `bufferedAmount` budget before every microphone send; retain `item_id`/`response_id` in protocol effects and key presentation turns by stable ID under explicit per-turn and aggregate UTF-8 byte budgets; carry playback generation plus monotonically increasing queue revision through worklet acknowledgements; add bounded, generation-fenced socket/session establishment timers; observe capture `AudioContext.statechange` and microphone track `ended`; and map initialization errors by stage without exposing content.
+
+- [x] **Step 3: Complete the operator contract**
+
+Document exact content-free provider-pool/session-idle commands and an explicit browser DevTools URL/source/network/storage/log inspection that confirms the bearer is absent. Lock the required commands and surfaces in `docs_test.go`.
+
+- [x] **Step 4: Run GREEN gates**
+
+Run all focused tests, `make test-demo-live-client`, relevant Go race tests, `make verify-deploy-static`, `git diff --check`, and the scope/privacy scan. Record exact RED/GREEN evidence in the task report.

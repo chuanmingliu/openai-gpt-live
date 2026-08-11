@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -87,6 +88,37 @@ func TestWebSocketRejectsForeignOriginBeforeDial(t *testing.T) {
 	require.NotNil(t, response)
 	assert.Equal(t, http.StatusForbidden, response.StatusCode)
 	assert.Zero(t, calls.Load())
+}
+
+func TestDefaultUpstreamDialRejectsRedirectWithoutContactingTargetOrForwardingBearer(t *testing.T) {
+	var targetCalls atomic.Int32
+	var targetAuthorization string
+	var targetMu sync.Mutex
+	target := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		targetCalls.Add(1)
+		targetMu.Lock()
+		targetAuthorization = request.Header.Get("Authorization")
+		targetMu.Unlock()
+		writer.WriteHeader(http.StatusTeapot)
+	}))
+	t.Cleanup(target.Close)
+
+	redirect := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		http.Redirect(writer, request, target.URL+"/escaped", http.StatusFound)
+	}))
+	t.Cleanup(redirect.Close)
+	endpoint, err := url.Parse(wsURL(redirect.URL) + "/v1/realtime")
+	require.NoError(t, err)
+
+	conn, err := defaultDialUpstream(t.Context(), endpoint, http.Header{
+		"Authorization": []string{"Bearer redirect-sentinel"},
+	})
+	require.Error(t, err)
+	assert.Nil(t, conn)
+	assert.Zero(t, targetCalls.Load())
+	targetMu.Lock()
+	defer targetMu.Unlock()
+	assert.Empty(t, targetAuthorization)
 }
 
 func mustTestHandler(t *testing.T, dial dialUpstream, bearer []byte) http.Handler {

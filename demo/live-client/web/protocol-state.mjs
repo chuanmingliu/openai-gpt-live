@@ -98,14 +98,15 @@ export class ProtocolState {
     const combined = (current?.text ?? '') + text;
     if (!validText(combined)) return [{type: 'error', code: 'invalid-transcript'}];
     insertBounded(store, id, {text: combined, done: false});
-    return text.length === 0 ? [] : [{type: effectType, text}];
+    if (text.length === 0) return [];
+    return [{type: effectType, [store === this.users ? 'item_id' : 'response_id']: id, text}];
   }
 
   transcriptDone(store, id, text, effectType) {
     if (!validID(id) || !validText(text)) return [{type: 'error', code: 'invalid-transcript'}];
     if (store.get(id)?.done) return [];
     insertBounded(store, id, {text, done: true});
-    return [{type: effectType, text}];
+    return [{type: effectType, [store === this.users ? 'item_id' : 'response_id']: id, text}];
   }
 
   assistantTranscriptPart(id, text) {
@@ -124,7 +125,7 @@ export class ProtocolState {
       }
     }
     insertBounded(this.assistants, id, {text: combined, done: false, lastPart: text});
-    return delta.length === 0 ? [] : [{type: 'assistant-delta', text: delta}];
+    return delta.length === 0 ? [] : [{type: 'assistant-delta', response_id: id, text: delta}];
   }
 
   responseDone(id) {
@@ -133,7 +134,7 @@ export class ProtocolState {
       const transcript = this.assistants.get(id);
       if (transcript && !transcript.done) {
         insertBounded(this.assistants, id, {text: transcript.text, done: true, lastPart: transcript.lastPart});
-        effects.push({type: 'assistant-done', text: transcript.text});
+        effects.push({type: 'assistant-done', response_id: id, text: transcript.text});
       }
     }
     if (!this.userSpeaking) effects.push({type: 'status', value: 'listening'});
