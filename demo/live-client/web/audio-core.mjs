@@ -73,6 +73,10 @@ export class StreamingPCM16Capture {
     this.reset();
   }
 
+  get stagedSamples() {
+    return this.frameOffset / 2;
+  }
+
   push(samples) {
     if (!(samples instanceof Float32Array)) throw new TypeError('samples must be Float32Array');
     this.completedFrames.length = 0;
@@ -196,7 +200,7 @@ export class PCMChunkBuffer {
     if (this.headIndex === this.segments.length) {
       this.segments.length = 0;
       this.headIndex = 0;
-    } else if (this.headIndex >= QUEUE_COMPACTION_THRESHOLD) {
+    } else if (this.headIndex >= QUEUE_COMPACTION_THRESHOLD && this.headIndex * 2 >= this.segments.length) {
       this.segments.copyWithin(0, this.headIndex);
       this.segments.length -= this.headIndex;
       this.headIndex = 0;
@@ -321,7 +325,13 @@ export class PCMPlaybackQueue {
     if (output.length > 16384) throw new RangeError('invalid playback frame count');
     output.fill(0);
     let written = 0;
-    while (written < output.length && this.queuedSourceSamples >= 2) {
+    while (written < output.length) {
+      const owedSamples = Math.floor(this.sourcePosition);
+      if (owedSamples > 0) {
+        this.sourcePosition -= this.consume(owedSamples);
+        if (this.sourcePosition >= 1) break;
+      }
+      if (this.queuedSourceSamples < 2) break;
       const first = this.peek(0) / 32768;
       const second = this.peek(1) / 32768;
       output[written] = first + ((second - first) * this.sourcePosition);
@@ -374,7 +384,7 @@ export class PCMPlaybackQueue {
     if (this.headIndex === this.segments.length) {
       this.segments.length = 0;
       this.headIndex = 0;
-    } else if (this.headIndex >= QUEUE_COMPACTION_THRESHOLD) {
+    } else if (this.headIndex >= QUEUE_COMPACTION_THRESHOLD && this.headIndex * 2 >= this.segments.length) {
       this.segments.copyWithin(0, this.headIndex);
       this.segments.length -= this.headIndex;
       this.headIndex = 0;

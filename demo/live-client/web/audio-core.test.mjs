@@ -36,6 +36,21 @@ test('playback reservoir refuses audio beyond its fixed duration and clears imme
   assert.equal(reservoir.take(10).length, 0);
 });
 
+test('playback reservoir compacts one-sample segments only after half are consumed', () => {
+  const reservoir = new audioCore.PCMChunkBuffer(0.2);
+  for (let index = 0; index < 4096; index += 1) {
+    assert.equal(reservoir.append(Int16Array.of(index)), true);
+  }
+
+  assert.deepEqual([...reservoir.take(32)], Array.from({length: 32}, (_, index) => index));
+  assert.equal(reservoir.segments.length, 4096);
+  assert.equal(reservoir.headIndex, 32);
+
+  assert.equal(reservoir.take(2016).at(-1), 2047);
+  assert.equal(reservoir.segments.length, 2048);
+  assert.equal(reservoir.headIndex, 0);
+});
+
 test('playback pacer feeds only a short real-time window ahead', () => {
   assert.equal(typeof audioCore.PCMPlaybackPacer, 'function');
   const pacer = new audioCore.PCMPlaybackPacer();
@@ -106,7 +121,8 @@ test('44.1 kHz irregular capture stays within one output sample over sixty secon
     for (const frame of pipeline.push(new Float32Array(count))) outputBytes += frame.byteLength;
     offset += count;
   }
-  assert.ok(Math.abs((outputBytes / 2) - (24000 * 60)) <= 1);
+  assert.ok(pipeline.stagedSamples >= 0 && pipeline.stagedSamples < 480);
+  assert.ok(Math.abs((outputBytes / 2) + pipeline.stagedSamples - (24000 * 60)) <= 1);
 });
 
 test('48 kHz irregular capture stays within one output sample over sixty seconds', () => {
@@ -119,14 +135,17 @@ test('48 kHz irregular capture stays within one output sample over sixty seconds
     for (const frame of pipeline.push(new Float32Array(count))) outputBytes += frame.byteLength;
     offset += count;
   }
-  assert.ok(Math.abs((outputBytes / 2) - (24000 * 60)) <= 1);
+  assert.ok(pipeline.stagedSamples >= 0 && pipeline.stagedSamples < 480);
+  assert.ok(Math.abs((outputBytes / 2) + pipeline.stagedSamples - (24000 * 60)) <= 1);
 });
 
 test('capture reset discards a partial frame before unmuted audio resumes', () => {
   const pipeline = new StreamingPCM16Capture(48000, 24000, 960);
   assert.equal(pipeline.push(new Float32Array(959).fill(1)).length, 0);
+  assert.equal(pipeline.stagedSamples, 479);
 
   pipeline.reset();
+  assert.equal(pipeline.stagedSamples, 0);
 
   const frames = pipeline.push(new Float32Array(960));
   assert.equal(frames.length, 1);
@@ -205,6 +224,41 @@ test('playback retains source position when a low-rate output underruns', () => 
   const resumed = new Float32Array(1);
   assert.equal(queue.pullInto(resumed), 1);
   assert.ok(Math.abs(resumed[0] - 0.75) < 0.001);
+});
+
+test('nonlinear 9 kHz playback is invariant across repeated chunk underruns', () => {
+  const samples = Int16Array.from([0, 30000, -20000, 10000, -30000, 28000, -5000, 20000, -25000, 15000]);
+  const monolithic = new PCMPlaybackQueue(9000, 1);
+  monolithic.append(samples);
+  const monolithicOutput = new Float32Array(16);
+  const monolithicCount = monolithic.pullInto(monolithicOutput);
+
+  const chunked = new PCMPlaybackQueue(9000, 1);
+  const chunkedOutput = [];
+  for (const [start, end] of [[0, 2], [2, 4], [4, samples.length]]) {
+    chunked.append(samples.subarray(start, end));
+    const quantum = new Float32Array(16);
+    const count = chunked.pullInto(quantum);
+    chunkedOutput.push(...quantum.subarray(0, count));
+  }
+
+  assert.equal(chunkedOutput.length, monolithicCount);
+  assert.deepEqual(chunkedOutput, [...monolithicOutput.subarray(0, monolithicCount)]);
+});
+
+test('playback queue compacts one-sample segments only after half are consumed', () => {
+  const queue = new PCMPlaybackQueue(24000, 1);
+  for (let index = 0; index < 4096; index += 1) {
+    assert.equal(queue.append(Int16Array.of(index)), true);
+  }
+
+  assert.equal(queue.pullInto(new Float32Array(32)), 32);
+  assert.equal(queue.segments.length, 4096);
+  assert.equal(queue.headIndex, 32);
+
+  assert.equal(queue.pullInto(new Float32Array(2016)), 2016);
+  assert.equal(queue.segments.length, 2048);
+  assert.equal(queue.headIndex, 0);
 });
 
 test('playback queue refuses audio beyond its fixed ten-second-style bound', () => {
