@@ -44,6 +44,26 @@ func TestParseConfigRejectsUnsafeNetworkAndURLInputs(t *testing.T) {
 	}
 }
 
+func TestParseConfigRequiresLiteralLoopbackGateway(t *testing.T) {
+	for _, endpoint := range []string{
+		"ws://example.com/v1/realtime",
+		"wss://example.com/v1/realtime",
+		"ws://localhost:18080/v1/realtime",
+		"ws://0.0.0.0:18080/v1/realtime",
+		"ws://192.0.2.1:18080/v1/realtime",
+	} {
+		_, err := parseConfig([]string{"-gateway-url", endpoint})
+		require.Error(t, err, endpoint)
+	}
+	for _, endpoint := range []string{
+		"ws://127.0.0.1:18080/v1/realtime",
+		"ws://[::1]:18080/v1/realtime",
+	} {
+		_, err := parseConfig([]string{"-gateway-url", endpoint})
+		require.NoError(t, err, endpoint)
+	}
+}
+
 func TestResolveBearerRequiresNonemptyBoundedValueWithoutEchoingIt(t *testing.T) {
 	cfg, err := parseConfig(nil)
 	require.NoError(t, err)

@@ -79,6 +79,9 @@ func (cfg demoConfig) validate() error {
 	if err != nil || (gateway.Scheme != "ws" && gateway.Scheme != "wss") || gateway.Host == "" || gateway.User != nil || gateway.Opaque != "" || gateway.RawQuery != "" || gateway.Fragment != "" || gateway.Path != "/v1/realtime" {
 		return errors.New("demo gateway URL is invalid")
 	}
+	if err := validateLoopbackWebSocket(gateway); err != nil {
+		return err
+	}
 	if !modelPattern.MatchString(cfg.Model) {
 		return errors.New("demo model is invalid")
 	}
@@ -87,6 +90,18 @@ func (cfg demoConfig) validate() error {
 	}
 	if cfg.MaxFrameBytes < 1024 || cfg.MaxFrameBytes > 1<<20 {
 		return errors.New("demo frame limit is invalid")
+	}
+	return nil
+}
+
+func validateLoopbackWebSocket(endpoint *url.URL) error {
+	host := endpoint.Hostname()
+	if host == "" || endpoint.Port() == "" {
+		return errors.New("demo gateway URL is invalid")
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return errors.New("demo gateway URL must be loopback")
 	}
 	return nil
 }
