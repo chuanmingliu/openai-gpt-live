@@ -65,28 +65,18 @@ go run ./cmd/live-worker config-hash --config deploy/config/local.yaml
 
 ## Talk to the service in a browser
 
-The repository includes a loopback-only hands-free voice client. It streams
-microphone PCM through `live-gateway`, plays the real speech provider audio,
-shows live user and assistant transcripts, and clears queued playback when the
-server reports that you started speaking.
+The repository includes a loopback browser BFF that streams microphone PCM
+through `live-gateway`, plays configured speech-provider audio, shows live user
+and assistant transcripts, and clears queued playback on a server speech-start
+event. Follow the [realtime browser operator
+guide](docs/demo/realtime-browser-client.md) for the exact speech/gateway/BFF
+configuration, hidden credential prompts, health checks, owned-process stop
+commands, and manual audible-playback/barge-in checklist.
 
-Before starting the page, verify the services you configured are healthy. The
-ports below match the documented local/Compose shape; substitute your focused
-process ports when they differ:
-
-```sh
-curl --fail http://127.0.0.1:19090/health/ready  # gateway
-curl --fail http://127.0.0.1:19091/health/ready  # async worker
-curl --fail http://127.0.0.1:18765/v1/pool       # speech service, if it exposes the reference pool endpoint
-pg_isready -h 127.0.0.1 -p 15432 -U live -d live # PostgreSQL, for the documented dedicated local DB
-```
-
-Only the gateway and speech service are required for the interactive voice
-turn. PostgreSQL and `live-worker` are also required when the model delegates a
-durable asynchronous handoff.
-
-Supply the same local static bearer accepted by the gateway without writing it
-to a tracked file. One shell-safe option is a hidden prompt:
+For realtime-only voice, you need a speech service, the local gateway, and the
+browser BFF. You do not need a DeepSeek API key, PostgreSQL handoff
+configuration, or `live-worker`. Once the guide's gateway is ready, supply the
+same local static bearer to the BFF through its operator shell environment:
 
 ```sh
 read -r -s "LIVE_DEMO_BEARER?Local gateway bearer: "
@@ -95,28 +85,13 @@ printf '\n'
 make demo-live-client
 ```
 
-Then open [http://127.0.0.1:3000](http://127.0.0.1:3000), click **Start
-listening**, and grant microphone permission. Speak normally; server VAD ends
-the turn and creates the response. Speak over assistant playback to test
-barge-in. **Mute** pauses capture and discards any partial local capture frame;
-**Stop** releases both audio contexts, every microphone track, and both
-WebSockets.
-
-The page connects only to its loopback Go BFF at `/ws`. The BFF injects the
-bearer into the upstream gateway request; the bearer never enters HTML,
-JavaScript, a WebSocket URL or subprotocol, cookies, browser storage, response
-headers, or logs. Audio and transcript strings stay in page memory and are not
-written by the demo. This is a local development boundary, not the production
-OIDC/browser authentication design.
-
-Run its automated gate independently:
+Open [http://127.0.0.1:3000](http://127.0.0.1:3000). Browser microphone/speaker
+permission, audible playback, and physical barge-in remain operator acceptance
+checks; automated tests do not claim them. Run the content-free gate with:
 
 ```sh
 make test-demo-live-client
 ```
-
-Stop only the foreground demo with `Ctrl-C`. That does not stop the gateway,
-worker, speech service, or PostgreSQL and does not delete database data.
 
 ## Configure speech-to-speech
 

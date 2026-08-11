@@ -3,6 +3,7 @@
 ## Contents
 
 - Local workflow
+- Realtime browser operator guide
 - Service endpoints
 - Compose
 - Kubernetes
@@ -14,6 +15,13 @@
 ## Local workflow
 
 Prerequisites: Go 1.26, PostgreSQL 16 for durable paths, an OpenAI-Realtime-compatible S2S endpoint, and a DeepSeek-compatible SSE Chat Completions endpoint for async work.
+
+For the focused realtime-only browser path, route operators to
+[`docs/demo/realtime-browser-client.md`](../../../docs/demo/realtime-browser-client.md).
+It is the authority for the exact speech/gateway/BFF configuration, hidden
+credential prompts, content-free checks, owned-process stop commands, and the
+manual audible-playback/barge-in checklist. That path does not require a
+DeepSeek API key, PostgreSQL handoff configuration, or `live-worker`.
 
 Network-free checks:
 
