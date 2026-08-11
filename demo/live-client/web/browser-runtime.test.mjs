@@ -583,9 +583,11 @@ test('current idle acknowledgement keeps buffering and repumps a delayed reservo
   harness.server({type: 'response.output_audio.delta', delta: SCHEDULED_PCM_BASE64});
 
   const first = harness.playbackNode.port.messages.filter(({type}) => type === 'append').at(-1);
+  harness.playback({type: 'playing', generation: first.generation, revision: first.revision});
+  assert.equal(harness.presentation.snapshot().status, 'assistant-speaking');
   const delayedRefill = harness.activeTimers[0];
   assert.ok(delayedRefill);
-  harness.playbackContext.currentTime += 0.2;
+  harness.playbackContext.currentTime += 0.05;
 
   harness.playback({type: 'idle', generation: first.generation, revision: first.revision});
 
@@ -595,7 +597,8 @@ test('current idle acknowledgement keeps buffering and repumps a delayed reservo
   assert.equal(appends.length, 2);
   assert.equal(appends[1].generation, first.generation);
   assert.ok(appends[1].revision > first.revision);
-  assert.equal(harness.activeTimers.length, 0);
+  assert.equal(harness.activeTimers.length, 1);
+  assert.notEqual(harness.activeTimers[0], delayedRefill);
   await runtime.stop();
 });
 

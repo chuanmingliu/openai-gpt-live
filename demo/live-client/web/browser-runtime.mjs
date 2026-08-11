@@ -271,6 +271,7 @@ export function createBrowserRuntime(dependencies) {
         if (data?.type === 'playing') presentation.apply({type: 'audio-playing'});
         if (data?.type === 'idle') {
           if (playbackPacer.queuedSamples > 0) {
+            presentation.apply({type: 'audio-idle'});
             presentation.apply({type: 'audio-buffered'});
             playbackFeedTimer.clear();
             pumpPlayback(currentGeneration);
