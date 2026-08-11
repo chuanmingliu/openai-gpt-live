@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestHashIsStableAndIgnoresSecretReferences(t *testing.T) {
@@ -66,6 +68,12 @@ func TestHashIgnoresReconnectSecretReferenceButBindsKeyIdentity(t *testing.T) {
 	}
 }
 
+func TestToolCatalogChangesConfigHash(t *testing.T) {
+	a, b := validConfig(t), validConfig(t)
+	b.Tools.WebSearch.MaxResults = a.Tools.WebSearch.MaxResults + 1
+	assert.NotEqual(t, mustHash(t, a), mustHash(t, b))
+}
+
 func TestValidateExpectedDoesNotDiscloseValue(t *testing.T) {
 	if err := ValidateExpected("v1:"+string(make([]byte, 64)), "secret"); err == nil || err.Error() == "secret" {
 		t.Fatalf("unexpected error %v", err)
@@ -100,8 +108,17 @@ func TestGatewayExampleConfigHashGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = "v1:c8f2a22720611f61ceed20e0ba4d37ea00433de3da9fd1f4951a424dbfa446fd"
+	const want = "v1:93869599e20e498a1ec1ac31009c4e101f121c6ac7f6dd986f703ecb562bbb5e"
 	if hash != want {
 		t.Fatalf("hash=%s want=%s", hash, want)
 	}
+}
+
+func mustHash(t *testing.T, cfg Config) string {
+	t.Helper()
+	hash, err := Hash(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return hash
 }

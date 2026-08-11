@@ -81,6 +81,41 @@ func TestRuntimeFeatureRefreshDefaultsAndIsBounded(t *testing.T) {
 	assert.ErrorContains(t, err, "runtime_refresh_interval")
 }
 
+func TestDevelopmentDurableSeparatesSecurityAndDurabilitySemantics(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.Mode = "development_durable"
+	cfg.Auth.StaticBearerEnv = "LIVE_STATIC_BEARER_TOKEN"
+	cfg.Store.DatabaseURLEnv = "DATABASE_URL"
+	cfg.Features.Handoffs = true
+
+	require.NoError(t, cfg.Validate())
+	assert.False(t, cfg.IsProduction())
+	assert.True(t, cfg.IsDurable())
+	assert.True(t, cfg.UsesStaticAuth())
+}
+
+func TestDevelopmentDurableRequiresDurablePrerequisites(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{"static identity", func(cfg *Config) { cfg.Auth.StaticUserID = "" }},
+		{"database reference", func(cfg *Config) { cfg.Store.DatabaseURLEnv = "" }},
+		{"retention HMAC", func(cfg *Config) { cfg.Store.Retention.HMACKeyEnv = ""; cfg.Store.Retention.HMACKeyID = "" }},
+		{"reconnect HMAC", func(cfg *Config) { cfg.Gateway.Reconnect.HMACKeyEnv = ""; cfg.Gateway.Reconnect.HMACKeyID = "" }},
+		{"handoffs", func(cfg *Config) { cfg.Features.Handoffs = false }},
+		{"enabled tool", func(cfg *Config) { cfg.Tools.WebSearch.Enabled = false }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := validConfig(t)
+			cfg.Mode = "development_durable"
+			test.mutate(&cfg)
+			assert.Error(t, cfg.Validate())
+		})
+	}
+}
+
 // TestLoadAppliesRealtimeDefaults catches a loader regression that leaves realtime
 // queues or PCM sample rate at zero when the operator omits optional limits.
 func TestLoadAppliesRealtimeDefaults(t *testing.T) {
@@ -195,4 +230,37 @@ func loadFixture(t *testing.T, yaml string, lookup func(string) (string, bool)) 
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	require.NoError(t, os.WriteFile(path, []byte(strings.TrimSpace(yaml)+"\n"), 0o600))
 	return Load(path, lookup)
+}
+
+func validConfig(t *testing.T) Config {
+	t.Helper()
+	key := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	cfg, err := loadFixture(t, `
+gateway:
+  reconnect: {hmac_key_env: RECONNECT_HMAC_KEY, hmac_key_id: reconnect-v1}
+store:
+  database_url_env: DATABASE_URL
+  retention: {hmac_key_env: RETENTION_HMAC_KEY, hmac_key_id: retention-v1}
+auth:
+  static_bearer_env: LIVE_STATIC_BEARER_TOKEN
+  static_tenant_id: local-tenant
+  static_user_id: local-user
+  static_scopes: [realtime]
+features: {handoffs: true}
+tools:
+  web_search: {enabled: true}
+`, func(name string) (string, bool) {
+		switch name {
+		case "RECONNECT_HMAC_KEY", "RETENTION_HMAC_KEY":
+			return key, true
+		case "DATABASE_URL":
+			return "postgres://db.example/live?sslmode=disable", true
+		case "LIVE_STATIC_BEARER_TOKEN":
+			return "local-token", true
+		default:
+			return "", false
+		}
+	})
+	require.NoError(t, err)
+	return cfg
 }

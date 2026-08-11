@@ -10,11 +10,13 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/secretbuf"
+	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 	"gopkg.in/yaml.v3"
 )
 
@@ -32,17 +34,18 @@ const (
 )
 
 type Config struct {
-	Mode      string          `yaml:"mode"`
-	Gateway   GatewayConfig   `yaml:"gateway"`
-	Worker    WorkerConfig    `yaml:"worker"`
-	Store     StoreConfig     `yaml:"store"`
-	Auth      AuthConfig      `yaml:"auth"`
-	Admission AdmissionConfig `yaml:"admission"`
-	Safety    SafetyConfig    `yaml:"safety"`
-	Telemetry TelemetryConfig `yaml:"telemetry"`
-	Shutdown  ShutdownConfig  `yaml:"shutdown"`
-	Admin     AdminConfig     `yaml:"admin"`
-	Features  FeatureConfig   `yaml:"features"`
+	Mode      string            `yaml:"mode"`
+	Gateway   GatewayConfig     `yaml:"gateway"`
+	Worker    WorkerConfig      `yaml:"worker"`
+	Store     StoreConfig       `yaml:"store"`
+	Auth      AuthConfig        `yaml:"auth"`
+	Admission AdmissionConfig   `yaml:"admission"`
+	Safety    SafetyConfig      `yaml:"safety"`
+	Telemetry TelemetryConfig   `yaml:"telemetry"`
+	Shutdown  ShutdownConfig    `yaml:"shutdown"`
+	Admin     AdminConfig       `yaml:"admin"`
+	Features  FeatureConfig     `yaml:"features"`
+	Tools     ToolCatalogConfig `yaml:"tools"`
 }
 
 type GatewayConfig struct {
@@ -220,6 +223,43 @@ type FeatureConfig struct {
 	ToolEncryptionKeyID  string        `yaml:"tool_encryption_key_id"`
 	Handoffs             bool          `yaml:"handoffs"`
 	RefreshInterval      time.Duration `yaml:"runtime_refresh_interval"`
+}
+
+type ToolCatalogConfig struct {
+	WebSearch WebSearchToolConfig `yaml:"web_search"`
+}
+
+type WebSearchToolConfig struct {
+	Enabled     bool          `yaml:"enabled"`
+	ForceStrict bool          `yaml:"force_strict"`
+	Regions     []string      `yaml:"regions"`
+	MaxResults  int           `yaml:"max_results"`
+	Timeout     time.Duration `yaml:"timeout"`
+}
+
+// IsProduction identifies the production-only security posture. Development
+// durable mode deliberately remains outside that posture.
+func (c Config) IsProduction() bool { return c.Mode == "production" }
+
+// IsDurable identifies modes that require PostgreSQL-backed handoffs.
+func (c Config) IsDurable() bool {
+	return c.Mode == "production" || c.Mode == "development_durable"
+}
+
+// UsesStaticAuth reports whether this configuration selects static bearer auth.
+func (c Config) UsesStaticAuth() bool { return c.Auth.StaticBearerEnv != "" }
+
+// ToolCatalog projects the YAML configuration into an owned, normalized server
+// catalog. Browser input can only select values inside this catalog.
+func (c Config) ToolCatalog() toolpolicy.Catalog {
+	web := c.Tools.WebSearch
+	return toolpolicy.Catalog{WebSearch: toolpolicy.WebSearchCatalog{
+		Enabled:          web.Enabled,
+		ForceStrict:      web.ForceStrict,
+		Regions:          sortedUnique(web.Regions),
+		MaximumResults:   web.MaxResults,
+		MaximumTimeoutMS: int(web.Timeout / time.Millisecond),
+	}}
 }
 
 // Load reads a YAML file, resolves only secret environment names, supplies
@@ -445,6 +485,15 @@ func (c *Config) applyDefaults() {
 	if c.Features.RefreshInterval == 0 {
 		c.Features.RefreshInterval = time.Second
 	}
+	if len(c.Tools.WebSearch.Regions) == 0 {
+		c.Tools.WebSearch.Regions = []string{"wt-wt", "us-en", "uk-en", "au-en", "ca-en", "cn-zh"}
+	}
+	if c.Tools.WebSearch.MaxResults == 0 {
+		c.Tools.WebSearch.MaxResults = 5
+	}
+	if c.Tools.WebSearch.Timeout == 0 {
+		c.Tools.WebSearch.Timeout = 8 * time.Second
+	}
 	if c.Store.Retention.ConversationTTL == 0 {
 		c.Store.Retention.ConversationTTL = 30 * 24 * time.Hour
 	}
@@ -484,8 +533,8 @@ func (c Config) Validate() error {
 	if safetyClarificationPrompt == "" {
 		safetyClarificationPrompt = "Approval is required before this task can continue."
 	}
-	if c.Mode != "local" && c.Mode != "production" {
-		return fmt.Errorf("mode must be local or production")
+	if c.Mode != "local" && c.Mode != "production" && c.Mode != "development_durable" {
+		return fmt.Errorf("mode must be local, development_durable, or production")
 	}
 	if c.Admin.ListenAddr != "" {
 		host, _, err := net.SplitHostPort(c.Admin.ListenAddr)
@@ -630,6 +679,9 @@ func (c Config) Validate() error {
 	if featureRefreshInterval(c) < 10*time.Millisecond || featureRefreshInterval(c) > time.Minute {
 		return errors.New("features.runtime_refresh_interval must be bounded")
 	}
+	if err := validateToolCatalog(c.Tools); err != nil {
+		return err
+	}
 	retention := effectiveRetention(c.Store.Retention)
 	if retention.ConversationTTL < time.Hour || retention.ConversationTTL > 10*365*24*time.Hour ||
 		retention.SweepInterval < time.Second || retention.SweepInterval > 24*time.Hour ||
@@ -681,10 +733,58 @@ func (c Config) Validate() error {
 			}
 		}
 	}
-	if c.Mode == "local" && c.Auth.StaticBearerEnv != "" && (strings.TrimSpace(c.Auth.StaticTenantID) == "" || strings.TrimSpace(c.Auth.StaticUserID) == "" || len(c.Auth.StaticScopes) == 0) {
+	if (c.Mode == "local" || c.Mode == "development_durable") && c.UsesStaticAuth() && (strings.TrimSpace(c.Auth.StaticTenantID) == "" || strings.TrimSpace(c.Auth.StaticUserID) == "" || len(c.Auth.StaticScopes) == 0) {
 		return errors.New("static authentication requires configured tenant, user, and scopes")
 	}
+	if c.Mode == "development_durable" {
+		if !c.UsesStaticAuth() {
+			return errors.New("development_durable requires static authentication")
+		}
+		if c.Store.URL == "" && c.Store.DatabaseURLEnv == "" {
+			return errors.New("development_durable requires PostgreSQL storage")
+		}
+		if retention.HMACKeyEnv == "" || retention.HMACKeyID == "" {
+			return errors.New("development_durable requires retention HMAC configuration")
+		}
+		if c.Gateway.Reconnect.HMACKeyEnv == "" || c.Gateway.Reconnect.HMACKeyID == "" {
+			return errors.New("development_durable requires reconnect HMAC configuration")
+		}
+		if !c.Features.Handoffs {
+			return errors.New("development_durable requires handoffs")
+		}
+		if !c.Tools.WebSearch.Enabled {
+			return errors.New("development_durable requires an enabled tool catalog")
+		}
+	}
 	return nil
+}
+
+func validateToolCatalog(catalog ToolCatalogConfig) error {
+	web := catalog.WebSearch
+	if web.MaxResults < 1 || web.MaxResults > 10 {
+		return errors.New("tools.web_search.max_results must be between 1 and 10")
+	}
+	if web.Timeout < time.Second || web.Timeout > 10*time.Second || web.Timeout%time.Millisecond != 0 {
+		return errors.New("tools.web_search.timeout must be between 1s and 10s in milliseconds")
+	}
+	if len(web.Regions) == 0 || len(web.Regions) > 6 {
+		return errors.New("tools.web_search.regions must contain reviewed regions")
+	}
+	for _, region := range web.Regions {
+		if !reviewedWebSearchRegion(region) {
+			return errors.New("tools.web_search.regions must contain reviewed regions")
+		}
+	}
+	return nil
+}
+
+func reviewedWebSearchRegion(region string) bool {
+	switch region {
+	case "wt-wt", "us-en", "uk-en", "au-en", "ca-en", "cn-zh":
+		return true
+	default:
+		return false
+	}
 }
 
 func featureRefreshInterval(c Config) time.Duration {
@@ -827,6 +927,22 @@ func validKeyID(value string) bool {
 		}
 	}
 	return true
+}
+
+func sortedUnique(values []string) []string {
+	out := append([]string(nil), values...)
+	sort.Strings(out)
+	if len(out) < 2 {
+		return out
+	}
+	n := 1
+	for _, value := range out[1:] {
+		if value != out[n-1] {
+			out[n] = value
+			n++
+		}
+	}
+	return out[:n]
 }
 
 func rejectPlaintextSecrets(data []byte) error {

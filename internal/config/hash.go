@@ -16,19 +16,20 @@ const HashVersion = "v1"
 // canonicalConfig is an intentional allowlist. Secret values, secret reference
 // names, database URLs, private-key paths, and certificate contents are absent.
 type canonicalConfig struct {
-	Version   string             `json:"version"`
-	Mode      string             `json:"mode"`
-	Gateway   canonicalGateway   `json:"gateway"`
-	Worker    canonicalWorker    `json:"worker"`
-	Auth      canonicalAuth      `json:"auth"`
-	Admission canonicalAdmission `json:"admission"`
-	Safety    canonicalSafety    `json:"safety"`
-	Telemetry canonicalTelemetry `json:"telemetry"`
-	Shutdown  ShutdownConfig     `json:"shutdown"`
-	Admin     AdminConfig        `json:"admin"`
-	Features  canonicalFeatures  `json:"features"`
-	Retention canonicalRetention `json:"retention"`
-	StoreURL  string             `json:"store_url"`
+	Version   string               `json:"version"`
+	Mode      string               `json:"mode"`
+	Gateway   canonicalGateway     `json:"gateway"`
+	Worker    canonicalWorker      `json:"worker"`
+	Auth      canonicalAuth        `json:"auth"`
+	Admission canonicalAdmission   `json:"admission"`
+	Safety    canonicalSafety      `json:"safety"`
+	Telemetry canonicalTelemetry   `json:"telemetry"`
+	Shutdown  ShutdownConfig       `json:"shutdown"`
+	Admin     AdminConfig          `json:"admin"`
+	Features  canonicalFeatures    `json:"features"`
+	Tools     canonicalToolCatalog `json:"tools"`
+	Retention canonicalRetention   `json:"retention"`
+	StoreURL  string               `json:"store_url"`
 }
 
 type canonicalGateway struct {
@@ -117,6 +118,16 @@ type canonicalFeatures struct {
 	Handoffs            bool          `json:"handoffs"`
 	RefreshInterval     time.Duration `json:"runtime_refresh_interval"`
 }
+type canonicalToolCatalog struct {
+	WebSearch canonicalWebSearchTool `json:"web_search"`
+}
+type canonicalWebSearchTool struct {
+	Enabled          bool     `json:"enabled"`
+	ForceStrict      bool     `json:"force_strict"`
+	Regions          []string `json:"regions"`
+	MaximumResults   int      `json:"maximum_results"`
+	MaximumTimeoutMS int      `json:"maximum_timeout_ms"`
+}
 type canonicalRetention struct {
 	ConversationTTL time.Duration `json:"conversation_ttl"`
 	SweepInterval   time.Duration `json:"sweep_interval"`
@@ -130,6 +141,7 @@ func Canonical(cfg Config) ([]byte, error) {
 		return nil, err
 	}
 	retention := effectiveRetention(cfg.Store.Retention)
+	tools := cfg.ToolCatalog()
 	c := canonicalConfig{
 		Version: HashVersion, Mode: cfg.Mode,
 		Gateway:   canonicalGateway{AdvertisedModel: cfg.Gateway.AdvertisedModel, ListenAddr: cfg.Gateway.ListenAddr, BehindIngress: cfg.Gateway.BehindIngress, TrustedProxies: sorted(cfg.Gateway.TrustedProxies), VoiceProvider: cfg.Gateway.Voice.Provider, VoiceURL: safeURL(cfg.Gateway.Voice.URL), VoiceModel: cfg.Gateway.Voice.Model, Audio: cfg.Gateway.Audio, Session: cfg.Gateway.Session, WebSocket: cfg.Gateway.WebSocket, ProviderRetry: cfg.Gateway.ProviderRetry, StorageGrace: cfg.Gateway.StorageGrace, Reconnect: canonicalReconnect{MaxRetries: cfg.Gateway.Reconnect.MaxRetries, RetryBase: cfg.Gateway.Reconnect.RetryBase, RetryMax: cfg.Gateway.Reconnect.RetryMax, HMACKeyID: cfg.Gateway.Reconnect.HMACKeyID, CredentialTTL: cfg.Gateway.Reconnect.CredentialTTL}},
@@ -138,7 +150,9 @@ func Canonical(cfg Config) ([]byte, error) {
 		Admission: canonicalAdmission{MaxSessions: cfg.Admission.MaxSessions, MaxSessionsPerTenant: cfg.Admission.MaxSessionsPerTenant, MaxSessionsPerUser: cfg.Admission.MaxSessionsPerUser, LeaseDuration: cfg.Admission.LeaseDuration, HeartbeatInterval: cfg.Admission.HeartbeatInterval, GlobalRate: cfg.Admission.GlobalRate, GlobalBurst: cfg.Admission.GlobalBurst, IPRate: cfg.Admission.IPRate, IPBurst: cfg.Admission.IPBurst, IPKeyTTL: cfg.Admission.IPKeyTTL, MaxIPKeys: cfg.Admission.MaxIPKeys, InstanceID: cfg.Admission.InstanceID},
 		Safety:    canonicalSafety{PolicyVersion: cfg.Safety.PolicyVersion, Mode: cfg.Safety.Mode, MaxInputBytes: cfg.Safety.MaxInputBytes, MaxSummaryBytes: cfg.Safety.MaxSummaryBytes, MaxStructuredBytes: cfg.Safety.MaxStructuredBytes, RedactedSummary: cfg.Safety.RedactedSummary, ClarificationPrompt: cfg.Safety.ClarificationPrompt, RedactionDeniedKeys: sorted(cfg.Safety.RedactionDeniedKeys)},
 		Telemetry: canonicalTelemetry{OTLPEndpoint: safeURL(cfg.Telemetry.OTLPEndpoint), ServiceName: cfg.Telemetry.ServiceName, Protocol: cfg.Telemetry.Protocol, ExportTimeout: cfg.Telemetry.ExportTimeout}, Shutdown: cfg.Shutdown, Admin: cfg.Admin,
-		Features: canonicalFeatures{SideEffectingTools: cfg.Features.SideEffectingTools, ToolEncryptionKeyID: cfg.Features.ToolEncryptionKeyID, Handoffs: cfg.Features.Handoffs, RefreshInterval: featureRefreshInterval(cfg)}, Retention: canonicalRetention{ConversationTTL: retention.ConversationTTL, SweepInterval: retention.SweepInterval, DeletionBatch: retention.DeletionBatch, ApprovalTTL: retention.ApprovalTTL, HMACKeyID: retention.HMACKeyID}, StoreURL: safeStoreURL(cfg.Store.URL),
+		Features:  canonicalFeatures{SideEffectingTools: cfg.Features.SideEffectingTools, ToolEncryptionKeyID: cfg.Features.ToolEncryptionKeyID, Handoffs: cfg.Features.Handoffs, RefreshInterval: featureRefreshInterval(cfg)},
+		Tools:     canonicalToolCatalog{WebSearch: canonicalWebSearchTool{Enabled: tools.WebSearch.Enabled, ForceStrict: tools.WebSearch.ForceStrict, Regions: tools.WebSearch.Regions, MaximumResults: tools.WebSearch.MaximumResults, MaximumTimeoutMS: tools.WebSearch.MaximumTimeoutMS}},
+		Retention: canonicalRetention{ConversationTTL: retention.ConversationTTL, SweepInterval: retention.SweepInterval, DeletionBatch: retention.DeletionBatch, ApprovalTTL: retention.ApprovalTTL, HMACKeyID: retention.HMACKeyID}, StoreURL: safeStoreURL(cfg.Store.URL),
 	}
 	return json.Marshal(c)
 }
