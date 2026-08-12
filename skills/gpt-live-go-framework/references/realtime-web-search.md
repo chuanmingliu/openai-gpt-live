@@ -32,9 +32,11 @@ only the canonical policy; the acknowledgement must name
    `DEEPSEEK_API_KEY`. Set `LIVE_DEMO_BEARER` symbolically from the local
    static bearer. Select reviewed non-secret `S2S_IMAGE` and absolute
    `S2S_CONFIG_PATH`. Values never enter docs, YAML, commands, browser, or logs.
-   The durable override constructs a container-only `DATABASE_URL` from the
-   password for migrate, gateway, and worker. PostgreSQL has no host port; do
-   not create a host DSN or print resolved Compose output.
+   The Make targets use `deploy/scripts/durable-compose.sh` (and require `jq`)
+   to percent-encode the password through standard input, then export one
+   container-only `DATABASE_URL` only to the Compose child for migrate,
+   gateway, and worker. PostgreSQL has no host port; do not create a host DSN,
+   trace the wrapper, or print resolved Compose output.
 2. Run `make durable-demo-migrate`. It starts PostgreSQL and migration inside
    Compose, then runs the same image with `-check`; require clean schema
    version 8 before starting any application service.

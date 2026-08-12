@@ -65,11 +65,16 @@ export LIVE_EXPECTED_CONFIG_HASH="$(
 )"
 ```
 
-The durable Compose override constructs one container-only `DATABASE_URL` from
-`POSTGRES_PASSWORD` for migrate, gateway, and worker. Its host is the internal
-service name `postgres`; the database has no published host port and this flow
-creates no host DSN. Do not run `docker compose config` in a shared terminal or
-attach resolved Compose output to a report because interpolation includes the
+The Make targets delegate to the fixed
+`deploy/scripts/durable-compose.sh` wrapper. It requires `jq`, reads
+`POSTGRES_PASSWORD` only from the environment, percent-encodes the password
+through standard input, and exports one container-only `DATABASE_URL` only to
+the Compose child process for migrate, gateway, and worker. Reserved URI
+characters such as `@`, `:`, `/`, `?`, and `#` therefore remain password data.
+Its host is the internal service name `postgres`; the database has no published
+host port and this flow creates no host DSN. Do not invoke the wrapper under
+shell tracing, run `docker compose config` in a shared terminal, or attach
+resolved Compose output to a report because interpolation includes the encoded
 password. The speech configuration selected above must serve
 `ws://speech-to-speech:8000/v1/realtime`, select `deepseek-v4-flash`, disable
 thinking, and provide a content-free pool-idle signal. Verify those external

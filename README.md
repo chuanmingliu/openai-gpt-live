@@ -311,10 +311,12 @@ Required inputs include:
 - Privacy, retention, reconnect, and tool keys.
 - `LIVE_EXPECTED_CONFIG_HASH` from the canonical local config.
 
-Example shape, with values supplied securely before running it:
+Example shape, with values supplied securely before running it. The password
+component of `DATABASE_URL` must already be percent-encoded; do not interpolate
+a raw password into a URI:
 
 ```sh
-export DATABASE_URL="postgres://live:${POSTGRES_PASSWORD}@postgres:5432/live?sslmode=disable"
+test -n "${DATABASE_URL:-}"
 export FORMAL_DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY"
 export LIVE_ADMIN_BEARER_TOKEN="$LIVE_STATIC_BEARER_TOKEN"
 export LIVE_EXPECTED_CONFIG_HASH="$(go run ./cmd/live-gateway config-hash --config deploy/config/local.yaml)"

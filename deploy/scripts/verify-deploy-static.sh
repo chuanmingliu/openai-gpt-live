@@ -3,7 +3,7 @@ set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 cd "$root"
-for tool in go kubectl docker; do
+for tool in go kubectl docker jq; do
   command -v "$tool" >/dev/null 2>&1 || { echo "missing deployment prerequisite: $tool" >&2; exit 127; }
 done
 
@@ -29,7 +29,8 @@ durable_worker_hash=$(cd "$root" && GOCACHE="$cache" go run ./cmd/live-worker co
 env -i PATH="$PATH" docker compose --env-file /dev/null -f "$root/deploy/docker-compose.yml" config >"$scratch/compose.yaml"
 env -i PATH="$PATH" docker compose --env-file /dev/null -f "$root/deploy/docker-compose.yml" -f "$root/deploy/compose.chaos.yml" config >"$scratch/compose-chaos.yaml"
 env -i PATH="$PATH" \
-  POSTGRES_PASSWORD=postgres-local \
+  POSTGRES_PASSWORD='p@ss:/?#% with space' \
+  DATABASE_URL='postgres://live:p%40ss%3A%2F%3F%23%25%20with%20space@postgres:5432/live?sslmode=disable' \
   S2S_API_KEY=speech-local \
   DEEPSEEK_API_KEY=reasoner-local \
   LIVE_STATIC_BEARER_TOKEN=bearer-local \
@@ -42,6 +43,7 @@ env -i PATH="$PATH" \
   S2S_IMAGE=speech-to-speech:local \
   S2S_CONFIG_PATH="$root/deploy/config/local.yaml" \
   docker compose --env-file /dev/null -f "$root/deploy/docker-compose.yml" -f "$root/deploy/compose.development-durable.yml" config >"$scratch/compose-development-durable.yaml"
+"$root/deploy/scripts/test-durable-compose.sh"
 "$root/deploy/scripts/render-kustomize.sh" local >"$scratch/local.yaml"
 LIVE_PRODUCTION_RENDER_MODE=fixture "$root/deploy/scripts/render-kustomize.sh" production >"$scratch/production-fixture.yaml"
 "$root/deploy/scripts/validate-render.sh" local local "$scratch/local.yaml"
@@ -97,6 +99,13 @@ fi
 if rg -n 'go run ./cmd/live-migrate -database-url-env DATABASE_URL' \
   "$root/docs/demo" "$root/skills/gpt-live-go-framework/references/realtime-web-search.md"; then
   echo "durable Compose guide contains a host migration command" >&2
+  exit 1
+fi
+if rg -n -F 'postgres://live:${POSTGRES_PASSWORD}' \
+  "$root/Makefile" "$root/README.md" "$root/docs/demo" \
+  "$root/deploy/compose.development-durable.yml" \
+  "$root/skills/gpt-live-go-framework/references/realtime-web-search.md"; then
+  echo "raw PostgreSQL password interpolation detected in URI" >&2
   exit 1
 fi
 if [ -e "$root/deploy/scripts/live-load-placeholder.sh" ] || ! grep -q '/out/live-load ./cmd/live-load' "$root/Dockerfile"; then

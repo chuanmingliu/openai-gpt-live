@@ -32,8 +32,8 @@ durable_migrate_plan=$(env \
   S2S_CONFIG_PATH="$root/deploy/config/local.yaml" \
   make -n durable-demo-migrate)
 for expected in \
-  'docker compose --project-name gpt-live-durable-demo -f deploy/docker-compose.yml -f deploy/compose.development-durable.yml up --build --wait postgres migrate' \
-  'docker compose --project-name gpt-live-durable-demo -f deploy/docker-compose.yml -f deploy/compose.development-durable.yml run --rm --no-deps migrate -check'; do
+  './deploy/scripts/durable-compose.sh migrate-up' \
+  './deploy/scripts/durable-compose.sh migrate-check'; do
   printf '%s\n' "$durable_migrate_plan" | rg -F "$expected" >/dev/null || {
     echo "durable demo migration command is not explicitly project-scoped" >&2
     exit 1
@@ -57,12 +57,12 @@ durable_up_plan=$(env \
   S2S_IMAGE=speech-to-speech:local \
   S2S_CONFIG_PATH="$root/deploy/config/local.yaml" \
   make -n durable-demo-up)
-printf '%s\n' "$durable_up_plan" | rg -F 'docker compose --project-name gpt-live-durable-demo -f deploy/docker-compose.yml -f deploy/compose.development-durable.yml up --build --wait speech-to-speech gateway worker' >/dev/null || {
+printf '%s\n' "$durable_up_plan" | rg -F './deploy/scripts/durable-compose.sh up' >/dev/null || {
   echo "durable demo start command is not explicitly project-scoped" >&2
   exit 1
 }
 durable_down_plan=$(make -n durable-demo-down)
-printf '%s\n' "$durable_down_plan" | rg -F 'docker compose --project-name gpt-live-durable-demo -f deploy/docker-compose.yml -f deploy/compose.development-durable.yml down' >/dev/null || {
+printf '%s\n' "$durable_down_plan" | rg -F './deploy/scripts/durable-compose.sh down' >/dev/null || {
   echo "durable demo down command is not explicitly project-scoped" >&2
   exit 1
 }
@@ -85,7 +85,8 @@ fi
 
 durable_hash=$(GOCACHE="$cache" go run ./cmd/live-gateway config-hash --config "$root/deploy/config/development-durable.yaml")
 env -i PATH="$PATH" \
-  POSTGRES_PASSWORD=postgres-local \
+  POSTGRES_PASSWORD='p@ss:/?#% with space' \
+  DATABASE_URL='postgres://live:p%40ss%3A%2F%3F%23%25%20with%20space@postgres:5432/live?sslmode=disable' \
   S2S_API_KEY=speech-local \
   DEEPSEEK_API_KEY=reasoner-local \
   LIVE_STATIC_BEARER_TOKEN=bearer-local \
@@ -98,7 +99,7 @@ env -i PATH="$PATH" \
   S2S_IMAGE=speech-to-speech:local \
   S2S_CONFIG_PATH="$root/deploy/config/local.yaml" \
   docker compose --env-file /dev/null -f "$root/deploy/docker-compose.yml" -f "$root/deploy/compose.development-durable.yml" config --format json >"$scratch/durable-compose.json"
-if ! jq -e --arg config "$root/deploy/config/development-durable.yaml" --arg database_url 'postgres://live:postgres-local@postgres:5432/live?sslmode=disable' '
+if ! jq -e --arg config "$root/deploy/config/development-durable.yaml" --arg database_url 'postgres://live:p%40ss%3A%2F%3F%23%25%20with%20space@postgres:5432/live?sslmode=disable' '
   .name == "gpt-live-durable-demo" and
   .services.migrate.environment.DATABASE_URL == $database_url and
   .services.gateway.environment.DATABASE_URL == $database_url and

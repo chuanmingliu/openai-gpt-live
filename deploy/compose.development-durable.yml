@@ -3,11 +3,11 @@ name: gpt-live-durable-demo
 services:
   migrate:
     environment:
-      DATABASE_URL: postgres://live:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/live?sslmode=disable
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required; use the durable Compose wrapper}
 
   gateway:
     environment:
-      DATABASE_URL: postgres://live:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/live?sslmode=disable
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required; use the durable Compose wrapper}
       S2S_API_KEY: ${S2S_API_KEY:?S2S_API_KEY is required}
       LIVE_STATIC_BEARER_TOKEN: ${LIVE_STATIC_BEARER_TOKEN:?LIVE_STATIC_BEARER_TOKEN is required}
       LIVE_ADMIN_BEARER_TOKEN: ${LIVE_ADMIN_BEARER_TOKEN:?LIVE_ADMIN_BEARER_TOKEN is required}
@@ -30,7 +30,7 @@ services:
 
   worker:
     environment:
-      DATABASE_URL: postgres://live:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/live?sslmode=disable
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required; use the durable Compose wrapper}
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:?DEEPSEEK_API_KEY is required}
       LIVE_STATIC_BEARER_TOKEN: ${LIVE_STATIC_BEARER_TOKEN:?LIVE_STATIC_BEARER_TOKEN is required}
       LIVE_ADMIN_BEARER_TOKEN: ${LIVE_ADMIN_BEARER_TOKEN:?LIVE_ADMIN_BEARER_TOKEN is required}

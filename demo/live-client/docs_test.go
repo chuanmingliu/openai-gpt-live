@@ -138,8 +138,11 @@ func TestRealtimeGuideDocumentsDurableStartupPolicyAndManualAcceptance(t *testin
 		assert.Contains(t, guide, exact)
 	}
 	assert.Contains(t, guide, "container-only `DATABASE_URL`")
+	assert.Contains(t, guide, "percent-encodes")
+	assert.Contains(t, guide, "deploy/scripts/durable-compose.sh")
 	assert.NotContains(t, guide, `read -r -s "DATABASE_URL?`)
 	assert.NotContains(t, guide, "go run ./cmd/live-migrate -database-url-env DATABASE_URL")
+	assert.NotContains(t, guide, `postgres://live:${POSTGRES_PASSWORD}`)
 	assert.False(t, hasCredentialLiteralAssignment(guide))
 }
 

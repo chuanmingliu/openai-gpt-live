@@ -44,8 +44,8 @@ durable-demo-migrate:
 	@test -n "$$LIVE_EXPECTED_CONFIG_HASH"
 	@test -n "$$S2S_IMAGE"
 	@test -n "$$S2S_CONFIG_PATH"
-	docker compose --project-name gpt-live-durable-demo -f deploy/docker-compose.yml -f deploy/compose.development-durable.yml up --build --wait postgres migrate
-	docker compose --project-name gpt-live-durable-demo -f deploy/docker-compose.yml -f deploy/compose.development-durable.yml run --rm --no-deps migrate -check
+	./deploy/scripts/durable-compose.sh migrate-up
+	./deploy/scripts/durable-compose.sh migrate-check
 
 durable-demo-up:
 	@test -n "$$POSTGRES_PASSWORD"
@@ -60,10 +60,10 @@ durable-demo-up:
 	@test -n "$$LIVE_EXPECTED_CONFIG_HASH"
 	@test -n "$$S2S_IMAGE"
 	@test -n "$$S2S_CONFIG_PATH"
-	docker compose --project-name gpt-live-durable-demo -f deploy/docker-compose.yml -f deploy/compose.development-durable.yml up --build --wait speech-to-speech gateway worker
+	./deploy/scripts/durable-compose.sh up
 
 durable-demo-down:
-	docker compose --project-name gpt-live-durable-demo -f deploy/docker-compose.yml -f deploy/compose.development-durable.yml down
+	./deploy/scripts/durable-compose.sh down
 
 test-durable-web-search:
 	go test -race -count=1 ./test/internal/fakesearch ./test/internal/loadgateway
