@@ -21,8 +21,101 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
 	"github.com/chuanmingliu/openai-gpt-live/internal/testkit"
+	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 	"github.com/stretchr/testify/require"
 )
+
+func TestManagerAcknowledgesPolicyWithoutSendingProviderCommand(t *testing.T) {
+	catalog := toolpolicy.DefaultCatalog()
+	catalog.WebSearch.ForceStrict = true
+	dispatcher := &durableDispatcherFake{
+		trusted: make(chan TrustedSessionContext, 1), transcripts: make(chan TranscriptRequestedEffect, 1),
+		handoffs: make(chan HandoffRequestedEffect, 1),
+	}
+	connector := testkit.NewFakeConnector(4)
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		ToolCatalog: catalog, AsyncModel: "deepseek-v4-flash", DurableDispatcher: dispatcher,
+	}, connector, managerIDs{session: "policy-session", conversation: "policy-conversation"})
+	client := newChannelClient(8)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- manager.Run(ctx, OpenRequest{Subject: Subject{
+			TenantID: "tenant", UserID: "user", ExpiresAt: time.Now().Add(time.Hour),
+		}}, client)
+	}()
+	voice, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	require.IsType(t, protocol.SessionCreatedEvent{}, <-client.writes)
+
+	requested := toolpolicy.DefaultPolicy()
+	requested.WebSearch.Region = "us-en"
+	requested.WebSearch.MaxResults = 2
+	requested.WebSearch.TimeoutMS = 4_000
+	client.reads <- protocol.LiveToolPolicyUpdateEvent{Type: "live.tool_policy.update", EventID: "policy-1", Tools: requested}
+	ack := (<-client.writes).(protocol.LiveToolPolicyUpdatedEvent)
+	require.Equal(t, "policy-1", ack.EventID)
+	require.Equal(t, "deepseek-v4-flash", ack.Model)
+	require.Equal(t, toolpolicy.SafeSearchStrict, ack.Tools.WebSearch.SafeSearch)
+	require.Equal(t, "us-en", ack.Tools.WebSearch.Region)
+
+	manager.activeMu.RLock()
+	var state *runState
+	for _, runtime := range manager.active {
+		state = runtime.state
+	}
+	manager.activeMu.RUnlock()
+	require.NotNil(t, state)
+	require.NoError(t, state.dispatchEffects(t.Context(), []Effect{{Handoff: &HandoffRequestedEffect{
+		ResponseID: "response", CallID: "call", ToolName: StartBackgroundTaskTool,
+		Arguments: json.RawMessage(`{"objective":"x"}`),
+	}}}, 0, 0))
+	require.Equal(t, ack.Tools, (<-dispatcher.handoffs).ToolPolicy)
+
+	providerCtx, stop := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer stop()
+	_, err = voice.NextCommand(providerCtx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	cancel()
+	require.ErrorIs(t, <-result, context.Canceled)
+}
+
+func TestManagerDerivesDefaultPolicyFromCatalogForHandoffs(t *testing.T) {
+	dispatcher := &durableDispatcherFake{
+		trusted: make(chan TrustedSessionContext, 1), transcripts: make(chan TranscriptRequestedEffect, 1),
+		handoffs: make(chan HandoffRequestedEffect, 1),
+	}
+	catalog := toolpolicy.DefaultCatalog()
+	catalog.WebSearch.MaximumResults = 3
+	catalog.WebSearch.MaximumTimeoutMS = 5_000
+	cfg, err := normalizeManagerConfig(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		ToolCatalog: catalog, AsyncModel: "deepseek-v4-flash", DurableDispatcher: dispatcher,
+	})
+	require.NoError(t, err)
+	state := newRunState(cfg, testIDs(), &recordingVoice{sent: make(chan realtime.Command, 1)}, newChannelClient(1), func() {})
+	handoffEffect := HandoffRequestedEffect{
+		ResponseID: "response", CallID: "call", ToolName: StartBackgroundTaskTool,
+		Arguments: json.RawMessage(`{"objective":"x"}`),
+	}
+	require.NoError(t, state.dispatchEffects(t.Context(), []Effect{{Handoff: &handoffEffect}}, 0, 0))
+	got := <-dispatcher.handoffs
+	require.Equal(t, toolpolicy.Policy{WebSearch: toolpolicy.WebSearchPolicy{
+		Enabled: true, SafeSearch: toolpolicy.SafeSearchModerate, Region: "wt-wt", MaxResults: 3, TimeoutMS: 5_000,
+	}}, got.ToolPolicy)
+}
+
+func TestManagerOwnsToolCatalogRegionStorage(t *testing.T) {
+	catalog := toolpolicy.DefaultCatalog()
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second, ToolCatalog: catalog,
+	}, testkit.NewFakeConnector(1), managerIDs{})
+	require.NoError(t, manager.validationErr)
+
+	catalog.WebSearch.Regions[0] = "caller-mutated"
+	require.NotEqual(t, "caller-mutated", manager.cfg.ToolCatalog.WebSearch.Regions[0])
+}
 
 type recoveryStoreFake struct {
 	snapshot RecoverySnapshot

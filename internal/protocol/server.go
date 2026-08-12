@@ -3,12 +3,24 @@ package protocol
 import (
 	"encoding/json"
 	"time"
+
+	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 )
 
 type ServerEvent interface {
 	EventType() string
 	isServerEvent()
 }
+
+type LiveToolPolicyUpdatedEvent struct {
+	Type    string            `json:"type"`
+	EventID string            `json:"event_id"`
+	Tools   toolpolicy.Policy `json:"tools"`
+	Model   string            `json:"model"`
+}
+
+func (e LiveToolPolicyUpdatedEvent) EventType() string { return e.Type }
+func (LiveToolPolicyUpdatedEvent) isServerEvent()      {}
 
 type SessionCreatedEvent struct {
 	Type      string             `json:"type"`

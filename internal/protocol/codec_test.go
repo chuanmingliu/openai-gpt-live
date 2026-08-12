@@ -10,11 +10,64 @@ import (
 	"time"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/testkit"
+	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 var testLimits = Limits{MaxFrameBytes: 16_384, MaxJSONDepth: 12, MaxAudioBytes: 1_920}
+
+func TestDecodeClientCanonicalizesToolPolicyUpdate(t *testing.T) {
+	event, err := DecodeClient([]byte(`{"type":"live.tool_policy.update","event_id":"policy-1","tools":{"web_search":{"enabled":true,"safe_search":"moderate","region":"wt-wt","max_results":5,"timeout_ms":8000}}}`), testLimits)
+	require.NoError(t, err)
+	assert.Equal(t, LiveToolPolicyUpdateEvent{
+		Type: "live.tool_policy.update", EventID: "policy-1", Tools: toolpolicy.DefaultPolicy(),
+	}, event)
+}
+
+func TestDecodeClientRejectsNonCanonicalToolPolicyUpdates(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{"executable field", `{"type":"live.tool_policy.update","event_id":"policy-1","tools":{"web_search":{"enabled":true,"safe_search":"moderate","region":"wt-wt","max_results":5,"timeout_ms":8000,"command":"npx"}}}`},
+		{"unknown tool", `{"type":"live.tool_policy.update","event_id":"policy-1","tools":{"web_search":{"enabled":true,"safe_search":"moderate","region":"wt-wt","max_results":5,"timeout_ms":8000},"shell":{}}}`},
+		{"duplicate nested key", `{"type":"live.tool_policy.update","event_id":"policy-1","tools":{"web_search":{"enabled":true,"enabled":false,"safe_search":"moderate","region":"wt-wt","max_results":5,"timeout_ms":8000}}}`},
+		{"unsafe region", `{"type":"live.tool_policy.update","event_id":"policy-1","tools":{"web_search":{"enabled":true,"safe_search":"moderate","region":"ru-ru","max_results":5,"timeout_ms":8000}}}`},
+		{"excess results", `{"type":"live.tool_policy.update","event_id":"policy-1","tools":{"web_search":{"enabled":true,"safe_search":"moderate","region":"wt-wt","max_results":11,"timeout_ms":8000}}}`},
+		{"excess timeout", `{"type":"live.tool_policy.update","event_id":"policy-1","tools":{"web_search":{"enabled":true,"safe_search":"moderate","region":"wt-wt","max_results":5,"timeout_ms":10001}}}`},
+		{"unknown top-level field", `{"type":"live.tool_policy.update","event_id":"policy-1","tools":{"web_search":{"enabled":true,"safe_search":"moderate","region":"wt-wt","max_results":5,"timeout_ms":8000}},"model":"browser-model"}`},
+		{"empty event id", `{"type":"live.tool_policy.update","event_id":"","tools":{"web_search":{"enabled":true,"safe_search":"moderate","region":"wt-wt","max_results":5,"timeout_ms":8000}}}`},
+		{"oversized event id", `{"type":"live.tool_policy.update","event_id":"` + strings.Repeat("x", 129) + `","tools":{"web_search":{"enabled":true,"safe_search":"moderate","region":"wt-wt","max_results":5,"timeout_ms":8000}}}`},
+		{"control character event id", "{\"type\":\"live.tool_policy.update\",\"event_id\":\"policy\\u000a1\",\"tools\":{\"web_search\":{\"enabled\":true,\"safe_search\":\"moderate\",\"region\":\"wt-wt\",\"max_results\":5,\"timeout_ms\":8000}}}"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := DecodeClient([]byte(tt.raw), testLimits)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestLiveToolPolicyUpdatedRoundTripsCanonicalAcknowledgement(t *testing.T) {
+	event := LiveToolPolicyUpdatedEvent{
+		Type: "live.tool_policy.updated", EventID: "policy-1", Tools: toolpolicy.DefaultPolicy(), Model: "deepseek-v4-flash",
+	}
+	raw, err := Encode(event)
+	require.NoError(t, err)
+	decoded, err := DecodeServer(raw, testLimits)
+	require.NoError(t, err)
+	assert.Equal(t, event, decoded)
+
+	for _, invalid := range []string{
+		`{"type":"live.tool_policy.updated","event_id":"policy-1","tools":{"web_search":{"enabled":true,"safe_search":"moderate","region":"wt-wt","max_results":5,"timeout_ms":8000}},"model":"deepseek-v4-flash","command":"npx"}`,
+		`{"type":"live.tool_policy.updated","event_id":"policy-1","tools":{"web_search":{"enabled":true,"safe_search":"moderate","region":"xx-xx","max_results":5,"timeout_ms":8000}},"model":"deepseek-v4-flash"}`,
+		`{"type":"live.tool_policy.updated","event_id":"policy-1","tools":{"web_search":{"enabled":true,"safe_search":"moderate","region":"wt-wt","max_results":5,"timeout_ms":8000}},"model":""}`,
+	} {
+		_, err := DecodeServer([]byte(invalid), testLimits)
+		require.Error(t, err)
+	}
+}
 
 func TestDecodeClientDispatchesEverySupportedType(t *testing.T) {
 	tests := []struct {

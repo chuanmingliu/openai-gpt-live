@@ -24,6 +24,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
 	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
+	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -102,6 +103,8 @@ type Config struct {
 	ReconnectCleanupInterval        time.Duration
 	ReconnectCleanupBatch           int
 	InitialSession                  realtime.SessionConfig
+	ToolCatalog                     toolpolicy.Catalog
+	AsyncModel                      string
 	HandoffToolsEnabled             bool
 	Clock                           clock.Clock
 	Jitter                          clock.JitterSource
@@ -602,6 +605,8 @@ type runState struct {
 	egressSequence  uint64
 	eventSequence   uint64
 	sequenceMu      sync.Mutex
+	toolPolicyMu    sync.RWMutex
+	toolPolicy      toolpolicy.Policy
 
 	outputMu    sync.Mutex
 	outputOrder uint64
@@ -767,6 +772,13 @@ func minimalReconnectSubject(subject Subject) Subject {
 
 func normalizeManagerConfig(cfg Config) (Config, error) {
 	cfg.InitialSession = cloneRealtimeSessionConfig(cfg.InitialSession)
+	if emptyToolCatalog(cfg.ToolCatalog) {
+		cfg.ToolCatalog = toolpolicy.DefaultCatalog()
+	}
+	cfg.ToolCatalog.WebSearch.Regions = append([]string(nil), cfg.ToolCatalog.WebSearch.Regions...)
+	if _, err := defaultToolPolicy(cfg.ToolCatalog); err != nil {
+		return cfg, fmt.Errorf("%w: tool catalog: %v", ErrInvalidManagerConfig, err)
+	}
 	defaults := []struct {
 		value *int
 		name  string
@@ -2158,6 +2170,7 @@ func (m *Manager) rollbackReplacementPublication(runtime *sessionRuntime, logica
 }
 
 func newRunState(cfg Config, ids IDs, voice realtime.Session, client ClientConn, cancel context.CancelFunc) *runState {
+	policy, _ := defaultToolPolicy(cfg.ToolCatalog)
 	state := &runState{
 		cfg:                cfg,
 		ids:                ids,
@@ -2184,6 +2197,7 @@ func newRunState(cfg Config, ids IDs, voice realtime.Session, client ClientConn,
 		dispatcher:         cfg.DurableDispatcher,
 		cancel:             cancel,
 		boundary:           Snapshot{IDs: ids, Response: ResponseIdle},
+		toolPolicy:         policy,
 	}
 	for range cfg.ControlEvents {
 		state.inboxSlots <- struct{}{}
@@ -2199,6 +2213,46 @@ func newRunState(cfg Config, ids IDs, voice realtime.Session, client ClientConn,
 		state.egressSlots <- struct{}{}
 	}
 	return state
+}
+
+func emptyToolCatalog(catalog toolpolicy.Catalog) bool {
+	web := catalog.WebSearch
+	return !web.Enabled && !web.ForceStrict && len(web.Regions) == 0 && web.MaximumResults == 0 && web.MaximumTimeoutMS == 0
+}
+
+func defaultToolPolicy(catalog toolpolicy.Catalog) (toolpolicy.Policy, error) {
+	policy := toolpolicy.DefaultPolicy()
+	web := catalog.WebSearch
+	policy.WebSearch.Enabled = web.Enabled
+	if web.MaximumResults < policy.WebSearch.MaxResults {
+		policy.WebSearch.MaxResults = web.MaximumResults
+	}
+	if web.MaximumTimeoutMS < policy.WebSearch.TimeoutMS {
+		policy.WebSearch.TimeoutMS = web.MaximumTimeoutMS
+	}
+	regionAllowed := false
+	for _, region := range web.Regions {
+		if region == policy.WebSearch.Region {
+			regionAllowed = true
+			break
+		}
+	}
+	if !regionAllowed && len(web.Regions) != 0 {
+		policy.WebSearch.Region = web.Regions[0]
+	}
+	return toolpolicy.Canonicalize(policy, catalog)
+}
+
+func (s *runState) replaceToolPolicy(policy toolpolicy.Policy) {
+	s.toolPolicyMu.Lock()
+	s.toolPolicy = policy
+	s.toolPolicyMu.Unlock()
+}
+
+func (s *runState) toolPolicySnapshot() toolpolicy.Policy {
+	s.toolPolicyMu.RLock()
+	defer s.toolPolicyMu.RUnlock()
+	return s.toolPolicy
 }
 
 func (m *Manager) Submit(ctx context.Context, sessionID identity.SessionID, incarnation identity.Incarnation, input Input) error {
@@ -2527,6 +2581,15 @@ func (s *runState) clientReader(ctx context.Context) error {
 		}
 		err = s.runtime.acceptClientEvent(ctx, func(sequence uint64) (bool, error) {
 			switch typed := event.(type) {
+			case protocol.LiveToolPolicyUpdateEvent:
+				canonical, canonicalErr := toolpolicy.Canonicalize(typed.Tools, s.cfg.ToolCatalog)
+				if canonicalErr != nil {
+					return false, canonicalErr
+				}
+				s.replaceToolPolicy(canonical)
+				return true, s.enqueueClientControl(clientControl{event: protocol.LiveToolPolicyUpdatedEvent{
+					Type: "live.tool_policy.updated", EventID: typed.EventID, Tools: canonical, Model: s.cfg.AsyncModel,
+				}})
 			case protocol.LiveToolApprovalResolveEvent:
 				select {
 				case s.approvalWork <- approvalResolutionWork{event: typed, sequence: sequence}:
@@ -3111,6 +3174,7 @@ func (s *runState) dispatchEffectsReconciled(ctx context.Context, effects []Effe
 				}
 				owned := *effect.Handoff
 				owned.Arguments = append(json.RawMessage(nil), effect.Handoff.Arguments...)
+				owned.ToolPolicy = s.toolPolicySnapshot()
 				if err := s.dispatcher.DispatchHandoff(ctx, trusted, owned); err != nil {
 					return err
 				}

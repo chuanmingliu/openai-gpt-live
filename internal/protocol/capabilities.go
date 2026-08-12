@@ -28,6 +28,7 @@ var clientEventTypes = [...]string{
 	"response.create",
 	"response.cancel",
 	"live.tool.approval.resolve",
+	"live.tool_policy.update",
 }
 
 var serverEventTypes = [...]string{
@@ -61,6 +62,7 @@ var extensionEventTypes = [...]string{
 	"live.session.degraded",
 	"live.session.resumed",
 	"live.tool.approval.required",
+	"live.tool_policy.updated",
 }
 
 type CapabilityFeatures struct {

@@ -9,6 +9,8 @@ import (
 	"io"
 	"reflect"
 	"unicode/utf8"
+
+	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 )
 
 const pcmFrameBytes = 960
@@ -41,6 +43,8 @@ func DecodeClient(raw []byte, limits Limits) (ClientEvent, error) {
 		target = &ResponseCancelEvent{}
 	case "live.tool.approval.resolve":
 		target = &LiveToolApprovalResolveEvent{}
+	case "live.tool_policy.update":
+		target = &LiveToolPolicyUpdateEvent{}
 	default:
 		return nil, fmt.Errorf("unsupported client event type %q", eventType)
 	}
@@ -51,6 +55,11 @@ func DecodeClient(raw []byte, limits Limits) (ClientEvent, error) {
 	event := reflect.ValueOf(target).Elem().Interface().(ClientEvent)
 	if err := validateClient(event, raw, limits); err != nil {
 		return nil, err
+	}
+	if typed, ok := event.(LiveToolPolicyUpdateEvent); ok {
+		fields, _ := rawObject(raw)
+		typed.Tools, _ = decodeCanonicalToolPolicy(fields, toolpolicy.DefaultCatalog())
+		event = typed
 	}
 	return event, nil
 }
@@ -111,6 +120,8 @@ func DecodeServer(raw []byte, limits Limits) (ServerEvent, error) {
 		target = &LiveSessionResumedEvent{}
 	case "live.tool.approval.required":
 		target = &LiveToolApprovalRequiredEvent{}
+	case "live.tool_policy.updated":
+		target = &LiveToolPolicyUpdatedEvent{}
 	default:
 		return nil, fmt.Errorf("unsupported server event type %q", eventType)
 	}
@@ -121,6 +132,11 @@ func DecodeServer(raw []byte, limits Limits) (ServerEvent, error) {
 	event := reflect.ValueOf(target).Elem().Interface().(ServerEvent)
 	if err := validateServer(event, raw, limits); err != nil {
 		return nil, err
+	}
+	if typed, ok := event.(LiveToolPolicyUpdatedEvent); ok {
+		fields, _ := rawObject(raw)
+		typed.Tools, _ = decodeCanonicalToolPolicy(fields, toolpolicy.DefaultCatalog())
+		event = typed
 	}
 	return event, nil
 }
@@ -263,6 +279,15 @@ func validateClient(event ClientEvent, raw []byte, limits Limits) error {
 			return err
 		}
 		return requireBoundedString(fields, "idempotency_key", 256, true)
+	case LiveToolPolicyUpdateEvent:
+		if err := exactFields(fields, "type", "event_id", "tools"); err != nil {
+			return err
+		}
+		if err := requirePrintableASCIIString(fields, "event_id", 128); err != nil {
+			return err
+		}
+		_, err := decodeCanonicalToolPolicy(fields, toolpolicy.DefaultCatalog())
+		return err
 	default:
 		return fmt.Errorf("unsupported client event %T", event)
 	}
@@ -498,6 +523,18 @@ func validateServer(event ServerEvent, raw []byte, limits Limits) error {
 			return errors.New("approval risk class is invalid")
 		}
 		return nil
+	case LiveToolPolicyUpdatedEvent:
+		if err := exactFields(fields, "type", "event_id", "tools", "model"); err != nil {
+			return err
+		}
+		if err := requirePrintableASCIIString(fields, "event_id", 128); err != nil {
+			return err
+		}
+		if err := requireBoundedString(fields, "model", 256, true); err != nil {
+			return err
+		}
+		_, err := decodeCanonicalToolPolicy(fields, toolpolicy.DefaultCatalog())
+		return err
 	default:
 		return fmt.Errorf("unsupported server event %T", event)
 	}
@@ -551,6 +588,32 @@ func requireBoundedString(fields map[string]json.RawMessage, name string, limit 
 		return fmt.Errorf("%s exceeds its byte limit", name)
 	}
 	return nil
+}
+
+func requirePrintableASCIIString(fields map[string]json.RawMessage, name string, limit int) error {
+	if err := requireBoundedString(fields, name, limit, true); err != nil {
+		return err
+	}
+	var value string
+	_ = json.Unmarshal(fields[name], &value)
+	for _, character := range value {
+		if character < 0x20 || character > 0x7e {
+			return fmt.Errorf("%s must contain only printable ASCII", name)
+		}
+	}
+	return nil
+}
+
+func decodeCanonicalToolPolicy(fields map[string]json.RawMessage, catalog toolpolicy.Catalog) (toolpolicy.Policy, error) {
+	raw, ok := fields["tools"]
+	if !ok {
+		return toolpolicy.Policy{}, errors.New("tools is required")
+	}
+	policy, err := toolpolicy.Decode(raw)
+	if err != nil {
+		return toolpolicy.Policy{}, err
+	}
+	return toolpolicy.Canonicalize(policy, catalog)
 }
 
 func exactFields(fields map[string]json.RawMessage, names ...string) error {

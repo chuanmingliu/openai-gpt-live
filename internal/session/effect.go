@@ -6,6 +6,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
+	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 )
 
 type Effect struct {
@@ -39,6 +40,7 @@ type HandoffRequestedEffect struct {
 	Turn         identity.TurnKey
 	Transcript   string
 	RejectReason string
+	ToolPolicy   toolpolicy.Policy
 }
 
 type AsyncEffect struct {

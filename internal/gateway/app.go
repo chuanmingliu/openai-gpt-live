@@ -245,6 +245,8 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 		ReconnectRetryBase:  cfg.Gateway.Reconnect.RetryBase,
 		ReconnectRetryMax:   cfg.Gateway.Reconnect.RetryMax,
 		HandoffToolsEnabled: cfg.Features.Handoffs,
+		ToolCatalog:         cfg.ToolCatalog(),
+		AsyncModel:          cfg.Worker.Reasoner.Model,
 	}
 	if cfg.Features.Handoffs {
 		managerConfig.InitialSession = session.ReservedHandoffSessionConfig()

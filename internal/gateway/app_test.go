@@ -106,6 +106,7 @@ func validConfig() config.Config {
 
 func TestNewMapsConfigAndAppliesBoundedTimeoutDefaults(t *testing.T) {
 	cfg := validConfig()
+	cfg.Worker.Reasoner.Model = "deepseek-v4-flash"
 	connector := testkit.NewFakeConnector(8)
 	app, err := New(cfg, connector, WithIDGenerator(deterministicIDs{}))
 	require.NoError(t, err)
@@ -122,6 +123,8 @@ func TestNewMapsConfigAndAppliesBoundedTimeoutDefaults(t *testing.T) {
 	require.False(t, *app.wsOptions.HandoffsEnabled)
 	require.Equal(t, session.DefaultRecoveryItemLimit, app.managerConfig.RecoveryItemLimit)
 	require.Equal(t, session.DefaultRecoveryByteLimit, app.managerConfig.RecoveryByteLimit)
+	require.Equal(t, cfg.ToolCatalog(), app.managerConfig.ToolCatalog)
+	require.Equal(t, "deepseek-v4-flash", app.managerConfig.AsyncModel)
 
 	cfg.Gateway.WebSocket.ReadTimeout = 17 * time.Second
 	cfg.Gateway.WebSocket.WriteTimeout = 19 * time.Second
