@@ -34,7 +34,7 @@ gateway:
     role: realtime_voice
     provider: speech_to_speech
     url: wss://speech.example.com/v1/realtime
-    model: provider-realtime-model
+    model: deepseek-v4-flash
     api_key_env: S2S_API_KEY
   audio:
     sample_rate: 24000
@@ -49,6 +49,9 @@ gateway:
 - URL userinfo, query, fragment, and opaque form fail. Production requires `wss://`; local accepts `ws://`.
 - Provider connect timeout is currently fixed at 10 seconds.
 - `role` and `provider` are labels; they do not select another implementation. Gateway currently constructs `s2sws`.
+- The selected speech service must configure `deepseek-v4-flash` with thinking
+  disabled. That provider-specific service setting is external to the Go
+  connector; verify it from the reviewed service configuration and startup.
 
 ## Asynchronous DeepSeek mapping
 
@@ -69,7 +72,7 @@ worker:
     role: async_gpt_5_5
     provider: deepseek
     base_url: https://api.deepseek.com
-    model: deepseek-chat
+    model: deepseek-v4-flash
     api_key_env: DEEPSEEK_API_KEY
 ```
 
@@ -80,6 +83,9 @@ worker:
 - `request_timeout` is the HTTP timeout. Retryable classes are transport errors, 408, 429, and 5xx.
 - `heartbeat_interval` must be strictly less than half `lease_duration`.
 - `role` and `provider` are labels; worker currently constructs the DeepSeek adapter.
+- Initial and tool-follow-up requests include the official
+  `{"thinking":{"type":"disabled"}}` shape. Provider reasoning content is
+  rejected rather than presented or persisted.
 
 ## Handoff enablement
 
@@ -103,6 +109,11 @@ features:
 ```
 
 The shipped worker registry contains no external tools. Enabling the flag and encryption key does not register tools.
+
+`development_durable` is the loopback exception that composes PostgreSQL,
+static local authentication, handoffs, the worker, and the compiled Web Search
+catalog. It is rejected by production rendering and release promotion. Use
+`deploy/config/development-durable.yaml`; do not weaken local-mode validation.
 
 ## Defaults
 
@@ -132,6 +143,10 @@ Omitted session block timeouts and WebSocket read/write timeouts hash as zero ev
 | `LIVE_RETENTION_HMAC_KEY` | gateway, worker | Base64 of 32–4096 decoded bytes; pair with immutable key ID |
 | `LIVE_RECONNECT_HMAC_KEY` | production gateway | Base64 of 32–4096 decoded bytes; pair with immutable key ID |
 | `LIVE_TOOL_ENCRYPTION_KEY` | gateway shared config, worker | Base64 of exactly 32 decoded bytes; pair with immutable key ID |
+
+`S2S_API_KEY` and `DEEPSEEK_API_KEY` may be issued by one provider account but
+remain independently named, process-scoped secret references. Never substitute
+a browser field or raw value into either `_env` field.
 
 Generate development-only values without printing them into tracked files:
 

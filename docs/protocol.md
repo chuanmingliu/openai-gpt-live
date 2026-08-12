@@ -4,11 +4,11 @@ The gateway advertises protocol `openai-realtime-subset`, version `1.0.0`. Clien
 
 ## Client events
 
-The accepted subset is `session.update`, `input_audio_buffer.append`, `input_audio_buffer.commit`, `conversation.item.create`, `response.create`, `response.cancel`, and `live.tool.approval.resolve`. Approval resolution carries only an invocation ID, `approved` or `denied`, a bounded reason, and an idempotency key; identity and tool inputs are server-authoritative.
+The accepted subset is `session.update`, `input_audio_buffer.append`, `input_audio_buffer.commit`, `conversation.item.create`, `response.create`, `response.cancel`, `live.tool_policy.update`, and `live.tool.approval.resolve`. The tool-policy update contains one exact closed-world `web_search` policy: enabled, SafeSearch (`strict` or `moderate`), reviewed region, 1–10 results, and a 1,000–10,000 ms timeout. Catalog limits may tighten those values. Unknown tools or fields, duplicate keys, trailing JSON, models, destinations, commands, packages, environment, credentials, paths, headers, and raw server definitions are rejected. Approval resolution carries only an invocation ID, `approved` or `denied`, a bounded reason, and an idempotency key; identity and tool inputs are server-authoritative.
 
 ## Server events
 
-The gateway emits `session.created`, `session.reconnect.updated`, `session.updated`, `error`, speech start/stop, input transcription delta/completed, `response.created`, output audio delta/done, output transcript delta/done, function-call completion, and `response.done`. `session.reconnect.updated` replaces the reconnect metadata after a cursor advance or before credential expiry; the immediately previous credential remains valid only for a bounded overlap.
+The gateway emits `session.created`, `session.reconnect.updated`, `session.updated`, `live.tool_policy.updated`, `error`, speech start/stop, input transcription delta/completed, `response.created`, output audio delta/done, output transcript delta/done, function-call completion, and `response.done`. A policy acknowledgement contains the canonical accepted policy and server-owned asynchronous model `deepseek-v4-flash`; untrusted input cannot choose it. `session.reconnect.updated` replaces the reconnect metadata after a cursor advance or before credential expiry; the immediately previous credential remains valid only for a bounded overlap.
 
 The durable extensions are:
 
@@ -18,6 +18,13 @@ The durable extensions are:
 - `live.tool.approval.resolve`, the only client-to-server extension.
 
 When the static handoff capability is disabled, `/v1/realtime/capabilities` omits the `live.handoff.*` extensions while retaining the remaining extension contract.
+
+Web Search presentation uses monotonic stable phases `queued`, `searching`,
+`reading_sources`, `preparing_answer`, then `completed`, `failed`, or
+`cancelled`; `needs_input` is an explicit nonterminal state. Progress has no
+percentage and never exposes raw queries, tool arguments or results, provider
+reasoning, transport logs, or credentials. Only the bounded final summary and
+approved HTTPS source links cross the private worker boundary.
 
 Reconnect mode is selected with the non-secret URL marker `reconnect=1`; the first bounded post-upgrade text frame is exactly `{"type":"session.reconnect","credential":"..."}`. The credential never appears in a URL or HTTP header. Reconnect restores only committed durable state and advances exact delivery cursors. Response incarnation and epoch fence every provider event. A cancellation advances the fence before later output can be presented; stale output is discarded and counted.
 

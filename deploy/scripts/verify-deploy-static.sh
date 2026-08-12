@@ -83,6 +83,18 @@ if rg -n --hidden --glob '!.git/**' --glob '!go.sum' -- '-----BEGIN (RSA |EC |OP
   echo "private key material detected" >&2
   exit 1
 fi
+if rg -n --glob '!**/references/verification.md' '(deepseek-chat|deepseek-reasoner)' \
+  "$root/README.md" "$root/docs/demo" "$root/deploy/config" \
+  "$root/deploy/k8s" "$root/configs" "$root/skills/gpt-live-go-framework"; then
+  echo "retired DeepSeek model identifier detected in active docs/config/skill" >&2
+  exit 1
+fi
+if rg -n --glob '!**/references/verification.md' '(npx[[:space:]]+-y|@modelcontextprotocol/server-duckduckgo)' \
+  "$root/README.md" "$root/docs/demo" "$root/deploy/config" "$root/deploy/k8s" \
+  "$root/configs" "$root/skills/gpt-live-go-framework"; then
+  echo "dynamic tool package instruction detected" >&2
+  exit 1
+fi
 if [ -e "$root/deploy/scripts/live-load-placeholder.sh" ] || ! grep -q '/out/live-load ./cmd/live-load' "$root/Dockerfile"; then
   echo "Docker load target is not the real live-load binary" >&2
   exit 1

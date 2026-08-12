@@ -1,90 +1,163 @@
-# Realtime browser client operator guide
+# Realtime durable Web Search operator guide
 
-This guide is the focused local path for one realtime voice turn through the
-browser BFF and `live-gateway`. Run the commands from the repository root in
-one `zsh` session so the recorded process IDs and hidden environment values
-remain available for the stop step.
+This is the complete loopback `development_durable` path: speech-to-speech,
+PostgreSQL schema v8, the durable gateway and worker, the browser BFF, and the
+server-owned Web Search preset. Run commands from the repository root in one
+`zsh` session. This mode is for development and acceptance only; it is not
+production or release evidence.
 
-You provide:
+The speech service and worker both use `deepseek-v4-flash` with thinking
+disabled. The worker enforces `{"thinking":{"type":"disabled"}}` on its
+initial and tool-follow-up requests and discards provider reasoning content.
+The separately supplied speech service must be configured for the same model
+and thinking-disabled behavior before it is selected by `S2S_IMAGE` and
+`S2S_CONFIG_PATH`. Speech and worker credentials may belong to the same
+provider account, but `S2S_API_KEY` and `DEEPSEEK_API_KEY` remain separate
+process secret references. Never copy either value between browser fields.
 
-- the speech WebSocket URL, provider model, and API key;
-- one local gateway static bearer; and
-- browser microphone/speaker permission and the input/output device choice.
+The browser controls only a bounded policy. It cannot choose a model,
+destination, command, package, schema, environment variable, credential,
+header, or executable. The first catalog contains one compiled, read-only
+executor named `web_search`. raw `mcpServers` JSON is intentionally rejected.
+Reviewed MCP adapters are future compiled, operator-owned catalog entries, not
+runtime browser installs.
 
-The repository provides:
+## 1. Configure the speech service and all secret references
 
-- the fixed 24 kHz mono PCM16LE and 960-byte/20 ms frame values;
-- loopback BFF defaults;
-- the gateway and demo build/start commands below; and
-- content-free process, health, and stop checks.
-
-Not needed for this realtime-only voice path:
-
-- a DeepSeek API key;
-- PostgreSQL handoff configuration; or
-- `live-worker`.
-
-Those components are required only for durable asynchronous handoffs. Your
-chosen speech service can still require its own model-provider credential.
-Keep every credential in the operator shell environment: do not put one in a
-tracked `.env`, YAML, URL query, browser storage, or command-line argument.
-
-## 1. Configure the speech service
-
-Use an OpenAI-Realtime-compatible WebSocket service. The copyable reference
-path below follows the public
-[`speech-to-speech` quickstart](https://github.com/huggingface/speech-to-speech#quickstart),
-which serves `ws://127.0.0.1:8765/v1/realtime` and accepts the Realtime model
-name `local`. Install `speech-to-speech` as described there before continuing.
-The exact launch command here is verified against the supplied local checkout:
-its `pyproject.toml` maps `speech-to-speech` directly to
-`speech_to_speech.s2s_pipeline:main`, and its local `--help` exposes flags at
-the top level. It has no `serve` subcommand.
-
-Prompt for the reference service's own LLM credential without putting its
-value in shell history, then start only that service:
+Use an external secret manager in shared environments. For a disposable local
+run, prompt without echoing values and generate independent HMAC/encryption
+keys in memory. Do not use a tracked `.env` file, command-line secret argument,
+URL credential, shell tracing, or support log.
 
 ```zsh
-read -r -s "OPENAI_API_KEY?Speech service LLM API key (hidden): "
-export OPENAI_API_KEY
+set +x
+
+read -r -s "POSTGRES_PASSWORD?Disposable PostgreSQL password (hidden): "
+export POSTGRES_PASSWORD
+printf '\n'
+read -r -s "DATABASE_URL?PostgreSQL URL (hidden): "
+export DATABASE_URL
 printf '\n'
 
-speech-to-speech &
-SPEECH_PID=$!
-kill -0 "$SPEECH_PID"
-```
+read -r -s "LIVE_STATIC_BEARER_TOKEN?New local bearer (hidden): "
+export LIVE_STATIC_BEARER_TOKEN
+export LIVE_ADMIN_BEARER_TOKEN="$LIVE_STATIC_BEARER_TOKEN"
+export LIVE_DEMO_BEARER="$LIVE_STATIC_BEARER_TOKEN"
+printf '\n'
 
-Wait for the service's documented startup indication. Then accept the
-reference endpoint/model defaults or enter the bare WebSocket URL and model
-for a different service. The gateway adds the model query itself, so the URL
-must not contain a query string. The reference server does not require client
-authentication; enter `not-needed` at its hidden bearer prompt. For another
-service, enter the actual gateway-to-speech bearer.
+export LIVE_PRIVACY_HMAC_KEY="$(openssl rand -hex 32)"
+export LIVE_RETENTION_HMAC_KEY="$(openssl rand -base64 32)"
+export LIVE_RECONNECT_HMAC_KEY="$(openssl rand -base64 32)"
+export LIVE_TOOL_ENCRYPTION_KEY="$(openssl rand -base64 32)"
 
-```zsh
-read -r "SPEECH_WS_URL?Speech WebSocket URL [ws://127.0.0.1:8765/v1/realtime]: "
-SPEECH_WS_URL="${SPEECH_WS_URL:-ws://127.0.0.1:8765/v1/realtime}"
-read -r "SPEECH_MODEL?Speech model [local]: "
-SPEECH_MODEL="${SPEECH_MODEL:-local}"
-
-read -r -s "S2S_API_KEY?Gateway-to-speech bearer (hidden; use not-needed for the reference server): "
+read -r -s "S2S_API_KEY?Speech service bearer (hidden): "
 export S2S_API_KEY
 printf '\n'
+read -r -s "DEEPSEEK_API_KEY?Worker DeepSeek bearer (hidden): "
+export DEEPSEEK_API_KEY
+printf '\n'
+
+read -r "S2S_IMAGE?Reviewed speech image: "
+export S2S_IMAGE
+read -r "S2S_CONFIG_PATH?Absolute non-secret speech config path: "
+export S2S_CONFIG_PATH
+
+export LIVE_EXPECTED_CONFIG_HASH="$(
+  go run ./cmd/live-gateway config-hash \
+    --config deploy/config/development-durable.yaml
+)"
 ```
 
-If you use an existing managed speech service, do not start the reference
-process; supply its reviewed `wss://` URL/model/key and omit `SPEECH_PID` from
-the stop step.
+`DATABASE_URL` must select the same disposable PostgreSQL database reached by
+the migrate, gateway, and worker processes. Its value is never printed. The
+speech configuration selected above must serve
+`ws://speech-to-speech:8000/v1/realtime`, select `deepseek-v4-flash`, disable
+thinking, and provide a content-free pool-idle signal. Verify those external
+facts from the reviewed speech-service configuration; this repository cannot
+infer them from an image name.
 
-## 2. Configure the gateway
+## 2. Migrate PostgreSQL to schema v8
 
-Create an untracked temporary runtime directory. This focused config has no
-worker, store, handoff, DeepSeek, or PostgreSQL settings. It contains only
-environment-variable names for credentials; the values never enter YAML.
+For a PostgreSQL endpoint reachable from the operator shell, run the migrator
+and check the exact clean version:
 
 ```zsh
-DEMO_RUNTIME_DIR="$(mktemp -d "${TMPDIR:-/tmp}/gpt-live-browser.XXXXXX")"
-GATEWAY_CONFIG="$DEMO_RUNTIME_DIR/gateway.yaml"
+go run ./cmd/live-migrate -database-url-env DATABASE_URL -direction up
+go run ./cmd/live-migrate -database-url-env DATABASE_URL -check
+```
+
+The second command must say `schema check passed at version 8`. It prints no
+DSN or credential. For the shipped Compose database, the migration service in
+the next step runs the same embedded migrations before either application
+service can become ready. A dirty schema, a version other than 8, or a database
+that is not the intended disposable target is a stop condition.
+
+## 3. Start the speech WebSocket
+
+Validate the exact durable config before starting anything:
+
+```zsh
+go run ./cmd/live-gateway check-config \
+  --config deploy/config/development-durable.yaml
+go run ./cmd/live-worker check-config \
+  --config deploy/config/development-durable.yaml
+```
+
+The supported Compose flow starts the reviewed speech image on its configured
+WebSocket URL, then gates the gateway on speech startup and schema migration:
+
+```zsh
+make durable-demo-up
+```
+
+This command also starts PostgreSQL, migration, gateway, and worker in the
+dependency order declared by Compose. Treat a speech startup that does not
+confirm `deepseek-v4-flash` and thinking disabled as a failure; do not fall
+back to a different model.
+
+## 4. Start the durable gateway and worker and verify readiness
+
+`make durable-demo-up` uses `deploy/config/development-durable.yaml`, where
+handoffs and the immutable Web Search catalog are enabled. Verify content-free
+readiness with bounded requests:
+
+```zsh
+wait_for_http() {
+  local service_name="$1"
+  local ready_url="$2"
+  local attempt
+
+  for attempt in {1..20}; do
+    if curl --fail --silent --output /dev/null \
+      --connect-timeout 0.05 --max-time 0.1 "$ready_url"; then
+      printf '%s\n' "$service_name ready"
+      return 0
+    fi
+    sleep 0.1
+  done
+  printf '%s\n' "$service_name readiness timed out" >&2
+  return 1
+}
+
+wait_for_http gateway http://127.0.0.1:19090/health/ready
+wait_for_http worker http://127.0.0.1:19091/health/ready
+```
+
+Every request uses a 0.05-second connect timeout and 0.1-second total timeout.
+The configured worst case is
+20 attempts x (0.1-second curl maximum + 0.1-second sleep) = 4.0 seconds.
+Readiness is content-free and proves process composition only; it does not
+prove a live speech turn, provider quota, Web Search egress, or audible output.
+
+## 5. Start the browser BFF
+
+The BFF reads `LIVE_DEMO_BEARER` from its process environment and injects it
+only into the upstream gateway connection. Browser JavaScript never receives
+the bearer.
+
+```zsh
+make demo-live-client &
+BFF_PID=$!
 
 wait_for_ready() {
   local service_name="$1"
@@ -108,162 +181,145 @@ wait_for_ready() {
   return 1
 }
 
-cat >"$GATEWAY_CONFIG" <<YAML
-mode: local
-gateway:
-  advertised_model: gpt-live-real
-  listen_addr: 127.0.0.1:18080
-  voice:
-    role: realtime_voice
-    provider: speech_to_speech
-    url: "${SPEECH_WS_URL}"
-    model: "${SPEECH_MODEL}"
-    api_key_env: S2S_API_KEY
-  audio:
-    sample_rate: 24000
-    channels: 1
-    bytes_per_sample: 2
-    frame_bytes: 960
-auth:
-  static_bearer_env: LIVE_STATIC_BEARER_TOKEN
-  static_tenant_id: browser-demo
-  static_user_id: local-operator
-  static_scopes: [realtime, live.admin]
-  allowed_origins: [http://127.0.0.1:3000]
-admin:
-  listen_addr: 127.0.0.1:19090
-YAML
-
-go run ./cmd/live-gateway check-config --config "$GATEWAY_CONFIG"
-
-read -r -s "LIVE_STATIC_BEARER_TOKEN?New local gateway bearer (hidden): "
-export LIVE_STATIC_BEARER_TOKEN
-export LIVE_DEMO_BEARER="$LIVE_STATIC_BEARER_TOKEN"
-printf '\n'
-
-go build -o "$DEMO_RUNTIME_DIR/live-gateway" ./cmd/live-gateway
-"$DEMO_RUNTIME_DIR/live-gateway" -config "$GATEWAY_CONFIG" &
-GATEWAY_PID=$!
-
-wait_for_ready gateway "$GATEWAY_PID" http://127.0.0.1:19090/health/ready
-```
-
-`check-config` validates structure without reading secret values. The readiness
-helper uses a 0.05-second connect timeout and a 0.1-second total timeout on
-every content-free request. Its configured worst-case total is
-20 attempts x (0.1-second curl maximum + 0.1-second sleep) = 4.0 seconds. It
-fails sooner if the owned process exits. A successful check proves only the
-local gateway process is ready; it does not prove provider authentication, a
-successful speech turn, or audible playback.
-
-## 3. Start the browser BFF
-
-The flags below spell out the BFF's loopback defaults. Its bearer environment
-must contain the same static bearer as the gateway. The bearer is injected
-only into the upstream gateway request and is not put in browser assets, URL
-queries, subprotocols, cookies, browser storage, response headers, or logs.
-
-```zsh
-go build -o "$DEMO_RUNTIME_DIR/live-client" ./demo/live-client
-"$DEMO_RUNTIME_DIR/live-client" \
-  -listen 127.0.0.1:3000 \
-  -gateway-url ws://127.0.0.1:18080/v1/realtime \
-  -model gpt-live-real \
-  -origin http://127.0.0.1:3000 \
-  -bearer-env LIVE_DEMO_BEARER &
-BFF_PID=$!
-
 wait_for_ready browser-bff "$BFF_PID" http://127.0.0.1:3000/health/ready
 ```
 
-Open [http://127.0.0.1:3000](http://127.0.0.1:3000) in a browser on the same
-machine. Do not expose either loopback listener through a tunnel or public
-bind.
+Open [http://127.0.0.1:3000/](http://127.0.0.1:3000/) on the same machine.
+Do not expose the BFF, gateway, admin listeners, PostgreSQL, or speech service
+through a tunnel or public bind.
 
-## 4. Verify audible playback and barge-in
+## 6. Configure and test the Tools drawer
 
-Automated tests cannot hear the selected speaker, grant physical microphone
-permission, or decide whether interruption feels correct. The operator owns
-these physical acceptance claims. Record PASS/FAIL (without transcripts,
-audio, or credentials) for each item:
+Before starting the voice session, expand **Tools** and review the server-owned
+**Web Search** preset:
 
-- Select the intended browser/OS microphone and speaker, click **Start
-  listening**, grant microphone access, and confirm the page reaches
-  **Listening**. If the page offers **Enable audio**, select it and confirm the
-  paused-audio message clears.
-- Speak one normal turn. Confirm the page shows a finalized **You** turn, a
-  finalized **Assistant** turn, and you physically hear the corresponding
-  assistant response from the intended speaker. A transcript alone is not an
-  audible-playback pass.
-- While a second assistant response is physically audible, speak a new turn.
-  Confirm the page changes to **You are speaking**, queued assistant playback
-  stops, and superseded audio does not resume afterward. Only the operator may
-  mark barge-in PASS.
-- Select **Mute**, speak, and confirm no new voice frame/turn is accepted;
-  select **Unmute** before continuing.
-- Select the page's **Stop** control and confirm the page reports **Stopped**.
-  This releases browser-owned microphone/audio/WebSocket resources but does
-  not terminate the three local processes.
-- With DevTools open, complete this bearer-absence inspection. Do not paste the bearer value into DevTools:
-  - **Address bar**: confirm the page URL is exactly the loopback origin/path
-    and contains no query token or fragment.
-  - **Sources**: search loaded page assets for `LIVE_STATIC_BEARER_TOKEN`,
-    `LIVE_DEMO_BEARER`, `Authorization`, and `Bearer`; expect no match.
-  - **Network**: inspect the `/ws` browser request and response. Confirm its
-    URL, query, cookies, subprotocols, and browser-visible headers contain no
-    bearer or `Authorization` header.
-  - **Application**: inspect Local Storage, Session Storage, Cookies, IndexedDB,
-    and Cache Storage for the loopback origin; expect no demo credential.
-  - **Console**: search browser-visible logs for `Authorization`, `Bearer`,
-    `LIVE_STATIC_BEARER_TOKEN`, and `LIVE_DEMO_BEARER`; expect no match.
+1. Turn on **Enable Web Search**.
+2. Choose **SafeSearch**: `Strict` or `Moderate`. The durable catalog has
+   `force_strict: true`, so the server may tighten Moderate to Strict.
+3. Choose **Region**: Worldwide, United States, United Kingdom, Australia,
+   Canada, or China · Chinese.
+4. Set **Maximum results** from 1 through 10; the durable deployment maximum is
+   5.
+5. Set **Timeout (ms)** from 1000 through 10000; the durable deployment maximum
+   is 8000.
+6. Select **Test**. It always runs the fixed diagnostic query
+   `DuckDuckGo privacy search`; browser-supplied query text is ignored.
+7. Require **Web Search test passed.**, select **Save**, and require the
+   `deepseek-v4-flash` acknowledgement before speaking.
 
-The content-free automated gate remains separate:
+The controls can only tighten the compiled catalog. A Test success checks the
+bounded adapter path but does not save the session policy. Save sends the
+closed-world policy to the gateway; it does not install or start an executor.
+
+Click **Start listening**, grant microphone access, and speak a request such
+as “Search the web for the current Go release notes and summarize the sources.”
+
+## 7. Verify progress while continuing realtime speech
+
+The task card must advance monotonically through the stable phases `queued`,
+`searching`, `reading_sources`, `preparing_answer`, then one terminal state:
+`completed`, `failed`, or `cancelled`. It may also show `needs_input`. There
+are no percentages, chain of thought, provider reasoning, raw queries, tool
+arguments, transport logs, or credentials in a progress card.
+
+While the card is active, continue a normal voice conversation. Confirm speech
+input, live transcription, and assistant audio continue independently. While
+assistant audio is physically audible, speak again and require playback to
+stop without superseded audio resuming. These are manual audible voice and
+manual barge-in acceptance checks; automated tests cannot claim them.
+
+On completion, the same card shows only the bounded final summary and approved
+HTTPS source links. On failure or cancellation, realtime voice remains usable.
+Disconnect/reconnect may restore a durable card; repeated events must not
+duplicate work or regress its phase.
+
+With DevTools open, complete the privacy inspection without pasting any secret:
+
+- **Address bar**: URL is exactly the loopback origin/path with no token.
+- **Sources**: loaded assets contain no `LIVE_STATIC_BEARER_TOKEN`,
+  `LIVE_DEMO_BEARER`, `Authorization`, or bearer value.
+- **Network**: `/ws` has no query token, cookie token, subprotocol token, or
+  browser-visible `Authorization` header.
+- **Application**: Local Storage, Session Storage, Cookies, IndexedDB, and
+  Cache Storage contain no credential.
+- **Console**: no credential, raw audio/transcript, Web Search query, tool
+  argument, provider reasoning, or result body appears.
+
+Do not paste the bearer value into DevTools. The demo does not persist raw
+audio or transcripts. PostgreSQL persists only committed durable coordination,
+policy, progress, reconnect, and bounded presentation records.
+
+## 8. Stop and prove every pool is idle
+
+Select the page **Stop** control first. It must report **Stopped**. Then check
+the gateway and worker through authenticated, content-free admin endpoints:
 
 ```zsh
-make test-demo-live-client
+curl --fail --silent --show-error \
+  --connect-timeout 0.05 --max-time 0.1 \
+  --header "Authorization: Bearer $LIVE_STATIC_BEARER_TOKEN" \
+  http://127.0.0.1:19090/admin/v1/sessions \
+  | jq -e '.active == 0' >/dev/null
+
+curl --fail --silent --show-error \
+  --connect-timeout 0.05 --max-time 0.1 \
+  --header "Authorization: Bearer $LIVE_ADMIN_BEARER_TOKEN" \
+  http://127.0.0.1:19091/admin/v1/capacity \
+  | jq -e '.Active == 0 or .active == 0' >/dev/null
 ```
 
-## 5. Stop only the demo processes
-
-Run these commands promptly in the same shell that captured the PIDs. They
-first prove the browser Stop returned both the gateway session count and the
-reference provider pool to idle without printing either JSON response. The
-provider check applies to the reference service from Step 1; for a managed
-speech service, use its reviewed content-free idle signal instead. `jq` is
-required for these exact assertions.
+For the reference speech service, require its reviewed content-free pool
+endpoint to report no unit in use. A host-run reference service uses:
 
 ```zsh
 curl --fail --silent --show-error \
   --connect-timeout 0.05 --max-time 0.1 \
   http://127.0.0.1:8765/v1/pool \
   | jq -e '.in_use == 0 and all(.units[]; .state == "idle")' >/dev/null
-
-curl --fail --silent --show-error \
-  --connect-timeout 0.05 --max-time 0.1 \
-  --header "Authorization: Bearer $LIVE_STATIC_BEARER_TOKEN" \
-  http://127.0.0.1:19090/admin/v1/sessions \
-  | jq -e '.active == 0' >/dev/null
 ```
 
-Only after both checks pass, signal the BFF, gateway, and optional reference
-speech process started by this guide, in dependency order:
+For a containerized or managed speech service, use its equivalent reviewed
+content-free signal; never print a diagnostic body. After all three checks:
 
 ```zsh
 kill -INT "$BFF_PID"
 wait "$BFF_PID" || true
+make durable-demo-down
 
-kill -INT "$GATEWAY_PID"
-wait "$GATEWAY_PID" || true
-
-# Run these two lines only when Step 1 set SPEECH_PID.
-kill -INT "$SPEECH_PID"
-wait "$SPEECH_PID" || true
-
-unset OPENAI_API_KEY S2S_API_KEY LIVE_STATIC_BEARER_TOKEN LIVE_DEMO_BEARER
+unset POSTGRES_PASSWORD DATABASE_URL S2S_API_KEY DEEPSEEK_API_KEY
+unset LIVE_STATIC_BEARER_TOKEN LIVE_ADMIN_BEARER_TOKEN LIVE_DEMO_BEARER
+unset LIVE_PRIVACY_HMAC_KEY LIVE_RETENTION_HMAC_KEY
+unset LIVE_RECONNECT_HMAC_KEY LIVE_TOOL_ENCRYPTION_KEY
+unset LIVE_EXPECTED_CONFIG_HASH S2S_IMAGE S2S_CONFIG_PATH
 ```
 
-Do not use a broad `pkill`, `killall`, Compose teardown, volume deletion, or a
-database migration to stop this focused path. These commands do not stop an
-unrelated worker or database and do not delete PostgreSQL or other durable
-state. The temporary config and binaries remain in `DEMO_RUNTIME_DIR` for the
-operator to inspect or remove separately.
+`make durable-demo-down` does not use `--volumes`; the PostgreSQL volume is
+retained for deliberate inspection or a later run. Do not use broad `pkill`,
+`killall`, or volume deletion as part of this guide.
+
+## 9. Troubleshoot without exposing content
+
+| Symptom | Content-free check and action |
+|---|---|
+| PostgreSQL/migration failure | Run the migrate `-check` command. Require clean version 8. Verify reachability and TLS policy without printing `DATABASE_URL`; never run down migrations on a non-disposable database. |
+| Worker not ready or no lease progress | Check `/health/ready`, then `/admin/v1/capacity`. Confirm the config hash, schema, worker-only `DEEPSEEK_API_KEY` reference, and that `heartbeat_interval` is below half the lease. Do not dump jobs. |
+| Search Test or task times out | Keep the 1–10 second policy bound. Check approved DNS/HTTPS egress and the provider status class without logging query text, response HTML, tool arguments, or credentials. Voice should remain connected. |
+| Browser has no audio | Confirm microphone/speaker selection, permission, **Enable audio**, 24 kHz PCM16, and the speech pool signal. A transcript is not an audible pass. |
+| Policy rejected | Restore only known fields and allowed values, Test, then Save. Browser input cannot add tools, commands, destinations, headers, credentials, packages, models, or raw server definitions. |
+
+Run the content-free automated browser gate separately:
+
+```zsh
+make test-demo-live-client
+```
+
+## Production roadmap
+
+Production requires reviewed OIDC/BFF authentication, `wss://`, PostgreSQL TLS,
+external secret management and rotation, immutable images/config hashes,
+default-deny egress through the reviewed proxy, telemetry redaction, canary and
+rollback evidence, capacity/chaos/soak gates, and operator-owned retention.
+Promoting the loopback demo is forbidden. Future MCP-backed tools require a
+compiled typed adapter, fixed destination/transport, bounded schema and output,
+idempotency and approval policy where relevant, privacy tests, static catalog
+registration, and deployment review before a browser preset can expose them.

@@ -1,68 +1,62 @@
 ---
 name: gpt-live-go-framework
-description: Use when configuring, extending, deploying, debugging, or verifying the GPT Live Go repository, especially Realtime speech-to-speech WebSockets, DeepSeek asynchronous handoffs, PostgreSQL durability, reconnect, authentication, Kubernetes or Compose, load and chaos evidence, release gates, or privacy-sensitive operations.
+description: Use when configuring, extending, deploying, debugging, or verifying the GPT Live Go repository, especially Realtime speech, durable asynchronous handoffs, Web Search tools, PostgreSQL, browser demos, release gates, or privacy-sensitive operations.
 ---
 
 # GPT Live Go Framework
 
-Treat configuration, runtime composition, and release evidence as separate trust boundaries. Valid YAML does not prove secrets, PostgreSQL, providers, telemetry, or topology are ready.
+Treat configuration, runtime composition, browser policy, and release evidence
+as separate trust boundaries. Source and validators win disagreements.
 
 ## Start
 
-1. Resolve the root with `git rev-parse --show-toplevel`; confirm `go.mod` declares `github.com/chuanmingliu/openai-gpt-live`.
-2. Classify local/production, voice-only/durable handoffs, and direct/Compose/Kubernetes.
-3. Read the repository `README.md` and the relevant reference:
+1. Resolve the root with `git rev-parse --show-toplevel`; require `go.mod` to
+   declare `github.com/chuanmingliu/openai-gpt-live`.
+2. Classify local, `development_durable`, or production; voice-only or durable;
+   direct, Compose, or Kubernetes.
+3. Read `README.md` and the required reference:
 
-| Task | Required reference |
+| Work | Reference |
 |---|---|
-| Provider, YAML, secrets, hash | `references/configuration.md` |
-| Ownership, protocol, durability | `references/architecture.md` |
-| Run, deploy, test, troubleshoot | `references/operations.md` |
+| YAML, providers, secrets, hashes | `references/configuration.md` |
+| Durable browser Web Search and progress | `references/realtime-web-search.md` |
+| Test and privacy evidence | `references/verification.md` |
+| Ownership and protocol | `references/architecture.md` |
+| Deployment and troubleshooting | `references/operations.md` |
 
-Read the exact source/config named there. Source and validators win disagreements.
+## Invariants
 
-## Configuration workflow
+- Clients reach only the gateway; browsers use the loopback BFF or a reviewed
+  production auth proxy. A bearer never enters a URL, asset, storage, or log.
+- Audio is 24 kHz mono PCM16LE, 960 bytes/20 ms, bounded, and never persisted.
+- PostgreSQL owns committed durability, leases, policy, progress, cursors,
+  reconnect, and runtime handoff authority.
+- Speech and worker use `deepseek-v4-flash`; worker thinking is disabled and
+  reasoning content is discarded. Their credentials remain separate process
+  references even when one provider account supplies both.
+- Web Search is a compiled, read-only, closed-world tool. Browser controls only
+  tighten policy. Raw server definitions and runtime package execution are not
+  extension mechanisms.
+- Secret values stay outside YAML, config hashes, evidence, browser surfaces,
+  and troubleshooting output. Unknown, skipped, unsafe, or uncertain state
+  fails closed.
 
-1. Start from `deploy/config/{local,production}.yaml` or `configs/*.example.yaml`; values never go in `_env` fields.
-   Use focused gateway/worker files for direct host processes; use the combined config only in isolated containers or pods.
-2. Keep `gateway.advertised_model` (client alias) distinct from `gateway.voice.model` (provider model).
-3. Use a bare speech URL; production requires `wss://`. Configure DeepSeek's parent base URL; its adapter appends `/chat/completions`.
-4. Durable delegation requires production mode, static `features.handoffs: true`, and enabled PostgreSQL runtime authority. A key alone enables nothing.
-5. Inject component-scoped secrets from the configuration reference.
-6. Run `check-config` and `config-hash`, then actual startup or the tagged boundary. `check-config` uses unresolved config only.
-7. Synchronize canonical config, Kubernetes copy, substitutions, environment inventory, and deploy validator.
+## Workflow
 
-## Non-negotiable invariants
-
-- Clients reach only the gateway; never expose providers.
-- Audio is 24 kHz mono PCM16LE, 960 bytes/20 ms, bounded, never persisted/logged.
-- One reactor owns session state; incarnation/epoch fence stale output.
-- PostgreSQL owns committed durability, leases, cursors, reconnect, and coordinator authority.
-- Reserved handoff tools are server-owned.
-- Static auth is local-only; browser production uses OIDC/exact origins, while deliberate non-browser mode is explicit; production also requires TLS/proxy identity and default deny.
-- Browser JavaScript cannot set the bearer header; no bootstrap ships. Require a reviewed auth proxy/BFF or native client, never a query token.
-- Secret values stay outside config hashes/evidence. Missing, skipped, unknown, unsafe, or uncertain state fails closed.
-
-## Verification ladder
-
-```sh
-go test -race ./path/to/affected/package
-go test -race -count=1 ./...
-go vet ./...
-go build ./...
-go mod tidy -diff
-make verify-deploy-static
-```
-
-Run tagged suites only with their documented dependency. Never reinterpret a skip, smoke, fixture, or unpinned host as release evidence.
+1. Start from a checked-in example; `_env` fields contain names only.
+2. Validate unresolved config and compare component hashes.
+3. For durable Web Search, follow the exact ordered runbook in
+   `references/realtime-web-search.md`.
+4. Run the relevant ladder in `references/verification.md` before claiming a
+   result. A smoke, fixture, skip, loopback run, or manual transcript is not
+   production evidence.
 
 ## Common mistakes
 
 | Mistake | Correction |
 |---|---|
-| URL contains model/token | Use fields; adapters add query/bearer. |
-| DeepSeek base ends in endpoint | Use parent; client appends it. |
-| Provider labels imply plugins | Runtime adapters are fixed today. |
-| Side-effect flag implies tools | Shipped registry is empty. |
-| Shared production network namespace | Admin/metrics ports collide; isolate pods. |
-| Raw-event debugging | Log only bounded metadata, never content/credentials. |
+| URL contains model/token | Use model and secret-reference fields. |
+| DeepSeek base includes the endpoint | Use the parent; adapter appends it. |
+| Side-effect flag implies a tool | Registry/catalog ownership is separate. |
+| Progress includes percent/reasoning | Use only stable phases and bounded summaries. |
+| Local demo called production-ready | Follow reviewed deployment/release gates. |

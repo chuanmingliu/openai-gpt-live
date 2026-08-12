@@ -3,7 +3,7 @@ kind: ConfigMap
 metadata:
   name: live-deploy-metadata
 data:
-  config-hash: v1:3ff33a2aad319854b7facbc17334e5e16f5ab651cc911eb73127df47b90638a7
+  config-hash: v1:6582fa59f6141e6e4ec8c6cf7466fd54f2f26f3c16834d80402fc131d85dd9b5
   render-readiness: local
   production-host: ""
   tls-secret: ""

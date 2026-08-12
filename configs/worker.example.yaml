@@ -7,7 +7,7 @@ worker:
     role: async_gpt_5_5
     provider: deepseek
     base_url: https://api.deepseek.com
-    model: deepseek-chat
+    model: deepseek-v4-flash
     api_key_env: DEEPSEEK_API_KEY
 store:
   database_url_env: DATABASE_URL

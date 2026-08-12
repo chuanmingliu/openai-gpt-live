@@ -38,6 +38,23 @@ For local static authentication, `LIVE_ADMIN_BEARER_TOKEN` and
 `LIVE_STATIC_BEARER_TOKEN` must reference the same scoped value because preStop
 uses the former while the local admin handler validates the latter.
 
+The durable browser-tool composition is a separate loopback profile:
+
+```sh
+go run ./cmd/live-gateway check-config --config deploy/config/development-durable.yaml
+go run ./cmd/live-worker check-config --config deploy/config/development-durable.yaml
+make durable-demo-up
+```
+
+It uses PostgreSQL schema v8, `deepseek-v4-flash` with thinking disabled,
+static local authentication, durable handoffs, and the compiled Web Search
+catalog. Follow `docs/demo/realtime-browser-client.md` for the required secret
+prompts, migration check, content-free gateway/worker readiness, BFF and Tools
+drawer flow, privacy inspection, idle checks, and non-destructive stop. The
+speech and worker credentials may derive from one provider account, but
+`S2S_API_KEY` and `DEEPSEEK_API_KEY` remain separate process secret references.
+`development_durable` is rejected by production rendering and promotion.
+
 The canary identity is a second, separately managed Secret named
 `gpt-live/live-synthetic-identity`. It must contain exactly one nonempty key,
 `data.token`. In production, the platform identity authority must continuously
@@ -139,6 +156,17 @@ shutdown margin inside the pod grace periods. In production,
 `LIVE_ADMIN_BEARER_TOKEN` must be a narrowly scoped token
 accepted by the configured OIDC policy; rotate it through the external secret
 manager.
+
+## Web Search production roadmap
+
+The loopback Web Search preset is not a production deployment recipe.
+Production enablement requires reviewed OIDC/BFF authentication, PostgreSQL
+TLS and backups, external secret rotation, immutable images and configuration
+hashes, bounded egress through the reviewed proxy, privacy-safe telemetry,
+capacity/chaos/soak evidence, canary observation, and tested rollback. Future
+MCP integrations are compiled, typed, operator-owned catalog adapters with
+fixed destinations and bounds. Browser-supplied raw server JSON, packages,
+commands, paths, environment, headers, or credentials remain rejected.
 
 ## Local smoke
 

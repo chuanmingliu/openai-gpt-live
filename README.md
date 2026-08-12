@@ -22,7 +22,7 @@ flowchart LR
 | Async reasoner | `worker.reasoner.base_url`, `worker.reasoner.model` | DeepSeek-compatible SSE Chat Completions adapter |
 | Durable async handoffs | `features.handoffs` plus PostgreSQL runtime authority | Gateway handoff coordinator and leased worker |
 | Authentication | Local static bearer or production OIDC | Validated before WebSocket upgrade |
-| Durability | `store.*`, retention, leases, reconnect | PostgreSQL migrations 1–7 |
+| Durability | `store.*`, retention, leases, reconnect | PostgreSQL migrations 1–8 |
 | Deployment | Compose or validated Kubernetes overlays | Hardened non-root images and default-deny policies |
 
 The `role` and `provider` strings do not dynamically select an adapter: the gateway currently constructs the S2S WebSocket adapter and the worker constructs the DeepSeek adapter. `provider` participates in the config hash and telemetry; `role` is descriptive and is excluded from the hash.
@@ -93,6 +93,15 @@ checks; automated tests do not claim them. Run the content-free gate with:
 make test-demo-live-client
 ```
 
+For durable asynchronous Web Search, use the same guide's ordered
+`development_durable` flow. It prompts for external PostgreSQL, bearer, HMAC,
+encryption, speech, and DeepSeek secret references without echoing values;
+migrates to schema v8; starts the speech service, gateway, worker, and BFF;
+walks the bounded Tools drawer; verifies stable progress while voice and
+barge-in continue; proves pools idle; and troubleshoots without printing
+content. This loopback composition is development acceptance, never production
+or release evidence.
+
 ## Configure speech-to-speech
 
 Use [configs/gateway.example.yaml](configs/gateway.example.yaml) for a direct local process, or edit the equivalent `gateway` block in your reviewed deployment config:
@@ -105,7 +114,7 @@ gateway:
     role: realtime_voice
     provider: speech_to_speech
     url: wss://speech.example.com/v1/realtime
-    model: provider-realtime-model
+    model: deepseek-v4-flash
     api_key_env: S2S_API_KEY
   audio:
     sample_rate: 24000
@@ -157,7 +166,7 @@ worker:
     role: async_gpt_5_5
     provider: deepseek
     base_url: https://api.deepseek.com
-    model: deepseek-chat
+    model: deepseek-v4-flash
     api_key_env: DEEPSEEK_API_KEY
 ```
 
@@ -174,9 +183,15 @@ After `DEEPSEEK_API_KEY` is already present through a secure prompt or secret ma
 
 ```sh
 DEEPSEEK_BASE_URL=https://api.deepseek.com \
-DEEPSEEK_MODEL=deepseek-chat \
+DEEPSEEK_MODEL=deepseek-v4-flash \
   go test -count=1 -tags=liveprovider ./test/liveprovider/...
 ```
+
+Worker requests, including tool follow-ups, send the provider's official
+thinking-disabled request shape and discard reasoning content. When a speech
+service uses the same provider account, keep `S2S_API_KEY` and
+`DEEPSEEK_API_KEY` as separate process secret references and independently
+scoped credentials where the provider supports it.
 
 Do not put the key itself in a tracked command, shell history, YAML file, report, or support log. A missing live-provider configuration skips before a request; once a request starts, failure is not converted to a skip.
 

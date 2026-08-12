@@ -8,7 +8,7 @@ gateway:
     role: realtime_voice
     provider: speech_to_speech
     url: ws://127.0.0.1:8000/v1/realtime
-    model: s2s-realtime
+    model: deepseek-v4-flash
     api_key_env: S2S_API_KEY
   audio:
     sample_rate: 24000
