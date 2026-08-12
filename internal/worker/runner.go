@@ -470,7 +470,7 @@ func (r *Runner) generate(ctx context.Context, lease Lease, control Control, exe
 	if maxTokens <= 0 || maxTokens > r.MaxOutputTokens {
 		maxTokens = r.MaxOutputTokens
 	}
-	request := reasoner.Request{Model: lease.Job.Request.Versions.Model, Messages: messages, Tools: definitions, MaxOutputTokens: maxTokens, SafetyUserID: safetyID}
+	request := reasoner.Request{Model: lease.Job.Request.Versions.Model, Messages: messages, Tools: definitions, MaxOutputTokens: maxTokens, DisableThinking: true, SafetyUserID: safetyID}
 	builder := execution.builder
 	builder.beginGeneration(ctx, control.ObjectiveRevision, control.InputRevision)
 	toolOrdinal := uint32(0)

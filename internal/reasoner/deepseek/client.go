@@ -49,7 +49,12 @@ type providerRequest struct {
 	MaxTokens     int                `json:"max_tokens"`
 	Stream        bool               `json:"stream"`
 	StreamOptions providerStreamOpts `json:"stream_options"`
+	Thinking      *providerThinking  `json:"thinking,omitempty"`
 	UserID        string             `json:"user_id,omitempty"`
+}
+
+type providerThinking struct {
+	Type string `json:"type"`
 }
 
 type providerStreamOpts struct {
@@ -151,6 +156,9 @@ func (client *Client) Stream(ctx context.Context, request reasoner.Request, onCh
 
 func mapRequest(request reasoner.Request) providerRequest {
 	out := providerRequest{Model: request.Model, MaxTokens: request.MaxOutputTokens, Stream: true, StreamOptions: providerStreamOpts{IncludeUsage: true}, UserID: request.SafetyUserID}
+	if request.DisableThinking {
+		out.Thinking = &providerThinking{Type: "disabled"}
+	}
 	out.Messages = make([]providerMessage, len(request.Messages))
 	for index, message := range request.Messages {
 		mapped := providerMessage{Role: message.Role, Content: message.Content, ToolCallID: message.ToolCallID}

@@ -21,6 +21,23 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestStreamUsesV4FlashAndOfficialThinkingDisabled(t *testing.T) {
+	raw := "data: {\"id\":\"r\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+	server := testkit.NewDeepSeekServer(t, testkit.DeepSeekResponse{Chunks: [][]byte{[]byte(raw)}})
+	client := newClient(t, server.URL, server.Client())
+	request := reasoner.Request{
+		Model:           "deepseek-v4-flash",
+		Messages:        []reasoner.Message{{Role: reasoner.RoleUser, Content: "hello"}},
+		MaxOutputTokens: 64,
+		DisableThinking: true,
+	}
+
+	_, err := client.Stream(t.Context(), request, func(reasoner.Chunk) error { return nil })
+	require.NoError(t, err)
+	captured := <-server.Requests
+	assert.JSONEq(t, `{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hello"}],"max_tokens":64,"stream":true,"stream_options":{"include_usage":true},"thinking":{"type":"disabled"}}`, string(captured.Body))
+}
+
 func TestStreamParsesSplitSSEAndOmitsReasoning(t *testing.T) {
 	raw := ": hi\r\n\r\ndata: {\"id\":\"req-1\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"private\",\"content\":\"hel\"}}]}\r\n\r\n" +
 		"data: {\"id\":\"req-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\r\n\r\n" +

@@ -1001,6 +1001,26 @@ func TestRunnerToolReplayReusesSucceededResultAndStableIdempotency(t *testing.T)
 	require.Len(t, store.completed, 1)
 }
 
+func TestRunnerDisablesThinkingForInitialAndToolFollowupRequests(t *testing.T) {
+	tool := RegisteredTool{Definition: reasoner.ToolDefinition{Name: "lookup", Parameters: json.RawMessage(`{"type":"object"}`)}, ReadOnly: true, Executor: toolExecutorFunc(func(context.Context, ToolExecutionRequest) (json.RawMessage, error) {
+		return json.RawMessage(`{"value":1}`), nil
+	})}
+	var requests []reasoner.Request
+	stream := streamerFunc(func(_ context.Context, request reasoner.Request, _ func(reasoner.Chunk) error) (reasoner.Result, error) {
+		requests = append(requests, request.Clone())
+		if len(requests) == 1 {
+			return reasoner.Result{FinishReason: "tool_calls", ToolCalls: []reasoner.ToolCall{{ID: "call-1", Name: "lookup", Arguments: json.RawMessage(`{"q":"x"}`)}}}, nil
+		}
+		return reasoner.Result{Text: "done", FinishReason: "stop"}, nil
+	})
+	ctx, _, _, runner := toolRunnerFixture(t, []RegisteredTool{tool}, stream)
+	require.NoError(t, runner.Run(ctx))
+	require.Len(t, requests, 2)
+	for _, request := range requests {
+		assert.True(t, request.DisableThinking, "worker requests, including tool follow-ups, must disable provider thinking")
+	}
+}
+
 func TestRunnerRunningToolRecoveryUsesStableIdempotencyKey(t *testing.T) {
 	var executions atomic.Int32
 	var observed string

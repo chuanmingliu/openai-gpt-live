@@ -41,6 +41,7 @@ type Request struct {
 	Messages        []Message
 	Tools           []ToolDefinition
 	MaxOutputTokens int
+	DisableThinking bool
 	SafetyUserID    string
 }
 
