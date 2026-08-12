@@ -73,45 +73,65 @@ test('needs-input cards can resume through running phases while terminals remain
   assert.equal(tools.snapshot().cards[0].phase, 'completed');
 });
 
-test('tool cards evict oldest active and terminal entries at independent 64-card bounds', () => {
-  const tools = new ToolState();
-  for (let index = 0; index < 65; index += 1) tools.consume(createdEvent(`active-${index}`, index + 1));
-  let cards = tools.snapshot().cards;
-  assert.equal(cards.filter(({terminal}) => !terminal).length, 64);
-  assert.equal(cards.some(({id}) => id === 'active-0'), false);
+test('active card pressure reports overflow without evicting live state while terminal pressure evicts oldest terminal', () => {
+	const tools = new ToolState();
+	for (let index = 0; index < 64; index += 1) tools.consume(createdEvent(`active-${index}`, index + 1));
+	const overflow = tools.consume(createdEvent('active-64', 65));
+	assert.equal(overflow.overflow, true);
+	let cards = tools.snapshot().cards;
+	assert.equal(cards.filter(({terminal}) => !terminal).length, 64);
+	assert.equal(cards.some(({id}) => id === 'active-0'), true);
+	assert.equal(cards.some(({id}) => id === 'active-64'), false);
 
-  for (let index = 0; index < 65; index += 1) {
-    tools.consume(createdEvent(`terminal-${index}`, 1000 + index * 2));
-    tools.consume({
-      type: 'live.handoff.completed', handoff_id: `terminal-${index}`, sequence_id: 1001 + index * 2,
-      status: 'succeeded', details: {summary: `done ${index}`},
-    });
-  }
-  cards = tools.snapshot().cards;
-  assert.equal(cards.filter(({terminal}) => terminal).length, 64);
-  assert.equal(cards.some(({id}) => id === 'terminal-0'), false);
+	const terminalTools = new ToolState();
+	for (let index = 0; index < 65; index += 1) {
+		terminalTools.consume(createdEvent(`terminal-${index}`, 1000 + index * 2));
+		terminalTools.consume({
+			type: 'live.handoff.completed', handoff_id: `terminal-${index}`, sequence_id: 1001 + index * 2,
+			status: 'succeeded', details: {summary: `done ${index}`},
+		});
+	}
+	cards = terminalTools.snapshot().cards;
+	assert.equal(cards.filter(({terminal}) => terminal).length, 64);
+	assert.equal(cards.some(({id}) => id === 'terminal-0'), false);
 });
 
-test('card summaries, sources, and aggregate retained text stay within fixed byte bounds', () => {
-  const tools = new ToolState();
-  for (let index = 0; index < 40; index += 1) {
-    tools.consume(createdEvent(`bounded-${index}`, index * 2 + 1));
-    tools.consume({
-      type: 'live.handoff.completed', handoff_id: `bounded-${index}`, sequence_id: index * 2 + 2,
-      status: 'succeeded',
-      details: {
-        summary: '界'.repeat(5000),
-        sources: Array.from({length: 12}, (_, source) => ({
-          title: `source-${source}`,
-          url: `https://example.com/${index}/${source}`,
-        })),
-      },
-    });
-  }
-  const snapshot = tools.snapshot();
-  assert.equal(snapshot.cards.every(({summary}) => Buffer.byteLength(summary) <= 8 << 10), true);
-  assert.equal(snapshot.cards.every(({sources}) => sources.length <= 10), true);
-  assert.ok(snapshot.totalTextBytes <= 256 << 10);
+test('card summaries and sources stay within fixed per-card bounds', () => {
+	const tools = new ToolState();
+	tools.consume(createdEvent('bounded'));
+	tools.consume({
+		type: 'live.handoff.completed', handoff_id: 'bounded', sequence_id: 2,
+		status: 'succeeded',
+		details: {
+			summary: '界'.repeat(5000),
+			sources: Array.from({length: 12}, (_, source) => ({
+				title: `source-${source}`,
+				url: `https://example.com/${source}`,
+			})),
+		},
+	});
+	const snapshot = tools.snapshot();
+	assert.equal(snapshot.cards.every(({summary}) => Buffer.byteLength(summary) <= 8 << 10), true);
+	assert.equal(snapshot.cards.every(({sources}) => sources.length <= 10), true);
+});
+
+test('aggregate text pressure reports overflow without discarding retained cards', () => {
+	const tools = new ToolState();
+	for (let index = 0; index < 31; index += 1) {
+		tools.consume(createdEvent(`aggregate-${index}`, index * 2 + 1));
+		assert.equal(tools.consume(progressEvent({id: `aggregate-${index}`, sequence_id: index * 2 + 2, summary: 'x'.repeat(8 << 10)})).overflow, false);
+	}
+	tools.consume(createdEvent('aggregate-overflow', 1000));
+	const before = tools.snapshot();
+	const result = tools.consume({
+		type: 'live.handoff.progress', handoff_id: 'aggregate-overflow', sequence_id: 1001,
+		status: 'running', details: {
+			phase: 'searching', summary: 'x'.repeat(8 << 10),
+			sources: [{title: 'extra', url: 'https://example.com/extra'}],
+		},
+	});
+	assert.equal(result.overflow, true);
+	assert.deepEqual(tools.snapshot().cards, before.cards);
 });
 
 test('source projection keeps only bounded HTTPS titles and ASCII URLs', () => {
@@ -170,11 +190,19 @@ test('disabled policy remains canonical and cannot carry executable or unknown f
   assert.deepEqual(normalizeToolPolicy(disabled), disabled);
   assert.throws(() => normalizeToolPolicy({...disabled, command: 'npx'}), /invalid tool policy/);
   assert.throws(() => normalizeToolPolicy({web_search: {...disabled.web_search, safe_search: 'off'}}), /invalid tool policy/);
-  assert.throws(() => normalizeToolPolicy({web_search: {...disabled.web_search, max_results: 11}}), /invalid tool policy/);
+	assert.throws(() => normalizeToolPolicy({web_search: {...disabled.web_search, max_results: 11}}), /invalid tool policy/);
+	assert.throws(() => normalizeToolPolicy({web_search: {...disabled.web_search, max_results: 6}}), /invalid tool policy/);
+	assert.throws(() => normalizeToolPolicy({web_search: {...disabled.web_search, timeout_ms: 8001}}), /invalid tool policy/);
+});
+
+test('new tool state is disabled and strict until the BFF policy is restored', () => {
+	assert.deepEqual(new ToolState().snapshot().policy, {
+		web_search: {enabled: false, safe_search: 'strict', region: 'wt-wt', max_results: 5, timeout_ms: 8000},
+	});
 });
 
 test('policy save keeps persisted policy authoritative until its exact gateway acknowledgement', () => {
-  const tools = new ToolState();
+	const tools = new ToolState(DEFAULT_POLICY);
   const disabled = structuredClone(DEFAULT_POLICY);
   disabled.web_search.enabled = false;
   tools.beginSave(disabled);
@@ -190,8 +218,20 @@ test('policy save keeps persisted policy authoritative until its exact gateway a
   assert.equal(tools.snapshot().model, 'deepseek-v4-flash');
 });
 
+test('policy acknowledgement accepts only canonical server tightening for the exact request', () => {
+	const tools = new ToolState(DEFAULT_POLICY);
+	tools.markPolicySent('policy-tightened', DEFAULT_POLICY);
+	const tightened = structuredClone(DEFAULT_POLICY);
+	tightened.web_search.safe_search = 'strict';
+	assert.equal(tools.acceptPolicy('policy-tightened', tightened, 'deepseek-v4-flash'), true);
+	assert.deepEqual(tools.snapshot().policy, tightened);
+
+	tools.markPolicySent('policy-loosened', tightened);
+	assert.equal(tools.acceptPolicy('policy-loosened', DEFAULT_POLICY, 'deepseek-v4-flash'), false);
+});
+
 test('failed save restores a late persisted load instead of retaining the draft', () => {
-  const tools = new ToolState();
+	const tools = new ToolState(DEFAULT_POLICY);
   const loaded = structuredClone(DEFAULT_POLICY);
   loaded.web_search.region = 'uk-en';
   const disabled = structuredClone(DEFAULT_POLICY);

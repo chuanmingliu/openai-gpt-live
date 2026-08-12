@@ -96,6 +96,7 @@ export class ClientPresentation {
         break;
       case 'handoff-card': {
         const result = this.tools.consume(effect.event);
+        if (result.overflow) return false;
         if (result.created && !this.toolOrder.has(effect.event.handoff_id)) {
           this.toolOrder.set(effect.event.handoff_id, this.nextOrder++);
         }

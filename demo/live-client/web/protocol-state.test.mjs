@@ -4,9 +4,9 @@ import assert from 'node:assert/strict';
 import {ProtocolState, buildAudioAppend, buildSessionUpdate} from './protocol-state.mjs';
 
 test('session stays configuring until the upstream update is acknowledged', () => {
-  const state = new ProtocolState();
-  assert.deepEqual(state.consume({type: 'session.created'}), [{type: 'status', value: 'configuring'}]);
-  assert.deepEqual(state.consume({type: 'session.updated'}), [{type: 'status', value: 'listening'}]);
+	const state = new ProtocolState();
+	assert.deepEqual(state.consume({type: 'session.created'}), [{type: 'status', value: 'configuring'}]);
+	assert.deepEqual(state.consume({type: 'session.updated'}), []);
 });
 
 test('speech start clears playback before reporting user speech', () => {

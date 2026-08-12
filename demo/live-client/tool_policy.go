@@ -34,8 +34,8 @@ func newToolPolicyStore(searcher toolSearcher) (*toolPolicyStore, error) {
 	if searcher == nil {
 		return nil, errors.New("demo tool search is unavailable")
 	}
-	catalog := toolpolicy.DefaultCatalog()
-	policy, err := toolpolicy.Canonicalize(toolpolicy.DefaultPolicy(), catalog)
+	catalog := toolpolicy.DevelopmentDurableCatalog()
+	policy, err := toolpolicy.DefaultPolicyForCatalog(catalog)
 	if err != nil {
 		return nil, errors.New("demo tool policy is unavailable")
 	}

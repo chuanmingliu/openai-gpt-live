@@ -6,7 +6,7 @@ import {ClientPresentation} from './client-state.mjs';
 
 const SCHEDULED_PCM_BASE64 = Buffer.alloc(16000).toString('base64');
 const DEFAULT_TOOL_POLICY = {
-  web_search: {enabled: true, safe_search: 'moderate', region: 'wt-wt', max_results: 5, timeout_ms: 8000},
+	web_search: {enabled: true, safe_search: 'strict', region: 'wt-wt', max_results: 5, timeout_ms: 8000},
 };
 
 class FakeGraphNode {
@@ -312,8 +312,10 @@ class BrowserHarness {
   }
 }
 
-test('accepted session sends current policy once per socket and reconnect resends it', async () => {
+test('accepted session sends current policy once per socket and reconnect resends it', async (t) => {
   const harness = new BrowserHarness();
+  harness.installFakeTimers();
+  t.after(() => harness.restoreTimers());
   const runtime = createBrowserRuntime(harness.dependencies());
   await runtime.start();
   harness.server({type: 'session.created'});
@@ -328,9 +330,11 @@ test('accepted session sends current policy once per socket and reconnect resend
     tools: DEFAULT_TOOL_POLICY, model: 'deepseek-v4-flash',
   });
   assert.equal(harness.presentation.snapshot().tools.saveStatus, 'saved');
+  assert.equal(harness.activeTimers.length, 0);
 
   harness.server({type: 'session.updated'});
   assert.equal(harness.sent.filter(({type}) => type === 'live.tool_policy.update').length, 1);
+  assert.equal(harness.activeTimers.length, 0);
   await runtime.stop();
   await runtime.start();
   const second = harness.socket;
@@ -341,6 +345,84 @@ test('accepted session sends current policy once per socket and reconnect resend
   assert.equal(updates.length, 1);
   assert.deepEqual(updates[0].tools, DEFAULT_TOOL_POLICY);
   await runtime.stop();
+});
+
+test('capture stays closed until delayed restored policy receives its exact acknowledgement', async () => {
+	let resolvePolicy;
+	const restored = structuredClone(DEFAULT_TOOL_POLICY);
+	restored.web_search.enabled = false;
+	const harness = new BrowserHarness({fetchHandler: async (path) => {
+		if (path === '/api/tool-policy') return new Promise((resolve) => { resolvePolicy = resolve; });
+		return {ok: true, json: async () => ({ok: true})};
+	}});
+	const runtime = createBrowserRuntime(harness.dependencies());
+	await runtime.start();
+	harness.server({type: 'session.created'});
+	harness.server({type: 'session.updated'});
+	harness.capture({type: 'frame', pcm: new ArrayBuffer(960)});
+	assert.equal(harness.sent.filter(({type}) => type === 'input_audio_buffer.append').length, 0);
+	assert.equal(harness.presentation.snapshot().status, 'configuring');
+
+	resolvePolicy({ok: true, json: async () => restored});
+	await new Promise((resolve) => setImmediate(resolve));
+	const update = harness.sent.find(({type}) => type === 'live.tool_policy.update');
+	assert.deepEqual(update.tools, restored);
+	harness.capture({type: 'frame', pcm: new ArrayBuffer(960)});
+	assert.equal(harness.sent.filter(({type}) => type === 'input_audio_buffer.append').length, 0);
+
+	harness.server({type: 'live.tool_policy.updated', event_id: update.event_id, tools: restored, model: 'deepseek-v4-flash'});
+	harness.capture({type: 'frame', pcm: new ArrayBuffer(960)});
+	assert.equal(harness.sent.filter(({type}) => type === 'input_audio_buffer.append').length, 1);
+	assert.equal(harness.presentation.snapshot().status, 'listening');
+	await runtime.stop();
+});
+
+test('failed policy restore sends disabled fail-closed policy and resumes only after exact ack', async () => {
+	const harness = new BrowserHarness({fetchHandler: async (path) => {
+		if (path === '/api/tool-policy') throw new Error('private restore failure');
+		return {ok: true, json: async () => ({ok: true})};
+	}});
+	const runtime = createBrowserRuntime(harness.dependencies());
+	await runtime.start();
+	harness.server({type: 'session.created'});
+	harness.server({type: 'session.updated'});
+	await new Promise((resolve) => setImmediate(resolve));
+	const update = harness.sent.find(({type}) => type === 'live.tool_policy.update');
+	assert.deepEqual(update.tools, {
+		web_search: {enabled: false, safe_search: 'strict', region: 'wt-wt', max_results: 5, timeout_ms: 8000},
+	});
+
+	harness.server({type: 'live.tool_policy.updated', event_id: update.event_id, tools: DEFAULT_TOOL_POLICY, model: 'deepseek-v4-flash'});
+	harness.capture({type: 'frame', pcm: new ArrayBuffer(960)});
+	assert.equal(harness.sent.filter(({type}) => type === 'input_audio_buffer.append').length, 0);
+	assert.equal(harness.presentation.snapshot().status, 'configuring');
+
+	harness.server({type: 'live.tool_policy.updated', event_id: update.event_id, tools: update.tools, model: 'deepseek-v4-flash'});
+	harness.capture({type: 'frame', pcm: new ArrayBuffer(960)});
+	assert.equal(harness.sent.filter(({type}) => type === 'input_audio_buffer.append').length, 1);
+	assert.equal(harness.presentation.snapshot().status, 'listening');
+	await runtime.stop();
+});
+
+test('gateway canonical SafeSearch tightening activates the exact saved policy', async () => {
+	const requested = structuredClone(DEFAULT_TOOL_POLICY);
+	requested.web_search.safe_search = 'moderate';
+	const harness = new BrowserHarness();
+	const runtime = createBrowserRuntime(harness.dependencies());
+	await runtime.start();
+	harness.server({type: 'session.created'});
+	harness.server({type: 'session.updated'});
+	await new Promise((resolve) => setImmediate(resolve));
+	let update = harness.sent.filter(({type}) => type === 'live.tool_policy.update').at(-1);
+	harness.server({type: 'live.tool_policy.updated', event_id: update.event_id, tools: update.tools, model: 'deepseek-v4-flash'});
+
+	await runtime.saveToolPolicy(requested);
+	update = harness.sent.filter(({type}) => type === 'live.tool_policy.update').at(-1);
+	assert.deepEqual(update.tools, requested);
+	harness.server({type: 'live.tool_policy.updated', event_id: update.event_id, tools: DEFAULT_TOOL_POLICY, model: 'deepseek-v4-flash'});
+	assert.equal(harness.presentation.snapshot().tools.saveStatus, 'saved');
+	assert.deepEqual(harness.presentation.snapshot().tools.policy, DEFAULT_TOOL_POLICY);
+	await runtime.stop();
 });
 
 test('policy load save and diagnostic test use same-origin no-store bounded requests and stable statuses', async () => {
@@ -582,6 +664,29 @@ test('handoff progress updates no playback worklet state and leaves voice status
   await runtime.stop();
 });
 
+test('active tool-card pressure fails the session with content-free state intact', async () => {
+	const harness = new BrowserHarness();
+	const runtime = createBrowserRuntime(harness.dependencies());
+	await runtime.start();
+	harness.server({type: 'session.created'});
+	harness.server({type: 'session.updated'});
+	await new Promise((resolve) => setImmediate(resolve));
+	const policyUpdate = harness.sent.find(({type}) => type === 'live.tool_policy.update');
+	harness.server({type: 'live.tool_policy.updated', event_id: policyUpdate.event_id, tools: policyUpdate.tools, model: 'deepseek-v4-flash'});
+	for (let index = 0; index < 65; index += 1) {
+		harness.server({
+			type: 'live.handoff.created', handoff_id: `pressure-${index}`, sequence_id: index + 1,
+			status: 'pending', details: {},
+		});
+	}
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(harness.notices.at(-1), 'tool-state-overflow');
+	assert.equal(harness.presentation.snapshot().status, 'error');
+	assert.equal(harness.presentation.snapshot().tools.cards.length, 64);
+	assert.equal(harness.presentation.snapshot().tools.cards.some(({id}) => id === 'pressure-0'), true);
+	assert.doesNotMatch(JSON.stringify(harness.presentation.snapshot()), /private|query|snippet|provider/);
+});
+
 test('start gates configuration and PCM, playback acknowledgement, barge-in, and stop release every boundary', async (t) => {
   const harness = new BrowserHarness();
   harness.installFakeTimers();
@@ -597,9 +702,12 @@ test('start gates configuration and PCM, playback acknowledgement, barge-in, and
   harness.capture({type: 'frame', pcm: new ArrayBuffer(960)});
   assert.equal(harness.sent.filter(({type}) => type === 'input_audio_buffer.append').length, 0);
 
-  harness.server({type: 'session.updated'});
-  harness.capture({type: 'frame', pcm: new ArrayBuffer(960)});
-  assert.equal(harness.sent.filter(({type}) => type === 'input_audio_buffer.append').length, 1);
+	harness.server({type: 'session.updated'});
+	await new Promise((resolve) => setImmediate(resolve));
+	const policyUpdate = harness.sent.find(({type}) => type === 'live.tool_policy.update');
+	harness.server({type: 'live.tool_policy.updated', event_id: policyUpdate.event_id, tools: policyUpdate.tools, model: 'deepseek-v4-flash'});
+	harness.capture({type: 'frame', pcm: new ArrayBuffer(960)});
+	assert.equal(harness.sent.filter(({type}) => type === 'input_audio_buffer.append').length, 1);
 
   const playbackGeneration = harness.presentation.snapshot().playbackGeneration;
   harness.server({type: 'response.output_audio.delta', delta: SCHEDULED_PCM_BASE64});
@@ -714,6 +822,9 @@ test('allocated resources and scheduled playback are released after a provider e
   await runtime.start();
   harness.server({type: 'session.created'});
   harness.server({type: 'session.updated'});
+  await new Promise((resolve) => setImmediate(resolve));
+  const policyUpdate = harness.sent.find(({type}) => type === 'live.tool_policy.update');
+  harness.server({type: 'live.tool_policy.updated', event_id: policyUpdate.event_id, tools: policyUpdate.tools, model: 'deepseek-v4-flash'});
   harness.server({type: 'response.output_audio.delta', delta: SCHEDULED_PCM_BASE64});
   assert.equal(harness.activeTimers.length, 1);
 
@@ -818,8 +929,11 @@ test('permanently backed-up microphone socket fails closed with a content-free n
   const runtime = createBrowserRuntime(harness.dependencies());
   await runtime.start();
   harness.server({type: 'session.created'});
-  harness.server({type: 'session.updated'});
-  harness.socket.bufferedAmount = Number.MAX_SAFE_INTEGER;
+	harness.server({type: 'session.updated'});
+	await new Promise((resolve) => setImmediate(resolve));
+	const policyUpdate = harness.sent.find(({type}) => type === 'live.tool_policy.update');
+	harness.server({type: 'live.tool_policy.updated', event_id: policyUpdate.event_id, tools: policyUpdate.tools, model: 'deepseek-v4-flash'});
+	harness.socket.bufferedAmount = Number.MAX_SAFE_INTEGER;
 
   harness.capture({type: 'frame', pcm: new ArrayBuffer(960)});
   await new Promise((resolve) => setImmediate(resolve));
@@ -865,6 +979,9 @@ test('current idle acknowledgement keeps buffering and repumps a delayed reservo
   await runtime.start();
   harness.server({type: 'session.created'});
   harness.server({type: 'session.updated'});
+  await new Promise((resolve) => setImmediate(resolve));
+  const policyUpdate = harness.sent.find(({type}) => type === 'live.tool_policy.update');
+  harness.server({type: 'live.tool_policy.updated', event_id: policyUpdate.event_id, tools: policyUpdate.tools, model: 'deepseek-v4-flash'});
   harness.server({type: 'response.output_audio.delta', delta: SCHEDULED_PCM_BASE64});
 
   const first = harness.playbackNode.port.messages.filter(({type}) => type === 'append').at(-1);
@@ -969,9 +1086,12 @@ test('capture suspension resume is bounded when the browser promise never settle
   t.after(() => harness.restoreTimers());
   const runtime = createBrowserRuntime(harness.dependencies());
   await runtime.start();
-  harness.server({type: 'session.created'});
-  harness.server({type: 'session.updated'});
-  harness.captureResumePending = true;
+	harness.server({type: 'session.created'});
+	harness.server({type: 'session.updated'});
+	await new Promise((resolve) => setImmediate(resolve));
+	const policyUpdate = harness.sent.find(({type}) => type === 'live.tool_policy.update');
+	harness.server({type: 'live.tool_policy.updated', event_id: policyUpdate.event_id, tools: policyUpdate.tools, model: 'deepseek-v4-flash'});
+	harness.captureResumePending = true;
 
   harness.captureContext.setState('suspended');
   assert.equal(harness.activeTimers.length, 1);

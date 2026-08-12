@@ -75,6 +75,8 @@ func TestStaticPageKeepsVoiceControlsVisibleBesideAccessibleToolsDrawer(t *testi
 	assert.Contains(t, body, `id="tool-region"`)
 	assert.Contains(t, body, `id="tool-max-results"`)
 	assert.Contains(t, body, `id="tool-timeout"`)
+	assert.Contains(t, body, `id="tool-max-results" name="max_results" type="number" min="1" max="5"`)
+	assert.Contains(t, body, `id="tool-timeout" name="timeout_ms" type="number" min="1000" max="8000"`)
 	assert.Contains(t, body, `deepseek-v4-flash · thinking disabled`)
 	assert.Contains(t, body, `id="tool-announcement" class="visually-hidden" aria-live="polite"`)
 	assert.Less(t, strings.Index(body, `id="start"`), strings.Index(body, `<details class="tool-drawer">`))

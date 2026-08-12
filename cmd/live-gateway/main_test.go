@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -14,7 +15,10 @@ import (
 	"time"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/config"
+	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
+	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/store/postgres"
+	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -103,18 +107,38 @@ func TestDevelopmentDurableHandoffSnapshotUsesExactEnabledCatalog(t *testing.T) 
 	cfg := config.Config{
 		Worker: config.WorkerConfig{MaxOutputTokens: 4096, Reasoner: config.ReasonerConfig{Model: "deepseek-v4-flash"}},
 		Safety: config.SafetyConfig{PolicyVersion: "static-v1"},
-		Tools:  config.ToolCatalogConfig{WebSearch: config.WebSearchToolConfig{Enabled: true}},
+		Tools: config.ToolCatalogConfig{WebSearch: config.WebSearchToolConfig{
+			Enabled: true, ForceStrict: true,
+			Regions:    []string{"wt-wt", "us-en", "uk-en", "au-en", "ca-en", "cn-zh"},
+			MaxResults: 5, Timeout: 8 * time.Second,
+		}},
 	}
 	configHash := "v1:" + strings.Repeat("a", 64)
 
-	snapshot := gatewayHandoffSnapshot(cfg, configHash)
+	snapshot, err := gatewayHandoffSnapshot(cfg, configHash)
+	require.NoError(t, err)
 	assert.Equal(t, []string{"web_search"}, snapshot.ToolAllowlist)
+	assert.JSONEq(t, `{"web_search":{"enabled":true,"safe_search":"strict","region":"wt-wt","max_results":5,"timeout_ms":8000}}`, string(snapshot.ToolPolicy))
 	assert.Equal(t, "deepseek-v4-flash", snapshot.Versions.Model)
 	assert.Equal(t, configHash, snapshot.Versions.ToolRegistry)
 	assert.Equal(t, configHash, snapshot.Versions.Config)
+	_, err = handoff.ValidateCreateRequest(handoff.CreateRequest{
+		Scope:     handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "conversation"},
+		SessionID: "session", SourceTurn: identity.TurnKey{ID: "turn", Revision: 1},
+		UserRequest: "search", Objective: "search", ContextRef: snapshot.ContextRef,
+		ContextHash: snapshot.ContextHash, Deadline: snapshot.Deadline, TokenBudget: snapshot.TokenBudget,
+		ToolAllowlist: snapshot.ToolAllowlist, ToolPolicy: snapshot.ToolPolicy,
+		ApprovalPolicy: json.RawMessage(`{"mode":"none"}`), Versions: snapshot.Versions,
+		PresentationHint: snapshot.PresentationHint, IdempotencyKey: "snapshot-validation",
+	}, time.Now().UTC())
+	require.NoError(t, err)
 
 	cfg.Tools.WebSearch.Enabled = false
-	assert.Empty(t, gatewayHandoffSnapshot(cfg, configHash).ToolAllowlist)
+	disabled, err := gatewayHandoffSnapshot(cfg, configHash)
+	require.NoError(t, err)
+	assert.Empty(t, disabled.ToolAllowlist)
+	assert.JSONEq(t, `{"web_search":{"enabled":false,"safe_search":"strict","region":"wt-wt","max_results":5,"timeout_ms":8000}}`, string(disabled.ToolPolicy))
+	assert.Equal(t, toolpolicy.DevelopmentDurableCatalog().WebSearch.MaximumResults, cfg.ToolCatalog().WebSearch.MaximumResults)
 }
 
 func TestComposeGatewayDurabilityIncludesRecoveryWhenHandoffsAreDisabled(t *testing.T) {

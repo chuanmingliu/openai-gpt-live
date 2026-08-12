@@ -118,7 +118,8 @@ func decodeArguments(raw json.RawMessage) (string, error) {
 	if _, err = decoder.Token(); !errors.Is(err, io.EOF) {
 		return "", errors.New("web search arguments are invalid")
 	}
-	if len(query) < 1 || len(query) > maximumQueryBytes || !utf8.ValidString(query) {
+	query, err = normalizeQuery(query)
+	if err != nil {
 		return "", errors.New("web search arguments are invalid")
 	}
 	return query, nil
@@ -166,7 +167,8 @@ func decodeOutput(raw json.RawMessage) (output, error) {
 	if _, err = decoder.Token(); !errors.Is(err, io.EOF) {
 		return output{}, errors.New("web search private output is invalid")
 	}
-	if len(decoded.Query) < 1 || len(decoded.Query) > maximumQueryBytes || !utf8.ValidString(decoded.Query) {
+	query, err := normalizeQuery(decoded.Query)
+	if err != nil || query != decoded.Query {
 		return output{}, errors.New("web search private output is invalid")
 	}
 	return decoded, nil

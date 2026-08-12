@@ -45,6 +45,38 @@ func TestExecuteAcceptsOnlyCanonicalClosedWorldArguments(t *testing.T) {
 	}
 }
 
+func TestExecuteCanonicalizesTrimmedQueryBeforeHTTPAndPrivateOutput(t *testing.T) {
+	var posted string
+	executor := executorWithTransport(roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		require.NoError(t, request.ParseForm())
+		posted = request.Form.Get("q")
+		return response(http.StatusOK, "text/html", "", resultHTML("Go", "Docs", "https://go.dev/")), nil
+	}))
+	output, err := executor.Execute(t.Context(), worker.ToolExecutionRequest{
+		Arguments: json.RawMessage(`{"query":"  golang  "}`),
+		Policy:    toolpolicy.DefaultPolicy(),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "golang", posted)
+	assert.JSONEq(t, `{"query":"golang","results":[{"title":"Go","snippet":"Docs","url":"https://go.dev/"}]}`, string(output))
+}
+
+func TestExecuteRejectsWhitespaceAndControlBearingQueriesBeforeHTTP(t *testing.T) {
+	for _, query := range []string{"   ", "  ", "line\nfeed", "tab\tinside", "nul\x00byte"} {
+		called := false
+		executor := executorWithTransport(roundTripFunc(func(*http.Request) (*http.Response, error) {
+			called = true
+			return nil, errors.New("must not execute")
+		}))
+		arguments, err := json.Marshal(map[string]string{"query": query})
+		require.NoError(t, err)
+		_, err = executor.Execute(t.Context(), worker.ToolExecutionRequest{Arguments: arguments, Policy: toolpolicy.DefaultPolicy()})
+		require.Error(t, err)
+		assert.False(t, called)
+		assert.NotContains(t, err.Error(), query)
+	}
+}
+
 func TestExecuteUsesServerPolicyNotArgumentPolicyFields(t *testing.T) {
 	executor := successfulExecutor(t)
 	policy := toolpolicy.DefaultPolicy()

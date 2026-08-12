@@ -163,6 +163,10 @@ func TestDevelopmentDurableConfigIsExactAndContainsOnlySecretReferences(t *testi
 	if !catalog.Enabled || !catalog.ForceStrict || catalog.MaximumResults != 5 || catalog.MaximumTimeoutMS != int((8*time.Second)/time.Millisecond) || !sameStrings(catalog.Regions, []string{"au-en", "ca-en", "cn-zh", "uk-en", "us-en", "wt-wt"}) {
 		t.Fatalf("durable catalog = %#v", catalog)
 	}
+	shared := toolpolicy.DevelopmentDurableCatalog().WebSearch
+	if catalog.Enabled != shared.Enabled || catalog.ForceStrict != shared.ForceStrict || catalog.MaximumResults != shared.MaximumResults || catalog.MaximumTimeoutMS != shared.MaximumTimeoutMS || !sameStrings(catalog.Regions, shared.Regions) {
+		t.Fatalf("durable catalog differs from shared browser/BFF contract: config=%#v shared=%#v", catalog, shared)
+	}
 	if _, err := os.ReadFile(path); err != nil {
 		t.Fatal(err)
 	}

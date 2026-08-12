@@ -2221,26 +2221,7 @@ func emptyToolCatalog(catalog toolpolicy.Catalog) bool {
 }
 
 func defaultToolPolicy(catalog toolpolicy.Catalog) (toolpolicy.Policy, error) {
-	policy := toolpolicy.DefaultPolicy()
-	web := catalog.WebSearch
-	policy.WebSearch.Enabled = web.Enabled
-	if web.MaximumResults < policy.WebSearch.MaxResults {
-		policy.WebSearch.MaxResults = web.MaximumResults
-	}
-	if web.MaximumTimeoutMS < policy.WebSearch.TimeoutMS {
-		policy.WebSearch.TimeoutMS = web.MaximumTimeoutMS
-	}
-	regionAllowed := false
-	for _, region := range web.Regions {
-		if region == policy.WebSearch.Region {
-			regionAllowed = true
-			break
-		}
-	}
-	if !regionAllowed && len(web.Regions) != 0 {
-		policy.WebSearch.Region = web.Regions[0]
-	}
-	return toolpolicy.Canonicalize(policy, catalog)
+	return toolpolicy.DefaultPolicyForCatalog(catalog)
 }
 
 func (s *runState) replaceToolPolicy(policy toolpolicy.Policy) {

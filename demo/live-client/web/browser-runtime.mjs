@@ -22,6 +22,7 @@ const NOTICE_CODES = new Set([
   'session-updated-timeout',
   'socket-open-timeout',
   'transport-closed',
+  'tool-state-overflow',
 ]);
 
 export function createBrowserRuntime(dependencies) {
@@ -47,6 +48,7 @@ export function createBrowserRuntime(dependencies) {
   let silentGain = null;
   let socket = null;
   let streamReady = false;
+  let sessionConfigured = false;
   let sessionUpdateSent = false;
   let socketOpenObserved = false;
   let initialPolicySent = false;
@@ -91,7 +93,7 @@ export function createBrowserRuntime(dependencies) {
   }
 
   function sendCurrentPolicy(currentGeneration, ownedSocket, initial) {
-    if (generation !== currentGeneration || socket !== ownedSocket || !streamReady || ownedSocket.readyState !== WebSocket.OPEN) return false;
+    if (generation !== currentGeneration || socket !== ownedSocket || !sessionConfigured || ownedSocket.readyState !== WebSocket.OPEN) return false;
     if (initial && initialPolicySent) return false;
     const eventID = `browser-policy-${nextPolicyEventID++}`;
     const policy = presentation.tools.snapshot().policy;
@@ -138,8 +140,18 @@ export function createBrowserRuntime(dependencies) {
 
   function applyEffect(effect, currentGeneration) {
     if (generation !== currentGeneration) return;
+    if (effect.type === 'tool-policy-accepted') {
+      if (presentation.tools.acceptPolicy(effect.event_id, effect.policy, effect.model)) {
+        establishmentTimer.clear();
+        streamReady = true;
+        presentation.apply({type: 'status', value: 'listening'});
+      }
+      publishSnapshot();
+      return;
+    }
+    if (effect.type === 'status' && effect.value === 'listening' && !streamReady) return;
     if (!presentation.apply(effect)) {
-      void failSession('invalid-transcript', currentGeneration);
+      void failSession(effect.type === 'handoff-card' ? 'tool-state-overflow' : 'invalid-transcript', currentGeneration);
       return;
     }
     switch (effect.type) {
@@ -209,11 +221,13 @@ export function createBrowserRuntime(dependencies) {
         void failSession('invalid-event', currentGeneration);
         return;
       }
-      establishmentTimer.clear();
-      streamReady = true;
-      void (policyLoadPromise ?? Promise.resolve()).then(() => {
-        sendCurrentPolicy(currentGeneration, ownedSocket, true);
-      });
+      if (!sessionConfigured) {
+        sessionConfigured = true;
+        armEstablishmentDeadline('session-updated-timeout', currentGeneration, ownedSocket);
+        void (policyLoadPromise ?? Promise.resolve()).then(() => {
+          sendCurrentPolicy(currentGeneration, ownedSocket, true);
+        });
+      }
     }
     for (const effect of protocol.consume(event)) applyEffect(effect, currentGeneration);
   }
@@ -369,6 +383,7 @@ export function createBrowserRuntime(dependencies) {
 
     const currentGeneration = ++generation;
     streamReady = false;
+    sessionConfigured = false;
     sessionUpdateSent = false;
     socketOpenObserved = false;
     initialPolicySent = false;
@@ -388,6 +403,7 @@ export function createBrowserRuntime(dependencies) {
 
   async function releaseResources(closeSocket) {
     streamReady = false;
+    sessionConfigured = false;
     sessionUpdateSent = false;
     socketOpenObserved = false;
     initialPolicySent = false;

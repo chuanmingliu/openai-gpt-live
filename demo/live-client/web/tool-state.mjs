@@ -9,8 +9,8 @@ const textEncoder = new TextEncoder();
 
 const DEFAULT_POLICY = Object.freeze({
   web_search: Object.freeze({
-    enabled: true,
-    safe_search: 'moderate',
+    enabled: false,
+    safe_search: 'strict',
     region: 'wt-wt',
     max_results: 5,
     timeout_ms: 8000,
@@ -68,6 +68,16 @@ function clonePolicy(policy) {
 
 function policiesEqual(left, right) {
   return WEB_SEARCH_KEYS.every((key) => left.web_search[key] === right.web_search[key]);
+}
+
+function policyIsCanonicalTightening(requested, accepted) {
+  const before = requested.web_search;
+  const after = accepted.web_search;
+  return before.enabled === after.enabled
+    && before.region === after.region
+    && (before.safe_search === after.safe_search || (before.safe_search === 'moderate' && after.safe_search === 'strict'))
+    && after.max_results <= before.max_results
+    && after.timeout_ms <= before.timeout_ms;
 }
 
 function byteLength(value) {
@@ -167,8 +177,8 @@ export function normalizeToolPolicy(value) {
   if (!exactKeys(value, POLICY_KEYS) || !exactKeys(value.web_search, WEB_SEARCH_KEYS)) throw new TypeError('invalid tool policy');
   const web = value.web_search;
   if (typeof web.enabled !== 'boolean' || !SAFE_SEARCH.has(web.safe_search) || !REGIONS.has(web.region)
-      || !Number.isInteger(web.max_results) || web.max_results < 1 || web.max_results > 10
-      || !Number.isInteger(web.timeout_ms) || web.timeout_ms < 1000 || web.timeout_ms > 10000) {
+      || !Number.isInteger(web.max_results) || web.max_results < 1 || web.max_results > 5
+      || !Number.isInteger(web.timeout_ms) || web.timeout_ms < 1000 || web.timeout_ms > 8000) {
     throw new TypeError('invalid tool policy');
   }
   return clonePolicy(value);
@@ -335,7 +345,7 @@ export class ToolState {
       return false;
     }
     if (eventID !== this.pendingPolicyEventID || model !== 'deepseek-v4-flash'
-        || !this.pendingAcknowledgementPolicy || !policiesEqual(accepted, this.pendingAcknowledgementPolicy)) return false;
+        || !this.pendingAcknowledgementPolicy || !policyIsCanonicalTightening(this.pendingAcknowledgementPolicy, accepted)) return false;
     this.policy = accepted;
     this.pendingPolicyEventID = null;
     this.pendingAcknowledgementPolicy = null;
@@ -369,20 +379,20 @@ export class ToolState {
     try {
       event = normalizeHandoffEvent(rawEvent);
     } catch {
-      return {accepted: false, created: false, phaseChanged: false};
+      return {accepted: false, created: false, phaseChanged: false, overflow: false};
     }
     const current = this.byID.get(event.handoff_id);
     if (current && (event.sequence_id <= current.sequence || current.terminal)) {
-      return {accepted: false, created: false, phaseChanged: false};
+      return {accepted: false, created: false, phaseChanged: false, overflow: false};
     }
     const nextPhase = event.details.phase ?? current?.phase ?? 'queued';
     const resumesFromNeedsInput = current?.phase === 'needs_input' && RESUME_PHASES.has(nextPhase);
     if (current && !resumesFromNeedsInput && !TERMINAL_PHASES.has(nextPhase) && PHASE_ORDER.get(nextPhase) < PHASE_ORDER.get(current.phase)) {
-      return {accepted: false, created: false, phaseChanged: false};
+      return {accepted: false, created: false, phaseChanged: false, overflow: false};
     }
     const created = !current;
     const phaseChanged = created || current.phase !== nextPhase;
-    const card = current ?? {
+    const card = current ? {...current, sources: current.sources.map((source) => ({...source}))} : {
       id: event.handoff_id,
       sequence: 0,
       status: event.status,
@@ -398,25 +408,30 @@ export class ToolState {
     if (event.details.summary) card.summary = event.details.summary;
     if (!card.summary) card.summary = STABLE_PHASE_TEXT[nextPhase];
     if (event.details.sources) card.sources = event.details.sources.map((source) => ({...source}));
+    const activeCount = this.cards.filter((candidate) => !candidate.terminal).length
+      - (current && !current.terminal ? 1 : 0) + (!card.terminal ? 1 : 0);
+    const aggregateBytes = this.totalTextBytes() - (current ? cardTextBytes(current) : 0) + cardTextBytes(card);
+    if (activeCount > MAXIMUM_ACTIVE_CARDS || aggregateBytes > MAXIMUM_AGGREGATE_TEXT_BYTES) {
+      return {accepted: false, created: false, phaseChanged: false, overflow: true};
+    }
     if (created) {
       this.cards.push(card);
-      this.byID.set(card.id, card);
+    } else {
+      this.cards[this.cards.indexOf(current)] = card;
     }
+    this.byID.set(card.id, card);
     if (phaseChanged) {
       this.announcements.push(STABLE_PHASE_TEXT[nextPhase]);
       if (this.announcements.length > 128) this.announcements.shift();
     }
     this.enforceBounds();
-    return {accepted: true, created, phaseChanged};
+    return {accepted: true, created, phaseChanged, overflow: false};
   }
 
   enforceBounds() {
-    for (const terminal of [false, true]) {
-      while (this.cards.filter((card) => card.terminal === terminal).length > (terminal ? MAXIMUM_TERMINAL_CARDS : MAXIMUM_ACTIVE_CARDS)) {
-        this.removeCard(this.cards.find((card) => card.terminal === terminal));
-      }
+    while (this.cards.filter((card) => card.terminal).length > MAXIMUM_TERMINAL_CARDS) {
+      this.removeCard(this.cards.find((card) => card.terminal));
     }
-    while (this.totalTextBytes() > MAXIMUM_AGGREGATE_TEXT_BYTES) this.removeCard(this.cards[0]);
   }
 
   removeCard(card) {

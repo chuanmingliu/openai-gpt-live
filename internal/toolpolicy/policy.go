@@ -71,6 +71,37 @@ func DefaultCatalog() Catalog {
 	}}
 }
 
+// DevelopmentDurableCatalog is the exact reviewed catalog shared by the
+// durable gateway composition and its loopback browser/BFF client.
+func DevelopmentDurableCatalog() Catalog {
+	return Catalog{WebSearch: WebSearchCatalog{
+		Enabled: true, ForceStrict: true, Regions: sortedUnique(defaultRegions),
+		MaximumResults: 5, MaximumTimeoutMS: 8_000,
+	}}
+}
+
+// DefaultPolicyForCatalog derives the canonical fail-closed session default
+// from one server-owned catalog.
+func DefaultPolicyForCatalog(catalog Catalog) (Policy, error) {
+	canonical, err := canonicalCatalog(catalog)
+	if err != nil {
+		return Policy{}, err
+	}
+	policy := DefaultPolicy()
+	web := canonical.WebSearch
+	policy.WebSearch.Enabled = web.Enabled
+	if web.MaximumResults < policy.WebSearch.MaxResults {
+		policy.WebSearch.MaxResults = web.MaximumResults
+	}
+	if web.MaximumTimeoutMS < policy.WebSearch.TimeoutMS {
+		policy.WebSearch.TimeoutMS = web.MaximumTimeoutMS
+	}
+	if !contains(web.Regions, policy.WebSearch.Region) {
+		policy.WebSearch.Region = web.Regions[0]
+	}
+	return Canonicalize(policy, canonical)
+}
+
 // Canonicalize validates a browser policy against the fixed catalog and
 // returns its normalized form. A policy can tighten a catalog, never loosen it.
 func Canonicalize(policy Policy, catalog Catalog) (Policy, error) {

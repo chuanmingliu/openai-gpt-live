@@ -28,8 +28,17 @@ func TestToolPolicyAPIStoresOnlyCanonicalSafeFields(t *testing.T) {
 	handler.ServeHTTP(response, get)
 	assert.Equal(t, http.StatusOK, response.Code)
 	assert.Equal(t, "no-store", response.Header().Get("Cache-Control"))
-	assert.JSONEq(t, `{"web_search":{"enabled":true,"safe_search":"moderate","region":"wt-wt","max_results":5,"timeout_ms":8000}}`, response.Body.String())
+	assert.JSONEq(t, `{"web_search":{"enabled":true,"safe_search":"strict","region":"wt-wt","max_results":5,"timeout_ms":8000}}`, response.Body.String())
 	assert.Zero(t, search.calls)
+}
+
+func TestToolPolicyAPIUsesExactGatewayCatalogBounds(t *testing.T) {
+	for _, body := range []string{
+		`{"web_search":{"enabled":true,"safe_search":"strict","region":"wt-wt","max_results":6,"timeout_ms":8000}}`,
+		`{"web_search":{"enabled":true,"safe_search":"strict","region":"wt-wt","max_results":5,"timeout_ms":8001}}`,
+	} {
+		assertRejectedToolPolicy(t, body, "http://127.0.0.1:3000")
+	}
 }
 
 func TestToolPolicyAPIRejectsExecutableAndCrossOriginInput(t *testing.T) {
@@ -67,7 +76,7 @@ func TestToolPolicyDiagnosticUsesFixedQueryAndReturnsOnlyCount(t *testing.T) {
 	assert.Equal(t, http.StatusOK, response.Code)
 	assert.JSONEq(t, `{"ok":true,"result_count":3}`, response.Body.String())
 	assert.Equal(t, "DuckDuckGo privacy search", search.request.Query)
-	assert.Equal(t, toolpolicy.DefaultPolicy().WebSearch, search.request.Policy)
+	assert.Equal(t, toolpolicy.WebSearchPolicy{Enabled: true, SafeSearch: toolpolicy.SafeSearchStrict, Region: "wt-wt", MaxResults: 5, TimeoutMS: 8_000}, search.request.Policy)
 	assert.NotContains(t, response.Body.String(), "private")
 }
 

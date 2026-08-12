@@ -1135,6 +1135,73 @@ func TestJobExecutionProjectionReplayIsIdempotentButSecondProjectionIsRejected(t
 	require.Error(t, err)
 }
 
+func TestRunnerRejectsSecondDistinctWebSearchBeforeExecution(t *testing.T) {
+	lease := workerLease()
+	lease.Job.Request.ToolAllowlist = []string{toolpolicy.WebSearchTool}
+	lease.Job.Request.ToolPolicy = canonicalWorkerPolicy(t, toolpolicy.DefaultPolicy())
+	var executions atomic.Int32
+	tool := searchToolForRunner(func(_ context.Context, request ToolExecutionRequest) (json.RawMessage, error) {
+		executions.Add(1)
+		if strings.Contains(string(request.Arguments), "first") {
+			return json.RawMessage(`{"query":"first","results":[{"title":"First","snippet":"private one","url":"https://first.example/"}]}`), nil
+		}
+		return json.RawMessage(`{"query":"second","results":[{"title":"Second","snippet":"private two","url":"https://second.example/"}]}`), nil
+	}, func(raw json.RawMessage) (json.RawMessage, error) {
+		if strings.Contains(string(raw), `"query":"first"`) {
+			return json.RawMessage(`{"sources":[{"title":"First","url":"https://first.example/"}]}`), nil
+		}
+		return json.RawMessage(`{"sources":[{"title":"Second","url":"https://second.example/"}]}`), nil
+	})
+	tool.StartedPhase = ""
+	tool.CompletedPhase = ""
+	round := 0
+	stream := streamerFunc(func(context.Context, reasoner.Request, func(reasoner.Chunk) error) (reasoner.Result, error) {
+		round++
+		switch round {
+		case 1:
+			return reasoner.Result{ToolCalls: []reasoner.ToolCall{{ID: "first", Name: toolpolicy.WebSearchTool, Arguments: json.RawMessage(`{"query":"first"}`)}}}, nil
+		case 2:
+			return reasoner.Result{ToolCalls: []reasoner.ToolCall{{ID: "second", Name: toolpolicy.WebSearchTool, Arguments: json.RawMessage(`{"query":"second"}`)}}}, nil
+		default:
+			return reasoner.Result{Text: "comparison"}, nil
+		}
+	})
+	store, runner := searchRunnerForLease(t, lease, tool, stream, allowPolicy())
+	runner.MaxToolRounds = 3
+	runner.MaxToolCalls = 3
+	require.NoError(t, runner.executeLease(t.Context(), lease))
+	assert.Equal(t, int32(1), executions.Load())
+	require.Len(t, store.failed, 1)
+	assert.Empty(t, store.completed)
+}
+
+func TestRunnerProjectionLimitPreflightsBeforeSecondExecutorInvocation(t *testing.T) {
+	lease := workerLease()
+	execution := &jobExecution{}
+	_, err := execution.storeProjection(json.RawMessage(`{"sources":[{"title":"First","url":"https://first.example/"}]}`))
+	require.NoError(t, err)
+	var executions atomic.Int32
+	tool := searchToolForRunner(func(context.Context, ToolExecutionRequest) (json.RawMessage, error) {
+		executions.Add(1)
+		return json.RawMessage(`{"query":"second","results":[]}`), nil
+	}, func(json.RawMessage) (json.RawMessage, error) {
+		return json.RawMessage(`{"sources":[{"title":"Second","url":"https://second.example/"}]}`), nil
+	})
+	tool.StartedPhase = ""
+	tool.CompletedPhase = ""
+	store := &memoryStore{}
+	runner := Runner{Store: store}
+	runner.ArgumentSealer, err = NewAESArgumentSealer("test-key", bytes.Repeat([]byte{5}, 32), bytes.NewReader(bytes.Repeat([]byte{1}, 12)))
+	require.NoError(t, err)
+	builder := &resultBuilder{ctx: t.Context(), limit: 1 << 20, clock: clock.Real{}, store: store, token: lease.Token}
+	_, err = runner.executeOneTool(t.Context(), lease, 0, 2,
+		reasoner.ToolCall{ID: "second", Name: toolpolicy.WebSearchTool, Arguments: json.RawMessage(`{"query":"second"}`)},
+		tool, json.RawMessage(`{"query":"second"}`), builder, execution, 1)
+	require.Error(t, err)
+	assert.Zero(t, executions.Load())
+	assert.Empty(t, store.invocations)
+}
+
 func TestRunnerDoesNotParallelizePhasedWebSearchBehindUnphasedTool(t *testing.T) {
 	lease := workerLease()
 	lease.Job.Request.ToolAllowlist = []string{"alpha", toolpolicy.WebSearchTool}

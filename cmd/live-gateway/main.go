@@ -40,6 +40,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/session"
 	"github.com/chuanmingliu/openai-gpt-live/internal/store/postgres"
 	"github.com/chuanmingliu/openai-gpt-live/internal/telemetry"
+	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 	transportws "github.com/chuanmingliu/openai-gpt-live/internal/transport/ws"
 	"github.com/chuanmingliu/openai-gpt-live/migrations"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -750,7 +751,10 @@ func composeGatewayDurability(cfg config.Config, runtime *gatewayFeatureRuntime,
 	if err != nil {
 		return nil, fmt.Errorf("configure handoff presentation safety: %w", err)
 	}
-	snapshot := gatewayHandoffSnapshot(cfg, configHash)
+	snapshot, err := gatewayHandoffSnapshot(cfg, configHash)
+	if err != nil {
+		return nil, err
+	}
 	dependencies.Service = service
 	dependencies.HandoffQueueCapacity = cfg.Gateway.Session.ControlEvents
 	dependencies.Snapshot = snapshot
@@ -764,18 +768,27 @@ func composeGatewayDurability(cfg config.Config, runtime *gatewayFeatureRuntime,
 	}, nil
 }
 
-func gatewayHandoffSnapshot(cfg config.Config, configHash string) gateway.SessionHandoffSnapshot {
+func gatewayHandoffSnapshot(cfg config.Config, configHash string) (gateway.SessionHandoffSnapshot, error) {
+	catalog := cfg.ToolCatalog()
 	toolAllowlist := []string{}
-	if cfg.ToolCatalog().WebSearch.Enabled {
+	if catalog.WebSearch.Enabled {
 		toolAllowlist = append(toolAllowlist, "web_search")
+	}
+	policy, err := toolpolicy.DefaultPolicyForCatalog(catalog)
+	if err != nil {
+		return gateway.SessionHandoffSnapshot{}, errors.New("configure canonical handoff tool policy")
+	}
+	policyRaw, err := toolpolicy.MarshalCanonical(policy)
+	if err != nil {
+		return gateway.SessionHandoffSnapshot{}, errors.New("configure canonical handoff tool policy")
 	}
 	return gateway.SessionHandoffSnapshot{
 		ContextRef: "context://conversation/current", ContextHash: configHash,
 		Deadline:    time.Date(9999, time.December, 31, 23, 59, 59, 0, time.UTC),
-		TokenBudget: cfg.Worker.MaxOutputTokens, ToolAllowlist: toolAllowlist, ApprovalPolicy: json.RawMessage(`{"mode":"none"}`),
+		TokenBudget: cfg.Worker.MaxOutputTokens, ToolAllowlist: toolAllowlist, ToolPolicy: policyRaw, ApprovalPolicy: json.RawMessage(`{"mode":"none"}`),
 		Versions:         handoff.Versions{Model: cfg.Worker.Reasoner.Model, Prompt: cfg.Safety.PolicyVersion, ToolRegistry: configHash, Config: configHash},
 		PresentationHint: "brief",
-	}
+	}, nil
 }
 
 func gatewayDurabilityIdentity(runtimeInstance string) (string, error) {

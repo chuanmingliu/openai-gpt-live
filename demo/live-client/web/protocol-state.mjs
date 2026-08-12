@@ -59,7 +59,7 @@ export class ProtocolState {
       case 'session.created':
         return [{type: 'status', value: 'configuring'}];
       case 'session.updated':
-        return [{type: 'status', value: 'listening'}];
+        return [];
       case 'live.tool_policy.updated':
         return this.toolPolicyAccepted(event);
       case 'live.handoff.created':

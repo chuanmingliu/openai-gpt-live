@@ -27,6 +27,23 @@ func TestCanonicalizeReturnsExactStableJSON(t *testing.T) {
 	assert.JSONEq(t, `{"web_search":{"enabled":true,"safe_search":"moderate","region":"wt-wt","max_results":5,"timeout_ms":8000}}`, string(raw))
 }
 
+func TestDevelopmentDurableCatalogProducesExactCanonicalDefault(t *testing.T) {
+	catalog := DevelopmentDurableCatalog()
+	policy, err := DefaultPolicyForCatalog(catalog)
+	require.NoError(t, err)
+	assert.Equal(t, Policy{WebSearch: WebSearchPolicy{
+		Enabled: true, SafeSearch: SafeSearchStrict, Region: "wt-wt",
+		MaxResults: 5, TimeoutMS: 8_000,
+	}}, policy)
+	assert.Equal(t, []string{"au-en", "ca-en", "cn-zh", "uk-en", "us-en", "wt-wt"}, catalog.WebSearch.Regions)
+
+	disabled := catalog
+	disabled.WebSearch.Enabled = false
+	policy, err = DefaultPolicyForCatalog(disabled)
+	require.NoError(t, err)
+	assert.False(t, policy.WebSearch.Enabled)
+}
+
 func TestCanonicalizeRejectsInvalidWebSearchPolicies(t *testing.T) {
 	base := DefaultPolicy()
 	tests := []struct {

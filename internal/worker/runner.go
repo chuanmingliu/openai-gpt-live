@@ -430,6 +430,12 @@ func (e *jobExecution) storeProjection(raw json.RawMessage) (bool, error) {
 	return true, nil
 }
 
+func (e *jobExecution) hasPublicProjection() bool {
+	e.projectionMu.Lock()
+	defer e.projectionMu.Unlock()
+	return e.hasProjection
+}
+
 func (e *jobExecution) completionStructured(text string) (json.RawMessage, error) {
 	e.projectionMu.Lock()
 	sources := append(json.RawMessage(nil), e.projectedSources...)
@@ -1037,6 +1043,9 @@ func parallelBatchTool(tool RegisteredTool) bool {
 func (r *Runner) executeOneTool(ctx context.Context, lease Lease, revision, ordinal uint32, call reasoner.ToolCall, tool RegisteredTool, arguments json.RawMessage, builder *resultBuilder, execution *jobExecution, generation uint64) (json.RawMessage, error) {
 	if r.ArgumentSealer == nil {
 		return nil, errors.New("worker argument sealer is required for tools")
+	}
+	if tool.Projector != nil && execution.hasPublicProjection() {
+		return nil, errors.New("worker public tool projection limit reached")
 	}
 	hash := sha256.Sum256(arguments)
 	hashText := hex.EncodeToString(hash[:])

@@ -386,6 +386,10 @@ func TestSearchValidatesResultURLsAndFieldBounds(t *testing.T) {
 func TestSearchRejectsInvalidQueryAndPolicyWithoutHTTP(t *testing.T) {
 	requests := []Request{
 		{Query: "", Policy: toolpolicy.DefaultPolicy().WebSearch},
+		{Query: "    ", Policy: toolpolicy.DefaultPolicy().WebSearch},
+		{Query: "line\nfeed", Policy: toolpolicy.DefaultPolicy().WebSearch},
+		{Query: "tab\tinside", Policy: toolpolicy.DefaultPolicy().WebSearch},
+		{Query: "nul\x00byte", Policy: toolpolicy.DefaultPolicy().WebSearch},
 		{Query: strings.Repeat("q", 513), Policy: toolpolicy.DefaultPolicy().WebSearch},
 		{Query: string([]byte{0xff}), Policy: toolpolicy.DefaultPolicy().WebSearch},
 	}

@@ -134,6 +134,11 @@ func (e *Executor) Search(ctx context.Context, request Request) ([]Result, error
 	if e == nil || e.client == nil || ctx == nil {
 		return nil, errors.New("web search executor is unavailable")
 	}
+	query, err := normalizeQuery(request.Query)
+	if err != nil {
+		return nil, err
+	}
+	request.Query = query
 	if err := validateSearchRequest(request); err != nil {
 		return nil, err
 	}
@@ -184,7 +189,8 @@ func (e *Executor) Search(ctx context.Context, request Request) ([]Result, error
 }
 
 func validateSearchRequest(request Request) error {
-	if len(request.Query) < 1 || len(request.Query) > maximumQueryBytes || !utf8.ValidString(request.Query) {
+	query, err := normalizeQuery(request.Query)
+	if err != nil || query != request.Query {
 		return errors.New("web search query is invalid")
 	}
 	canonical, err := toolpolicy.Canonicalize(toolpolicy.Policy{WebSearch: request.Policy}, toolpolicy.DefaultCatalog())
@@ -192,6 +198,22 @@ func validateSearchRequest(request Request) error {
 		return errors.New("web search policy is invalid")
 	}
 	return nil
+}
+
+func normalizeQuery(query string) (string, error) {
+	if !utf8.ValidString(query) {
+		return "", errors.New("web search query is invalid")
+	}
+	for _, character := range query {
+		if unicode.IsControl(character) {
+			return "", errors.New("web search query is invalid")
+		}
+	}
+	query = strings.TrimSpace(query)
+	if len(query) < 1 || len(query) > maximumQueryBytes {
+		return "", errors.New("web search query is invalid")
+	}
+	return query, nil
 }
 
 func safeSearchParameter(value toolpolicy.SafeSearch) string {

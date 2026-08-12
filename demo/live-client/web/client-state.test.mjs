@@ -216,6 +216,47 @@ test('timeline orders transcript turns and tool cards once while card updates re
   ]);
 });
 
+test('tool active-card and aggregate pressure fail the presentation without evicting retained cards', () => {
+	const active = new ClientPresentation();
+	for (let index = 0; index < 64; index += 1) {
+		assert.equal(active.apply({type: 'handoff-card', event: {
+			type: 'live.handoff.created', handoff_id: `active-${index}`, sequence_id: index + 1,
+			status: 'pending', details: {},
+		}}), true);
+	}
+	assert.equal(active.apply({type: 'handoff-card', event: {
+		type: 'live.handoff.created', handoff_id: 'active-overflow', sequence_id: 100,
+		status: 'pending', details: {},
+	}}), false);
+	assert.equal(active.snapshot().tools.cards.some(({id}) => id === 'active-0'), true);
+	assert.equal(active.snapshot().tools.cards.some(({id}) => id === 'active-overflow'), false);
+
+	const aggregate = new ClientPresentation();
+	for (let index = 0; index < 31; index += 1) {
+		aggregate.apply({type: 'handoff-card', event: {
+			type: 'live.handoff.created', handoff_id: `aggregate-${index}`, sequence_id: index * 2 + 1,
+			status: 'pending', details: {},
+		}});
+		assert.equal(aggregate.apply({type: 'handoff-card', event: {
+			type: 'live.handoff.progress', handoff_id: `aggregate-${index}`, sequence_id: index * 2 + 2,
+			status: 'running', details: {phase: 'searching', summary: 'x'.repeat(8 << 10)},
+		}}), true);
+	}
+	aggregate.apply({type: 'handoff-card', event: {
+		type: 'live.handoff.created', handoff_id: 'aggregate-overflow', sequence_id: 1000,
+		status: 'pending', details: {},
+	}});
+	const before = aggregate.snapshot().tools.cards;
+	assert.equal(aggregate.apply({type: 'handoff-card', event: {
+		type: 'live.handoff.progress', handoff_id: 'aggregate-overflow', sequence_id: 1001,
+		status: 'running', details: {
+			phase: 'searching', summary: 'x'.repeat(8 << 10),
+			sources: [{title: 'extra', url: 'https://example.com/extra'}],
+		},
+	}}), false);
+	assert.deepEqual(aggregate.snapshot().tools.cards, before);
+});
+
 test('handoff progress never changes voice status or playback generation', () => {
   const state = new ClientPresentation();
   state.apply({type: 'status', value: 'assistant-speaking'});
