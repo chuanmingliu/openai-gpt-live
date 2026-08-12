@@ -49,6 +49,7 @@ var requiredColumns = map[string]map[string]string{
 		"source_turn_id": "text", "source_turn_revision": "bigint", "user_request": "text", "objective": "text",
 		"context_ref": "text", "context_hash": "text", "deadline": "timestamp with time zone", "token_budget": "integer",
 		"priority": "smallint", "tool_allowlist": "json", "approval_policy": "json", "model_version": "text",
+		"tool_policy":    "jsonb",
 		"prompt_version": "text", "tool_registry_version": "text", "config_version": "text", "presentation_hint": "text",
 		"idempotency_key": "text", "request_hash": "text", "state": "text", "objective_revision": "bigint",
 		"input_revision": "bigint", "consumed_input_revision": "bigint", "input": "json", "ready_at": "timestamp with time zone",
@@ -118,6 +119,7 @@ var requiredDefaults = map[string]string{
 	"coordinator_delivery_shards.updated_at":    `CURRENT_TIMESTAMP`,
 	"handoffs.priority":                         `0`,
 	"handoffs.tool_allowlist":                   `'[]'::json`,
+	"handoffs.tool_policy":                      `'{"web_search": {"region": "wt-wt", "enabled": false, "timeout_ms": 8000, "max_results": 5, "safe_search": "moderate"}}'::jsonb`,
 	"handoffs.presentation_hint":                `''::text`,
 	"handoffs.state":                            `'pending'::text`,
 	"handoffs.objective_revision":               `0`,
@@ -219,7 +221,7 @@ func TestSchemaMigrationLifecycle(t *testing.T) {
 
 	version, dirty, err := migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
-	assert.Equal(t, uint(7), version)
+	assert.Equal(t, uint(8), version)
 	assert.False(t, dirty)
 	var journalPresent bool
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
@@ -241,6 +243,13 @@ func TestSchemaMigrationLifecycle(t *testing.T) {
 	}
 	require.NoError(t, migrations.Down(t.Context(), pool))
 	require.NoError(t, migrations.Up(t.Context(), pool))
+	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
+	version, dirty, err = migrations.Version(t.Context(), pool)
+	require.NoError(t, err)
+	assert.Equal(t, uint(7), version)
+	assert.False(t, dirty)
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
+	assert.True(t, journalPresent)
 	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
 	version, dirty, err = migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
@@ -283,9 +292,43 @@ func TestSchemaMigrationLifecycle(t *testing.T) {
 	assert.False(t, dirty)
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
 	assert.False(t, journalPresent)
-	require.NoError(t, migrations.Steps(t.Context(), pool, 6))
+	require.NoError(t, migrations.Steps(t.Context(), pool, 7))
 	require.NoError(t, migrations.Steps(t.Context(), pool, 0))
 	require.NoError(t, migrations.Check(t.Context(), pool))
+}
+
+func TestSchemaHandoffToolPolicyV8UpDownUpIsExactAndRefusesDataLoss(t *testing.T) {
+	pool := migratedPostgres(t)
+	insertConversation(t, pool, "tenant-v8", "conversation-v8")
+	require.NoError(t, insertHandoff(t, pool, "tenant-v8", "conversation-v8", "handoff-v8", "idem-v8"))
+
+	const defaultPolicy = `{"web_search":{"enabled":false,"safe_search":"moderate","region":"wt-wt","max_results":5,"timeout_ms":8000}}`
+	var exact bool
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT tool_policy=$1::jsonb FROM handoffs WHERE id='handoff-v8'`, defaultPolicy).Scan(&exact))
+	assert.True(t, exact)
+
+	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
+	var columnPresent bool
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT EXISTS (
+		SELECT 1 FROM information_schema.columns
+		WHERE table_schema=current_schema() AND table_name='handoffs' AND column_name='tool_policy'
+	)`).Scan(&columnPresent))
+	assert.False(t, columnPresent)
+	require.NoError(t, migrations.Steps(t.Context(), pool, 1))
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT tool_policy=$1::jsonb FROM handoffs WHERE id='handoff-v8'`, defaultPolicy).Scan(&exact))
+	assert.True(t, exact)
+
+	const enabledPolicy = `{"web_search":{"enabled":true,"safe_search":"strict","region":"cn-zh","max_results":2,"timeout_ms":3000}}`
+	_, err := pool.Exec(t.Context(), `UPDATE handoffs SET tool_policy=$1::jsonb WHERE id='handoff-v8'`, enabledPolicy)
+	require.NoError(t, err)
+	err = migrations.Steps(t.Context(), pool, -1)
+	require.ErrorIs(t, err, migrations.ErrHandoffToolPolicyDataLoss)
+	version, dirty, versionErr := migrations.Version(t.Context(), pool)
+	require.NoError(t, versionErr)
+	assert.Equal(t, uint(8), version)
+	assert.False(t, dirty)
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT tool_policy=$1::jsonb FROM handoffs WHERE id='handoff-v8'`, enabledPolicy).Scan(&exact))
+	assert.True(t, exact)
 }
 
 func TestSchemaTask20RuntimeFlagsV4UpDownUpPreservesPriorDurableRowsAndTriggers(t *testing.T) {

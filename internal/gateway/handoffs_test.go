@@ -19,6 +19,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
 	"github.com/chuanmingliu/openai-gpt-live/internal/session"
 	"github.com/chuanmingliu/openai-gpt-live/internal/store/postgres"
+	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -113,9 +114,11 @@ func validHandoffWork() HandoffWork {
 		CallID: "call-1", ResponseID: "response-1", ToolName: handoff.ToolStartBackgroundTask,
 		Arguments: json.RawMessage(`{"objective":"validated objective"}`),
 		Turn:      identity.TurnKey{ID: "turn-1", Revision: 2}, Transcript: "trusted transcript",
+		ToolPolicy: mustGatewayToolPolicy(toolpolicy.DefaultPolicy()),
 		Snapshot: SessionHandoffSnapshot{
 			ContextRef: "context://trusted", ContextHash: "hash-trusted", Deadline: time.Now().Add(time.Hour),
-			TokenBudget: 99, Priority: 4, ToolAllowlist: []string{"search"},
+			TokenBudget: 99, Priority: 4, ToolAllowlist: []string{"search", toolpolicy.WebSearchTool},
+			ToolPolicy:       mustGatewayToolPolicy(toolpolicy.DefaultPolicy()),
 			ApprovalPolicy:   json.RawMessage(`{"mode":"strict"}`),
 			Versions:         handoff.Versions{Model: "m", Prompt: "p", ToolRegistry: "t", Config: "c"},
 			PresentationHint: "server-policy",
@@ -130,7 +133,9 @@ func TestHandoffCoordinatorUsesTrustedWorkAndSnapshotThenSubmitsAcceptance(t *te
 	work := validHandoffWork()
 	require.NoError(t, coordinator.Enqueue(work))
 	work.Arguments[14] = 'X'
+	work.ToolPolicy[0] = '['
 	work.Snapshot.ToolAllowlist[0] = "attacker"
+	work.Snapshot.ToolPolicy[0] = '['
 	work.Snapshot.ApprovalPolicy[9] = 'X'
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -143,7 +148,8 @@ func TestHandoffCoordinatorUsesTrustedWorkAndSnapshotThenSubmitsAcceptance(t *te
 	assert.Equal(t, "trusted transcript", request.UserRequest)
 	assert.Equal(t, 99, request.TokenBudget)
 	assert.Equal(t, int16(4), request.Priority)
-	assert.Equal(t, []string{"search"}, request.ToolAllowlist)
+	assert.Equal(t, []string{"search", toolpolicy.WebSearchTool}, request.ToolAllowlist)
+	assert.Equal(t, mustGatewayToolPolicy(toolpolicy.DefaultPolicy()), request.ToolPolicy)
 	assert.JSONEq(t, `{"mode":"strict"}`, string(request.ApprovalPolicy))
 	assert.Equal(t, "server-policy", request.PresentationHint)
 	assert.NotEmpty(t, request.IdempotencyKey)
@@ -154,6 +160,44 @@ func TestHandoffCoordinatorUsesTrustedWorkAndSnapshotThenSubmitsAcceptance(t *te
 	assert.Equal(t, work.CallID, accepted.CallID)
 	cancel()
 	require.NoError(t, <-done)
+}
+
+func TestHandoffCoordinatorIntersectsDisabledPolicyWithImmutableToolCatalog(t *testing.T) {
+	service := &handoffServiceFake{creates: make(chan handoff.CreateRequest, 1), result: handoff.Snapshot{ID: "handoff-disabled-policy"}}
+	submit := &submitterFake{inputs: make(chan session.Input, 1)}
+	coordinator := NewHandoffCoordinator(service, submit, 1)
+	work := validHandoffWork()
+	disabled := toolpolicy.DefaultPolicy()
+	disabled.WebSearch.Enabled = false
+	work.ToolPolicy = mustGatewayToolPolicy(disabled)
+	require.NoError(t, coordinator.Enqueue(work))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- coordinator.Run(ctx) }()
+	request := <-service.creates
+	assert.Equal(t, []string{"search"}, request.ToolAllowlist)
+	assert.Equal(t, mustGatewayToolPolicy(disabled), request.ToolPolicy)
+	cancel()
+	require.NoError(t, <-done)
+}
+
+func TestHandoffCoordinatorBoundsToolPolicyBytes(t *testing.T) {
+	coordinator := NewHandoffCoordinator(&handoffServiceFake{}, &submitterFake{}, 1)
+	work := validHandoffWork()
+	work.ToolPolicy = json.RawMessage(bytes.Repeat([]byte{'x'}, (64<<10)+1))
+	assert.ErrorIs(t, coordinator.Enqueue(work), ErrCoordinatorWorkTooLarge)
+}
+
+func TestHandoffWorkRetainedBytesIncludeBothToolPolicyCopies(t *testing.T) {
+	work := validHandoffWork()
+	baseline, err := validateHandoffWorkBounds(work)
+	require.NoError(t, err)
+	work.ToolPolicy = append(work.ToolPolicy, ' ')
+	work.Snapshot.ToolPolicy = append(work.Snapshot.ToolPolicy, ' ')
+	withPolicyPadding, err := validateHandoffWorkBounds(work)
+	require.NoError(t, err)
+	assert.Equal(t, baseline+2, withPolicyPadding)
 }
 
 func TestHandoffCoordinatorRejectsAdversarialArgumentsAndOverflow(t *testing.T) {
@@ -817,6 +861,14 @@ func mustCanonicalHandoffWork(t *testing.T, work HandoffWork) HandoffWork {
 	canonical, err := canonicalizeHandoffWork(work)
 	require.NoError(t, err)
 	return canonical
+}
+
+func mustGatewayToolPolicy(policy toolpolicy.Policy) json.RawMessage {
+	raw, err := toolpolicy.MarshalCanonical(policy)
+	if err != nil {
+		panic(err)
+	}
+	return raw
 }
 
 func applyGatewayReactor(t *testing.T, reactor *session.Reactor, input session.Input) []session.Effect {

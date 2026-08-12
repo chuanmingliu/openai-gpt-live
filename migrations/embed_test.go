@@ -88,6 +88,49 @@ func TestCoordinatorDeliveryShardMigrationEmbeddedChecksums(t *testing.T) {
 	}
 }
 
+func TestHandoffToolPolicyMigrationCatalogIsExact(t *testing.T) {
+	assert.Equal(t, uint(8), latestVersion)
+	wantChecksums := map[string]string{
+		"000008_handoff_tool_policy.up.sql":   "1d8c8b02aeb778c6f7dd773e202af3385c7898f1ec597109b35452377adc2af7",
+		"000008_handoff_tool_policy.down.sql": "a58d92d73037821a1358840f786f81ac006c04dc17675bde52ac2765607e1697",
+	}
+	for name, checksum := range wantChecksums {
+		contents, err := files.ReadFile(name)
+		require.NoError(t, err)
+		digest := sha256.Sum256(contents)
+		assert.Equal(t, checksum, hex.EncodeToString(digest[:]), name)
+	}
+	up, err := files.ReadFile("000008_handoff_tool_policy.up.sql")
+	require.NoError(t, err)
+	down, err := files.ReadFile("000008_handoff_tool_policy.down.sql")
+	require.NoError(t, err)
+	assert.Equal(t, `ALTER TABLE handoffs
+    ADD COLUMN tool_policy JSONB NOT NULL
+    DEFAULT '{"web_search":{"enabled":false,"safe_search":"moderate","region":"wt-wt","max_results":5,"timeout_ms":8000}}'::JSONB;
+`, string(up))
+	assert.Equal(t, `LOCK TABLE handoffs IN ACCESS EXCLUSIVE MODE;
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM handoffs
+        WHERE tool_policy <> '{"web_search":{"enabled":false,"safe_search":"moderate","region":"wt-wt","max_results":5,"timeout_ms":8000}}'::JSONB
+    ) THEN
+        RAISE EXCEPTION 'handoff tool policy downgrade would lose non-default data' USING ERRCODE = '55000';
+    END IF;
+END;
+$$;
+
+ALTER TABLE handoffs DROP COLUMN tool_policy;
+`, string(down))
+}
+
+func TestHandoffToolPolicyDataLossRefusalClassificationIsExact(t *testing.T) {
+	assert.True(t, isHandoffToolPolicyDataLossRefusal(&pgconn.PgError{Code: "55000", Message: ErrHandoffToolPolicyDataLoss.Error()}))
+	assert.False(t, isHandoffToolPolicyDataLossRefusal(&pgconn.PgError{Code: "57014", Message: ErrHandoffToolPolicyDataLoss.Error()}))
+	assert.False(t, isHandoffToolPolicyDataLossRefusal(&pgconn.PgError{Code: "55000", Message: "arbitrary prerequisite failure"}))
+}
+
 func TestCoordinatorPendingRefusalClassificationIsExact(t *testing.T) {
 	assert.True(t, isCoordinatorPendingRefusal(&pgconn.PgError{Code: "55000", Message: ErrCoordinatorPendingWork.Error()}))
 	assert.False(t, isCoordinatorPendingRefusal(&pgconn.PgError{Code: "57014", Message: ErrCoordinatorPendingWork.Error()}))

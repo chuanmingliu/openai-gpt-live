@@ -27,6 +27,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/session"
 	"github.com/chuanmingliu/openai-gpt-live/internal/store/postgres"
 	"github.com/chuanmingliu/openai-gpt-live/internal/testkit"
+	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 	transportws "github.com/chuanmingliu/openai-gpt-live/internal/transport/ws"
 	"github.com/coder/websocket"
 	"github.com/stretchr/testify/assert"
@@ -260,7 +261,8 @@ func TestDurableDispatcherBuildsScopeOnlyFromTrustedManagerContext(t *testing.T)
 	require.NoError(t, dispatcher.DispatchHandoff(t.Context(), trusted, session.HandoffRequestedEffect{
 		OriginEpoch: 3, Turn: identity.TurnKey{ID: "trusted-turn", Revision: 1}, Transcript: "trusted transcript",
 		ResponseID: "response", CallID: "call", ToolName: handoff.ToolCancelBackgroundTask,
-		Arguments: json.RawMessage(`{"handoff_id":"h-1"}`),
+		Arguments:  json.RawMessage(`{"handoff_id":"h-1"}`),
+		ToolPolicy: toolpolicy.DefaultPolicy(),
 	}))
 	queued := <-handoffs.work
 	assert.Equal(t, "trusted-tenant", queued.Scope.TenantID)
@@ -268,6 +270,7 @@ func TestDurableDispatcherBuildsScopeOnlyFromTrustedManagerContext(t *testing.T)
 	assert.Equal(t, identity.ConversationID("trusted-conversation"), queued.Scope.ConversationID)
 	assert.Equal(t, identity.SessionID("trusted-session"), queued.SessionID)
 	assert.Equal(t, identity.Incarnation(7), queued.Incarnation)
+	assert.Equal(t, mustGatewayToolPolicy(toolpolicy.DefaultPolicy()), queued.ToolPolicy)
 	assert.Equal(t, snapshot, queued.Snapshot)
 }
 

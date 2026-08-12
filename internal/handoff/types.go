@@ -27,6 +27,7 @@ type CreateRequest struct {
 	TokenBudget      int
 	Priority         int16
 	ToolAllowlist    []string
+	ToolPolicy       json.RawMessage
 	ApprovalPolicy   json.RawMessage
 	Versions         Versions
 	PresentationHint string
@@ -172,6 +173,7 @@ func cloneRequest(in CreateRequest) CreateRequest {
 	if in.ToolAllowlist != nil {
 		out.ToolAllowlist = append([]string{}, in.ToolAllowlist...)
 	}
+	out.ToolPolicy = cloneBytes(in.ToolPolicy)
 	out.ApprovalPolicy = cloneBytes(in.ApprovalPolicy)
 	return out
 }

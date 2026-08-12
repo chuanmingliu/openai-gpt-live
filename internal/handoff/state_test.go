@@ -8,9 +8,61 @@ import (
 	"time"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
+	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestNormalizeCreateRequestCanonicalizesToolPolicy(t *testing.T) {
+	request := validCreateRequest(time.Now().UTC())
+	request.ToolAllowlist = append(request.ToolAllowlist, toolpolicy.WebSearchTool)
+	request.ToolPolicy = json.RawMessage(`{"web_search":{"timeout_ms":8000,"max_results":5,"region":"wt-wt","safe_search":"moderate","enabled":true}}`)
+
+	normalized, err := NormalizeCreateRequest(request)
+	require.NoError(t, err)
+	assert.Equal(t, json.RawMessage(`{"web_search":{"enabled":true,"safe_search":"moderate","region":"wt-wt","max_results":5,"timeout_ms":8000}}`), normalized.ToolPolicy)
+}
+
+func TestNormalizeCreateRequestRejectsPolicyNotInAllowlist(t *testing.T) {
+	request := validCreateRequest(time.Now().UTC())
+	request.ToolAllowlist = nil
+	request.ToolPolicy = mustPolicyJSON(t, enabledPolicy())
+
+	_, err := NormalizeCreateRequest(request)
+	assert.ErrorIs(t, err, ErrInvalidRequest)
+}
+
+func TestNormalizeCreateRequestRejectsAllowlistedToolDisabledByPolicy(t *testing.T) {
+	request := validCreateRequest(time.Now().UTC())
+	request.ToolAllowlist = append(request.ToolAllowlist, toolpolicy.WebSearchTool)
+	policy := enabledPolicy()
+	policy.WebSearch.Enabled = false
+	request.ToolPolicy = mustPolicyJSON(t, policy)
+
+	_, err := NormalizeCreateRequest(request)
+	assert.ErrorIs(t, err, ErrInvalidRequest)
+}
+
+func TestCanonicalRequestHashCoversToolPolicy(t *testing.T) {
+	request := validCreateRequest(time.Now().UTC())
+	disabledHash, err := CanonicalRequestHash(request)
+	require.NoError(t, err)
+
+	stricterPolicy := enabledPolicy()
+	stricterPolicy.WebSearch.Enabled = false
+	stricterPolicy.WebSearch.SafeSearch = toolpolicy.SafeSearchStrict
+	request.ToolPolicy = mustPolicyJSON(t, stricterPolicy)
+	stricterHash, err := CanonicalRequestHash(request)
+	require.NoError(t, err)
+	assert.NotEqual(t, disabledHash, stricterHash)
+}
+
+func TestCloneSnapshotDeepCopiesToolPolicy(t *testing.T) {
+	original := Snapshot{Request: validCreateRequest(time.Now().UTC())}
+	cloned := CloneSnapshot(original)
+	cloned.Request.ToolPolicy[0] = '['
+	assert.Equal(t, byte('{'), original.Request.ToolPolicy[0])
+}
 
 func TestValidateTransition_AllOrderedPairs(t *testing.T) {
 	states := []State{StatePending, StateLeased, StateRunning, StateNeedsInput, StateSucceeded, StateFailed, StateCancelled, StateExpired}
@@ -475,11 +527,14 @@ func TestStableSentinelsSupportErrorsIs(t *testing.T) {
 }
 
 func validCreateRequest(now time.Time) CreateRequest {
+	disabledPolicy := enabledPolicy()
+	disabledPolicy.WebSearch.Enabled = false
 	return CreateRequest{
 		Scope:     Scope{TenantID: "tenant-1", UserID: "user-1", ConversationID: "conversation-1"},
 		SessionID: "session-1", SourceTurn: identity.TurnKey{ID: "turn-1", Revision: 3},
 		UserRequest: "research this", Objective: "produce a report", ContextRef: "context://one", ContextHash: "sha256:context",
 		Deadline: now.Add(time.Hour), TokenBudget: 2048, Priority: 5, ToolAllowlist: []string{"read", "search"},
+		ToolPolicy:       mustPolicyJSONWithoutTest(disabledPolicy),
 		ApprovalPolicy:   json.RawMessage(`{"mode":"ask"}`),
 		Versions:         Versions{Model: "model-1", Prompt: "prompt-1", ToolRegistry: "tools-1", Config: "config-1"},
 		PresentationHint: "brief", IdempotencyKey: "idem-1",
@@ -488,8 +543,28 @@ func validCreateRequest(now time.Time) CreateRequest {
 
 func cloneCreateRequest(in CreateRequest) CreateRequest {
 	in.ToolAllowlist = append([]string(nil), in.ToolAllowlist...)
+	in.ToolPolicy = append(json.RawMessage(nil), in.ToolPolicy...)
 	in.ApprovalPolicy = append(json.RawMessage(nil), in.ApprovalPolicy...)
 	return in
+}
+
+func enabledPolicy() toolpolicy.Policy {
+	return toolpolicy.DefaultPolicy()
+}
+
+func mustPolicyJSON(t *testing.T, policy toolpolicy.Policy) json.RawMessage {
+	t.Helper()
+	raw, err := toolpolicy.MarshalCanonical(policy)
+	require.NoError(t, err)
+	return raw
+}
+
+func mustPolicyJSONWithoutTest(policy toolpolicy.Policy) json.RawMessage {
+	raw, err := toolpolicy.MarshalCanonical(policy)
+	if err != nil {
+		panic(err)
+	}
+	return raw
 }
 
 func makeToolNames(n int) []string {

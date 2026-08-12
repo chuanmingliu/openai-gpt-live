@@ -15,6 +15,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
+	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 	"github.com/chuanmingliu/openai-gpt-live/internal/worker"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -29,17 +30,42 @@ func (i integrationHandoffIDs) NewHandoffID() identity.HandoffID { return i.hand
 func (i integrationHandoffIDs) NewEventID() string               { return i.eventID }
 
 func validCreateRecord(scope handoff.Scope, suffix string) handoff.CreateRecord {
+	policy := toolpolicy.DefaultPolicy()
+	policy.WebSearch.Enabled = false
+	toolPolicy, _ := toolpolicy.MarshalCanonical(policy)
 	request := handoff.CreateRequest{
 		Scope: scope, SessionID: identity.SessionID("session-" + suffix), SourceTurn: identity.TurnKey{ID: "turn-" + suffix, Revision: 2},
 		UserRequest: "remember exact request", Objective: "perform durable work", ContextRef: "context://" + suffix,
 		ContextHash: "sha256:context-" + suffix, Deadline: repositoryTestNow.Add(time.Hour), TokenBudget: 4096, Priority: 12,
-		ToolAllowlist: []string{"fetch", "search"}, ApprovalPolicy: json.RawMessage(`{"mode":"ask"}`),
+		ToolAllowlist: []string{"fetch", "search"}, ToolPolicy: toolPolicy, ApprovalPolicy: json.RawMessage(`{"mode":"ask"}`),
 		Versions:         handoff.Versions{Model: "model-v1", Prompt: "prompt-v2", ToolRegistry: "tools-v3", Config: "config-v4"},
 		PresentationHint: "compact", IdempotencyKey: "create-" + suffix,
 	}
 	hash, _ := handoff.CanonicalRequestHash(request)
 	return handoff.CreateRecord{HandoffID: identity.HandoffID("handoff-" + suffix), EventID: "event-" + suffix,
 		Request: request, RequestHash: hash, CreatedAt: repositoryTestNow}
+}
+
+func TestHandoffRoundTripPreservesExactToolPolicy(t *testing.T) {
+	repo, pool, _ := repositoryHarness(t)
+	scope := testScope("tenant-tool-policy", "conversation-tool-policy")
+	insertConversation(t, pool, scope)
+	record := prepareCreate(t, repo, scope, "tool-policy")
+	record.Request.ToolAllowlist = append(record.Request.ToolAllowlist, toolpolicy.WebSearchTool)
+	record.Request.ToolPolicy, _ = toolpolicy.MarshalCanonical(toolpolicy.DefaultPolicy())
+	record.RequestHash, _ = handoff.CanonicalRequestHash(record.Request)
+
+	created, wasCreated, err := repo.CreateHandoff(t.Context(), record)
+	require.NoError(t, err)
+	require.True(t, wasCreated)
+	loaded, err := repo.GetHandoff(t.Context(), record.Request.Scope, created.ID)
+	require.NoError(t, err)
+	assert.Equal(t, string(record.Request.ToolPolicy), string(loaded.Request.ToolPolicy))
+	steered, err := repo.SteerHandoff(t.Context(), record.Request.Scope, created.ID, handoff.SteerRequest{
+		Objective: "refined objective", ExpectedRevision: 1, Actor: record.Request.Scope.UserID, IdempotencyKey: "steer-tool-policy",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, string(record.Request.ToolPolicy), string(steered.Request.ToolPolicy))
 }
 
 func prepareCreate(t *testing.T, repo *Repository, scope handoff.Scope, suffix string) handoff.CreateRecord {

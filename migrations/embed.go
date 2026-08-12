@@ -20,7 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const latestVersion uint = 7
+const latestVersion uint = 8
 
 const (
 	migrationCancelTimeout     = 2 * time.Second
@@ -33,6 +33,7 @@ var migrationRunnerSequence atomic.Uint64
 
 var ErrCoordinatorPendingWork = errors.New("coordinator journal contains undelivered replay work")
 var ErrToolInvocationScopeConflict = errors.New("tool invocation rows conflict under legacy scope")
+var ErrHandoffToolPolicyDataLoss = errors.New("handoff tool policy downgrade would lose non-default data")
 
 //go:embed *.sql
 var files embed.FS
@@ -307,6 +308,12 @@ func (d *cancellablePGXDriver) Run(migration io.Reader) error {
 	}
 	if _, err := tx.Exec(d.ctx, string(statement)); err != nil {
 		_ = tx.Rollback(context.Background())
+		if isHandoffToolPolicyDataLossRefusal(err) {
+			if recoveryErr := d.recoverHandoffToolPolicyDataLossRefusal(); recoveryErr != nil {
+				return errors.Join(err, fmt.Errorf("recover handoff tool policy downgrade refusal: %w", recoveryErr))
+			}
+			return errors.Join(ErrHandoffToolPolicyDataLoss, err)
+		}
 		if isToolInvocationScopeRefusal(err) {
 			if recoveryErr := d.recoverToolInvocationScopeRefusal(); recoveryErr != nil {
 				return errors.Join(err, fmt.Errorf("recover tool invocation scope downgrade refusal: %w", recoveryErr))
@@ -322,6 +329,11 @@ func (d *cancellablePGXDriver) Run(migration io.Reader) error {
 		return err
 	}
 	return tx.Commit(d.ctx)
+}
+
+func isHandoffToolPolicyDataLossRefusal(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "55000" && pgErr.Message == ErrHandoffToolPolicyDataLoss.Error()
 }
 
 func isCoordinatorPendingRefusal(err error) bool {
@@ -411,6 +423,35 @@ func (d *cancellablePGXDriver) recoverCoordinatorPendingRefusal() error {
 		return errors.New("coordinator delivery shard fence is absent")
 	}
 	return d.SetVersion(7, false)
+}
+
+func (d *cancellablePGXDriver) recoverHandoffToolPolicyDataLossRefusal() error {
+	if d.ctx == nil || d.ctx.Err() != nil {
+		return errors.New("migration context is not active")
+	}
+	version, dirty, err := d.Version()
+	if err != nil {
+		return err
+	}
+	if version != 7 || !dirty {
+		return fmt.Errorf("unexpected migration state version=%d dirty=%t", version, dirty)
+	}
+	var policyColumnPresent, nonDefaultPolicyPresent bool
+	if err := d.connection.QueryRow(d.ctx, `SELECT
+		EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema=$1 AND table_name='handoffs' AND column_name='tool_policy'
+		),
+		EXISTS (
+			SELECT 1 FROM handoffs
+			WHERE tool_policy <> '{"web_search":{"enabled":false,"safe_search":"moderate","region":"wt-wt","max_results":5,"timeout_ms":8000}}'::jsonb
+		)`, d.schema).Scan(&policyColumnPresent, &nonDefaultPolicyPresent); err != nil {
+		return err
+	}
+	if !policyColumnPresent || !nonDefaultPolicyPresent {
+		return errors.New("handoff tool policy downgrade refusal invariant is absent")
+	}
+	return d.SetVersion(8, false)
 }
 
 func (d *cancellablePGXDriver) SetVersion(version int, dirty bool) error {

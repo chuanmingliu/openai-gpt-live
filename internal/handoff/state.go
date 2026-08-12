@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 )
 
 const (
@@ -130,14 +132,29 @@ func normalizeCreateRequest(request CreateRequest, now time.Time, checkFuture bo
 		seen[name] = struct{}{}
 	}
 	sort.Strings(request.ToolAllowlist)
+	if len(request.ToolPolicy) == 0 {
+		return CreateRequest{}, invalid("tool policy is required", nil)
+	}
+	policy, err := toolpolicy.Decode(request.ToolPolicy)
+	if err != nil {
+		return CreateRequest{}, invalid("tool policy", err)
+	}
+	request.ToolPolicy, err = toolpolicy.MarshalCanonical(policy)
+	if err != nil {
+		return CreateRequest{}, invalid("tool policy", err)
+	}
+	_, webSearchAllowed := seen[toolpolicy.WebSearchTool]
+	if webSearchAllowed != policy.WebSearch.Enabled {
+		return CreateRequest{}, invalid("web search policy and tool allowlist disagree", nil)
+	}
 	if len(request.ApprovalPolicy) == 0 {
 		return CreateRequest{}, invalid("approval policy is required", nil)
 	}
-	policy, err := canonicalJSON(request.ApprovalPolicy, maxJSONBytes, maxJSONDepth)
+	approvalPolicy, err := canonicalJSON(request.ApprovalPolicy, maxJSONBytes, maxJSONDepth)
 	if err != nil {
 		return CreateRequest{}, invalid("approval policy", err)
 	}
-	request.ApprovalPolicy = policy
+	request.ApprovalPolicy = approvalPolicy
 	for name, value := range map[string]string{
 		"model version": request.Versions.Model, "prompt version": request.Versions.Prompt,
 		"tool registry version": request.Versions.ToolRegistry, "config version": request.Versions.Config,
@@ -173,6 +190,7 @@ func CanonicalRequestHash(request CreateRequest) (string, error) {
 		TokenBudget      int             `json:"token_budget"`
 		Priority         int16           `json:"priority"`
 		ToolAllowlist    []string        `json:"tool_allowlist"`
+		ToolPolicy       json.RawMessage `json:"tool_policy"`
 		ApprovalPolicy   json.RawMessage `json:"approval_policy"`
 		Versions         Versions        `json:"versions"`
 		PresentationHint string          `json:"presentation_hint"`
@@ -181,6 +199,7 @@ func CanonicalRequestHash(request CreateRequest) (string, error) {
 		SourceRevision: normalized.SourceTurn.Revision, UserRequest: normalized.UserRequest, Objective: normalized.Objective,
 		ContextRef: normalized.ContextRef, ContextHash: normalized.ContextHash, Deadline: normalized.Deadline.Format(time.RFC3339Nano),
 		TokenBudget: normalized.TokenBudget, Priority: normalized.Priority, ToolAllowlist: normalized.ToolAllowlist,
+		ToolPolicy:     normalized.ToolPolicy,
 		ApprovalPolicy: normalized.ApprovalPolicy, Versions: normalized.Versions, PresentationHint: normalized.PresentationHint,
 	}
 	encoded, err := json.Marshal(canonical)

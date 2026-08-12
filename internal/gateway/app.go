@@ -26,6 +26,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
 	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
 	"github.com/chuanmingliu/openai-gpt-live/internal/session"
+	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 	transportws "github.com/chuanmingliu/openai-gpt-live/internal/transport/ws"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -463,17 +464,26 @@ func (d *durableDispatcher) DispatchHandoff(_ context.Context, trusted session.T
 	if d == nil || d.handoffs == nil {
 		return errors.New("handoff coordinator is unavailable")
 	}
+	policy, err := toolpolicy.MarshalCanonical(effect.ToolPolicy)
+	if err != nil {
+		return errors.New("handoff tool policy is invalid")
+	}
 	return d.handoffs.Enqueue(HandoffWork{
 		SessionID: trusted.IDs.SessionID, Incarnation: trusted.IDs.Incarnation,
 		OriginEpoch: effect.OriginEpoch,
 		Scope:       handoff.Scope{TenantID: trusted.Subject.TenantID, UserID: trusted.Subject.UserID, ConversationID: trusted.IDs.ConversationID},
 		CallID:      effect.CallID, ResponseID: effect.ResponseID, ToolName: effect.ToolName,
 		Arguments: append(json.RawMessage(nil), effect.Arguments...), Turn: effect.Turn,
-		Transcript: effect.Transcript, Snapshot: cloneHandoffSnapshot(d.snapshot), RejectReason: effect.RejectReason,
+		Transcript: effect.Transcript, ToolPolicy: policy, Snapshot: cloneHandoffSnapshot(d.snapshot), RejectReason: effect.RejectReason,
 	})
 }
 
 func validateHandoffSnapshot(snapshot SessionHandoffSnapshot) error {
+	if len(snapshot.ToolPolicy) == 0 {
+		policy := toolpolicy.DefaultPolicy()
+		policy.WebSearch.Enabled = false
+		snapshot.ToolPolicy, _ = toolpolicy.MarshalCanonical(policy)
+	}
 	_, err := handoff.ValidateCreateRequest(handoff.CreateRequest{
 		Scope:     handoff.Scope{TenantID: "snapshot-validation", UserID: "snapshot-validation", ConversationID: "snapshot-validation"},
 		SessionID: "snapshot-validation", SourceTurn: identity.TurnKey{ID: "snapshot-validation", Revision: 1},
@@ -481,6 +491,7 @@ func validateHandoffSnapshot(snapshot SessionHandoffSnapshot) error {
 		ContextRef: snapshot.ContextRef, ContextHash: snapshot.ContextHash, Deadline: snapshot.Deadline,
 		TokenBudget: snapshot.TokenBudget, Priority: snapshot.Priority,
 		ToolAllowlist:  append([]string(nil), snapshot.ToolAllowlist...),
+		ToolPolicy:     append(json.RawMessage(nil), snapshot.ToolPolicy...),
 		ApprovalPolicy: append(json.RawMessage(nil), snapshot.ApprovalPolicy...),
 		Versions:       snapshot.Versions, PresentationHint: snapshot.PresentationHint,
 		IdempotencyKey: "snapshot-validation",

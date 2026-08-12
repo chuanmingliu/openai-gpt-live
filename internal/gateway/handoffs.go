@@ -19,6 +19,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/session"
 	"github.com/chuanmingliu/openai-gpt-live/internal/store/postgres"
+	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -34,6 +35,7 @@ type HandoffWork struct {
 	Arguments    json.RawMessage
 	Turn         identity.TurnKey
 	Transcript   string
+	ToolPolicy   json.RawMessage
 	Snapshot     SessionHandoffSnapshot
 	RejectReason string
 	queuedAt     time.Time
@@ -46,6 +48,7 @@ type SessionHandoffSnapshot struct {
 	TokenBudget      int
 	Priority         int16
 	ToolAllowlist    []string
+	ToolPolicy       json.RawMessage
 	ApprovalPolicy   json.RawMessage
 	Versions         handoff.Versions
 	PresentationHint string
@@ -429,6 +432,10 @@ func canonicalizeHandoffWork(work HandoffWork) (HandoffWork, error) {
 		return HandoffWork{}, err
 	}
 	work.Arguments = canonical
+	work.ToolPolicy, _, err = canonicalToolPolicy(work.ToolPolicy)
+	if err != nil {
+		return HandoffWork{}, err
+	}
 	if _, err := validateHandoffWorkBounds(work); err != nil {
 		return HandoffWork{}, err
 	}
@@ -469,12 +476,18 @@ func (c *HandoffCoordinator) process(appCtx context.Context, work HandoffWork) (
 			completion.Reason = "invalid_reserved_tool"
 			return completion, nil
 		}
+		canonicalPolicy, policy, policyErr := canonicalToolPolicy(work.ToolPolicy)
+		if policyErr != nil {
+			completion.Reason = "handoff_rejected"
+			return completion, nil
+		}
 		request := handoff.CreateRequest{
 			Scope: work.Scope, SessionID: work.SessionID, SourceTurn: work.Turn,
 			UserRequest: work.Transcript, Objective: args.Objective,
 			ContextRef: work.Snapshot.ContextRef, ContextHash: work.Snapshot.ContextHash,
 			Deadline: work.Snapshot.Deadline.UTC(), TokenBudget: work.Snapshot.TokenBudget,
-			Priority: work.Snapshot.Priority, ToolAllowlist: cloneStringSlice(work.Snapshot.ToolAllowlist),
+			Priority: work.Snapshot.Priority, ToolAllowlist: toolAllowlistForPolicy(work.Snapshot.ToolAllowlist, policy),
+			ToolPolicy:     canonicalPolicy,
 			ApprovalPolicy: append(json.RawMessage(nil), work.Snapshot.ApprovalPolicy...),
 			Versions:       work.Snapshot.Versions, PresentationHint: work.Snapshot.PresentationHint,
 			IdempotencyKey: handoffIdempotencyKey(work, canonical),
@@ -556,7 +569,9 @@ func handoffIdempotencyKey(work HandoffWork, canonical []byte) string {
 
 func cloneHandoffWork(work HandoffWork) HandoffWork {
 	work.Arguments = append(json.RawMessage(nil), work.Arguments...)
+	work.ToolPolicy = append(json.RawMessage(nil), work.ToolPolicy...)
 	work.Snapshot.ToolAllowlist = cloneStringSlice(work.Snapshot.ToolAllowlist)
+	work.Snapshot.ToolPolicy = append(json.RawMessage(nil), work.Snapshot.ToolPolicy...)
 	work.Snapshot.ApprovalPolicy = append(json.RawMessage(nil), work.Snapshot.ApprovalPolicy...)
 	return work
 }
@@ -570,8 +585,31 @@ func cloneStringSlice(values []string) []string {
 
 func cloneHandoffSnapshot(snapshot SessionHandoffSnapshot) SessionHandoffSnapshot {
 	snapshot.ToolAllowlist = cloneStringSlice(snapshot.ToolAllowlist)
+	snapshot.ToolPolicy = append(json.RawMessage(nil), snapshot.ToolPolicy...)
 	snapshot.ApprovalPolicy = append(json.RawMessage(nil), snapshot.ApprovalPolicy...)
 	return snapshot
+}
+
+func canonicalToolPolicy(raw json.RawMessage) (json.RawMessage, toolpolicy.Policy, error) {
+	policy, err := toolpolicy.Decode(raw)
+	if err != nil {
+		return nil, toolpolicy.Policy{}, err
+	}
+	canonical, err := toolpolicy.MarshalCanonical(policy)
+	if err != nil {
+		return nil, toolpolicy.Policy{}, err
+	}
+	return canonical, policy, nil
+}
+
+func toolAllowlistForPolicy(catalog []string, policy toolpolicy.Policy) []string {
+	allowed := make([]string, 0, len(catalog))
+	for _, tool := range catalog {
+		if tool != toolpolicy.WebSearchTool || policy.WebSearch.Enabled {
+			allowed = append(allowed, tool)
+		}
+	}
+	return allowed
 }
 
 func boundedReason(reason string) string {
@@ -586,7 +624,7 @@ func validateHandoffWorkBounds(work HandoffWork) (int, error) {
 		string(work.SessionID), work.Scope.TenantID, work.Scope.UserID, string(work.Scope.ConversationID),
 		work.CallID, work.ResponseID, work.ToolName,
 	}
-	retained := len(work.Arguments) + len(work.Transcript) + len(work.Snapshot.ApprovalPolicy)
+	retained := len(work.Arguments) + len(work.Transcript) + len(work.ToolPolicy) + len(work.Snapshot.ToolPolicy) + len(work.Snapshot.ApprovalPolicy)
 	for _, value := range stringsToCheck {
 		if strings.TrimSpace(value) == "" || !utf8.ValidString(value) || len(value) > session.DurableIdentifierBytes {
 			return 0, ErrCoordinatorWorkTooLarge
@@ -596,7 +634,8 @@ func validateHandoffWorkBounds(work HandoffWork) (int, error) {
 	if work.Incarnation == 0 || work.OriginEpoch == 0 ||
 		len(work.Arguments) == 0 || len(work.Arguments) > session.DurableArgumentsBytes ||
 		len(work.Transcript) > session.DurableTranscriptBytes || !utf8.ValidString(work.Transcript) ||
-		len(work.Snapshot.ApprovalPolicy) > 64<<10 || len(work.Snapshot.ToolAllowlist) > 64 {
+		len(work.ToolPolicy) == 0 || len(work.ToolPolicy) > 64<<10 ||
+		len(work.Snapshot.ToolPolicy) > 64<<10 || len(work.Snapshot.ApprovalPolicy) > 64<<10 || len(work.Snapshot.ToolAllowlist) > 64 {
 		return 0, ErrCoordinatorWorkTooLarge
 	}
 	if work.RejectReason == "" {
