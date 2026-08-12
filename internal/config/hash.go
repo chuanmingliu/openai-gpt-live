@@ -141,7 +141,7 @@ func Canonical(cfg Config) ([]byte, error) {
 		return nil, err
 	}
 	retention := effectiveRetention(cfg.Store.Retention)
-	tools := cfg.ToolCatalog()
+	tools := effectiveToolCatalog(cfg.Tools).WebSearch
 	c := canonicalConfig{
 		Version: HashVersion, Mode: cfg.Mode,
 		Gateway:   canonicalGateway{AdvertisedModel: cfg.Gateway.AdvertisedModel, ListenAddr: cfg.Gateway.ListenAddr, BehindIngress: cfg.Gateway.BehindIngress, TrustedProxies: sorted(cfg.Gateway.TrustedProxies), VoiceProvider: cfg.Gateway.Voice.Provider, VoiceURL: safeURL(cfg.Gateway.Voice.URL), VoiceModel: cfg.Gateway.Voice.Model, Audio: cfg.Gateway.Audio, Session: cfg.Gateway.Session, WebSocket: cfg.Gateway.WebSocket, ProviderRetry: cfg.Gateway.ProviderRetry, StorageGrace: cfg.Gateway.StorageGrace, Reconnect: canonicalReconnect{MaxRetries: cfg.Gateway.Reconnect.MaxRetries, RetryBase: cfg.Gateway.Reconnect.RetryBase, RetryMax: cfg.Gateway.Reconnect.RetryMax, HMACKeyID: cfg.Gateway.Reconnect.HMACKeyID, CredentialTTL: cfg.Gateway.Reconnect.CredentialTTL}},
@@ -151,7 +151,7 @@ func Canonical(cfg Config) ([]byte, error) {
 		Safety:    canonicalSafety{PolicyVersion: cfg.Safety.PolicyVersion, Mode: cfg.Safety.Mode, MaxInputBytes: cfg.Safety.MaxInputBytes, MaxSummaryBytes: cfg.Safety.MaxSummaryBytes, MaxStructuredBytes: cfg.Safety.MaxStructuredBytes, RedactedSummary: cfg.Safety.RedactedSummary, ClarificationPrompt: cfg.Safety.ClarificationPrompt, RedactionDeniedKeys: sorted(cfg.Safety.RedactionDeniedKeys)},
 		Telemetry: canonicalTelemetry{OTLPEndpoint: safeURL(cfg.Telemetry.OTLPEndpoint), ServiceName: cfg.Telemetry.ServiceName, Protocol: cfg.Telemetry.Protocol, ExportTimeout: cfg.Telemetry.ExportTimeout}, Shutdown: cfg.Shutdown, Admin: cfg.Admin,
 		Features:  canonicalFeatures{SideEffectingTools: cfg.Features.SideEffectingTools, ToolEncryptionKeyID: cfg.Features.ToolEncryptionKeyID, Handoffs: cfg.Features.Handoffs, RefreshInterval: featureRefreshInterval(cfg)},
-		Tools:     canonicalToolCatalog{WebSearch: canonicalWebSearchTool{Enabled: tools.WebSearch.Enabled, ForceStrict: tools.WebSearch.ForceStrict, Regions: tools.WebSearch.Regions, MaximumResults: tools.WebSearch.MaximumResults, MaximumTimeoutMS: tools.WebSearch.MaximumTimeoutMS}},
+		Tools:     canonicalToolCatalog{WebSearch: canonicalWebSearchTool{Enabled: tools.Enabled, ForceStrict: tools.ForceStrict, Regions: tools.Regions, MaximumResults: tools.MaxResults, MaximumTimeoutMS: int(tools.Timeout / time.Millisecond)}},
 		Retention: canonicalRetention{ConversationTTL: retention.ConversationTTL, SweepInterval: retention.SweepInterval, DeletionBatch: retention.DeletionBatch, ApprovalTTL: retention.ApprovalTTL, HMACKeyID: retention.HMACKeyID}, StoreURL: safeStoreURL(cfg.Store.URL),
 	}
 	return json.Marshal(c)

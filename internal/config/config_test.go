@@ -116,6 +116,26 @@ func TestDevelopmentDurableRequiresDurablePrerequisites(t *testing.T) {
 	}
 }
 
+func TestDirectConfigWithDisabledZeroValueToolCatalogUsesReviewedDefaults(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.Tools = ToolCatalogConfig{}
+
+	require.NoError(t, cfg.Validate())
+	catalog := cfg.ToolCatalog().WebSearch
+	assert.False(t, catalog.Enabled)
+	assert.Equal(t, []string{"au-en", "ca-en", "cn-zh", "uk-en", "us-en", "wt-wt"}, catalog.Regions)
+	assert.Equal(t, 5, catalog.MaximumResults)
+	assert.Equal(t, 8_000, catalog.MaximumTimeoutMS)
+
+	normalized := cfg
+	normalized.Tools.WebSearch = WebSearchToolConfig{
+		Regions:    []string{"wt-wt", "us-en", "uk-en", "au-en", "ca-en", "cn-zh"},
+		MaxResults: 5,
+		Timeout:    8 * time.Second,
+	}
+	assert.Equal(t, mustHash(t, normalized), mustHash(t, cfg))
+}
+
 // TestLoadAppliesRealtimeDefaults catches a loader regression that leaves realtime
 // queues or PCM sample rate at zero when the operator omits optional limits.
 func TestLoadAppliesRealtimeDefaults(t *testing.T) {

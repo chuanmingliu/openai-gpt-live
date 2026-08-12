@@ -33,6 +33,8 @@ const (
 	defaultReconnectCredentialTTL = 5 * time.Minute
 )
 
+var reviewedWebSearchRegions = []string{"wt-wt", "us-en", "uk-en", "au-en", "ca-en", "cn-zh"}
+
 type Config struct {
 	Mode      string            `yaml:"mode"`
 	Gateway   GatewayConfig     `yaml:"gateway"`
@@ -252,7 +254,7 @@ func (c Config) UsesStaticAuth() bool { return c.Auth.StaticBearerEnv != "" }
 // ToolCatalog projects the YAML configuration into an owned, normalized server
 // catalog. Browser input can only select values inside this catalog.
 func (c Config) ToolCatalog() toolpolicy.Catalog {
-	web := c.Tools.WebSearch
+	web := effectiveToolCatalog(c.Tools).WebSearch
 	return toolpolicy.Catalog{WebSearch: toolpolicy.WebSearchCatalog{
 		Enabled:          web.Enabled,
 		ForceStrict:      web.ForceStrict,
@@ -485,15 +487,7 @@ func (c *Config) applyDefaults() {
 	if c.Features.RefreshInterval == 0 {
 		c.Features.RefreshInterval = time.Second
 	}
-	if len(c.Tools.WebSearch.Regions) == 0 {
-		c.Tools.WebSearch.Regions = []string{"wt-wt", "us-en", "uk-en", "au-en", "ca-en", "cn-zh"}
-	}
-	if c.Tools.WebSearch.MaxResults == 0 {
-		c.Tools.WebSearch.MaxResults = 5
-	}
-	if c.Tools.WebSearch.Timeout == 0 {
-		c.Tools.WebSearch.Timeout = 8 * time.Second
-	}
+	c.Tools = effectiveToolCatalog(c.Tools)
 	if c.Store.Retention.ConversationTTL == 0 {
 		c.Store.Retention.ConversationTTL = 30 * 24 * time.Hour
 	}
@@ -679,7 +673,7 @@ func (c Config) Validate() error {
 	if featureRefreshInterval(c) < 10*time.Millisecond || featureRefreshInterval(c) > time.Minute {
 		return errors.New("features.runtime_refresh_interval must be bounded")
 	}
-	if err := validateToolCatalog(c.Tools); err != nil {
+	if err := validateToolCatalog(effectiveToolCatalog(c.Tools)); err != nil {
 		return err
 	}
 	retention := effectiveRetention(c.Store.Retention)
@@ -776,6 +770,26 @@ func validateToolCatalog(catalog ToolCatalogConfig) error {
 		}
 	}
 	return nil
+}
+
+// effectiveToolCatalog applies the reviewed non-security defaults to catalog
+// values whether configuration came from YAML or was constructed directly. It
+// intentionally preserves Enabled so Web Search stays opt-in.
+func effectiveToolCatalog(catalog ToolCatalogConfig) ToolCatalogConfig {
+	web := catalog.WebSearch
+	if len(web.Regions) == 0 {
+		web.Regions = sortedUnique(reviewedWebSearchRegions)
+	} else {
+		web.Regions = sortedUnique(web.Regions)
+	}
+	if web.MaxResults == 0 {
+		web.MaxResults = 5
+	}
+	if web.Timeout == 0 {
+		web.Timeout = 8 * time.Second
+	}
+	catalog.WebSearch = web
+	return catalog
 }
 
 func reviewedWebSearchRegion(region string) bool {
