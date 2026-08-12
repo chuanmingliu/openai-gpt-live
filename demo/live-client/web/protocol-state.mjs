@@ -60,6 +60,15 @@ export class ProtocolState {
         return [{type: 'status', value: 'configuring'}];
       case 'session.updated':
         return [{type: 'status', value: 'listening'}];
+      case 'live.tool_policy.updated':
+        return this.toolPolicyAccepted(event);
+      case 'live.handoff.created':
+      case 'live.handoff.progress':
+      case 'live.handoff.needs_input':
+      case 'live.handoff.completed':
+      case 'live.handoff.failed':
+      case 'live.handoff.cancelled':
+        return this.handoffCard(event);
       case 'input_audio_buffer.speech_started':
         this.userSpeaking = true;
         return [{type: 'clear-playback'}, {type: 'status', value: 'user-speaking'}];
@@ -140,5 +149,26 @@ export class ProtocolState {
     if (!this.userSpeaking) effects.push({type: 'status', value: 'listening'});
     return effects;
   }
+
+  toolPolicyAccepted(event) {
+    if (!event || Object.keys(event).sort().join(',') !== 'event_id,model,tools,type' || event.model !== 'deepseek-v4-flash') {
+      return [{type: 'error', code: 'invalid-event'}];
+    }
+    try {
+      const update = buildToolPolicyUpdate(event.tools, event.event_id);
+      return [{type: 'tool-policy-accepted', policy: update.tools, model: event.model}];
+    } catch {
+      return [{type: 'error', code: 'invalid-event'}];
+    }
+  }
+
+  handoffCard(event) {
+    try {
+      return [{type: 'handoff-card', event: normalizeHandoffEvent(event)}];
+    } catch {
+      return [{type: 'error', code: 'invalid-event'}];
+    }
+  }
 }
 import {encodeBytesBase64} from './audio-core.mjs';
+import {buildToolPolicyUpdate, normalizeHandoffEvent} from './tool-state.mjs';

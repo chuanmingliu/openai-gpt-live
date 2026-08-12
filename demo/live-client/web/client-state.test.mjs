@@ -196,3 +196,36 @@ test('per-turn and aggregate UTF-8 transcript byte budgets remain bounded', () =
   assert.equal(state.snapshot().turns.some(({id}) => id === 'one'), false);
   assert.equal(state.apply({type: 'user-delta', item_id: 'two', text: '901'}), false);
 });
+
+test('timeline orders transcript turns and tool cards once while card updates retain position', () => {
+  const state = new ClientPresentation();
+  state.apply({type: 'user-done', item_id: 'turn-1', text: 'Find the latest docs.'});
+  state.apply({type: 'handoff-card', event: {
+    type: 'live.handoff.created', handoff_id: 'handoff-1', sequence_id: 1, status: 'pending', details: {},
+  }});
+  state.apply({type: 'assistant-done', response_id: 'turn-2', text: 'I started that.'});
+  state.apply({type: 'handoff-card', event: {
+    type: 'live.handoff.progress', handoff_id: 'handoff-1', sequence_id: 2, status: 'running',
+    details: {phase: 'searching', summary: 'Searching the web.'},
+  }});
+
+  assert.deepEqual(state.snapshot().timeline.map(({kind, id, phase}) => ({kind, id, phase})), [
+    {kind: 'turn', id: 'turn-1', phase: undefined},
+    {kind: 'tool', id: 'handoff-1', phase: 'searching'},
+    {kind: 'turn', id: 'turn-2', phase: undefined},
+  ]);
+});
+
+test('handoff progress never changes voice status or playback generation', () => {
+  const state = new ClientPresentation();
+  state.apply({type: 'status', value: 'assistant-speaking'});
+  const before = state.snapshot();
+  state.apply({type: 'handoff-card', event: {
+    type: 'live.handoff.progress', handoff_id: 'handoff-1', sequence_id: 2, status: 'running',
+    details: {phase: 'searching', summary: 'Searching the web.'},
+  }});
+  const after = state.snapshot();
+  assert.equal(after.status, before.status);
+  assert.equal(after.playbackGeneration, before.playbackGeneration);
+  assert.deepEqual(state.drainToolAnnouncements(), ['Searching the web.']);
+});

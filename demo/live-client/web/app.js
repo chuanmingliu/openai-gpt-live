@@ -34,6 +34,41 @@ const errorLabels = {
   'transport-closed': 'The local voice connection closed. Select Start listening to reconnect.',
 };
 
+const toolSaveLabels = {
+  ready: 'Policy ready.',
+  saving: 'Saving policy…',
+  'awaiting-ack': 'Waiting for gateway confirmation…',
+  saved: 'Policy saved and active.',
+  error: 'Policy action failed. Try again.',
+};
+
+const toolTestLabels = {
+  running: 'Testing Web Search…',
+  passed: 'Web Search test passed.',
+  error: 'Web Search test failed.',
+};
+
+const toolPhaseLabels = {
+  queued: 'Queued',
+  searching: 'Searching',
+  reading_sources: 'Reading sources',
+  preparing_answer: 'Preparing answer',
+  needs_input: 'Needs input',
+  completed: 'Completed',
+  failed: 'Failed',
+  cancelled: 'Stopped',
+};
+
+export function safeSourceHref(value) {
+  if (typeof value !== 'string' || value.length > 2048 || !/^[\x20-\x7e]+$/.test(value)) return null;
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === 'https:' && parsed.username === '' && parsed.password === '' ? parsed.href : null;
+  } catch {
+    return null;
+  }
+}
+
 export function presentationUI(snapshot, noticeCode = '') {
   const active = !terminalStatuses.has(snapshot.status);
   const muted = Boolean(snapshot.muted);
@@ -63,6 +98,16 @@ if (typeof document !== 'undefined') {
     start: document.querySelector('#start'),
     status: document.querySelector('#status'),
     stop: document.querySelector('#stop'),
+    toolAnnouncement: document.querySelector('#tool-announcement'),
+    toolEnabled: document.querySelector('#tool-web-search'),
+    toolForm: document.querySelector('#tool-policy-form'),
+    toolMaxResults: document.querySelector('#tool-max-results'),
+    toolRegion: document.querySelector('#tool-region'),
+    toolSafeSearch: document.querySelector('#tool-safe-search'),
+    toolSave: document.querySelector('#tool-save'),
+    toolStatus: document.querySelector('#tool-policy-status'),
+    toolTest: document.querySelector('#tool-test'),
+    toolTimeout: document.querySelector('#tool-timeout'),
     transcript: document.querySelector('#transcript'),
   };
 
@@ -70,6 +115,69 @@ if (typeof document !== 'undefined') {
   presentation.endSession('idle');
   let noticeCode = '';
   let renderFrame = null;
+  let toolFormDirty = false;
+
+  function renderTurn(item) {
+    const turn = document.createElement('article');
+    turn.className = `turn ${item.role}${item.final ? ' final' : ''}`;
+    const label = document.createElement('div');
+    label.className = 'turn-role';
+    label.textContent = item.role === 'user' ? 'You' : 'Assistant';
+    const text = document.createElement('p');
+    text.className = 'turn-text';
+    text.textContent = item.text;
+    turn.append(label, text);
+    return turn;
+  }
+
+  function renderToolCard(item) {
+    const card = document.createElement('article');
+    card.className = `tool-card${item.terminal ? ' terminal' : ''}`;
+    const header = document.createElement('div');
+    header.className = 'tool-card-header';
+    const title = document.createElement('span');
+    title.className = 'tool-card-title';
+    title.textContent = 'Web Search';
+    const phase = document.createElement('span');
+    phase.className = 'tool-card-phase';
+    phase.textContent = toolPhaseLabels[item.phase] ?? 'Updated';
+    header.append(title, phase);
+    const summary = document.createElement('p');
+    summary.className = 'tool-card-summary';
+    summary.textContent = item.summary;
+    card.append(header, summary);
+    if (item.sources.length > 0) {
+      const sources = document.createElement('ol');
+      sources.className = 'tool-sources';
+      for (const source of item.sources) {
+        const href = safeSourceHref(source.url);
+        if (!href) continue;
+        const row = document.createElement('li');
+        const anchor = document.createElement('a');
+        anchor.href = href;
+        anchor.target = '_blank';
+        anchor.rel = 'noopener noreferrer';
+        anchor.textContent = source.title;
+        row.append(anchor);
+        sources.append(row);
+      }
+      if (sources.children.length > 0) card.append(sources);
+    }
+    return card;
+  }
+
+  function renderToolPolicy(tools) {
+    if (!toolFormDirty) {
+      elements.toolEnabled.checked = tools.policy.web_search.enabled;
+      elements.toolSafeSearch.value = tools.policy.web_search.safe_search;
+      elements.toolRegion.value = tools.policy.web_search.region;
+      elements.toolMaxResults.value = String(tools.policy.web_search.max_results);
+      elements.toolTimeout.value = String(tools.policy.web_search.timeout_ms);
+    }
+    elements.toolSave.disabled = tools.saveStatus === 'saving' || tools.saveStatus === 'awaiting-ack';
+    elements.toolTest.disabled = tools.testStatus === 'running';
+    elements.toolStatus.textContent = toolTestLabels[tools.testStatus] ?? toolSaveLabels[tools.saveStatus] ?? '';
+  }
 
   function renderPresentation(snapshot) {
     const ui = presentationUI(snapshot, noticeCode);
@@ -83,22 +191,13 @@ if (typeof document !== 'undefined') {
     elements.resumeAudio.disabled = ui.resumeAudioDisabled;
     elements.resumeAudio.hidden = ui.resumeAudioHidden;
     elements.notice.textContent = ui.noticeText;
-    elements.empty.hidden = snapshot.turns.length > 0;
-    for (const turn of elements.transcript.querySelectorAll('article.turn')) turn.remove();
-    for (const item of snapshot.turns) {
-      const turn = document.createElement('article');
-      turn.className = `turn ${item.role}${item.final ? ' final' : ''}`;
-      const label = document.createElement('div');
-      label.className = 'turn-role';
-      label.textContent = item.role === 'user' ? 'You' : 'Assistant';
-      const text = document.createElement('p');
-      text.className = 'turn-text';
-      text.textContent = item.text;
-      turn.append(label, text);
-      elements.transcript.append(turn);
-    }
+    elements.empty.hidden = snapshot.timeline.length > 0;
+    for (const item of elements.transcript.querySelectorAll('article.turn, article.tool-card')) item.remove();
+    for (const item of snapshot.timeline) elements.transcript.append(item.kind === 'tool' ? renderToolCard(item) : renderTurn(item));
+    renderToolPolicy(snapshot.tools);
     elements.transcript.scrollTop = elements.transcript.scrollHeight;
     elements.finalAnnouncement.textContent = presentation.drainAnnouncements().join(' ');
+    elements.toolAnnouncement.textContent = presentation.drainToolAnnouncements().join(' ');
   }
 
   function scheduleRender() {
@@ -122,12 +221,29 @@ if (typeof document !== 'undefined') {
     presentation,
     onSnapshot: scheduleRender,
     onNotice: setNotice,
+    fetch: window.fetch.bind(window),
   });
 
   elements.start.addEventListener('click', () => { void runtime.start(); });
   elements.stop.addEventListener('click', () => { void runtime.stop(); });
   elements.mute.addEventListener('click', () => { runtime.mute(!presentation.isMuted()); });
   elements.resumeAudio.addEventListener('click', () => { void runtime.resumeAudio(); });
+  elements.toolForm.addEventListener('input', () => { toolFormDirty = true; });
+  elements.toolForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    const policy = {
+      web_search: {
+        enabled: elements.toolEnabled.checked,
+        safe_search: elements.toolSafeSearch.value,
+        region: elements.toolRegion.value,
+        max_results: Number(elements.toolMaxResults.value),
+        timeout_ms: Number(elements.toolTimeout.value),
+      },
+    };
+    toolFormDirty = false;
+    void runtime.saveToolPolicy(policy);
+  });
+  elements.toolTest.addEventListener('click', () => { void runtime.testToolPolicy(); });
   window.addEventListener('beforeunload', () => { void runtime.stop(); });
 
   scheduleRender();

@@ -1,9 +1,11 @@
 import {decodePCM16Base64, PCMPlaybackPacer, SinglePendingTimer} from './audio-core.mjs';
 import {ProtocolState, buildAudioAppend, buildSessionUpdate} from './protocol-state.mjs';
+import {buildToolPolicyUpdate, normalizeToolPolicy} from './tool-state.mjs';
 
 const ESTABLISHMENT_TIMEOUT_MS = 5000;
 const CAPTURE_RESUME_TIMEOUT_MS = 1000;
 const MAXIMUM_SOCKET_BUFFERED_BYTES = 32 << 10;
+const TOOL_REQUEST_TIMEOUT_MS = 12000;
 
 const NOTICE_CODES = new Set([
   'audio-overflow',
@@ -27,6 +29,7 @@ export function createBrowserRuntime(dependencies) {
     mediaDevices,
     AudioContext,
     WebSocket,
+    fetch: fetchImpl,
     location,
     presentation,
     onSnapshot,
@@ -46,6 +49,9 @@ export function createBrowserRuntime(dependencies) {
   let streamReady = false;
   let sessionUpdateSent = false;
   let socketOpenObserved = false;
+  let initialPolicySent = false;
+  let policyLoadPromise = null;
+  let nextPolicyEventID = 1;
   let startPromise = null;
   let playbackRevision = 0;
   let captureResumePending = false;
@@ -56,6 +62,41 @@ export function createBrowserRuntime(dependencies) {
 
   function publishSnapshot() {
     onSnapshot(presentation.snapshot());
+  }
+
+  async function boundedFetch(path, options) {
+    if (typeof fetchImpl !== 'function') throw new TypeError('fetch unavailable');
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), TOOL_REQUEST_TIMEOUT_MS);
+    try {
+      return await fetchImpl(path, {...options, signal: controller.signal, cache: 'no-store'});
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function loadToolPolicy(currentGeneration) {
+    try {
+      const response = await boundedFetch('/api/tool-policy', {method: 'GET'});
+      if (!response.ok) throw new Error('tool policy unavailable');
+      const policy = normalizeToolPolicy(await response.json());
+      if (generation === currentGeneration) presentation.tools.loadPolicy(policy);
+    } catch {
+      if (generation === currentGeneration) presentation.tools.failSave();
+    } finally {
+      if (generation === currentGeneration) publishSnapshot();
+    }
+  }
+
+  function sendCurrentPolicy(currentGeneration, ownedSocket, initial) {
+    if (generation !== currentGeneration || socket !== ownedSocket || !streamReady || ownedSocket.readyState !== WebSocket.OPEN) return false;
+    if (initial && initialPolicySent) return false;
+    const eventID = `browser-policy-${nextPolicyEventID++}`;
+    ownedSocket.send(JSON.stringify(buildToolPolicyUpdate(presentation.tools.snapshot().policy, eventID)));
+    if (initial) initialPolicySent = true;
+    presentation.tools.markPolicySent();
+    publishSnapshot();
+    return true;
   }
 
   function reflectPlaybackState(currentGeneration, ownedPlaybackContext) {
@@ -167,6 +208,9 @@ export function createBrowserRuntime(dependencies) {
       }
       establishmentTimer.clear();
       streamReady = true;
+      void (policyLoadPromise ?? Promise.resolve()).then(() => {
+        sendCurrentPolicy(currentGeneration, ownedSocket, true);
+      });
     }
     for (const effect of protocol.consume(event)) applyEffect(effect, currentGeneration);
   }
@@ -324,11 +368,13 @@ export function createBrowserRuntime(dependencies) {
     streamReady = false;
     sessionUpdateSent = false;
     socketOpenObserved = false;
+    initialPolicySent = false;
     protocol = new ProtocolState();
     presentation.beginSession();
     onNotice('');
     publishSnapshot();
 
+    policyLoadPromise = loadToolPolicy(currentGeneration);
     const pending = initialize(currentGeneration);
     startPromise = pending;
     void pending.then(() => {
@@ -341,6 +387,7 @@ export function createBrowserRuntime(dependencies) {
     streamReady = false;
     sessionUpdateSent = false;
     socketOpenObserved = false;
+    initialPolicySent = false;
     captureResumePending = false;
     establishmentTimer.clear();
     captureResumeTimer.clear();
@@ -419,5 +466,41 @@ export function createBrowserRuntime(dependencies) {
     oscillator.stop(ownedPlaybackContext.currentTime + 0.2);
   }
 
-  return {start, stop, mute, resumeAudio};
+  async function saveToolPolicy(policy) {
+    let canonical;
+    try {
+      canonical = normalizeToolPolicy(policy);
+      presentation.tools.beginSave(canonical);
+      publishSnapshot();
+      const response = await boundedFetch('/api/tool-policy', {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(canonical),
+      });
+      if (!response.ok) throw new Error('tool policy save failed');
+      presentation.tools.markPolicySent();
+      if (socket) sendCurrentPolicy(generation, socket, false);
+    } catch {
+      presentation.tools.failSave();
+    }
+    publishSnapshot();
+  }
+
+  async function testToolPolicy() {
+    presentation.tools.beginTest();
+    publishSnapshot();
+    let passed = false;
+    try {
+      const response = await boundedFetch('/api/tool-policy/test', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: '{}',
+      });
+      passed = response.ok;
+    } catch {}
+    presentation.tools.finishTest(passed);
+    publishSnapshot();
+  }
+
+  return {start, stop, mute, resumeAudio, saveToolPolicy, testToolPolicy};
 }

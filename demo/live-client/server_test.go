@@ -48,7 +48,7 @@ func TestStaticAssetsCarryStrictHeadersWithoutBearer(t *testing.T) {
 
 func TestJavaScriptAssetsAreServedAsNoStoreJavaScript(t *testing.T) {
 	handler := mustTestHandler(t, nil, []byte("sentinel"))
-	for _, path := range []string{"/audio-core.mjs", "/browser-runtime.mjs", "/client-state.mjs", "/protocol-state.mjs", "/app.js", "/capture-worklet.js", "/playback-worklet.js"} {
+	for _, path := range []string{"/audio-core.mjs", "/browser-runtime.mjs", "/client-state.mjs", "/protocol-state.mjs", "/tool-state.mjs", "/app.js", "/capture-worklet.js", "/playback-worklet.js"} {
 		path := path
 		t.Run(path, func(t *testing.T) {
 			response := httptest.NewRecorder()
@@ -59,6 +59,25 @@ func TestJavaScriptAssetsAreServedAsNoStoreJavaScript(t *testing.T) {
 			assert.Contains(t, response.Header().Get("Content-Security-Policy"), "default-src 'self'")
 		})
 	}
+}
+
+func TestStaticPageKeepsVoiceControlsVisibleBesideAccessibleToolsDrawer(t *testing.T) {
+	handler := mustTestHandler(t, nil, []byte("sentinel"))
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:3000/", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	body := response.Body.String()
+	assert.Equal(t, http.StatusOK, response.Code)
+	assert.Contains(t, body, `<details class="tool-drawer">`)
+	assert.Contains(t, body, `id="tool-web-search"`)
+	assert.Contains(t, body, `id="tool-safe-search"`)
+	assert.Contains(t, body, `id="tool-region"`)
+	assert.Contains(t, body, `id="tool-max-results"`)
+	assert.Contains(t, body, `id="tool-timeout"`)
+	assert.Contains(t, body, `deepseek-v4-flash · thinking disabled`)
+	assert.Contains(t, body, `id="tool-announcement" class="visually-hidden" aria-live="polite"`)
+	assert.Less(t, strings.Index(body, `id="start"`), strings.Index(body, `<details class="tool-drawer">`))
 }
 
 func TestHealthAndUnknownRoutesAreExact(t *testing.T) {

@@ -5,6 +5,9 @@ import {createBrowserRuntime} from './browser-runtime.mjs';
 import {ClientPresentation} from './client-state.mjs';
 
 const SCHEDULED_PCM_BASE64 = Buffer.alloc(16000).toString('base64');
+const DEFAULT_TOOL_POLICY = {
+  web_search: {enabled: true, safe_search: 'moderate', region: 'wt-wt', max_results: 5, timeout_ms: 8000},
+};
 
 class FakeGraphNode {
   constructor() {
@@ -42,7 +45,7 @@ class FakeAudioWorkletNode extends FakeGraphNode {
 globalThis.AudioWorkletNode = FakeAudioWorkletNode;
 
 class BrowserHarness {
-  constructor({getUserMedia, socketReadyState = 1, failWorkletModule = false, captureResumeFailure = false} = {}) {
+  constructor({getUserMedia, socketReadyState = 1, failWorkletModule = false, captureResumeFailure = false, fetchHandler} = {}) {
     this.contexts = [];
     this.getUserMediaCalls = 0;
     this.gains = [];
@@ -50,6 +53,7 @@ class BrowserHarness {
     this.mediaStreams = [];
     this.notices = [];
     this.oscillators = [];
+    this.requests = [];
     this.sent = [];
     this.snapshots = [];
     this.sockets = [];
@@ -61,6 +65,15 @@ class BrowserHarness {
     this.failWorkletModule = failWorkletModule;
     this.captureResumeFailure = captureResumeFailure;
     this.captureResumePending = false;
+    this.fetchHandler = fetchHandler ?? (async (path) => ({
+      ok: true,
+      status: 200,
+      json: async () => path === '/api/tool-policy' ? structuredClone(DEFAULT_TOOL_POLICY) : {ok: true, result_count: 1},
+    }));
+    this.fetch = async (path, options = {}) => {
+      this.requests.push({path, options});
+      return this.fetchHandler(path, options);
+    };
     this.presentation = new ClientPresentation();
     this.presentation.endSession('idle');
 
@@ -198,6 +211,7 @@ class BrowserHarness {
       mediaDevices: this.mediaDevices,
       AudioContext: this.AudioContext,
       WebSocket: this.WebSocket,
+      fetch: this.fetch,
       location: {protocol: 'http:', host: '127.0.0.1:3000'},
       presentation: this.presentation,
       onSnapshot: (snapshot) => {
@@ -298,6 +312,107 @@ class BrowserHarness {
   }
 }
 
+test('accepted session sends current policy once per socket and reconnect resends it', async () => {
+  const harness = new BrowserHarness();
+  const runtime = createBrowserRuntime(harness.dependencies());
+  await runtime.start();
+  harness.server({type: 'session.created'});
+  harness.server({type: 'session.updated'});
+  await new Promise((resolve) => setImmediate(resolve));
+
+  let updates = harness.sent.filter(({type}) => type === 'live.tool_policy.update');
+  assert.equal(updates.length, 1);
+  assert.deepEqual(updates[0].tools, DEFAULT_TOOL_POLICY);
+  harness.server({
+    type: 'live.tool_policy.updated', event_id: updates[0].event_id,
+    tools: DEFAULT_TOOL_POLICY, model: 'deepseek-v4-flash',
+  });
+  assert.equal(harness.presentation.snapshot().tools.saveStatus, 'saved');
+
+  harness.server({type: 'session.updated'});
+  assert.equal(harness.sent.filter(({type}) => type === 'live.tool_policy.update').length, 1);
+  await runtime.stop();
+  await runtime.start();
+  const second = harness.socket;
+  harness.server({type: 'session.created'}, second);
+  harness.server({type: 'session.updated'}, second);
+  await new Promise((resolve) => setImmediate(resolve));
+  updates = second.sent.filter(({type}) => type === 'live.tool_policy.update');
+  assert.equal(updates.length, 1);
+  assert.deepEqual(updates[0].tools, DEFAULT_TOOL_POLICY);
+  await runtime.stop();
+});
+
+test('policy load save and diagnostic test use same-origin no-store bounded requests and stable statuses', async () => {
+  const disabled = structuredClone(DEFAULT_TOOL_POLICY);
+  disabled.web_search.enabled = false;
+  const harness = new BrowserHarness();
+  const runtime = createBrowserRuntime(harness.dependencies());
+  await runtime.start();
+  harness.server({type: 'session.created'});
+  harness.server({type: 'session.updated'});
+  await new Promise((resolve) => setImmediate(resolve));
+
+  await runtime.saveToolPolicy(disabled);
+  const put = harness.requests.find(({path, options}) => path === '/api/tool-policy' && options.method === 'PUT');
+  assert.ok(put);
+  assert.equal(put.options.cache, 'no-store');
+  assert.equal(put.options.headers['Content-Type'], 'application/json');
+  assert.deepEqual(JSON.parse(put.options.body), disabled);
+  assert.equal(put.path.includes('?'), false);
+  assert.equal(put.path.includes('#'), false);
+  assert.equal(harness.presentation.snapshot().tools.saveStatus, 'awaiting-ack');
+
+  const sent = harness.sent.filter(({type}) => type === 'live.tool_policy.update').at(-1);
+  harness.server({type: 'live.tool_policy.updated', event_id: sent.event_id, tools: disabled, model: 'deepseek-v4-flash'});
+  assert.equal(harness.presentation.snapshot().tools.saveStatus, 'saved');
+
+  await runtime.testToolPolicy();
+  const diagnostic = harness.requests.find(({path, options}) => path === '/api/tool-policy/test' && options.method === 'POST');
+  assert.ok(diagnostic);
+  assert.equal(diagnostic.options.cache, 'no-store');
+  assert.equal(diagnostic.path.includes('?'), false);
+  assert.equal(harness.presentation.snapshot().tools.testStatus, 'passed');
+  await runtime.stop();
+});
+
+test('policy request failures expose only stable state and never private response content', async () => {
+  const harness = new BrowserHarness({fetchHandler: async (path, options) => {
+    if (path === '/api/tool-policy' && options.method === 'GET') return {ok: true, json: async () => structuredClone(DEFAULT_TOOL_POLICY)};
+    throw new Error('private query, credential, and provider body');
+  }});
+  const runtime = createBrowserRuntime(harness.dependencies());
+  await runtime.start();
+  await runtime.saveToolPolicy(DEFAULT_TOOL_POLICY);
+  await runtime.testToolPolicy();
+  const serialized = JSON.stringify(harness.presentation.snapshot());
+  assert.equal(harness.presentation.snapshot().tools.saveStatus, 'error');
+  assert.equal(harness.presentation.snapshot().tools.testStatus, 'error');
+  assert.doesNotMatch(serialized, /private|credential|provider body/);
+  await runtime.stop();
+});
+
+test('handoff progress updates no playback worklet state and leaves voice status unchanged', async () => {
+  const harness = new BrowserHarness();
+  const runtime = createBrowserRuntime(harness.dependencies());
+  await runtime.start();
+  harness.server({type: 'session.created'});
+  harness.server({type: 'session.updated'});
+  await new Promise((resolve) => setImmediate(resolve));
+  const beforeMessages = harness.playbackNode.port.messages.length;
+  const beforeStatus = harness.presentation.snapshot().status;
+
+  harness.server({
+    type: 'live.handoff.progress', event_id: 'event-2', handoff_id: 'handoff-1', sequence_id: 2,
+    status: 'running', details: {phase: 'searching', summary: 'Searching the web.'},
+  });
+
+  assert.equal(harness.playbackNode.port.messages.length, beforeMessages);
+  assert.equal(harness.presentation.snapshot().status, beforeStatus);
+  assert.equal(harness.presentation.snapshot().timeline.at(-1).kind, 'tool');
+  await runtime.stop();
+});
+
 test('start gates configuration and PCM, playback acknowledgement, barge-in, and stop release every boundary', async (t) => {
   const harness = new BrowserHarness();
   harness.installFakeTimers();
@@ -377,6 +492,7 @@ test('resumeAudio resumes suspended playback with one local 200 ms low-volume to
   await runtime.start();
   harness.server({type: 'session.created'});
   harness.server({type: 'session.updated'});
+  await new Promise((resolve) => setImmediate(resolve));
   harness.server({type: 'response.output_audio.delta', delta: SCHEDULED_PCM_BASE64});
   assert.equal(harness.presentation.snapshot().status, 'assistant-buffering');
   harness.playbackContext.setState('suspended');

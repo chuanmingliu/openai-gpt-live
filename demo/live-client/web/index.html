@@ -45,8 +45,55 @@
           Enable audio
         </button>
       </div>
+
+      <details class="tool-drawer">
+        <summary>Tools <span>Web Search</span></summary>
+        <div class="tool-panel">
+          <div class="tool-heading">
+            <div>
+              <p class="label">SERVER-OWNED PRESET</p>
+              <h3>Web Search</h3>
+            </div>
+            <p class="tool-model" aria-label="Tool model">deepseek-v4-flash · thinking disabled</p>
+          </div>
+          <form id="tool-policy-form" class="tool-form">
+            <label class="tool-switch" for="tool-web-search">
+              <span>Enable Web Search</span>
+              <input id="tool-web-search" name="enabled" type="checkbox" role="switch">
+            </label>
+            <label for="tool-safe-search">SafeSearch
+              <select id="tool-safe-search" name="safe_search">
+                <option value="strict">Strict</option>
+                <option value="moderate">Moderate</option>
+              </select>
+            </label>
+            <label for="tool-region">Region
+              <select id="tool-region" name="region">
+                <option value="wt-wt">Worldwide</option>
+                <option value="us-en">United States</option>
+                <option value="uk-en">United Kingdom</option>
+                <option value="au-en">Australia</option>
+                <option value="ca-en">Canada</option>
+                <option value="cn-zh">China · Chinese</option>
+              </select>
+            </label>
+            <label for="tool-max-results">Maximum results
+              <input id="tool-max-results" name="max_results" type="number" min="1" max="10" step="1">
+            </label>
+            <label for="tool-timeout">Timeout (ms)
+              <input id="tool-timeout" name="timeout_ms" type="number" min="1000" max="10000" step="500">
+            </label>
+            <div class="tool-actions">
+              <button id="tool-test" class="button button-secondary" type="button">Test</button>
+              <button id="tool-save" class="button button-primary" type="submit">Save</button>
+              <span id="tool-policy-status" role="status" aria-live="polite"></span>
+            </div>
+          </form>
+        </div>
+      </details>
       <p id="notice" class="notice" aria-live="assertive"></p>
       <p id="final-announcement" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
+      <p id="tool-announcement" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
 
       <div id="transcript" class="transcript" role="region" aria-label="Live transcript">
         <div id="empty-transcript" class="empty-transcript">

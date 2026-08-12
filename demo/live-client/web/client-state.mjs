@@ -3,6 +3,7 @@ const DEFAULT_MAXIMUM_ACTIVE_TURNS = 64;
 const DEFAULT_MAXIMUM_TURN_BYTES = 64 << 10;
 const DEFAULT_MAXIMUM_TRANSCRIPT_BYTES = 256 << 10;
 const textEncoder = new TextEncoder();
+import {ToolState} from './tool-state.mjs';
 
 function transcriptRole(type) {
   if (type === 'user-delta' || type === 'user-done') return 'user';
@@ -44,6 +45,10 @@ export class ClientPresentation {
     this.maximumTranscriptBytes = maximumTranscriptBytes;
     this.turns = [];
     this.active = new Map();
+    this.tools = new ToolState();
+    this.turnOrder = new Map();
+    this.toolOrder = new Map();
+    this.nextOrder = 1;
     this.totalTranscriptBytes = 0;
     this.announcements = [];
     this.playbackGeneration = 0;
@@ -86,6 +91,17 @@ export class ClientPresentation {
     }
 
     switch (effect.type) {
+      case 'tool-policy-accepted':
+        this.tools.acceptPolicy(effect.policy, effect.model);
+        break;
+      case 'handoff-card': {
+        const result = this.tools.consume(effect.event);
+        if (result.created && !this.toolOrder.has(effect.event.handoff_id)) {
+          this.toolOrder.set(effect.event.handoff_id, this.nextOrder++);
+        }
+        this.trimToolOrder();
+        break;
+      }
       case 'status':
         if (typeof effect.value === 'string' && !(effect.value === 'listening' && this.playbackIsActive())) {
           this.status = effect.value;
@@ -119,10 +135,19 @@ export class ClientPresentation {
   }
 
   snapshot() {
+    const turns = this.turns.map(({id, role, text, final}) => ({id, role, text, final}));
+    const tools = this.tools.snapshot();
+    const timeline = [
+      ...turns.map((turn) => ({kind: 'turn', order: this.turnOrder.get(`${turn.role}:${turn.id}`), ...turn})),
+      ...tools.cards.map((card) => ({kind: 'tool', order: this.toolOrder.get(card.id), ...card})),
+    ].filter(({order}) => Number.isSafeInteger(order)).sort((left, right) => left.order - right.order)
+      .map(({order: _order, ...item}) => item);
     return {
       status: this.audioSuspended ? 'audio-suspended' : this.status,
       muted: this.muted,
-      turns: this.turns.map(({id, role, text, final}) => ({id, role, text, final})),
+      turns,
+      timeline,
+      tools,
       announcement: this.announcement,
       playbackGeneration: this.playbackGeneration,
     };
@@ -133,6 +158,10 @@ export class ClientPresentation {
     this.announcements = [];
     this.announcement = '';
     return announcements;
+  }
+
+  drainToolAnnouncements() {
+    return this.tools.drainAnnouncements();
   }
 
   appendTurn(role, id, text) {
@@ -172,6 +201,7 @@ export class ClientPresentation {
     }
     const turn = {id, role, text, final: false, bytes};
     this.turns.push(turn);
+    this.turnOrder.set(`${role}:${id}`, this.nextOrder++);
     this.totalTranscriptBytes += bytes;
     this.active.set(`${role}:${id}`, turn);
     if (final) this.finishActive(turn);
@@ -193,7 +223,15 @@ export class ClientPresentation {
     const index = this.turns.indexOf(turn);
     if (index >= 0) this.turns.splice(index, 1);
     this.active.delete(`${turn.role}:${turn.id}`);
+    this.turnOrder.delete(`${turn.role}:${turn.id}`);
     this.totalTranscriptBytes -= turn.bytes;
+  }
+
+  trimToolOrder() {
+    const retained = new Set(this.tools.snapshot().cards.map(({id}) => id));
+    for (const id of this.toolOrder.keys()) {
+      if (!retained.has(id)) this.toolOrder.delete(id);
+    }
   }
 
   announce(turn) {

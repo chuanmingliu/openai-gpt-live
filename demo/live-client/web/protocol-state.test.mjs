@@ -155,3 +155,63 @@ test('interleaved assistant transcript effects retain response attribution', () 
     [{type: 'assistant-done', response_id: 'resp_a', text: 'alpha'}, {type: 'status', value: 'listening'}],
   );
 });
+
+test('tool policy acknowledgement is reduced to a canonical accepted effect', () => {
+  const tools = {web_search: {enabled: false, safe_search: 'strict', region: 'cn-zh', max_results: 1, timeout_ms: 1000}};
+  assert.deepEqual(new ProtocolState().consume({
+    type: 'live.tool_policy.updated', event_id: 'policy-1', tools, model: 'deepseek-v4-flash',
+  }), [{type: 'tool-policy-accepted', policy: tools, model: 'deepseek-v4-flash'}]);
+});
+
+test('tool policy acknowledgement rejects blank identity and unexpected model', () => {
+  const tools = {web_search: {enabled: false, safe_search: 'strict', region: 'cn-zh', max_results: 1, timeout_ms: 1000}};
+  for (const event of [
+    {type: 'live.tool_policy.updated', event_id: '', tools, model: 'deepseek-v4-flash'},
+    {type: 'live.tool_policy.updated', event_id: 'policy-1', tools, model: ''},
+  ]) {
+    assert.deepEqual(new ProtocolState().consume(event), [{type: 'error', code: 'invalid-event'}]);
+  }
+});
+
+test('handoff events normalize only exact monotonic display fields', () => {
+  const event = {
+    type: 'live.handoff.progress', event_id: 'event-2', handoff_id: 'handoff-1', sequence_id: 2,
+    status: 'running', details: {phase: 'searching', summary: 'Searching the web.', query: 'private query'},
+  };
+  assert.deepEqual(new ProtocolState().consume(event), [{
+    type: 'handoff-card',
+    event: {
+      type: 'live.handoff.progress', handoff_id: 'handoff-1', sequence_id: 2, status: 'running',
+      details: {phase: 'searching', summary: 'Searching the web.'},
+    },
+  }]);
+});
+
+test('handoff envelopes reject invalid sequence, status, phase, and details without retaining content', () => {
+  const base = {
+    type: 'live.handoff.progress', event_id: 'event-2', handoff_id: 'handoff-1', sequence_id: 2,
+    status: 'running', details: {phase: 'searching', summary: 'Searching the web.'},
+  };
+  for (const event of [
+    {...base, sequence_id: 0},
+    {...base, status: 'completed'},
+    {...base, details: {...base.details, phase: 'fetching_query'}},
+    {...base, details: []},
+    {...base, command: 'npx'},
+  ]) {
+    assert.deepEqual(new ProtocolState().consume(event), [{type: 'error', code: 'invalid-event'}]);
+  }
+});
+
+test('handoff phases accept only the exact phase belonging to each event class', () => {
+  const state = new ProtocolState();
+  assert.equal(state.consume({
+    type: 'live.handoff.created', handoff_id: 'h1', sequence_id: 1, status: 'pending', details: {phase: 'queued'},
+  })[0].type, 'handoff-card');
+  assert.equal(state.consume({
+    type: 'live.handoff.completed', handoff_id: 'h1', sequence_id: 2, status: 'succeeded', details: {phase: 'completed'},
+  })[0].type, 'handoff-card');
+  assert.deepEqual(state.consume({
+    type: 'live.handoff.progress', handoff_id: 'h1', sequence_id: 3, status: 'running', details: {phase: 'completed'},
+  }), [{type: 'error', code: 'invalid-event'}]);
+});
