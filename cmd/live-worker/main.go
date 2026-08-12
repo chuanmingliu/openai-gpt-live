@@ -258,7 +258,7 @@ func resolveSecrets(cfg config.Config, lookup func(string) (string, bool)) (reso
 		secrets.ToolEncryptionKey = append([]byte(nil), key...)
 		clear(key)
 	}
-	if cfg.Admin.ListenAddr != "" && cfg.Mode == "local" {
+	if cfg.Admin.ListenAddr != "" && !cfg.IsProduction() && cfg.UsesStaticAuth() {
 		secrets.AdminBearer, err = require(cfg.Auth.StaticBearerEnv, "admin bearer")
 		if err != nil {
 			secrets.clear()
@@ -572,7 +572,7 @@ func (c workerCapacity) Capacity() admin.Capacity {
 	return admin.Capacity{Active: active, Limit: c.limit, Available: available}
 }
 func workerAdminAuthenticator(ctx context.Context, cfg config.Config, secrets resolvedSecrets) (auth.Authenticator, error) {
-	if cfg.Mode == "local" {
+	if !cfg.IsProduction() && cfg.UsesStaticAuth() {
 		scopes := make(map[string]struct{}, len(cfg.Auth.StaticScopes))
 		for _, scope := range cfg.Auth.StaticScopes {
 			scopes[scope] = struct{}{}

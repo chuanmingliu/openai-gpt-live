@@ -20,8 +20,29 @@ grep -v '^#' "$root/deploy/config/production.yaml" >"$scratch/production-config.
 grep -v '^#' "$root/deploy/k8s/base/production.yaml" >"$scratch/production-copy.yaml"
 cmp -s "$scratch/production-config.yaml" "$scratch/production-copy.yaml" || { echo "production Kubernetes config copy drift" >&2; exit 1; }
 
+(cd "$root" && GOCACHE="$cache" go run ./cmd/live-gateway check-config --config "$root/deploy/config/development-durable.yaml")
+(cd "$root" && GOCACHE="$cache" go run ./cmd/live-worker check-config --config "$root/deploy/config/development-durable.yaml")
+durable_gateway_hash=$(cd "$root" && GOCACHE="$cache" go run ./cmd/live-gateway config-hash --config "$root/deploy/config/development-durable.yaml")
+durable_worker_hash=$(cd "$root" && GOCACHE="$cache" go run ./cmd/live-worker config-hash --config "$root/deploy/config/development-durable.yaml")
+[ "$durable_gateway_hash" = "$durable_worker_hash" ] || { echo "durable gateway/worker config hash drift" >&2; exit 1; }
+
 env -i PATH="$PATH" docker compose --env-file /dev/null -f "$root/deploy/docker-compose.yml" config >"$scratch/compose.yaml"
 env -i PATH="$PATH" docker compose --env-file /dev/null -f "$root/deploy/docker-compose.yml" -f "$root/deploy/compose.chaos.yml" config >"$scratch/compose-chaos.yaml"
+env -i PATH="$PATH" \
+  POSTGRES_PASSWORD=postgres-local \
+  DATABASE_URL='postgres://live@postgres/live?sslmode=disable' \
+  S2S_API_KEY=speech-local \
+  DEEPSEEK_API_KEY=reasoner-local \
+  LIVE_STATIC_BEARER_TOKEN=bearer-local \
+  LIVE_ADMIN_BEARER_TOKEN=bearer-local \
+  LIVE_PRIVACY_HMAC_KEY=privacy-local \
+  LIVE_RETENTION_HMAC_KEY=retention-local \
+  LIVE_RECONNECT_HMAC_KEY=reconnect-local \
+  LIVE_TOOL_ENCRYPTION_KEY=tool-local \
+  LIVE_EXPECTED_CONFIG_HASH="$durable_gateway_hash" \
+  S2S_IMAGE=speech-to-speech:local \
+  S2S_CONFIG_PATH="$root/deploy/config/local.yaml" \
+  docker compose --env-file /dev/null -f "$root/deploy/docker-compose.yml" -f "$root/deploy/compose.development-durable.yml" config >"$scratch/compose-development-durable.yaml"
 "$root/deploy/scripts/render-kustomize.sh" local >"$scratch/local.yaml"
 LIVE_PRODUCTION_RENDER_MODE=fixture "$root/deploy/scripts/render-kustomize.sh" production >"$scratch/production-fixture.yaml"
 "$root/deploy/scripts/validate-render.sh" local local "$scratch/local.yaml"

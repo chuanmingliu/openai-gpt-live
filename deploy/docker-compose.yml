@@ -51,7 +51,6 @@ services:
     environment:
       - DATABASE_URL
       - S2S_API_KEY
-      - DEEPSEEK_API_KEY=${FORMAL_DEEPSEEK_API_KEY:-}
       - LIVE_STATIC_BEARER_TOKEN
       - LIVE_ADMIN_BEARER_TOKEN
       - LIVE_PRIVACY_HMAC_KEY

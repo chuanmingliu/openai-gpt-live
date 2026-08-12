@@ -106,6 +106,48 @@ func TestWorkerRegistryRegistersWebSearchOnlyWhenConfigured(t *testing.T) {
 	}
 }
 
+func TestDevelopmentDurableWorkerUsesStaticAdminAuthenticator(t *testing.T) {
+	cfg := config.Config{
+		Mode: "development_durable",
+		Auth: config.AuthConfig{
+			StaticBearerEnv: "LIVE_STATIC_BEARER_TOKEN",
+			StaticTenantID:  "development",
+			StaticUserID:    "durable-demo",
+			StaticScopes:    []string{"realtime", "live.admin"},
+		},
+	}
+	secrets := resolvedSecrets{AdminBearer: "development-token"}
+	authenticator, err := workerAdminAuthenticator(t.Context(), cfg, secrets)
+	require.NoError(t, err)
+
+	principal, err := authenticator.Authenticate(t.Context(), "development-token")
+	require.NoError(t, err)
+	assert.Equal(t, "development", principal.TenantID)
+	assert.Contains(t, principal.Scopes, "live.admin")
+}
+
+func TestDevelopmentDurableWorkerResolvesStaticAdminBearer(t *testing.T) {
+	cfg := config.Config{
+		Mode:   "development_durable",
+		Admin:  config.AdminConfig{ListenAddr: "127.0.0.1:9090"},
+		Auth:   config.AuthConfig{StaticBearerEnv: "LIVE_STATIC_BEARER_TOKEN"},
+		Store:  config.StoreConfig{DatabaseURLEnv: "DATABASE_URL"},
+		Worker: config.WorkerConfig{Reasoner: config.ReasonerConfig{APIKeyEnv: "DEEPSEEK_API_KEY"}},
+		Safety: config.SafetyConfig{PrivacyHMACKeyEnv: "LIVE_PRIVACY_HMAC_KEY"},
+	}
+	values := map[string]string{
+		"DATABASE_URL":             "postgres://live@postgres/live?sslmode=disable",
+		"DEEPSEEK_API_KEY":         "reasoner-secret",
+		"LIVE_PRIVACY_HMAC_KEY":    strings.Repeat("p", 32),
+		"LIVE_STATIC_BEARER_TOKEN": "development-token",
+	}
+
+	secrets, err := resolveSecrets(cfg, lookupFrom(values))
+	require.NoError(t, err)
+	defer secrets.clear()
+	assert.Equal(t, "development-token", secrets.AdminBearer)
+}
+
 func TestProductionRuntimeDrainTimeoutClosesResourcesEvenWhenComponentIsStuck(t *testing.T) {
 	manual := clock.NewManual(time.Now().UTC())
 	started, release := make(chan struct{}), make(chan struct{})

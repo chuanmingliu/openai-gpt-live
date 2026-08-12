@@ -178,6 +178,7 @@ func TestHandlerCapabilitiesReflectStaticHandoffFeature(t *testing.T) {
 				"live.session.degraded",
 				"live.session.resumed",
 				"live.tool.approval.required",
+				"live.tool_policy.updated",
 			},
 		},
 		{
@@ -193,6 +194,7 @@ func TestHandlerCapabilitiesReflectStaticHandoffFeature(t *testing.T) {
 				"live.session.degraded",
 				"live.session.resumed",
 				"live.tool.approval.required",
+				"live.tool_policy.updated",
 			},
 		},
 	}

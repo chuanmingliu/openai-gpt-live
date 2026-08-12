@@ -16,6 +16,36 @@ LIVE_PRODUCTION_RENDER_MODE=fixture "$root/deploy/scripts/render-kustomize.sh" p
 for tool in docker jq; do
   command -v "$tool" >/dev/null 2>&1 || { echo "missing deployment contract prerequisite: $tool" >&2; exit 127; }
 done
+
+durable_up_plan=$(env \
+  POSTGRES_PASSWORD=postgres-local \
+  DATABASE_URL='postgres://live@postgres/live?sslmode=disable' \
+  S2S_API_KEY=speech-local \
+  DEEPSEEK_API_KEY=reasoner-local \
+  LIVE_STATIC_BEARER_TOKEN=bearer-local \
+  LIVE_ADMIN_BEARER_TOKEN=bearer-local \
+  LIVE_PRIVACY_HMAC_KEY=privacy-local \
+  LIVE_RETENTION_HMAC_KEY=retention-local \
+  LIVE_RECONNECT_HMAC_KEY=reconnect-local \
+  LIVE_TOOL_ENCRYPTION_KEY=tool-local \
+  LIVE_EXPECTED_CONFIG_HASH=v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  S2S_IMAGE=speech-to-speech:local \
+  S2S_CONFIG_PATH="$root/deploy/config/local.yaml" \
+  make -n durable-demo-up)
+printf '%s\n' "$durable_up_plan" | rg -F 'docker compose --project-name gpt-live-durable-demo -f deploy/docker-compose.yml -f deploy/compose.development-durable.yml up --build --wait postgres migrate gateway worker' >/dev/null || {
+  echo "durable demo up command is not explicitly project-scoped" >&2
+  exit 1
+}
+durable_down_plan=$(make -n durable-demo-down)
+printf '%s\n' "$durable_down_plan" | rg -F 'docker compose --project-name gpt-live-durable-demo -f deploy/docker-compose.yml -f deploy/compose.development-durable.yml down' >/dev/null || {
+  echo "durable demo down command is not explicitly project-scoped" >&2
+  exit 1
+}
+if printf '%s\n' "$durable_down_plan" | rg -F -- '--project-name gpt-live ' >/dev/null; then
+  echo "durable demo down targets the canonical gpt-live project" >&2
+  exit 1
+fi
+
 compose_gateway_image=registry.acme.com/gateway@sha256:4d1b72371c42a69bd949048883897aa673059f2e7b1cc992a650584132aae8f3
 env -i PATH="$PATH" GATEWAY_IMAGE="$compose_gateway_image" FORMAL_DEEPSEEK_API_KEY= \
   docker compose --env-file /dev/null -f "$root/deploy/docker-compose.yml" config --format json >"$scratch/compose.json"
@@ -25,6 +55,42 @@ if ! jq -e --arg image "$compose_gateway_image" '
   .services.gateway.environment.LIVE_GATEWAY_IMAGE == $image
 ' "$scratch/compose.json" >/dev/null; then
   echo "formal Compose gateway runtime identity is not bound to its exact candidate image" >&2
+  exit 1
+fi
+
+durable_hash=$(GOCACHE="$cache" go run ./cmd/live-gateway config-hash --config "$root/deploy/config/development-durable.yaml")
+env -i PATH="$PATH" \
+  POSTGRES_PASSWORD=postgres-local \
+  DATABASE_URL='postgres://live@postgres/live?sslmode=disable' \
+  S2S_API_KEY=speech-local \
+  DEEPSEEK_API_KEY=reasoner-local \
+  LIVE_STATIC_BEARER_TOKEN=bearer-local \
+  LIVE_ADMIN_BEARER_TOKEN=bearer-local \
+  LIVE_PRIVACY_HMAC_KEY=privacy-local \
+  LIVE_RETENTION_HMAC_KEY=retention-local \
+  LIVE_RECONNECT_HMAC_KEY=reconnect-local \
+  LIVE_TOOL_ENCRYPTION_KEY=tool-local \
+  LIVE_EXPECTED_CONFIG_HASH="$durable_hash" \
+  S2S_IMAGE=speech-to-speech:local \
+  S2S_CONFIG_PATH="$root/deploy/config/local.yaml" \
+  docker compose --env-file /dev/null -f "$root/deploy/docker-compose.yml" -f "$root/deploy/compose.development-durable.yml" config --format json >"$scratch/durable-compose.json"
+if ! jq -e --arg config "$root/deploy/config/development-durable.yaml" '
+  .name == "gpt-live-durable-demo" and
+  .services.gateway.read_only == true and .services.worker.read_only == true and .services.migrate.read_only == true and
+  .services.gateway.depends_on.migrate.condition == "service_completed_successfully" and
+  .services.worker.depends_on.migrate.condition == "service_completed_successfully" and
+  ([.services.gateway.ports[].host_ip] | unique) == ["127.0.0.1"] and
+  ([.services.worker.ports[].host_ip] | unique) == ["127.0.0.1"] and
+  ([.services.gateway.volumes[] | select(.target == "/etc/live/config.yaml" and .read_only == true) | .source] | length) == 1 and
+  ([.services.gateway.volumes[] | select(.target == "/etc/live/config.yaml") | .source] | all(. == $config)) and
+  ([.services.worker.volumes[] | select(.target == "/etc/live/config.yaml" and .read_only == true) | .source] | length) == 1 and
+  ([.services.worker.volumes[] | select(.target == "/etc/live/config.yaml") | .source] | all(. == $config)) and
+  (.services.gateway.environment | has("LIVE_RECONNECT_HMAC_KEY")) and
+  (.services.gateway.environment | has("DEEPSEEK_API_KEY") | not) and
+  (.services.worker.environment | has("DEEPSEEK_API_KEY")) and
+  (.services.worker.environment | has("LIVE_RECONNECT_HMAC_KEY") | not)
+' "$scratch/durable-compose.json" >/dev/null; then
+  echo "durable Compose service ownership or hardening is invalid" >&2
   exit 1
 fi
 
@@ -67,7 +133,7 @@ for mutation in \
   hpa-gateway:target hpa-gateway:replicas hpa-gateway:behavior hpa-gateway:metric-name hpa-gateway:metric-value hpa-gateway:metric-type hpa-gateway:extra-metric \
   hpa-worker:target hpa-worker:replicas hpa-worker:behavior hpa-worker:metric-name hpa-worker:metric-value hpa-worker:metric-type hpa-worker:extra-metric \
   ingress:backend ingress:backend-port ingress:rule-host ingress:tls-host ingress:tls-secret ingress:path ingress:class ingress:annotation ingress:extra-path \
-  live-config:missing live-config:extra live-config:content deploy-metadata:trusted deploy-metadata:extra \
+  live-config:missing live-config:extra live-config:content live-config:development-durable deploy-metadata:trusted deploy-metadata:extra \
   live-gateway:metadata-label live-gateway:selector live-gateway:config-volume live-gateway:config-subpath live-gateway:config-mount live-gateway:config-key live-gateway:config-path live-gateway:extra-volume live-gateway:args live-gateway:container-port live-gateway:container-port-name live-gateway:container-port-protocol \
   live-worker:metadata-label live-worker:selector live-worker:config-volume live-worker:config-subpath live-worker:config-mount live-worker:config-key live-worker:config-path live-worker:extra-volume live-worker:args live-worker:container-port live-worker:container-port-name live-worker:container-port-protocol live-migrate:args \
   namespace:name default-deny:selector \

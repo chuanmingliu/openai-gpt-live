@@ -142,7 +142,7 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 	if err := verifyExpectedHash(cfg, lookup); err != nil {
 		return err
 	}
-	if err := cfg.ResolveSecrets(lookup); err != nil {
+	if err := resolveGatewayConfigSecrets(cfg, lookup); err != nil {
 		return fmt.Errorf("load gateway configuration: %w", err)
 	}
 	admissionController, closeAdmission, err := composeAdmission(ctx, cfg, lookup)
@@ -243,7 +243,7 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 	}, QueueState: func(name string, depth, bytes int, buffered time.Duration) {
 		queueObserver(name).Set(depth, bytes, buffered)
 	}, QueueBlocked: func(name string, d time.Duration) { queueObserver(name).ObserveBlocked(d) }, QueueOldest: func(name string, d time.Duration) { queueObserver(name).ObserveOldest(d) }, BargeinSuppression: func(d time.Duration) { bargeObserver.Observe(d.Seconds()) }})}
-	if cfg.Mode == "production" {
+	if cfg.IsProduction() {
 		appOptions = append(appOptions, gateway.WithCanaryRuntimeIdentity(canaryIdentity))
 	}
 	if featureRuntime != nil {
@@ -270,7 +270,7 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 	if err != nil {
 		return fmt.Errorf("configure gateway: %w", err)
 	}
-	if cfg.Mode == "production" {
+	if requiresReconnectReadiness(cfg) {
 		_ = ready.RegisterRequired("reconnect_owners", health.CheckFunc(app.ReconnectReady))
 	}
 	diagnostics, err := startGatewayDiagnostics(ctx, cfg, admissionController, app, drainer, ready, registry, featureRuntime)
@@ -296,7 +296,7 @@ type gatewayFeatureRuntime struct {
 var composeGatewayRepositoryHook func(*postgres.Repository) error
 
 func composeGatewayFeatures(ctx context.Context, cfg config.Config, lookup func(string) (string, bool)) (*gatewayFeatureRuntime, error) {
-	if cfg.Mode != "production" {
+	if !requiresRuntimeRepository(cfg) {
 		return nil, nil
 	}
 	databaseURL := cfg.Store.URL
@@ -444,7 +444,7 @@ func startGatewayDiagnostics(ctx context.Context, cfg config.Config, authenticat
 		}
 		d.errors <- err
 	}()
-	if cfg.Mode == "production" {
+	if cfg.IsProduction() {
 		metricsMux := http.NewServeMux()
 		metricsMux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
 		d.metricsServer = &http.Server{Handler: metricsMux, ReadHeaderTimeout: 5 * time.Second}
@@ -558,6 +558,15 @@ func verifyExpectedHash(cfg config.Config, lookup func(string) (string, bool)) e
 	return config.ValidateExpected(actual, expected)
 }
 
+// resolveGatewayConfigSecrets validates only the references the gateway owns.
+// The worker's reasoner credential remains scoped to the worker process even
+// when both components consume the same immutable configuration document.
+func resolveGatewayConfigSecrets(cfg config.Config, lookup func(string) (string, bool)) error {
+	gatewayConfig := cfg
+	gatewayConfig.Worker.Reasoner.APIKeyEnv = ""
+	return gatewayConfig.ResolveSecrets(lookup)
+}
+
 func finishAdmission(runErr error, closeAdmission func() error) error {
 	if closeAdmission == nil {
 		return runErr
@@ -571,7 +580,7 @@ func finishAdmission(runErr error, closeAdmission func() error) error {
 func composeAdmission(ctx context.Context, cfg config.Config, lookup func(string) (string, bool)) (*admission.Controller, func() error, error) {
 	var authenticator auth.Authenticator
 	requiredScopes := cfg.Auth.OIDCRequiredScopes
-	if cfg.Mode == "local" && cfg.Auth.StaticBearerEnv != "" {
+	if allowsStaticAuthenticator(cfg) {
 		token, ok := lookup(cfg.Auth.StaticBearerEnv)
 		if !ok || token == "" {
 			return nil, nil, errors.New("configured static credential is unavailable")
@@ -590,13 +599,13 @@ func composeAdmission(ctx context.Context, cfg config.Config, lookup func(string
 			return nil, nil, errors.New("OIDC authentication is unavailable")
 		}
 		authenticator = oidcAuthenticator
-	} else if cfg.Mode == "local" {
+	} else if !requiresRuntimeRepository(cfg) {
 		return nil, nil, nil
 	} else {
 		return nil, nil, errors.New("production authentication is unavailable")
 	}
-	controllerConfig := admission.Config{RequireTLS: cfg.Mode == "production", BehindIngress: cfg.Gateway.BehindIngress, TrustedProxyCIDRs: cfg.Gateway.TrustedProxies, AllowedOrigins: cfg.Auth.AllowedOrigins, AllowEmptyOrigin: cfg.Auth.AllowNonBrowser, GlobalRate: cfg.Admission.GlobalRate, GlobalBurst: cfg.Admission.GlobalBurst, IPRate: cfg.Admission.IPRate, IPBurst: cfg.Admission.IPBurst, IPKeyTTL: cfg.Admission.IPKeyTTL, MaxIPKeys: cfg.Admission.MaxIPKeys, RequiredScopes: requiredScopes, EphemeralTenantID: cfg.Auth.EphemeralTenantID, EphemeralUserID: cfg.Auth.EphemeralUserID, Limits: admission.Limits{Global: cfg.Admission.MaxSessions, PerTenant: cfg.Admission.MaxSessionsPerTenant, PerUser: cfg.Admission.MaxSessionsPerUser}, RequireStore: cfg.Mode == "production"}
-	if cfg.Mode != "production" {
+	controllerConfig := admission.Config{RequireTLS: requiresProductionTLS(cfg), BehindIngress: cfg.Gateway.BehindIngress, TrustedProxyCIDRs: cfg.Gateway.TrustedProxies, AllowedOrigins: cfg.Auth.AllowedOrigins, AllowEmptyOrigin: cfg.Auth.AllowNonBrowser, GlobalRate: cfg.Admission.GlobalRate, GlobalBurst: cfg.Admission.GlobalBurst, IPRate: cfg.Admission.IPRate, IPBurst: cfg.Admission.IPBurst, IPKeyTTL: cfg.Admission.IPKeyTTL, MaxIPKeys: cfg.Admission.MaxIPKeys, RequiredScopes: requiredScopes, EphemeralTenantID: cfg.Auth.EphemeralTenantID, EphemeralUserID: cfg.Auth.EphemeralUserID, Limits: admission.Limits{Global: cfg.Admission.MaxSessions, PerTenant: cfg.Admission.MaxSessionsPerTenant, PerUser: cfg.Admission.MaxSessionsPerUser}, RequireStore: requiresRuntimeRepository(cfg)}
+	if !requiresRuntimeRepository(cfg) {
 		controller, err := admission.New(authenticator, controllerConfig)
 		if err != nil {
 			return nil, nil, fmt.Errorf("configure admission: %w", err)
@@ -650,11 +659,21 @@ func composeAdmission(ctx context.Context, cfg config.Config, lookup func(string
 }
 
 func validateComposition(cfg config.Config) error {
-	if cfg.Features.Handoffs && cfg.Mode != "production" {
-		return errors.New("handoff delivery requires production durability composition")
+	if cfg.Features.Handoffs && !cfg.IsDurable() {
+		return errors.New("handoff delivery requires durable PostgreSQL composition")
 	}
 	return nil
 }
+
+func requiresRuntimeRepository(cfg config.Config) bool { return cfg.IsDurable() }
+
+func allowsStaticAuthenticator(cfg config.Config) bool {
+	return !cfg.IsProduction() && cfg.UsesStaticAuth()
+}
+
+func requiresProductionTLS(cfg config.Config) bool { return cfg.IsProduction() }
+
+func requiresReconnectReadiness(cfg config.Config) bool { return cfg.IsDurable() }
 
 type gatewayHandoffIDs struct{}
 
@@ -686,7 +705,7 @@ func (gatewayCryptoJitter) Duration(max time.Duration) time.Duration {
 }
 
 func composeGatewayDurability(cfg config.Config, runtime *gatewayFeatureRuntime, configHash, runtimeInstance, deliveryRegion string) ([]gateway.Option, error) {
-	if cfg.Mode != "production" {
+	if !requiresRuntimeRepository(cfg) {
 		return nil, nil
 	}
 	if runtime == nil || runtime.repo == nil {
@@ -731,13 +750,7 @@ func composeGatewayDurability(cfg config.Config, runtime *gatewayFeatureRuntime,
 	if err != nil {
 		return nil, fmt.Errorf("configure handoff presentation safety: %w", err)
 	}
-	snapshot := gateway.SessionHandoffSnapshot{
-		ContextRef: "context://conversation/current", ContextHash: configHash,
-		Deadline:    time.Date(9999, time.December, 31, 23, 59, 59, 0, time.UTC),
-		TokenBudget: cfg.Worker.MaxOutputTokens, ToolAllowlist: []string{}, ApprovalPolicy: json.RawMessage(`{"mode":"none"}`),
-		Versions:         handoff.Versions{Model: cfg.Worker.Reasoner.Model, Prompt: cfg.Safety.PolicyVersion, ToolRegistry: configHash, Config: configHash},
-		PresentationHint: "brief",
-	}
+	snapshot := gatewayHandoffSnapshot(cfg, configHash)
 	dependencies.Service = service
 	dependencies.HandoffQueueCapacity = cfg.Gateway.Session.ControlEvents
 	dependencies.Snapshot = snapshot
@@ -749,6 +762,20 @@ func composeGatewayDurability(cfg config.Config, runtime *gatewayFeatureRuntime,
 			WakeupCapacity: cfg.Gateway.Session.ControlEvents, Policy: presentation.NewPolicy(presentation.Config{}), Safety: policy,
 		}),
 	}, nil
+}
+
+func gatewayHandoffSnapshot(cfg config.Config, configHash string) gateway.SessionHandoffSnapshot {
+	toolAllowlist := []string{}
+	if cfg.ToolCatalog().WebSearch.Enabled {
+		toolAllowlist = append(toolAllowlist, "web_search")
+	}
+	return gateway.SessionHandoffSnapshot{
+		ContextRef: "context://conversation/current", ContextHash: configHash,
+		Deadline:    time.Date(9999, time.December, 31, 23, 59, 59, 0, time.UTC),
+		TokenBudget: cfg.Worker.MaxOutputTokens, ToolAllowlist: toolAllowlist, ApprovalPolicy: json.RawMessage(`{"mode":"none"}`),
+		Versions:         handoff.Versions{Model: cfg.Worker.Reasoner.Model, Prompt: cfg.Safety.PolicyVersion, ToolRegistry: configHash, Config: configHash},
+		PresentationHint: "brief",
+	}
 }
 
 func gatewayDurabilityIdentity(runtimeInstance string) (string, error) {
@@ -770,7 +797,7 @@ func gatewayDeliveryShard(region string) (string, error) {
 }
 
 func composeGatewayReconnect(cfg config.Config, runtime *gatewayFeatureRuntime, lookup func(string) (string, bool)) (gateway.Option, error) {
-	if cfg.Mode != "production" {
+	if !requiresRuntimeRepository(cfg) {
 		return nil, nil
 	}
 	if runtime == nil || runtime.pool == nil {

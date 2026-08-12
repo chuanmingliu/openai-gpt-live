@@ -6,6 +6,10 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	liveconfig "github.com/chuanmingliu/openai-gpt-live/internal/config"
+	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 )
 
 func TestReadDocumentsFindsNamespace(t *testing.T) {
@@ -114,6 +118,73 @@ func TestValidateProductionInputsAcceptsReviewedValues(t *testing.T) {
 	setValidProductionInputs(t)
 	if err := validateProductionInputs("deploy"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDevelopmentDurableCannotPassKubernetesRenderOrReleaseFixture(t *testing.T) {
+	raw := "mode: development_durable\n"
+	for _, test := range []struct {
+		name, overlay, readiness string
+	}{
+		{name: "local Kubernetes render", overlay: "local", readiness: "local"},
+		{name: "production release fixture", overlay: "production", readiness: "fixture"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateRenderedConfigMode(raw, test.overlay, test.readiness)
+			if err == nil || !strings.Contains(err.Error(), "development_durable") {
+				t.Fatalf("development_durable render error = %v", err)
+			}
+		})
+	}
+}
+
+func TestDevelopmentDurableConfigIsExactAndContainsOnlySecretReferences(t *testing.T) {
+	path := filepath.Join("..", "config", "development-durable.yaml")
+	cfg, err := liveconfig.LoadUnresolved(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Mode != "development_durable" || !cfg.IsDurable() || cfg.IsProduction() || !cfg.UsesStaticAuth() {
+		t.Fatalf("durable mode classification is invalid: mode=%q durable=%v production=%v static=%v", cfg.Mode, cfg.IsDurable(), cfg.IsProduction(), cfg.UsesStaticAuth())
+	}
+	if cfg.Gateway.Voice.URL != "ws://speech-to-speech:8000/v1/realtime" || cfg.Store.DatabaseURLEnv != "DATABASE_URL" {
+		t.Fatalf("durable local transport/store = %q/%q", cfg.Gateway.Voice.URL, cfg.Store.DatabaseURLEnv)
+	}
+	if cfg.Worker.Reasoner.Provider != "deepseek" || cfg.Worker.Reasoner.BaseURL != "https://api.deepseek.com" || cfg.Worker.Reasoner.Model != "deepseek-v4-flash" || cfg.Worker.Reasoner.APIKeyEnv != "DEEPSEEK_API_KEY" {
+		t.Fatalf("durable reasoner configuration = %#v", cfg.Worker.Reasoner)
+	}
+	if cfg.Gateway.Reconnect.HMACKeyEnv != "LIVE_RECONNECT_HMAC_KEY" || cfg.Store.Retention.HMACKeyEnv != "LIVE_RETENTION_HMAC_KEY" || cfg.Features.ToolEncryptionKeyEnv != "LIVE_TOOL_ENCRYPTION_KEY" {
+		t.Fatal("durable key references are not component-safe named references")
+	}
+	if !cfg.Features.Handoffs || cfg.Features.SideEffectingTools {
+		t.Fatalf("durable handoff/read-only features = %#v", cfg.Features)
+	}
+	catalog := cfg.ToolCatalog().WebSearch
+	if !catalog.Enabled || !catalog.ForceStrict || catalog.MaximumResults != 5 || catalog.MaximumTimeoutMS != int((8*time.Second)/time.Millisecond) || !sameStrings(catalog.Regions, []string{"au-en", "ca-en", "cn-zh", "uk-en", "us-en", "wt-wt"}) {
+		t.Fatalf("durable catalog = %#v", catalog)
+	}
+	if _, err := os.ReadFile(path); err != nil {
+		t.Fatal(err)
+	}
+	if catalog.Enabled && toolpolicy.WebSearchTool != "web_search" {
+		t.Fatalf("unexpected immutable tool name %q", toolpolicy.WebSearchTool)
+	}
+}
+
+func TestProductionRejectsDevelopmentDurableStaticAuthAndPlainWS(t *testing.T) {
+	cfg, err := liveconfig.LoadUnresolved(filepath.Join("..", "config", "development-durable.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Mode = "production"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "must use wss") {
+		t.Fatalf("production plain-WS error = %v", err)
+	}
+	cfg.Gateway.Voice.URL = "wss://speech.acme.com/v1/realtime"
+	cfg.Gateway.TLS.CertFile = "/run/tls/tls.crt"
+	cfg.Gateway.TLS.KeyFile = "/run/tls/tls.key"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "static authentication") {
+		t.Fatalf("production static-auth error = %v", err)
 	}
 }
 

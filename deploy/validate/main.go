@@ -199,7 +199,11 @@ func validate(docs []document, overlay, readiness string) error {
 	if liveConfig == nil || !exactKeys(mapAt(liveConfig, "data"), "config.yaml") || stringAt(mapAt(liveConfig, "data"), "config.yaml") == "" {
 		return errors.New("live-config must contain exactly config.yaml")
 	}
-	computedHash, err := hashRenderedConfig(stringAt(mapAt(liveConfig, "data"), "config.yaml"))
+	rawConfig := stringAt(mapAt(liveConfig, "data"), "config.yaml")
+	if err := validateRenderedConfigMode(rawConfig, overlay, readiness); err != nil {
+		return err
+	}
+	computedHash, err := hashRenderedConfig(rawConfig)
 	if err != nil {
 		return fmt.Errorf("live-config content is invalid: %w", err)
 	}
@@ -305,6 +309,19 @@ func validate(docs []document, overlay, readiness string) error {
 	}
 	if err := validateProduction(docs, data, images, readiness); err != nil {
 		return err
+	}
+	return nil
+}
+
+func validateRenderedConfigMode(raw, overlay, readiness string) error {
+	var config document
+	if err := yaml.Unmarshal([]byte(raw), &config); err != nil {
+		return fmt.Errorf("rendered config mode is invalid: %w", err)
+	}
+	mode := stringAt(config, "mode")
+	want := overlay
+	if mode != want {
+		return fmt.Errorf("rendered %s/%s config mode %q is forbidden; want %q", overlay, readiness, mode, want)
 	}
 	return nil
 }
@@ -2033,6 +2050,8 @@ func mutate(docs []document, mutation string) error {
 			mapAt(config, "data")["extra"] = "orphan"
 		case "content":
 			mapAt(config, "data")["config.yaml"] = strings.Replace(stringAt(mapAt(config, "data"), "config.yaml"), "service_name: gpt-live", "service_name: gpt-live-mutated", 1)
+		case "development-durable":
+			mapAt(config, "data")["config.yaml"] = strings.Replace(stringAt(mapAt(config, "data"), "config.yaml"), "mode: production", "mode: development_durable", 1)
 		default:
 			return errors.New("unknown live-config mutation")
 		}

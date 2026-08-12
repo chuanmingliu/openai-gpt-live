@@ -49,11 +49,72 @@ func TestGatewayFatalErrorIsStructuredRedactedAndExitsOne(t *testing.T) {
 	assert.Contains(t, string(output), "error=[REDACTED]")
 }
 
-func TestGatewayHandoffsRequireProductionDurabilityComposition(t *testing.T) {
+func TestGatewayHandoffsRequireDurablePostgresComposition(t *testing.T) {
 	assert.NoError(t, validateComposition(config.Config{Mode: "production", Features: config.FeatureConfig{Handoffs: true}}))
 	err := validateComposition(config.Config{Mode: "local", Features: config.FeatureConfig{Handoffs: true}})
-	assert.ErrorContains(t, err, "production durability composition")
+	assert.ErrorContains(t, err, "durable PostgreSQL composition")
 	assert.NoError(t, validateComposition(config.Config{}), "non-handoff local startup stays compatible")
+}
+
+func TestDevelopmentDurableUsesStaticAuthAndPostgresDurability(t *testing.T) {
+	cfg := config.Config{
+		Mode:     "development_durable",
+		Auth:     config.AuthConfig{StaticBearerEnv: "LIVE_STATIC_BEARER_TOKEN"},
+		Features: config.FeatureConfig{Handoffs: true},
+	}
+
+	assert.NoError(t, validateComposition(cfg))
+	assert.True(t, requiresRuntimeRepository(cfg))
+	assert.True(t, allowsStaticAuthenticator(cfg))
+	assert.False(t, requiresProductionTLS(cfg))
+	assert.True(t, requiresReconnectReadiness(cfg))
+}
+
+func TestLocalStillRejectsHandoffs(t *testing.T) {
+	cfg := config.Config{Mode: "local", Features: config.FeatureConfig{Handoffs: true}}
+	require.Error(t, validateComposition(cfg))
+}
+
+func TestDevelopmentDurableGatewaySecretResolutionDoesNotRequireWorkerCredential(t *testing.T) {
+	cfg := config.Config{
+		Mode:    "development_durable",
+		Gateway: config.GatewayConfig{Voice: config.VoiceConfig{APIKeyEnv: "S2S_API_KEY"}},
+		Worker:  config.WorkerConfig{Reasoner: config.ReasonerConfig{APIKeyEnv: "DEEPSEEK_API_KEY"}},
+		Store:   config.StoreConfig{DatabaseURLEnv: "DATABASE_URL"},
+		Auth:    config.AuthConfig{StaticBearerEnv: "LIVE_STATIC_BEARER_TOKEN"},
+	}
+	values := map[string]string{
+		"S2S_API_KEY":              "speech-secret",
+		"DATABASE_URL":             "postgres://live@postgres/live?sslmode=disable",
+		"LIVE_STATIC_BEARER_TOKEN": "local-bearer",
+	}
+
+	err := resolveGatewayConfigSecrets(cfg, func(name string) (string, bool) {
+		if name == "DEEPSEEK_API_KEY" {
+			t.Fatal("gateway looked up worker-only DeepSeek credential")
+		}
+		value, ok := values[name]
+		return value, ok
+	})
+	require.NoError(t, err)
+}
+
+func TestDevelopmentDurableHandoffSnapshotUsesExactEnabledCatalog(t *testing.T) {
+	cfg := config.Config{
+		Worker: config.WorkerConfig{MaxOutputTokens: 4096, Reasoner: config.ReasonerConfig{Model: "deepseek-v4-flash"}},
+		Safety: config.SafetyConfig{PolicyVersion: "static-v1"},
+		Tools:  config.ToolCatalogConfig{WebSearch: config.WebSearchToolConfig{Enabled: true}},
+	}
+	configHash := "v1:" + strings.Repeat("a", 64)
+
+	snapshot := gatewayHandoffSnapshot(cfg, configHash)
+	assert.Equal(t, []string{"web_search"}, snapshot.ToolAllowlist)
+	assert.Equal(t, "deepseek-v4-flash", snapshot.Versions.Model)
+	assert.Equal(t, configHash, snapshot.Versions.ToolRegistry)
+	assert.Equal(t, configHash, snapshot.Versions.Config)
+
+	cfg.Tools.WebSearch.Enabled = false
+	assert.Empty(t, gatewayHandoffSnapshot(cfg, configHash).ToolAllowlist)
 }
 
 func TestComposeGatewayDurabilityIncludesRecoveryWhenHandoffsAreDisabled(t *testing.T) {
@@ -193,7 +254,7 @@ gateway:
 		lookups++
 		return "secret", true
 	})
-	assert.ErrorContains(t, err, "production durability composition")
+	assert.ErrorContains(t, err, "durable PostgreSQL composition")
 	assert.Zero(t, lookups)
 }
 
