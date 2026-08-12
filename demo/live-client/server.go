@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/tools/websearch"
 	"github.com/coder/websocket"
 )
 
@@ -23,9 +24,18 @@ type demoHandler struct {
 	upstream        *url.URL
 	websocketOrigin string
 	dial            dialUpstream
+	tools           *toolPolicyStore
 }
 
 func newHandler(cfg demoConfig, bearer []byte, dial dialUpstream) (http.Handler, error) {
+	search, err := websearch.New(net.DefaultResolver)
+	if err != nil {
+		return nil, errors.New("demo tool search is unavailable")
+	}
+	return newHandlerWithToolSearch(cfg, bearer, dial, search)
+}
+
+func newHandlerWithToolSearch(cfg demoConfig, bearer []byte, dial dialUpstream, search toolSearcher) (http.Handler, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -47,45 +57,94 @@ func newHandler(cfg demoConfig, bearer []byte, dial dialUpstream) (http.Handler,
 	if dial == nil {
 		dial = defaultDialUpstream
 	}
+	tools, err := newToolPolicyStore(search)
+	if err != nil {
+		return nil, err
+	}
 	return &demoHandler{
 		cfg:             cfg,
 		bearer:          append([]byte(nil), bearer...),
 		upstream:        upstream,
 		websocketOrigin: websocketScheme + "://" + origin.Host,
 		dial:            dial,
+		tools:           tools,
 	}, nil
 }
 
 func (handler *demoHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	setBrowserHeaders(writer.Header(), handler.websocketOrigin)
-	if request.Method != http.MethodGet {
-		writer.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
 	switch request.URL.Path {
+	case "/api/tool-policy":
+		handler.serveToolPolicy(writer, request)
+	case "/api/tool-policy/test":
+		handler.serveToolPolicyTest(writer, request)
 	case "/":
+		if request.Method != http.MethodGet {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		handler.serveAsset(writer, "web/index.html", "text/html; charset=utf-8")
 	case "/styles.css":
+		if request.Method != http.MethodGet {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		handler.serveAsset(writer, "web/styles.css", "text/css; charset=utf-8")
 	case "/audio-core.mjs":
+		if request.Method != http.MethodGet {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		handler.serveAsset(writer, "web/audio-core.mjs", "text/javascript; charset=utf-8")
 	case "/browser-runtime.mjs":
+		if request.Method != http.MethodGet {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		handler.serveAsset(writer, "web/browser-runtime.mjs", "text/javascript; charset=utf-8")
 	case "/client-state.mjs":
+		if request.Method != http.MethodGet {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		handler.serveAsset(writer, "web/client-state.mjs", "text/javascript; charset=utf-8")
 	case "/protocol-state.mjs":
+		if request.Method != http.MethodGet {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		handler.serveAsset(writer, "web/protocol-state.mjs", "text/javascript; charset=utf-8")
 	case "/app.js":
+		if request.Method != http.MethodGet {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		handler.serveAsset(writer, "web/app.js", "text/javascript; charset=utf-8")
 	case "/capture-worklet.js":
+		if request.Method != http.MethodGet {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		handler.serveAsset(writer, "web/capture-worklet.js", "text/javascript; charset=utf-8")
 	case "/playback-worklet.js":
+		if request.Method != http.MethodGet {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		handler.serveAsset(writer, "web/playback-worklet.js", "text/javascript; charset=utf-8")
 	case "/health/ready":
+		if request.Method != http.MethodGet {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		writer.WriteHeader(http.StatusOK)
 		_, _ = writer.Write([]byte("ready\n"))
 	case "/ws":
+		if request.Method != http.MethodGet {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		handler.serveWebSocket(writer, request)
 	default:
 		writer.WriteHeader(http.StatusNotFound)
