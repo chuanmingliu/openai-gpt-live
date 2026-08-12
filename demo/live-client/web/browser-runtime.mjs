@@ -77,13 +77,14 @@ export function createBrowserRuntime(dependencies) {
   }
 
   async function loadToolPolicy(currentGeneration) {
+    const loadGeneration = presentation.tools.beginPolicyLoad();
     try {
       const response = await boundedFetch('/api/tool-policy', {method: 'GET'});
       if (!response.ok) throw new Error('tool policy unavailable');
       const policy = normalizeToolPolicy(await response.json());
-      if (generation === currentGeneration) presentation.tools.loadPolicy(policy);
+      if (generation === currentGeneration) presentation.tools.loadPolicy(policy, loadGeneration);
     } catch {
-      if (generation === currentGeneration) presentation.tools.failLoad();
+      if (generation === currentGeneration) presentation.tools.failLoad(loadGeneration);
     } finally {
       if (generation === currentGeneration) publishSnapshot();
     }
@@ -469,7 +470,7 @@ export function createBrowserRuntime(dependencies) {
   }
 
   async function persistToolPolicy(canonical) {
-    presentation.tools.beginSave(canonical);
+    const operation = presentation.tools.beginSave(canonical);
     publishSnapshot();
     try {
       const response = await boundedFetch('/api/tool-policy', {
@@ -478,10 +479,10 @@ export function createBrowserRuntime(dependencies) {
         body: JSON.stringify(canonical),
       });
       if (!response.ok) throw new Error('tool policy save failed');
-      presentation.tools.commitSave(canonical);
+      presentation.tools.commitSave(canonical, operation);
       if (socket) sendCurrentPolicy(generation, socket, false);
     } catch {
-      presentation.tools.failSave();
+      presentation.tools.failSave(operation);
     }
     publishSnapshot();
   }
@@ -501,7 +502,7 @@ export function createBrowserRuntime(dependencies) {
   }
 
   async function testToolPolicy() {
-    presentation.tools.beginTest();
+    const operation = presentation.tools.beginTest();
     publishSnapshot();
     let passed = false;
     try {
@@ -512,7 +513,7 @@ export function createBrowserRuntime(dependencies) {
       });
       passed = response.ok;
     } catch {}
-    presentation.tools.finishTest(passed);
+    presentation.tools.finishTest(passed, operation);
     publishSnapshot();
   }
 

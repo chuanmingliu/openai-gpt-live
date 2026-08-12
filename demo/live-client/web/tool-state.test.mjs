@@ -238,6 +238,36 @@ test('the latest operation selects Test then later Save success and failure stat
   assert.equal(toolPolicyStatusText(tools.snapshot()), 'Policy action failed. Try again.');
 });
 
+test('an older Test completion cannot reclaim status from a later successful Save', () => {
+  for (const passed of [true, false]) {
+    const tools = new ToolState();
+    const saved = structuredClone(DEFAULT_POLICY);
+    saved.web_search.region = 'uk-en';
+    const testOperation = tools.beginTest();
+    const saveOperation = tools.beginSave(saved);
+    tools.commitSave(saved, saveOperation);
+
+    assert.equal(tools.finishTest(passed, testOperation), true);
+    assert.equal(tools.snapshot().testStatus, passed ? 'passed' : 'error');
+    assert.equal(tools.snapshot().lastOperation, 'save');
+    assert.equal(toolPolicyStatusText(tools.snapshot()), 'Policy saved and active.');
+  }
+});
+
+test('a load started before a committed Save cannot later replace or fail it', () => {
+  const tools = new ToolState();
+  const saved = structuredClone(DEFAULT_POLICY);
+  saved.web_search.region = 'uk-en';
+  const staleLoad = tools.beginPolicyLoad();
+  const saveOperation = tools.beginSave(saved);
+  tools.commitSave(saved, saveOperation);
+
+  assert.equal(tools.loadPolicy(DEFAULT_POLICY, staleLoad), false);
+  assert.deepEqual(tools.snapshot().policy, saved);
+  assert.equal(tools.failLoad(staleLoad), false);
+  assert.equal(tools.snapshot().saveStatus, 'saved');
+});
+
 test('tool policy update is a closed-world canonical WebSocket event', () => {
   assert.deepEqual(buildToolPolicyUpdate(DEFAULT_POLICY, 'policy-1'), {
     type: 'live.tool_policy.update', event_id: 'policy-1', tools: DEFAULT_POLICY,

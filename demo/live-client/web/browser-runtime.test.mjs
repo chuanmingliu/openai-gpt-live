@@ -472,6 +472,95 @@ test('session acceptance during a failed save sends only the last persisted poli
   await runtime.stop();
 });
 
+test('Test completion success or failure cannot mask a later no-socket Save', async () => {
+  for (const passed of [true, false]) {
+    let resolveTest;
+    const testResponse = new Promise((resolve) => { resolveTest = resolve; });
+    const saved = structuredClone(DEFAULT_TOOL_POLICY);
+    saved.web_search.region = passed ? 'uk-en' : 'cn-zh';
+    const harness = new BrowserHarness({fetchHandler: async (path, options) => {
+      if (path === '/api/tool-policy/test' && options.method === 'POST') return testResponse;
+      if (path === '/api/tool-policy' && options.method === 'PUT') return {ok: true};
+      return {ok: true, json: async () => structuredClone(DEFAULT_TOOL_POLICY)};
+    }});
+    const runtime = createBrowserRuntime(harness.dependencies());
+
+    const testing = runtime.testToolPolicy();
+    await new Promise((resolve) => setImmediate(resolve));
+    await runtime.saveToolPolicy(saved);
+    assert.equal(harness.presentation.snapshot().tools.lastOperation, 'save');
+    assert.equal(harness.presentation.snapshot().tools.saveStatus, 'saved');
+
+    resolveTest({ok: passed});
+    await testing;
+    assert.equal(harness.presentation.snapshot().tools.testStatus, passed ? 'passed' : 'error');
+    assert.equal(harness.presentation.snapshot().tools.lastOperation, 'save');
+    assert.equal(harness.presentation.snapshot().tools.saveStatus, 'saved');
+  }
+});
+
+test('late initial GET success cannot replace a no-socket persisted Save', async () => {
+  let resolveGET;
+  let resolveMedia;
+  const getResponse = new Promise((resolve) => { resolveGET = resolve; });
+  const media = new Promise((resolve) => { resolveMedia = resolve; });
+  const saved = structuredClone(DEFAULT_TOOL_POLICY);
+  saved.web_search.region = 'uk-en';
+  const harness = new BrowserHarness({
+    getUserMedia: () => media,
+    fetchHandler: async (path, options) => {
+      if (path === '/api/tool-policy' && options.method === 'GET') return getResponse;
+      if (path === '/api/tool-policy' && options.method === 'PUT') return {ok: true};
+      return {ok: true, json: async () => ({ok: true})};
+    },
+  });
+  const runtime = createBrowserRuntime(harness.dependencies());
+  const starting = runtime.start();
+  await new Promise((resolve) => setImmediate(resolve));
+  await runtime.saveToolPolicy(saved);
+  assert.equal(harness.sockets.length, 0);
+
+  resolveGET({ok: true, json: async () => structuredClone(DEFAULT_TOOL_POLICY)});
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(harness.presentation.snapshot().tools.policy, saved);
+  assert.equal(harness.presentation.snapshot().tools.saveStatus, 'saved');
+
+  resolveMedia(harness.makeMediaStream());
+  await starting;
+  await runtime.stop();
+});
+
+test('late initial GET failure cannot fail a no-socket persisted Save', async () => {
+  let rejectGET;
+  let resolveMedia;
+  const getResponse = new Promise((_resolve, reject) => { rejectGET = reject; });
+  const media = new Promise((resolve) => { resolveMedia = resolve; });
+  const saved = structuredClone(DEFAULT_TOOL_POLICY);
+  saved.web_search.region = 'uk-en';
+  const harness = new BrowserHarness({
+    getUserMedia: () => media,
+    fetchHandler: async (path, options) => {
+      if (path === '/api/tool-policy' && options.method === 'GET') return getResponse;
+      if (path === '/api/tool-policy' && options.method === 'PUT') return {ok: true};
+      return {ok: true, json: async () => ({ok: true})};
+    },
+  });
+  const runtime = createBrowserRuntime(harness.dependencies());
+  const starting = runtime.start();
+  await new Promise((resolve) => setImmediate(resolve));
+  await runtime.saveToolPolicy(saved);
+  assert.equal(harness.sockets.length, 0);
+
+  rejectGET(new Error('stale load failure'));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(harness.presentation.snapshot().tools.policy, saved);
+  assert.equal(harness.presentation.snapshot().tools.saveStatus, 'saved');
+
+  resolveMedia(harness.makeMediaStream());
+  await starting;
+  await runtime.stop();
+});
+
 test('handoff progress updates no playback worklet state and leaves voice status unchanged', async () => {
   const harness = new BrowserHarness();
   const runtime = createBrowserRuntime(harness.dependencies());

@@ -230,44 +230,62 @@ export class ToolState {
     this.pendingPolicy = null;
     this.pendingPolicyEventID = null;
     this.pendingAcknowledgementPolicy = null;
+    this.pendingAcknowledgementOperation = null;
     this.deferredLoadedPolicy = null;
+    this.policyCommitGeneration = 0;
+    this.operationGeneration = 0;
+    this.latestOperationGeneration = 0;
+    this.pendingSaveOperation = null;
+    this.persistedSaveOperation = 0;
+    this.pendingTestOperation = null;
     this.model = 'deepseek-v4-flash';
   }
 
-  loadPolicy(policy) {
+  beginPolicyLoad() {
+    return this.policyCommitGeneration;
+  }
+
+  loadPolicy(policy, loadGeneration = this.policyCommitGeneration) {
     const loaded = normalizeToolPolicy(policy);
+    if (loadGeneration !== this.policyCommitGeneration) return false;
     if (this.saveStatus === 'saving') {
       this.deferredLoadedPolicy = loaded;
       return false;
     }
-    if (this.saveStatus === 'awaiting-ack') return false;
     this.policy = loaded;
     this.saveStatus = 'ready';
-    this.lastOperation = 'save';
     return true;
   }
 
   beginSave(policy) {
+    const operation = ++this.operationGeneration;
+    this.latestOperationGeneration = operation;
     this.pendingPolicy = normalizeToolPolicy(policy);
+    this.pendingSaveOperation = operation;
     this.pendingPolicyEventID = null;
     this.pendingAcknowledgementPolicy = null;
+    this.pendingAcknowledgementOperation = null;
     this.deferredLoadedPolicy = null;
     this.saveStatus = 'saving';
     this.lastOperation = 'save';
+    return operation;
   }
 
-  commitSave(policy) {
+  commitSave(policy, operation = this.pendingSaveOperation) {
     const persisted = normalizeToolPolicy(policy);
-    if (!this.pendingPolicy || !policiesEqual(persisted, this.pendingPolicy)) return false;
+    if (operation !== this.pendingSaveOperation || !this.pendingPolicy || !policiesEqual(persisted, this.pendingPolicy)) return false;
     this.policy = persisted;
     this.pendingPolicy = null;
+    this.pendingSaveOperation = null;
+    this.persistedSaveOperation = operation;
+    this.policyCommitGeneration += 1;
     this.deferredLoadedPolicy = null;
     this.saveStatus = 'saved';
-    this.lastOperation = 'save';
+    if (operation === this.latestOperationGeneration) this.lastOperation = 'save';
     return true;
   }
 
-  markPolicySent(eventID, policy = this.policy) {
+  markPolicySent(eventID, policy = this.policy, operation = this.persistedSaveOperation) {
     if (typeof eventID !== 'string' || !EVENT_ID_PATTERN.test(eventID)) return false;
     let sent;
     try {
@@ -278,25 +296,34 @@ export class ToolState {
     if (!policiesEqual(sent, this.policy)) return false;
     this.pendingPolicyEventID = eventID;
     this.pendingAcknowledgementPolicy = sent;
+    this.pendingAcknowledgementOperation = operation;
     this.saveStatus = 'awaiting-ack';
-    this.lastOperation = 'save';
+    if (operation === this.latestOperationGeneration) this.lastOperation = 'save';
     return true;
   }
 
-  failSave() {
+  failSave(operation = this.pendingSaveOperation) {
+    if (this.pendingSaveOperation !== null && operation !== this.pendingSaveOperation) return false;
+    if (operation === null) {
+      operation = ++this.operationGeneration;
+      this.latestOperationGeneration = operation;
+    }
     this.pendingPolicy = null;
+    this.pendingSaveOperation = null;
     this.pendingPolicyEventID = null;
     this.pendingAcknowledgementPolicy = null;
+    this.pendingAcknowledgementOperation = null;
     if (this.deferredLoadedPolicy) this.policy = this.deferredLoadedPolicy;
     this.deferredLoadedPolicy = null;
     this.saveStatus = 'error';
-    this.lastOperation = 'save';
+    if (operation === this.latestOperationGeneration) this.lastOperation = 'save';
+    return true;
   }
 
-  failLoad() {
+  failLoad(loadGeneration = this.policyCommitGeneration) {
+    if (loadGeneration !== this.policyCommitGeneration) return false;
     if (this.saveStatus === 'saving' || this.saveStatus === 'awaiting-ack') return false;
     this.saveStatus = 'error';
-    this.lastOperation = 'save';
     return true;
   }
 
@@ -312,20 +339,29 @@ export class ToolState {
     this.policy = accepted;
     this.pendingPolicyEventID = null;
     this.pendingAcknowledgementPolicy = null;
+    const operation = this.pendingAcknowledgementOperation;
+    this.pendingAcknowledgementOperation = null;
     this.model = model;
     this.saveStatus = 'saved';
-    this.lastOperation = 'save';
+    if (operation === this.latestOperationGeneration) this.lastOperation = 'save';
     return true;
   }
 
   beginTest() {
+    const operation = ++this.operationGeneration;
+    this.latestOperationGeneration = operation;
+    this.pendingTestOperation = operation;
     this.testStatus = 'running';
     this.lastOperation = 'test';
+    return operation;
   }
 
-  finishTest(passed) {
+  finishTest(passed, operation = this.pendingTestOperation) {
+    if (operation !== this.pendingTestOperation) return false;
+    this.pendingTestOperation = null;
     this.testStatus = passed ? 'passed' : 'error';
-    this.lastOperation = 'test';
+    if (operation === this.latestOperationGeneration) this.lastOperation = 'test';
+    return true;
   }
 
   consume(rawEvent) {
