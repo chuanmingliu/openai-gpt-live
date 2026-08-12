@@ -481,13 +481,13 @@ func (c *Config) applyDefaults() {
 	if c.Shutdown.CleanupTimeout == 0 {
 		c.Shutdown.CleanupTimeout = 5 * time.Second
 	}
-	if c.Features.SideEffectingTools && c.Features.ToolEncryptionKeyEnv == "" {
+	c.Tools = effectiveToolCatalog(c.Tools)
+	if (c.Features.SideEffectingTools || c.Tools.WebSearch.Enabled) && c.Features.ToolEncryptionKeyEnv == "" {
 		c.Features.ToolEncryptionKeyEnv = "LIVE_TOOL_ENCRYPTION_KEY"
 	}
 	if c.Features.RefreshInterval == 0 {
 		c.Features.RefreshInterval = time.Second
 	}
-	c.Tools = effectiveToolCatalog(c.Tools)
 	if c.Store.Retention.ConversationTTL == 0 {
 		c.Store.Retention.ConversationTTL = 30 * 24 * time.Hour
 	}
@@ -662,6 +662,9 @@ func (c Config) Validate() error {
 	}
 	if c.Admission.InstanceID != "" && (!validKeyID(c.Admission.InstanceID) || len(c.Admission.InstanceID) > 256) {
 		return errors.New("admission.instance_id is invalid")
+	}
+	if (c.Features.SideEffectingTools || effectiveToolCatalog(c.Tools).WebSearch.Enabled) && c.Features.ToolEncryptionKeyEnv == "" {
+		return errors.New("registered tools require features.tool_encryption_key_env")
 	}
 	if c.Features.ToolEncryptionKeyEnv != "" {
 		if !validKeyID(c.Features.ToolEncryptionKeyID) {

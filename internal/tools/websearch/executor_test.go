@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/config"
 	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 	"github.com/chuanmingliu/openai-gpt-live/internal/worker"
 	"github.com/stretchr/testify/assert"
@@ -108,6 +109,23 @@ func TestRegisteredToolHasExactSchemaAndReadOnlyMetadata(t *testing.T) {
 
 	_, err := worker.NewToolRegistry(map[string][]worker.RegisteredTool{"tools-v1": {registered}})
 	require.NoError(t, err)
+}
+
+func TestRegisteredReadOnlyWebSearchExecutesWithSideEffectingToolsDisabled(t *testing.T) {
+	cfg := config.Config{}
+	cfg.Tools.WebSearch.Enabled = true
+	cfg.Features.SideEffectingTools = false
+	registered := RegisteredTool(successfulExecutor(t))
+	require.False(t, cfg.Features.SideEffectingTools)
+	require.True(t, cfg.Tools.WebSearch.Enabled)
+	require.False(t, registered.SideEffecting)
+
+	output, err := registered.Executor.Execute(t.Context(), worker.ToolExecutionRequest{
+		Arguments: json.RawMessage(`{"query":"golang"}`),
+		Policy:    toolpolicy.DefaultPolicy(),
+	})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"query":"golang","results":[{"title":"Go & Docs","snippet":"Go documentation","url":"https://go.dev/doc/"}]}`, string(output))
 }
 
 func TestExecuteAndProjectErrorsDoNotContainPrivateContent(t *testing.T) {

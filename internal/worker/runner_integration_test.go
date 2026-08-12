@@ -5,6 +5,7 @@ package worker_test
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -144,11 +145,17 @@ func (s *acquiredLeaseStore) LeaseNext(ctx context.Context, _ worker.LeaseReques
 
 func integrationRunner(t *testing.T, repo *postgres.Repository, manual *clock.Manual, registry worker.ToolRegistry, id string, stream reasoner.Streamer, concurrency int) *worker.Runner {
 	t.Helper()
-	runner, err := worker.NewRunner(worker.Runner{Store: repo, Reasoner: stream, Safety: integrationPolicy{}, Tools: registry, Clock: manual, Jitter: zeroJitter{},
+	config := worker.Runner{Store: repo, Reasoner: stream, Safety: integrationPolicy{}, Tools: registry, Clock: manual, Jitter: zeroJitter{},
 		Retry: worker.RetryPolicy{Base: time.Second, Maximum: time.Minute, MaxRetries: 2}, WorkerID: id, LeaseDuration: 9 * time.Second, HeartbeatInterval: 3 * time.Second, Concurrency: concurrency,
 		PollInterval: time.Second, MaxOutputBytes: 64 << 10, MaxOutputTokens: 1024, MaxToolRounds: 2, MaxToolCalls: 4, MaxToolArgumentBytes: 1024, MaxToolOutputBytes: 1024,
 		ProviderSafetyID: func(string, string) (string, error) { return "integration-safety-id", nil },
-	})
+	}
+	if registry.HasTools() {
+		var err error
+		config.ArgumentSealer, err = worker.NewAESArgumentSealer("integration-default", bytes.Repeat([]byte{9}, 32), rand.Reader)
+		require.NoError(t, err)
+	}
+	runner, err := worker.NewRunner(config)
 	require.NoError(t, err)
 	return runner
 }

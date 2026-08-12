@@ -24,6 +24,24 @@ func TestToolEncryptionKeyRequiresImmutableConfiguredID(t *testing.T) {
 	assert.ErrorContains(t, err, "tool_encryption_key_id")
 }
 
+func TestEnabledWebSearchDefaultsEncryptionSecretReferenceAndRequiresKeyID(t *testing.T) {
+	key := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	lookup := func(name string) (string, bool) { return key, name == "LIVE_TOOL_ENCRYPTION_KEY" }
+	_, err := loadFixture(t, "tools:\n  web_search: {enabled: true}\n", lookup)
+	assert.ErrorContains(t, err, "tool_encryption_key_id")
+
+	cfg, err := loadFixture(t, "features:\n  tool_encryption_key_id: search-v1\ntools:\n  web_search: {enabled: true}\n", lookup)
+	require.NoError(t, err)
+	assert.False(t, cfg.Features.SideEffectingTools)
+	assert.Equal(t, "LIVE_TOOL_ENCRYPTION_KEY", cfg.Features.ToolEncryptionKeyEnv)
+	assert.Equal(t, "search-v1", cfg.Features.ToolEncryptionKeyID)
+
+	direct := validConfig(t)
+	direct.Features.ToolEncryptionKeyEnv = ""
+	direct.Features.ToolEncryptionKeyID = ""
+	require.ErrorContains(t, direct.Validate(), "tool_encryption_key_env")
+}
+
 func TestProductionReconnectAuthorityIsExplicitAndSecretIsBounded(t *testing.T) {
 	const production = `
 mode: production
@@ -266,12 +284,14 @@ auth:
   static_tenant_id: local-tenant
   static_user_id: local-user
   static_scopes: [realtime]
-features: {handoffs: true}
+features:
+  handoffs: true
+  tool_encryption_key_id: test-tools-v1
 tools:
   web_search: {enabled: true}
 `, func(name string) (string, bool) {
 		switch name {
-		case "RECONNECT_HMAC_KEY", "RETENTION_HMAC_KEY":
+		case "RECONNECT_HMAC_KEY", "RETENTION_HMAC_KEY", "LIVE_TOOL_ENCRYPTION_KEY":
 			return key, true
 		case "DATABASE_URL":
 			return "postgres://db.example/live?sslmode=disable", true

@@ -285,6 +285,38 @@ func TestRunRequiresConfig(t *testing.T) {
 	assert.ErrorContains(t, err, "-config is required")
 }
 
+func TestRunRejectsEnabledWebSearchWhenDefaultEncryptionSecretIsMissing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "worker.yaml")
+	data := `mode: local
+worker:
+  concurrency: 1
+  lease_duration: 9s
+  heartbeat_interval: 2s
+  reasoner:
+    base_url: https://provider.invalid
+    model: reasoner-v1
+    api_key_env: TEST_DEEPSEEK_KEY
+store:
+  database_url_env: TEST_DATABASE_URL
+safety:
+  privacy_hmac_key_env: TEST_PRIVACY_KEY
+features:
+  tool_encryption_key_id: search-v1
+tools:
+  web_search: {enabled: true}
+`
+	require.NoError(t, os.WriteFile(path, []byte(data), 0o600))
+	secrets := dummySecrets()
+	delete(secrets, "TEST_TOOL_KEY")
+	called := false
+	err := runWithBuilder(t.Context(), []string{"-config", path}, lookupFrom(secrets), func(context.Context, config.Config, resolvedSecrets) (serviceRuntime, error) {
+		called = true
+		return nil, errors.New("builder must not be called")
+	})
+	require.ErrorContains(t, err, "LIVE_TOOL_ENCRYPTION_KEY")
+	assert.False(t, called)
+}
+
 func TestRunResolvesSecretsAndDrainsOnCancellation(t *testing.T) {
 	path := writeWorkerConfig(t)
 	ctx, cancel := context.WithCancel(t.Context())

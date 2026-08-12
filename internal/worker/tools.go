@@ -85,8 +85,21 @@ type RegisteredTool struct {
 type ToolRegistry interface {
 	ToolGate
 	Registered(context.Context, string, string) bool
+	HasTools() bool
 	Lookup(version, name string) (RegisteredTool, bool)
 	Definitions(version string, allowlist []string) ([]reasoner.ToolDefinition, error)
+}
+
+func (r *immutableToolRegistry) HasTools() bool {
+	if r == nil {
+		return false
+	}
+	for _, tools := range r.versions {
+		if len(tools) != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 type immutableToolRegistry struct {

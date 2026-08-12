@@ -347,6 +347,8 @@ func TestRunnerShadowExcludesSideEffectsButKeepsReadOnlyDefinitions(t *testing.T
 	gates.shadow.Store(true)
 	runner := testRunner(store, stream, allowPolicy(), clock.Real{}, fixedJitter(0), registry)
 	runner.FeatureGates = gates
+	runner.ArgumentSealer, err = NewAESArgumentSealer("test-key", bytes.Repeat([]byte{5}, 32), bytes.NewReader(bytes.Repeat([]byte{1}, 12)))
+	require.NoError(t, err)
 	require.NoError(t, runner.Run(ctx))
 	require.Len(t, store.completed, 1)
 }
@@ -818,8 +820,8 @@ func TestRunnerApprovalProvenanceUsesCurrentCanonicalBeginRetryOrReplay(t *testi
 
 func TestJobExecutionApprovalFenceRejectsStaleSameRevisionGeneration(t *testing.T) {
 	execution := &jobExecution{}
-	stale := execution.beginGeneration(4)
-	current := execution.beginGeneration(4)
+	stale := execution.beginGeneration(4, 0)
+	current := execution.beginGeneration(4, 0)
 	execution.markApproved(4, stale)
 	required, approved := execution.approval(4, current)
 	assert.False(t, required)
@@ -1243,6 +1245,150 @@ func TestRunnerSafetyRedactionOmitsProjectedWebSearchSources(t *testing.T) {
 	assert.Equal(t, "safe answer", store.completed[0].Summary)
 	assert.JSONEq(t, `{}`, string(store.completed[0].Structured))
 	assert.NotContains(t, string(store.completed[0].Structured), "Source")
+}
+
+func TestRunnerSteerClearsAbandonedWebSearchProjectionWhenNewRevisionUsesNoTool(t *testing.T) {
+	result := runSteeredWebSearchProjectionScenario(t, false)
+	assert.JSONEq(t, `{"text":"new answer"}`, string(result.Structured))
+	assert.NotContains(t, string(result.Structured), "Old Source")
+}
+
+func TestRunnerSteerReplacesAbandonedWebSearchProjectionWithNewRevisionSearch(t *testing.T) {
+	result := runSteeredWebSearchProjectionScenario(t, true)
+	assert.JSONEq(t, `{"text":"new answer","sources":[{"title":"New Source","url":"https://new.example/"}]}`, string(result.Structured))
+	assert.NotContains(t, string(result.Structured), "Old Source")
+}
+
+func runSteeredWebSearchProjectionScenario(t *testing.T, searchNewRevision bool) handoff.Result {
+	t.Helper()
+	lease := workerLease()
+	lease.Job.Request.ToolAllowlist = []string{toolpolicy.WebSearchTool}
+	lease.Job.Request.ToolPolicy = canonicalWorkerPolicy(t, toolpolicy.DefaultPolicy())
+	tool := searchToolForRunner(func(_ context.Context, request ToolExecutionRequest) (json.RawMessage, error) {
+		if request.Arguments[0] == 0 {
+			t.Fatal("empty search arguments")
+		}
+		if strings.Contains(string(request.Arguments), "new") {
+			return json.RawMessage(`{"query":"new","results":[]}`), nil
+		}
+		return json.RawMessage(`{"query":"old","results":[]}`), nil
+	}, func(raw json.RawMessage) (json.RawMessage, error) {
+		if strings.Contains(string(raw), `"new"`) {
+			return json.RawMessage(`{"sources":[{"title":"New Source","url":"https://new.example/"}]}`), nil
+		}
+		return json.RawMessage(`{"sources":[{"title":"Old Source","url":"https://old.example/"}]}`), nil
+	})
+	registry, err := NewToolRegistry(map[string][]RegisteredTool{"tools-v1": {tool}})
+	require.NoError(t, err)
+	store := &memoryStore{heartbeat: func(context.Context, LeaseToken, time.Time) (Control, error) {
+		return Control{ObjectiveRevision: 1, Objective: "replacement objective"}, nil
+	}}
+	var reading atomic.Int32
+	store.progressResult = func(record ProgressRecord) error {
+		if record.Phase == ProgressPhaseReadingSources && reading.Add(1) == 1 {
+			return ErrLeaseLost
+		}
+		return nil
+	}
+	var streams atomic.Int32
+	stream := streamerFunc(func(context.Context, reasoner.Request, func(reasoner.Chunk) error) (reasoner.Result, error) {
+		switch streams.Add(1) {
+		case 1:
+			return reasoner.Result{ToolCalls: []reasoner.ToolCall{{ID: "old-search", Name: toolpolicy.WebSearchTool, Arguments: json.RawMessage(`{"query":"old"}`)}}}, nil
+		case 2:
+			if searchNewRevision {
+				return reasoner.Result{ToolCalls: []reasoner.ToolCall{{ID: "new-search", Name: toolpolicy.WebSearchTool, Arguments: json.RawMessage(`{"query":"new"}`)}}}, nil
+			}
+			return reasoner.Result{Text: "new answer"}, nil
+		default:
+			return reasoner.Result{Text: "new answer"}, nil
+		}
+	})
+	runner := testRunner(store, stream, allowPolicy(), clock.Real{}, fixedJitter(0), registry)
+	nonces := append(bytes.Repeat([]byte{1}, 12), bytes.Repeat([]byte{2}, 12)...)
+	runner.ArgumentSealer, err = NewAESArgumentSealer("test-key", bytes.Repeat([]byte{5}, 32), bytes.NewReader(nonces))
+	require.NoError(t, err)
+	require.NoError(t, runner.executeLease(t.Context(), lease))
+	require.Len(t, store.completed, 1)
+	return store.completed[0]
+}
+
+type disabledSideEffectGate struct{}
+
+func (disabledSideEffectGate) Enabled(string) bool { return false }
+
+func TestRunnerReadOnlyWebSearchRequiresSealerAndExecutesWithSideEffectsDisabled(t *testing.T) {
+	tool := searchToolForRunner(func(context.Context, ToolExecutionRequest) (json.RawMessage, error) {
+		return json.RawMessage(`{"query":"q","results":[]}`), nil
+	}, func(json.RawMessage) (json.RawMessage, error) { return json.RawMessage(`{"sources":[]}`), nil })
+	registry, err := NewToolRegistry(map[string][]RegisteredTool{"tools-v1": {tool}})
+	require.NoError(t, err)
+	runner := testRunner(&memoryStore{}, streamerFunc(func(context.Context, reasoner.Request, func(reasoner.Chunk) error) (reasoner.Result, error) {
+		return reasoner.Result{Text: "unused"}, nil
+	}), allowPolicy(), clock.Real{}, fixedJitter(0), registry)
+	runner.FeatureGates = disabledSideEffectGate{}
+	_, err = NewRunner(runner)
+	require.ErrorContains(t, err, "argument sealer")
+
+	lease := workerLease()
+	lease.Job.Request.ToolAllowlist = []string{toolpolicy.WebSearchTool}
+	lease.Job.Request.ToolPolicy = canonicalWorkerPolicy(t, toolpolicy.DefaultPolicy())
+	store := &memoryStore{}
+	var calls atomic.Int32
+	tool.Executor = toolExecutorFunc(func(context.Context, ToolExecutionRequest) (json.RawMessage, error) {
+		calls.Add(1)
+		return json.RawMessage(`{"query":"q","results":[]}`), nil
+	})
+	registry, err = NewToolRegistry(map[string][]RegisteredTool{"tools-v1": {tool}})
+	require.NoError(t, err)
+	rounds := 0
+	runner = testRunner(store, streamerFunc(func(context.Context, reasoner.Request, func(reasoner.Chunk) error) (reasoner.Result, error) {
+		rounds++
+		if rounds == 1 {
+			return reasoner.Result{ToolCalls: []reasoner.ToolCall{{ID: "search", Name: toolpolicy.WebSearchTool, Arguments: json.RawMessage(`{"query":"q"}`)}}}, nil
+		}
+		return reasoner.Result{Text: "answer"}, nil
+	}), allowPolicy(), clock.Real{}, fixedJitter(0), registry)
+	runner.FeatureGates = disabledSideEffectGate{}
+	runner.ArgumentSealer, err = NewAESArgumentSealer("test-key", bytes.Repeat([]byte{5}, 32), bytes.NewReader(bytes.Repeat([]byte{1}, 12)))
+	require.NoError(t, err)
+	normalized, err := NewRunner(runner)
+	require.NoError(t, err)
+	require.NoError(t, normalized.executeLease(t.Context(), lease))
+	assert.Equal(t, int32(1), calls.Load())
+	require.Len(t, store.completed, 1)
+}
+
+func TestRunnerCompletionTextUsesSharedPublicBoundary(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		text      string
+		completes bool
+	}{
+		{name: "exact", text: strings.Repeat("x", MaxCompletionTextBytes), completes: true},
+		{name: "one byte over", text: strings.Repeat("x", MaxCompletionTextBytes+1), completes: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			lease := workerLease()
+			store := &memoryStore{}
+			registry, err := NewToolRegistry(map[string][]RegisteredTool{"tools-v1": {}})
+			require.NoError(t, err)
+			runner := testRunner(store, streamerFunc(func(context.Context, reasoner.Request, func(reasoner.Chunk) error) (reasoner.Result, error) {
+				return reasoner.Result{Text: test.text}, nil
+			}), allowPolicy(), clock.Real{}, fixedJitter(0), registry)
+			runner.MaxOutputBytes = 256 << 10
+			require.NoError(t, runner.executeLease(t.Context(), lease))
+			if test.completes {
+				require.Len(t, store.completed, 1)
+				assert.JSONEq(t, `{"text":"`+test.text+`"}`, string(store.completed[0].Structured))
+				assert.Empty(t, store.failed)
+			} else {
+				assert.Empty(t, store.completed)
+				require.Len(t, store.failed, 1)
+				assert.Equal(t, "output_limit", store.failed[0].Code)
+			}
+		})
+	}
 }
 
 func TestToolRegistryRejectsUnknownProgressPhase(t *testing.T) {

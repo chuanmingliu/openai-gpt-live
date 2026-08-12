@@ -272,7 +272,7 @@ func sanitizeCompletionStructured(raw json.RawMessage) (json.RawMessage, error) 
 		return nil, errors.New("completion projection is invalid")
 	}
 	var text string
-	if err := json.Unmarshal(textRaw, &text); err != nil || !publicString(text, 16<<10, true) {
+	if err := json.Unmarshal(textRaw, &text); err != nil || !publicString(text, worker.MaxCompletionTextBytes, true) {
 		return nil, errors.New("completion projection is invalid")
 	}
 	var sources []completionSource

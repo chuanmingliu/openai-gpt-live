@@ -2,6 +2,7 @@ package presentation
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
@@ -94,6 +95,31 @@ func TestSanitizeCompletionAllowsOnlyBoundedTextAndHTTPSources(t *testing.T) {
 	public, err = SanitizeEvent(handoff.Event{Kind: "handoff.complete", State: handoff.StateSucceeded, Payload: payload})
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"summary":"safe"}`, string(public.Details))
+}
+
+func TestSanitizeCompletionUsesWorkerSharedTextBoundary(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		text string
+		ok   bool
+	}{
+		{name: "exact", text: strings.Repeat("x", worker.MaxCompletionTextBytes), ok: true},
+		{name: "one byte over", text: strings.Repeat("x", worker.MaxCompletionTextBytes+1), ok: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			structured, err := json.Marshal(map[string]any{"text": test.text})
+			require.NoError(t, err)
+			record := worker.CompletionRecord{Result: handoff.Result{Summary: "answer", Structured: structured}}
+			payload, err := json.Marshal(record)
+			require.NoError(t, err)
+			_, err = SanitizeEvent(handoff.Event{Kind: "handoff.complete", State: handoff.StateSucceeded, Payload: payload})
+			if test.ok {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+		})
+	}
 }
 
 func TestSanitizeApprovalOutcomesAreContentFreeAndPresentationSafe(t *testing.T) {

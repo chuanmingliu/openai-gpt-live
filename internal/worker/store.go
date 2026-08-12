@@ -26,6 +26,8 @@ var (
 	ErrInfrastructureUncertain = errors.New("worker infrastructure outcome uncertain")
 )
 
+const MaxCompletionTextBytes = 16 << 10
+
 type LeaseToken struct {
 	TenantID       string
 	ConversationID identity.ConversationID

@@ -94,6 +94,9 @@ func NewRunner(config Runner) (*Runner, error) {
 	if nilValue(config.Store) || nilValue(config.Reasoner) || nilValue(config.Safety) || nilValue(config.Tools) || nilValue(config.Clock) || nilValue(config.Jitter) || config.ProviderSafetyID == nil {
 		return nil, errors.New("worker runner dependencies are required")
 	}
+	if config.Tools.HasTools() && nilValue(config.ArgumentSealer) {
+		return nil, errors.New("worker argument sealer is required for registered tools")
+	}
 	if strings.TrimSpace(config.WorkerID) == "" || len(config.WorkerID) > 256 || !utf8.ValidString(config.WorkerID) || config.Concurrency <= 0 || config.Concurrency > 4096 || config.LeaseDuration < 3*time.Millisecond || config.HeartbeatInterval <= 0 || config.HeartbeatInterval >= config.LeaseDuration-config.HeartbeatInterval {
 		return nil, errors.New("worker runner identity or lease bounds are invalid")
 	}
@@ -274,7 +277,7 @@ func (r *Runner) executeLease(parent context.Context, lease Lease) (runErr error
 	}
 	execution := &jobExecution{builder: &resultBuilder{limit: r.MaxOutputBytes, clock: r.Clock, store: r.Store, token: lease.Token, observer: observer}}
 	for {
-		generation := execution.beginGeneration(control.ObjectiveRevision)
+		generation := execution.beginGeneration(control.ObjectiveRevision, control.InputRevision)
 		generationCtx, cancelGeneration := context.WithCancelCause(jobCtx)
 		canceller.install(cancelGeneration)
 		terminal, err := r.generate(generationCtx, lease, control, execution, generation)
@@ -393,6 +396,8 @@ type jobExecution struct {
 	projectionMu       sync.Mutex
 	projectedSources   json.RawMessage
 	hasProjection      bool
+	projectionRevision uint32
+	projectionInput    uint32
 	approvalMu         sync.Mutex
 	approvalRevision   uint32
 	approvalGeneration uint64
@@ -509,7 +514,15 @@ func validProjectedURL(raw string) bool {
 	return err == nil && parsed.Scheme == "https" && parsed.Host != "" && parsed.Hostname() != "" && parsed.User == nil && parsed.Opaque == ""
 }
 
-func (e *jobExecution) beginGeneration(revision uint32) uint64 {
+func (e *jobExecution) beginGeneration(revision, inputRevision uint32) uint64 {
+	e.projectionMu.Lock()
+	if e.projectionRevision != revision || e.projectionInput != inputRevision {
+		e.projectedSources = nil
+		e.hasProjection = false
+		e.projectionRevision = revision
+		e.projectionInput = inputRevision
+	}
+	e.projectionMu.Unlock()
 	e.approvalMu.Lock()
 	e.approvalGeneration++
 	e.approvalRevision = revision
@@ -655,6 +668,9 @@ func (r *Runner) generate(ctx context.Context, lease Lease, control Control, exe
 		if len(result.ToolCalls) == 0 {
 			if strings.TrimSpace(result.Text) == "" {
 				return generatedResult{}, errors.New("worker reasoner returned empty result")
+			}
+			if len(result.Text) > MaxCompletionTextBytes {
+				return generatedResult{}, errOutputLimit
 			}
 			structured, err := execution.completionStructured(result.Text)
 			if err != nil {
