@@ -1,4 +1,4 @@
-.PHONY: test test-race vet fmt verify-deploy verify-deploy-static smoke-deploy durable-demo-up durable-demo-down load-unit chaos capacity barge soak load-smoke load-evidence release-gate release-gate-verify demo-live-client test-demo-live-client
+.PHONY: test test-race vet fmt verify-deploy verify-deploy-static smoke-deploy durable-demo-up durable-demo-down test-durable-web-search load-unit chaos capacity barge soak load-smoke load-evidence release-gate release-gate-verify demo-live-client test-demo-live-client
 
 test:
 	go test ./...
@@ -49,6 +49,10 @@ durable-demo-up:
 
 durable-demo-down:
 	docker compose --project-name gpt-live-durable-demo -f deploy/docker-compose.yml -f deploy/compose.development-durable.yml down
+
+test-durable-web-search:
+	go test -race -count=1 ./test/internal/fakesearch ./test/internal/loadgateway
+	go test -race -tags=integration -run '^TestDurableWebSearch' ./test/integration -count=1 -timeout=10m
 
 load-unit:
 	go test -race -count=1 ./cmd/live-load ./internal/loadgen

@@ -5,6 +5,7 @@ package loadgateway
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net/http"
@@ -20,6 +21,34 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/session"
 	transportws "github.com/chuanmingliu/openai-gpt-live/internal/transport/ws"
 )
+
+const watermarkFrameBytes = 960
+
+// WatermarkPCM returns one full 20 ms PCM frame carrying a deterministic
+// sequence watermark in every four-byte lane. The bytes are synthetic test
+// data; they are never persisted or logged.
+func WatermarkPCM(sequence uint32) []byte {
+	frame := make([]byte, watermarkFrameBytes)
+	for offset := 0; offset < len(frame); offset += 4 {
+		binary.LittleEndian.PutUint32(frame[offset:offset+4], sequence)
+	}
+	return frame
+}
+
+// WatermarkSequence validates an entire synthetic PCM frame before returning
+// its sequence. This catches truncation, reordering, and cross-frame mixing.
+func WatermarkSequence(frame []byte) (uint32, bool) {
+	if len(frame) != watermarkFrameBytes {
+		return 0, false
+	}
+	sequence := binary.LittleEndian.Uint32(frame[:4])
+	for offset := 4; offset < len(frame); offset += 4 {
+		if binary.LittleEndian.Uint32(frame[offset:offset+4]) != sequence {
+			return 0, false
+		}
+	}
+	return sequence, true
+}
 
 type Server struct {
 	http      *httptest.Server
