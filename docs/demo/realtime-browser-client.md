@@ -35,9 +35,6 @@ set +x
 read -r -s "POSTGRES_PASSWORD?Disposable PostgreSQL password (hidden): "
 export POSTGRES_PASSWORD
 printf '\n'
-read -r -s "DATABASE_URL?PostgreSQL URL (hidden): "
-export DATABASE_URL
-printf '\n'
 
 read -r -s "LIVE_STATIC_BEARER_TOKEN?New local bearer (hidden): "
 export LIVE_STATIC_BEARER_TOKEN
@@ -68,9 +65,12 @@ export LIVE_EXPECTED_CONFIG_HASH="$(
 )"
 ```
 
-`DATABASE_URL` must select the same disposable PostgreSQL database reached by
-the migrate, gateway, and worker processes. Its value is never printed. The
-speech configuration selected above must serve
+The durable Compose override constructs one container-only `DATABASE_URL` from
+`POSTGRES_PASSWORD` for migrate, gateway, and worker. Its host is the internal
+service name `postgres`; the database has no published host port and this flow
+creates no host DSN. Do not run `docker compose config` in a shared terminal or
+attach resolved Compose output to a report because interpolation includes the
+password. The speech configuration selected above must serve
 `ws://speech-to-speech:8000/v1/realtime`, select `deepseek-v4-flash`, disable
 thinking, and provide a content-free pool-idle signal. Verify those external
 facts from the reviewed speech-service configuration; this repository cannot
@@ -78,19 +78,17 @@ infer them from an image name.
 
 ## 2. Migrate PostgreSQL to schema v8
 
-For a PostgreSQL endpoint reachable from the operator shell, run the migrator
-and check the exact clean version:
+Run both migration and its clean-version check inside the Compose network:
 
 ```zsh
-go run ./cmd/live-migrate -database-url-env DATABASE_URL -direction up
-go run ./cmd/live-migrate -database-url-env DATABASE_URL -check
+make durable-demo-migrate
 ```
 
-The second command must say `schema check passed at version 8`. It prints no
-DSN or credential. For the shipped Compose database, the migration service in
-the next step runs the same embedded migrations before either application
-service can become ready. A dirty schema, a version other than 8, or a database
-that is not the intended disposable target is a stop condition.
+The target starts only PostgreSQL and the one-shot embedded migrator, waits for
+migration success, then runs that same image with `-check` on the private
+Compose network. It must say `schema check passed at version 8` and prints no
+DSN or credential. A dirty schema or any version other than 8 is a stop
+condition. PostgreSQL remains internal and running for the next step.
 
 ## 3. Start the speech WebSocket
 
@@ -103,17 +101,16 @@ go run ./cmd/live-worker check-config \
   --config deploy/config/development-durable.yaml
 ```
 
-The supported Compose flow starts the reviewed speech image on its configured
-WebSocket URL, then gates the gateway on speech startup and schema migration:
+After the migration check passes, start the reviewed speech image and the two
+application services:
 
 ```zsh
 make durable-demo-up
 ```
 
-This command also starts PostgreSQL, migration, gateway, and worker in the
-dependency order declared by Compose. Treat a speech startup that does not
-confirm `deepseek-v4-flash` and thinking disabled as a failure; do not fall
-back to a different model.
+Compose still gates gateway and worker on the successfully completed migrate
+service. Treat a speech startup that does not confirm `deepseek-v4-flash` and
+thinking disabled as a failure; do not fall back to a different model.
 
 ## 4. Start the durable gateway and worker and verify readiness
 
@@ -286,7 +283,7 @@ kill -INT "$BFF_PID"
 wait "$BFF_PID" || true
 make durable-demo-down
 
-unset POSTGRES_PASSWORD DATABASE_URL S2S_API_KEY DEEPSEEK_API_KEY
+unset POSTGRES_PASSWORD S2S_API_KEY DEEPSEEK_API_KEY
 unset LIVE_STATIC_BEARER_TOKEN LIVE_ADMIN_BEARER_TOKEN LIVE_DEMO_BEARER
 unset LIVE_PRIVACY_HMAC_KEY LIVE_RETENTION_HMAC_KEY
 unset LIVE_RECONNECT_HMAC_KEY LIVE_TOOL_ENCRYPTION_KEY
@@ -301,7 +298,7 @@ retained for deliberate inspection or a later run. Do not use broad `pkill`,
 
 | Symptom | Content-free check and action |
 |---|---|
-| PostgreSQL/migration failure | Run the migrate `-check` command. Require clean version 8. Verify reachability and TLS policy without printing `DATABASE_URL`; never run down migrations on a non-disposable database. |
+| PostgreSQL/migration failure | Rerun `make durable-demo-migrate` and require clean version 8. Inspect only container status/exit code; do not print the resolved Compose environment. Never run down migrations on a non-disposable database. |
 | Worker not ready or no lease progress | Check `/health/ready`, then `/admin/v1/capacity`. Confirm the config hash, schema, worker-only `DEEPSEEK_API_KEY` reference, and that `heartbeat_interval` is below half the lease. Do not dump jobs. |
 | Search Test or task times out | Keep the 1–10 second policy bound. Check approved DNS/HTTPS egress and the provider status class without logging query text, response HTML, tool arguments, or credentials. Voice should remain connected. |
 | Browser has no audio | Confirm microphone/speaker selection, permission, **Enable audio**, 24 kHz PCM16, and the speech pool signal. A transcript is not an audible pass. |

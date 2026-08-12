@@ -17,9 +17,34 @@ for tool in docker jq; do
   command -v "$tool" >/dev/null 2>&1 || { echo "missing deployment contract prerequisite: $tool" >&2; exit 127; }
 done
 
+durable_migrate_plan=$(env \
+  POSTGRES_PASSWORD=postgres-local \
+  S2S_API_KEY=speech-local \
+  DEEPSEEK_API_KEY=reasoner-local \
+  LIVE_STATIC_BEARER_TOKEN=bearer-local \
+  LIVE_ADMIN_BEARER_TOKEN=bearer-local \
+  LIVE_PRIVACY_HMAC_KEY=privacy-local \
+  LIVE_RETENTION_HMAC_KEY=retention-local \
+  LIVE_RECONNECT_HMAC_KEY=reconnect-local \
+  LIVE_TOOL_ENCRYPTION_KEY=tool-local \
+  LIVE_EXPECTED_CONFIG_HASH=v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  S2S_IMAGE=speech-to-speech:local \
+  S2S_CONFIG_PATH="$root/deploy/config/local.yaml" \
+  make -n durable-demo-migrate)
+for expected in \
+  'docker compose --project-name gpt-live-durable-demo -f deploy/docker-compose.yml -f deploy/compose.development-durable.yml up --build --wait postgres migrate' \
+  'docker compose --project-name gpt-live-durable-demo -f deploy/docker-compose.yml -f deploy/compose.development-durable.yml run --rm --no-deps migrate -check'; do
+  printf '%s\n' "$durable_migrate_plan" | rg -F "$expected" >/dev/null || {
+    echo "durable demo migration command is not explicitly project-scoped" >&2
+    exit 1
+  }
+done
+if printf '%s\n' "$durable_migrate_plan" | rg -F 'go run ./cmd/live-migrate' >/dev/null; then
+  echo "durable demo migration escaped the Compose network" >&2
+  exit 1
+fi
 durable_up_plan=$(env \
   POSTGRES_PASSWORD=postgres-local \
-  DATABASE_URL='postgres://live@postgres/live?sslmode=disable' \
   S2S_API_KEY=speech-local \
   DEEPSEEK_API_KEY=reasoner-local \
   LIVE_STATIC_BEARER_TOKEN=bearer-local \
@@ -32,8 +57,8 @@ durable_up_plan=$(env \
   S2S_IMAGE=speech-to-speech:local \
   S2S_CONFIG_PATH="$root/deploy/config/local.yaml" \
   make -n durable-demo-up)
-printf '%s\n' "$durable_up_plan" | rg -F 'docker compose --project-name gpt-live-durable-demo -f deploy/docker-compose.yml -f deploy/compose.development-durable.yml up --build --wait postgres migrate gateway worker' >/dev/null || {
-  echo "durable demo up command is not explicitly project-scoped" >&2
+printf '%s\n' "$durable_up_plan" | rg -F 'docker compose --project-name gpt-live-durable-demo -f deploy/docker-compose.yml -f deploy/compose.development-durable.yml up --build --wait speech-to-speech gateway worker' >/dev/null || {
+  echo "durable demo start command is not explicitly project-scoped" >&2
   exit 1
 }
 durable_down_plan=$(make -n durable-demo-down)
@@ -61,7 +86,6 @@ fi
 durable_hash=$(GOCACHE="$cache" go run ./cmd/live-gateway config-hash --config "$root/deploy/config/development-durable.yaml")
 env -i PATH="$PATH" \
   POSTGRES_PASSWORD=postgres-local \
-  DATABASE_URL='postgres://live@postgres/live?sslmode=disable' \
   S2S_API_KEY=speech-local \
   DEEPSEEK_API_KEY=reasoner-local \
   LIVE_STATIC_BEARER_TOKEN=bearer-local \
@@ -74,8 +98,12 @@ env -i PATH="$PATH" \
   S2S_IMAGE=speech-to-speech:local \
   S2S_CONFIG_PATH="$root/deploy/config/local.yaml" \
   docker compose --env-file /dev/null -f "$root/deploy/docker-compose.yml" -f "$root/deploy/compose.development-durable.yml" config --format json >"$scratch/durable-compose.json"
-if ! jq -e --arg config "$root/deploy/config/development-durable.yaml" '
+if ! jq -e --arg config "$root/deploy/config/development-durable.yaml" --arg database_url 'postgres://live:postgres-local@postgres:5432/live?sslmode=disable' '
   .name == "gpt-live-durable-demo" and
+  .services.migrate.environment.DATABASE_URL == $database_url and
+  .services.gateway.environment.DATABASE_URL == $database_url and
+  .services.worker.environment.DATABASE_URL == $database_url and
+  ((.services.postgres.ports // []) | length) == 0 and
   .services.gateway.read_only == true and .services.worker.read_only == true and .services.migrate.read_only == true and
   .services.gateway.depends_on.migrate.condition == "service_completed_successfully" and
   .services.worker.depends_on.migrate.condition == "service_completed_successfully" and

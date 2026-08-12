@@ -43,6 +43,7 @@ The durable browser-tool composition is a separate loopback profile:
 ```sh
 go run ./cmd/live-gateway check-config --config deploy/config/development-durable.yaml
 go run ./cmd/live-worker check-config --config deploy/config/development-durable.yaml
+make durable-demo-migrate
 make durable-demo-up
 ```
 
@@ -54,6 +55,10 @@ drawer flow, privacy inspection, idle checks, and non-destructive stop. The
 speech and worker credentials may derive from one provider account, but
 `S2S_API_KEY` and `DEEPSEEK_API_KEY` remain separate process secret references.
 `development_durable` is rejected by production rendering and promotion.
+The durable override derives a container-only `DATABASE_URL` from the hidden
+`POSTGRES_PASSWORD`; PostgreSQL is not host-published. Migration and `-check`
+therefore run inside Compose before the application services, and resolved
+Compose output must not be printed or attached to reports.
 
 The canary identity is a second, separately managed Secret named
 `gpt-live/live-synthetic-identity`. It must contain exactly one nonempty key,

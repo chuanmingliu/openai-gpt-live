@@ -99,8 +99,10 @@ encryption, speech, and DeepSeek secret references without echoing values;
 migrates to schema v8; starts the speech service, gateway, worker, and BFF;
 walks the bounded Tools drawer; verifies stable progress while voice and
 barge-in continue; proves pools idle; and troubleshoots without printing
-content. This loopback composition is development acceptance, never production
-or release evidence.
+content. Its PostgreSQL DSN is container-only: the guide runs migrate and
+schema `-check` inside Compose and does not publish the database to the host.
+This loopback composition is development acceptance, never production or
+release evidence.
 
 ## Configure speech-to-speech
 

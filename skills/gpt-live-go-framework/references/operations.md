@@ -84,6 +84,12 @@ The Compose file maps the worker/gateway provider credential from `FORMAL_DEEPSE
 
 Compose order is PostgreSQL health, migration completion, then gateway/worker. It uses read-only filesystems, tmpfs, dropped capabilities, no-new-privileges, and bounded stop grace. The smoke opens one content-free authenticated session and verifies drain. Because the Compose project name is fixed to `gpt-live` and cleanup runs `down --volumes`, never run it alongside a `gpt-live` project or volume that must be preserved.
 
+The separate `development_durable` browser profile does not accept a host
+DSN. Its override derives container-only `DATABASE_URL` values from
+`POSTGRES_PASSWORD` and keeps PostgreSQL off host ports. Run
+`make durable-demo-migrate` for migration plus schema `-check`, then
+`make durable-demo-up`; do not print resolved Compose configuration.
+
 ## Kubernetes
 
 Static validation:

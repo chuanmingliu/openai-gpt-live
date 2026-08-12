@@ -26,19 +26,23 @@ only the canonical policy; the acknowledgement must name
 ## Ordered operator flow
 
 1. In a non-traced shell, securely prompt/export `POSTGRES_PASSWORD`,
-   `DATABASE_URL`, `LIVE_STATIC_BEARER_TOKEN`, `LIVE_ADMIN_BEARER_TOKEN`,
+   `LIVE_STATIC_BEARER_TOKEN`, `LIVE_ADMIN_BEARER_TOKEN`,
    `LIVE_RETENTION_HMAC_KEY`, `LIVE_RECONNECT_HMAC_KEY`,
    `LIVE_PRIVACY_HMAC_KEY`, `LIVE_TOOL_ENCRYPTION_KEY`, `S2S_API_KEY`, and
    `DEEPSEEK_API_KEY`. Set `LIVE_DEMO_BEARER` symbolically from the local
    static bearer. Select reviewed non-secret `S2S_IMAGE` and absolute
    `S2S_CONFIG_PATH`. Values never enter docs, YAML, commands, browser, or logs.
-2. Run `go run ./cmd/live-migrate -database-url-env DATABASE_URL -direction up`
-   then the same command with `-check`; require clean schema version 8.
+   The durable override constructs a container-only `DATABASE_URL` from the
+   password for migrate, gateway, and worker. PostgreSQL has no host port; do
+   not create a host DSN or print resolved Compose output.
+2. Run `make durable-demo-migrate`. It starts PostgreSQL and migration inside
+   Compose, then runs the same image with `-check`; require clean schema
+   version 8 before starting any application service.
 3. Check both components against `deploy/config/development-durable.yaml`.
    Verify the external speech configuration selects the model and
    thinking-disabled behavior.
-4. Compute `LIVE_EXPECTED_CONFIG_HASH` from that file and run
-   `make durable-demo-up`. Require content-free readiness at gateway
+4. Compute `LIVE_EXPECTED_CONFIG_HASH` from that file and, after migration
+   passes, run `make durable-demo-up`. Require content-free readiness at gateway
    `http://127.0.0.1:19090/health/ready` and worker
    `http://127.0.0.1:19091/health/ready`.
 5. Set `LIVE_DEMO_BEARER` and run `make demo-live-client`. Open only

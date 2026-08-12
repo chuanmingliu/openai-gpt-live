@@ -30,7 +30,6 @@ env -i PATH="$PATH" docker compose --env-file /dev/null -f "$root/deploy/docker-
 env -i PATH="$PATH" docker compose --env-file /dev/null -f "$root/deploy/docker-compose.yml" -f "$root/deploy/compose.chaos.yml" config >"$scratch/compose-chaos.yaml"
 env -i PATH="$PATH" \
   POSTGRES_PASSWORD=postgres-local \
-  DATABASE_URL='postgres://live@postgres/live?sslmode=disable' \
   S2S_API_KEY=speech-local \
   DEEPSEEK_API_KEY=reasoner-local \
   LIVE_STATIC_BEARER_TOKEN=bearer-local \
@@ -93,6 +92,11 @@ if rg -n --glob '!**/references/verification.md' '(npx[[:space:]]+-y|@modelconte
   "$root/README.md" "$root/docs/demo" "$root/deploy/config" "$root/deploy/k8s" \
   "$root/configs" "$root/skills/gpt-live-go-framework"; then
   echo "dynamic tool package instruction detected" >&2
+  exit 1
+fi
+if rg -n 'go run ./cmd/live-migrate -database-url-env DATABASE_URL' \
+  "$root/docs/demo" "$root/skills/gpt-live-go-framework/references/realtime-web-search.md"; then
+  echo "durable Compose guide contains a host migration command" >&2
   exit 1
 fi
 if [ -e "$root/deploy/scripts/live-load-placeholder.sh" ] || ! grep -q '/out/live-load ./cmd/live-load' "$root/Dockerfile"; then

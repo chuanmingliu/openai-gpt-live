@@ -123,7 +123,7 @@ func TestRealtimeGuideDocumentsDurableStartupPolicyAndManualAcceptance(t *testin
 		"DATABASE_URL", "LIVE_STATIC_BEARER_TOKEN", "LIVE_ADMIN_BEARER_TOKEN",
 		"LIVE_RETENTION_HMAC_KEY", "LIVE_RECONNECT_HMAC_KEY", "LIVE_PRIVACY_HMAC_KEY",
 		"LIVE_TOOL_ENCRYPTION_KEY", "S2S_API_KEY", "DEEPSEEK_API_KEY",
-		"go run ./cmd/live-migrate -database-url-env DATABASE_URL -direction up",
+		"make durable-demo-migrate",
 		"schema check passed at version 8",
 		"make durable-demo-up",
 		"http://127.0.0.1:19090/health/ready",
@@ -137,6 +137,9 @@ func TestRealtimeGuideDocumentsDurableStartupPolicyAndManualAcceptance(t *testin
 	} {
 		assert.Contains(t, guide, exact)
 	}
+	assert.Contains(t, guide, "container-only `DATABASE_URL`")
+	assert.NotContains(t, guide, `read -r -s "DATABASE_URL?`)
+	assert.NotContains(t, guide, "go run ./cmd/live-migrate -database-url-env DATABASE_URL")
 	assert.False(t, hasCredentialLiteralAssignment(guide))
 }
 

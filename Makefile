@@ -1,4 +1,4 @@
-.PHONY: test test-race vet fmt verify-deploy verify-deploy-static smoke-deploy durable-demo-up durable-demo-down test-durable-web-search load-unit chaos capacity barge soak load-smoke load-evidence release-gate release-gate-verify demo-live-client test-demo-live-client
+.PHONY: test test-race vet fmt verify-deploy verify-deploy-static smoke-deploy durable-demo-migrate durable-demo-up durable-demo-down test-durable-web-search load-unit chaos capacity barge soak load-smoke load-evidence release-gate release-gate-verify demo-live-client test-demo-live-client
 
 test:
 	go test ./...
@@ -31,9 +31,8 @@ verify-deploy-static:
 smoke-deploy:
 	./deploy/scripts/smoke-compose.sh
 
-durable-demo-up:
+durable-demo-migrate:
 	@test -n "$$POSTGRES_PASSWORD"
-	@test -n "$$DATABASE_URL"
 	@test -n "$$S2S_API_KEY"
 	@test -n "$$DEEPSEEK_API_KEY"
 	@test -n "$$LIVE_STATIC_BEARER_TOKEN"
@@ -45,7 +44,23 @@ durable-demo-up:
 	@test -n "$$LIVE_EXPECTED_CONFIG_HASH"
 	@test -n "$$S2S_IMAGE"
 	@test -n "$$S2S_CONFIG_PATH"
-	docker compose --project-name gpt-live-durable-demo -f deploy/docker-compose.yml -f deploy/compose.development-durable.yml up --build --wait postgres migrate gateway worker
+	docker compose --project-name gpt-live-durable-demo -f deploy/docker-compose.yml -f deploy/compose.development-durable.yml up --build --wait postgres migrate
+	docker compose --project-name gpt-live-durable-demo -f deploy/docker-compose.yml -f deploy/compose.development-durable.yml run --rm --no-deps migrate -check
+
+durable-demo-up:
+	@test -n "$$POSTGRES_PASSWORD"
+	@test -n "$$S2S_API_KEY"
+	@test -n "$$DEEPSEEK_API_KEY"
+	@test -n "$$LIVE_STATIC_BEARER_TOKEN"
+	@test -n "$$LIVE_ADMIN_BEARER_TOKEN"
+	@test -n "$$LIVE_PRIVACY_HMAC_KEY"
+	@test -n "$$LIVE_RETENTION_HMAC_KEY"
+	@test -n "$$LIVE_RECONNECT_HMAC_KEY"
+	@test -n "$$LIVE_TOOL_ENCRYPTION_KEY"
+	@test -n "$$LIVE_EXPECTED_CONFIG_HASH"
+	@test -n "$$S2S_IMAGE"
+	@test -n "$$S2S_CONFIG_PATH"
+	docker compose --project-name gpt-live-durable-demo -f deploy/docker-compose.yml -f deploy/compose.development-durable.yml up --build --wait speech-to-speech gateway worker
 
 durable-demo-down:
 	docker compose --project-name gpt-live-durable-demo -f deploy/docker-compose.yml -f deploy/compose.development-durable.yml down
