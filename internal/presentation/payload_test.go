@@ -17,9 +17,9 @@ func TestSanitizeActualWorkerRecordsStripsInternalMetadata(t *testing.T) {
 		record any
 		want   string
 	}{
-		{"handoff.progress", handoff.StateRunning, worker.ProgressRecord{MutationID: "mutation-secret", ExpectedObjectiveRevision: 9, InputRevision: 7, Sequence: 3, Summary: "halfway"}, `{"summary":"halfway"}`},
+		{"handoff.progress", handoff.StateRunning, worker.ProgressRecord{MutationID: "mutation-secret", ExpectedObjectiveRevision: 9, InputRevision: 7, Sequence: 3, Phase: worker.ProgressPhaseSearching, Summary: "Searching the web."}, `{"phase":"searching","summary":"Searching the web."}`},
 		{"handoff.needs-input", handoff.StateNeedsInput, worker.NeedsInputRecord{MutationID: "mutation-secret", ExpectedObjectiveRevision: 9, Prompt: "choose", Schema: json.RawMessage(`{"type":"string"}`)}, `{"prompt":"choose","schema":{"type":"string"}}`},
-		{"handoff.complete", handoff.StateSucceeded, worker.CompletionRecord{ExpectedObjectiveRevision: 9, Result: handoff.Result{MutationID: "mutation-secret", Summary: "done", Structured: json.RawMessage(`{"answer":42}`), SafetyDecision: json.RawMessage(`{"private":true}`), Usage: json.RawMessage(`{"tokens":99}`)}}, `{"summary":"done","structured":{"answer":42}}`},
+		{"handoff.complete", handoff.StateSucceeded, worker.CompletionRecord{ExpectedObjectiveRevision: 9, Result: handoff.Result{MutationID: "mutation-secret", Summary: "done", Structured: json.RawMessage(`{"text":"done","sources":[{"title":"Go Docs","url":"https://go.dev/doc/"}]}`), SafetyDecision: json.RawMessage(`{"private":true}`), Usage: json.RawMessage(`{"tokens":99}`)}}, `{"summary":"done","structured":{"text":"done","sources":[{"title":"Go Docs","url":"https://go.dev/doc/"}]}}`},
 		{"handoff.fail", handoff.StateFailed, worker.FailureRecord{ExpectedObjectiveRevision: 9, Failure: handoff.Failure{MutationID: "mutation-secret", Code: "failed", Retryable: true, Message: "try later"}}, `{"code":"failed","retryable":true,"message":"try later"}`},
 		{"handoff.cancel", handoff.StateCancelled, worker.CancelledRecord{MutationID: "mutation-secret", ExpectedObjectiveRevision: 9, Reason: "stopped"}, `{"reason":"stopped"}`},
 	}
@@ -35,6 +35,65 @@ func TestSanitizeActualWorkerRecordsStripsInternalMetadata(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSanitizeProgressPhaseRequiresExactEnumAndServerSummary(t *testing.T) {
+	for _, test := range []struct {
+		phase, summary, want string
+	}{
+		{worker.ProgressPhaseSearching, "Searching the web.", `{"phase":"searching","summary":"Searching the web."}`},
+		{worker.ProgressPhaseReadingSources, "Reading sources.", `{"phase":"reading_sources","summary":"Reading sources."}`},
+		{worker.ProgressPhasePreparingAnswer, "Preparing the answer.", `{"phase":"preparing_answer","summary":"Preparing the answer."}`},
+	} {
+		record := worker.ProgressRecord{MutationID: "private", ExpectedObjectiveRevision: 1, Phase: test.phase, Summary: test.summary}
+		payload, err := json.Marshal(record)
+		require.NoError(t, err)
+		public, err := SanitizeEvent(handoff.Event{Kind: "handoff.progress", State: handoff.StateRunning, Payload: payload})
+		require.NoError(t, err)
+		assert.JSONEq(t, test.want, string(public.Details))
+	}
+
+	for _, record := range []worker.ProgressRecord{
+		{Phase: "searching_private_query", Summary: "Searching the web."},
+		{Phase: worker.ProgressPhaseSearching, Summary: "Searching private query terms."},
+		{Phase: worker.ProgressPhaseReadingSources, Summary: "private snippet"},
+	} {
+		payload, err := json.Marshal(record)
+		require.NoError(t, err)
+		_, err = SanitizeEvent(handoff.Event{Kind: "handoff.progress", State: handoff.StateRunning, Payload: payload})
+		require.Error(t, err)
+	}
+}
+
+func TestSanitizeCompletionAllowsOnlyBoundedTextAndHTTPSources(t *testing.T) {
+	valid := worker.CompletionRecord{Result: handoff.Result{Summary: "answer", Structured: json.RawMessage(`{"text":"answer","sources":[{"title":"Title","url":"https://example.com/path"}]}`)}}
+	payload, err := json.Marshal(valid)
+	require.NoError(t, err)
+	public, err := SanitizeEvent(handoff.Event{Kind: "handoff.complete", State: handoff.StateSucceeded, Payload: payload})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"summary":"answer","structured":{"text":"answer","sources":[{"title":"Title","url":"https://example.com/path"}]}}`, string(public.Details))
+
+	invalid := []json.RawMessage{
+		json.RawMessage(`{"text":"answer","query":"private"}`),
+		json.RawMessage(`{"text":"answer","snippet":"private"}`),
+		json.RawMessage(`{"text":"answer","sources":[{"title":"Title","url":"http://example.com/"}]}`),
+		json.RawMessage(`{"text":"answer","sources":[{"title":"","url":"https://example.com/"}]}`),
+		json.RawMessage(`{"text":"answer","sources":[],"sources":[]}`),
+	}
+	for _, structured := range invalid {
+		record := worker.CompletionRecord{Result: handoff.Result{Summary: "answer", Structured: structured}}
+		raw, err := json.Marshal(record)
+		require.NoError(t, err)
+		_, err = SanitizeEvent(handoff.Event{Kind: "handoff.complete", State: handoff.StateSucceeded, Payload: raw})
+		require.Error(t, err, string(structured))
+	}
+
+	redacted := worker.CompletionRecord{Result: handoff.Result{Summary: "safe", Structured: json.RawMessage(`{}`)}}
+	payload, err = json.Marshal(redacted)
+	require.NoError(t, err)
+	public, err = SanitizeEvent(handoff.Event{Kind: "handoff.complete", State: handoff.StateSucceeded, Payload: payload})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"summary":"safe"}`, string(public.Details))
 }
 
 func TestSanitizeApprovalOutcomesAreContentFreeAndPresentationSafe(t *testing.T) {

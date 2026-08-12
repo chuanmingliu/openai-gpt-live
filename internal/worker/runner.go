@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
@@ -19,6 +22,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/lifecycle"
 	"github.com/chuanmingliu/openai-gpt-live/internal/reasoner"
 	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
+	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -385,11 +389,124 @@ type jobExecution struct {
 	builder            *resultBuilder
 	toolCalls          int
 	toolRounds         int
+	policy             toolpolicy.Policy
+	projectionMu       sync.Mutex
+	projectedSources   json.RawMessage
+	hasProjection      bool
 	approvalMu         sync.Mutex
 	approvalRevision   uint32
 	approvalGeneration uint64
 	requiresApproval   bool
 	approved           bool
+}
+
+const maxPublicToolProjectionBytes = 32 << 10
+
+type projectedSource struct {
+	Title string `json:"title"`
+	URL   string `json:"url"`
+}
+
+func (e *jobExecution) storeProjection(raw json.RawMessage) (bool, error) {
+	sources, err := validatePublicToolProjection(raw)
+	if err != nil {
+		return false, err
+	}
+	e.projectionMu.Lock()
+	defer e.projectionMu.Unlock()
+	if e.hasProjection {
+		if bytes.Equal(e.projectedSources, sources) {
+			return false, nil
+		}
+		return false, errors.New("worker public tool projection already exists")
+	}
+	e.projectedSources = sources
+	e.hasProjection = true
+	return true, nil
+}
+
+func (e *jobExecution) completionStructured(text string) (json.RawMessage, error) {
+	e.projectionMu.Lock()
+	sources := append(json.RawMessage(nil), e.projectedSources...)
+	hasProjection := e.hasProjection
+	e.projectionMu.Unlock()
+	if !hasProjection {
+		return json.Marshal(struct {
+			Text string `json:"text"`
+		}{Text: text})
+	}
+	return json.Marshal(struct {
+		Text    string          `json:"text"`
+		Sources json.RawMessage `json:"sources"`
+	}{Text: text, Sources: sources})
+}
+
+func validatePublicToolProjection(raw json.RawMessage) (json.RawMessage, error) {
+	canonical, err := canonicalToolArguments(raw, maxPublicToolProjectionBytes)
+	if err != nil {
+		return nil, errors.New("worker public tool projection is invalid")
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(canonical, &object); err != nil || len(object) != 1 {
+		return nil, errors.New("worker public tool projection is invalid")
+	}
+	sourcesRaw, ok := object["sources"]
+	if !ok || len(sourcesRaw) < 2 || sourcesRaw[0] != '[' {
+		return nil, errors.New("worker public tool projection is invalid")
+	}
+	var sourceObjects []map[string]json.RawMessage
+	if err := json.Unmarshal(sourcesRaw, &sourceObjects); err != nil || len(sourceObjects) > 10 {
+		return nil, errors.New("worker public tool projection is invalid")
+	}
+	for _, sourceObject := range sourceObjects {
+		if len(sourceObject) != 2 {
+			return nil, errors.New("worker public tool projection is invalid")
+		}
+		var source projectedSource
+		if err := json.Unmarshal(sourceObject["title"], &source.Title); err != nil {
+			return nil, errors.New("worker public tool projection is invalid")
+		}
+		if err := json.Unmarshal(sourceObject["url"], &source.URL); err != nil || !validProjectedTitle(source.Title) || !validProjectedURL(source.URL) {
+			return nil, errors.New("worker public tool projection is invalid")
+		}
+	}
+	return append(json.RawMessage(nil), sourcesRaw...), nil
+}
+
+func validProjectedTitle(value string) bool {
+	if !utf8.ValidString(value) {
+		return false
+	}
+	count := 0
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return false
+		}
+		count++
+	}
+	return count >= 1 && count <= 256
+}
+
+func validProjectedURL(raw string) bool {
+	if len(raw) < 1 || len(raw) > 2048 || !utf8.ValidString(raw) {
+		return false
+	}
+	for _, character := range raw {
+		if character > unicode.MaxASCII || unicode.IsControl(character) {
+			return false
+		}
+	}
+	decoded, err := url.PathUnescape(raw)
+	if err != nil || !utf8.ValidString(decoded) {
+		return false
+	}
+	for _, character := range decoded {
+		if unicode.IsControl(character) {
+			return false
+		}
+	}
+	parsed, err := url.Parse(raw)
+	return err == nil && parsed.Scheme == "https" && parsed.Host != "" && parsed.Hostname() != "" && parsed.User == nil && parsed.Opaque == ""
 }
 
 func (e *jobExecution) beginGeneration(revision uint32) uint64 {
@@ -436,6 +553,15 @@ func (e *jobExecution) consumeTools(calls, maxCalls, maxRounds int) error {
 }
 
 func (r *Runner) generate(ctx context.Context, lease Lease, control Control, execution *jobExecution, generation uint64) (generatedResult, error) {
+	persistedPolicy, err := decodePersistedToolPolicy(lease.Job.Request.ToolPolicy)
+	if err != nil {
+		return generatedResult{}, err
+	}
+	webSearchAllowed := containsString(lease.Job.Request.ToolAllowlist, toolpolicy.WebSearchTool)
+	if webSearchAllowed != persistedPolicy.WebSearch.Enabled {
+		return generatedResult{}, ErrToolNotAllowed
+	}
+	execution.policy = persistedPolicy
 	allowlist := lease.Job.Request.ToolAllowlist
 	if r.shadowMode() {
 		allowlist = make([]string, 0, len(lease.Job.Request.ToolAllowlist))
@@ -472,7 +598,7 @@ func (r *Runner) generate(ctx context.Context, lease Lease, control Control, exe
 	}
 	request := reasoner.Request{Model: lease.Job.Request.Versions.Model, Messages: messages, Tools: definitions, MaxOutputTokens: maxTokens, DisableThinking: true, SafetyUserID: safetyID}
 	builder := execution.builder
-	builder.beginGeneration(ctx, control.ObjectiveRevision, control.InputRevision)
+	builder.beginGeneration(ctx, control.ObjectiveRevision, control.InputRevision, persistedPolicy.WebSearch.Enabled)
 	toolOrdinal := uint32(0)
 	type claimOutcome struct {
 		invocation ToolInvocation
@@ -496,7 +622,19 @@ func (r *Runner) generate(ctx context.Context, lease Lease, control Control, exe
 			reasoner.Message{Role: reasoner.RoleTool, ToolCallID: call.ID, Content: string(output)},
 		)
 	}
+	preparingKey := ""
+	if claimed.found {
+		if tool, ok := r.Tools.Lookup(lease.Job.Request.Versions.ToolRegistry, claimed.invocation.Record.ToolName); ok && (tool.StartedPhase != "" || tool.CompletedPhase != "") {
+			preparingKey = claimed.invocation.Record.InvocationID
+		}
+	}
 	for {
+		if preparingKey != "" {
+			if err := builder.appendPhase(ProgressPhasePreparingAnswer, preparingKey); err != nil {
+				return generatedResult{}, err
+			}
+			preparingKey = ""
+		}
 		builder.beginStream()
 		result, streamErr := r.Reasoner.Stream(ctx, request.Clone(), builder.onChunk)
 		if streamErr != nil {
@@ -518,9 +656,10 @@ func (r *Runner) generate(ctx context.Context, lease Lease, control Control, exe
 			if strings.TrimSpace(result.Text) == "" {
 				return generatedResult{}, errors.New("worker reasoner returned empty result")
 			}
-			structured, _ := json.Marshal(struct {
-				Text string `json:"text"`
-			}{result.Text})
+			structured, err := execution.completionStructured(result.Text)
+			if err != nil {
+				return generatedResult{}, err
+			}
 			usage, _ := json.Marshal(result.Usage)
 			summary := boundedUTF8(result.Text, 16<<10)
 			if err := builder.reserve(len(summary) + len(structured) + len(usage)); err != nil {
@@ -542,7 +681,25 @@ func (r *Runner) generate(ctx context.Context, lease Lease, control Control, exe
 		toolOrdinal = nextOrdinal
 		request.Messages = append(request.Messages, reasoner.Message{Role: reasoner.RoleAssistant, Content: result.Text, ToolCalls: cloneReasonerCalls(result.ToolCalls)})
 		request.Messages = append(request.Messages, toolMessages...)
+		for _, call := range result.ToolCalls {
+			if tool, ok := r.Tools.Lookup(lease.Job.Request.Versions.ToolRegistry, call.Name); ok && (tool.StartedPhase != "" || tool.CompletedPhase != "") {
+				preparingKey = fmt.Sprintf("tool-round-%d", execution.toolRounds)
+				break
+			}
+		}
 	}
+}
+
+func decodePersistedToolPolicy(raw json.RawMessage) (toolpolicy.Policy, error) {
+	policy, err := toolpolicy.Decode(raw)
+	if err != nil {
+		return toolpolicy.Policy{}, errors.New("worker persisted tool policy is invalid")
+	}
+	canonical, err := toolpolicy.MarshalCanonical(policy)
+	if err != nil || !bytes.Equal(canonical, raw) {
+		return toolpolicy.Policy{}, errors.New("worker persisted tool policy is invalid")
+	}
+	return policy, nil
 }
 
 func (r *Runner) executeClaimedApprovedTool(ctx context.Context, lease Lease, revision uint32, invocation ToolInvocation, builder *resultBuilder, execution *jobExecution, generation uint64) (reasoner.ToolCall, json.RawMessage, error) {
@@ -604,7 +761,13 @@ func (r *Runner) executeClaimedApprovedTool(ctx context.Context, lease Lease, re
 			clear(arguments)
 			return reasoner.ToolCall{}, nil, errors.New("worker durable tool execution state is invalid")
 		}
-		output, err = tool.Executor.Execute(ctx, ToolExecutionRequest{InvocationID: expectedID, IdempotencyKey: expectedID, Arguments: append(json.RawMessage(nil), arguments...)})
+		if tool.StartedPhase != "" {
+			err = builder.appendPhase(tool.StartedPhase, expectedID)
+			if err != nil {
+				break
+			}
+		}
+		output, err = tool.Executor.Execute(ctx, ToolExecutionRequest{InvocationID: expectedID, IdempotencyKey: expectedID, Arguments: append(json.RawMessage(nil), arguments...), Policy: execution.policy})
 		if err != nil {
 			err = fmt.Errorf("%w", errToolFailure)
 			break
@@ -624,6 +787,16 @@ func (r *Runner) executeClaimedApprovedTool(ctx context.Context, lease Lease, re
 	if err != nil {
 		clear(arguments)
 		return reasoner.ToolCall{}, nil, err
+	}
+	if err := r.projectToolResult(tool, output, builder, execution); err != nil {
+		clear(arguments)
+		return reasoner.ToolCall{}, nil, err
+	}
+	if tool.CompletedPhase != "" {
+		if err := builder.appendPhase(tool.CompletedPhase, expectedID); err != nil {
+			clear(arguments)
+			return reasoner.ToolCall{}, nil, err
+		}
 	}
 	call := reasoner.ToolCall{ID: expectedID, Name: record.ToolName, Arguments: arguments}
 	return call, output, nil
@@ -653,6 +826,7 @@ type resultBuilder struct {
 	token             LeaseToken
 	objectiveRevision uint32
 	inputRevision     uint32
+	phasedProgress    bool
 	first             bool
 	lastProgress      time.Time
 	sequence          uint64
@@ -661,11 +835,12 @@ type resultBuilder struct {
 	streamArgs        int
 }
 
-func (b *resultBuilder) beginGeneration(ctx context.Context, objectiveRevision, inputRevision uint32) {
+func (b *resultBuilder) beginGeneration(ctx context.Context, objectiveRevision, inputRevision uint32, phasedProgress bool) {
 	b.mu.Lock()
 	b.ctx = ctx
 	b.objectiveRevision = objectiveRevision
 	b.inputRevision = inputRevision
+	b.phasedProgress = phasedProgress
 	b.mu.Unlock()
 }
 
@@ -701,7 +876,7 @@ func (b *resultBuilder) onChunk(chunk reasoner.Chunk) error {
 	if first {
 		b.first = true
 	}
-	emit := b.lastProgress.IsZero() || !now.Before(b.lastProgress.Add(time.Second))
+	emit := !b.phasedProgress && (b.lastProgress.IsZero() || !now.Before(b.lastProgress.Add(time.Second)))
 	if emit {
 		b.lastProgress = now
 		b.sequence++
@@ -743,6 +918,29 @@ func (b *resultBuilder) addResult(result reasoner.Result) error {
 	return b.reserve(textMissing + argumentsMissing)
 }
 
+func (b *resultBuilder) appendPhase(phase, discriminator string) error {
+	summary, ok := StableProgressSummary(phase)
+	if !ok || discriminator == "" {
+		return errors.New("worker progress phase is invalid")
+	}
+	if err := b.reserve(len(summary)); err != nil {
+		return err
+	}
+	b.mu.Lock()
+	progressCtx := b.ctx
+	objectiveRevision := b.objectiveRevision
+	inputRevision := b.inputRevision
+	b.mu.Unlock()
+	mutationID := stableMutationID(Lease{Token: b.token}, objectiveRevision, fmt.Sprintf("progress-phase-input-%d-%s-%s", inputRevision, discriminator, phase))
+	digest := sha256.Sum256([]byte(mutationID))
+	sequence := binary.BigEndian.Uint64(digest[:8]) & ^(uint64(1) << 63)
+	if sequence == 0 {
+		sequence = 1
+	}
+	record := ProgressRecord{MutationID: mutationID, ExpectedObjectiveRevision: objectiveRevision, InputRevision: inputRevision, Sequence: sequence, Phase: phase, Summary: summary}
+	return retryExactMutation(progressCtx, func() error { return b.store.AppendProgress(progressCtx, b.token, record) })
+}
+
 func (r *Runner) executeToolCalls(ctx context.Context, lease Lease, revision, startOrdinal uint32, calls []reasoner.ToolCall, builder *resultBuilder, execution *jobExecution, generation uint64) ([]reasoner.Message, uint32, error) {
 	seenIDs := make(map[string]struct{}, len(calls))
 	resolved := make([]RegisteredTool, len(calls))
@@ -767,9 +965,9 @@ func (r *Runner) executeToolCalls(ctx context.Context, lease Lease, revision, st
 	}
 	outputs := make([]json.RawMessage, len(calls))
 	for index := 0; index < len(calls); {
-		if resolved[index].ReadOnly && resolved[index].ParallelSafe {
+		if parallelBatchTool(resolved[index]) {
 			end := index + 1
-			for end < len(calls) && resolved[end].ReadOnly && resolved[end].ParallelSafe {
+			for end < len(calls) && parallelBatchTool(resolved[end]) {
 				end++
 			}
 			groupCtx, cancel := context.WithCancel(ctx)
@@ -816,6 +1014,10 @@ func (r *Runner) executeToolCalls(ctx context.Context, lease Lease, revision, st
 	return messages, startOrdinal + uint32(len(calls)), nil
 }
 
+func parallelBatchTool(tool RegisteredTool) bool {
+	return tool.ReadOnly && tool.ParallelSafe && tool.StartedPhase == "" && tool.CompletedPhase == "" && tool.Projector == nil
+}
+
 func (r *Runner) executeOneTool(ctx context.Context, lease Lease, revision, ordinal uint32, call reasoner.ToolCall, tool RegisteredTool, arguments json.RawMessage, builder *resultBuilder, execution *jobExecution, generation uint64) (json.RawMessage, error) {
 	if r.ArgumentSealer == nil {
 		return nil, errors.New("worker argument sealer is required for tools")
@@ -860,6 +1062,14 @@ func (r *Runner) executeOneTool(ctx context.Context, lease Lease, revision, ordi
 		if reserveErr := builder.reserve(len(output)); reserveErr != nil {
 			return nil, reserveErr
 		}
+		if err := r.projectToolResult(tool, output, builder, execution); err != nil {
+			return nil, err
+		}
+		if tool.CompletedPhase != "" {
+			if err := builder.appendPhase(tool.CompletedPhase, invocationID); err != nil {
+				return nil, err
+			}
+		}
 		return output, nil
 	}
 	// This is the final side-effect boundary. Metadata came from the immutable
@@ -867,7 +1077,12 @@ func (r *Runner) executeOneTool(ctx context.Context, lease Lease, revision, ordi
 	if tool.SideEffecting && r.shadowMode() {
 		return nil, ErrToolNotAllowed
 	}
-	output, err := tool.Executor.Execute(ctx, ToolExecutionRequest{InvocationID: invocationID, IdempotencyKey: invocationID, Arguments: append(json.RawMessage(nil), arguments...)})
+	if tool.StartedPhase != "" {
+		if err := builder.appendPhase(tool.StartedPhase, invocationID); err != nil {
+			return nil, err
+		}
+	}
+	output, err := tool.Executor.Execute(ctx, ToolExecutionRequest{InvocationID: invocationID, IdempotencyKey: invocationID, Arguments: append(json.RawMessage(nil), arguments...), Policy: execution.policy})
 	if err != nil {
 		return nil, fmt.Errorf("%w", errToolFailure)
 	}
@@ -878,11 +1093,42 @@ func (r *Runner) executeOneTool(ctx context.Context, lease Lease, revision, ordi
 	if err := builder.reserve(len(output)); err != nil {
 		return nil, err
 	}
+	if err := r.projectToolResult(tool, output, builder, execution); err != nil {
+		return nil, err
+	}
 	completion := ToolCompletionRecord{InvocationID: invocationID, MutationID: stableMutationID(lease, revision, "tool-"+invocationID), Result: output}
 	if err := retryExactMutation(ctx, func() error { return r.Store.CompleteToolInvocation(ctx, lease.Token, completion) }); err != nil {
 		return nil, err
 	}
+	if tool.CompletedPhase != "" {
+		if err := builder.appendPhase(tool.CompletedPhase, invocationID); err != nil {
+			return nil, err
+		}
+	}
 	return output, nil
+}
+
+func (r *Runner) projectToolResult(tool RegisteredTool, output json.RawMessage, builder *resultBuilder, execution *jobExecution) error {
+	if tool.Projector == nil {
+		return nil
+	}
+	projected, err := tool.Projector.Project(append(json.RawMessage(nil), output...))
+	if err != nil {
+		return fmt.Errorf("%w", errToolFailure)
+	}
+	if len(projected) == 0 || len(projected) > maxPublicToolProjectionBytes || !utf8.Valid(projected) {
+		return fmt.Errorf("%w", errToolFailure)
+	}
+	added, err := execution.storeProjection(projected)
+	if err != nil {
+		return fmt.Errorf("%w", errToolFailure)
+	}
+	if added {
+		if err := builder.reserve(len(projected)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *Runner) shadowMode() bool {

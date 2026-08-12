@@ -1,10 +1,14 @@
 package presentation
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/url"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
@@ -27,6 +31,11 @@ type PublicEvent struct {
 
 type publicSummary struct {
 	Summary string `json:"summary,omitempty"`
+}
+
+type publicProgress struct {
+	Phase   string `json:"phase"`
+	Summary string `json:"summary"`
 }
 
 type publicNeedsInput struct {
@@ -115,8 +124,18 @@ func SanitizeEvent(event handoff.Event) (PublicEvent, error) {
 		if err := decodeRecord(event.Payload, &record); err != nil || !publicString(record.Summary, 16<<10, true) {
 			return PublicEvent{}, malformed(event, err)
 		}
+		if record.Phase != "" {
+			summary, ok := worker.StableProgressSummary(record.Phase)
+			if !ok || record.Summary != summary {
+				return PublicEvent{}, malformed(event, errors.New("progress phase is invalid"))
+			}
+			details = publicProgress{Phase: record.Phase, Summary: summary}
+		} else {
+			// Legacy content-free generation heartbeats remain present for
+			// non-phased tools; stable tool phases always use publicProgress.
+			details = publicSummary{Summary: record.Summary}
+		}
 		out.Summary = record.Summary
-		details = publicSummary{Summary: record.Summary}
 	case "tool.approval_approved":
 		if event.State != handoff.StatePending {
 			return PublicEvent{}, unsupported(event)
@@ -156,11 +175,15 @@ func SanitizeEvent(event handoff.Event) (PublicEvent, error) {
 			return PublicEvent{}, unsupported(event)
 		}
 		var record worker.CompletionRecord
-		if err := decodeRecord(event.Payload, &record); err != nil || !publicString(record.Result.Summary, 16<<10, true) || !publicJSON(record.Result.Structured) {
+		if err := decodeRecord(event.Payload, &record); err != nil || !publicString(record.Result.Summary, 16<<10, true) {
+			return PublicEvent{}, malformed(event, err)
+		}
+		structured, err := sanitizeCompletionStructured(record.Result.Structured)
+		if err != nil {
 			return PublicEvent{}, malformed(event, err)
 		}
 		out.Summary = record.Result.Summary
-		details = publicCompletion{Summary: record.Result.Summary, Structured: cloneJSON(record.Result.Structured)}
+		details = publicCompletion{Summary: record.Result.Summary, Structured: structured}
 	case "handoff.fail":
 		if event.State != handoff.StateFailed {
 			return PublicEvent{}, unsupported(event)
@@ -224,6 +247,160 @@ func publicJSON(value json.RawMessage) bool {
 }
 
 func cloneJSON(value json.RawMessage) json.RawMessage { return append(json.RawMessage(nil), value...) }
+
+type completionSource struct {
+	Title string `json:"title"`
+	URL   string `json:"url"`
+}
+
+func sanitizeCompletionStructured(raw json.RawMessage) (json.RawMessage, error) {
+	if len(raw) == 0 || len(raw) > maxPublicPayloadBytes || !utf8.Valid(raw) {
+		return nil, errors.New("completion projection is invalid")
+	}
+	object, err := strictRawObject(raw)
+	if err != nil {
+		return nil, errors.New("completion projection is invalid")
+	}
+	if len(object) == 0 {
+		return nil, nil
+	}
+	if len(object) < 1 || len(object) > 2 {
+		return nil, errors.New("completion projection is invalid")
+	}
+	textRaw, ok := object["text"]
+	if !ok {
+		return nil, errors.New("completion projection is invalid")
+	}
+	var text string
+	if err := json.Unmarshal(textRaw, &text); err != nil || !publicString(text, 16<<10, true) {
+		return nil, errors.New("completion projection is invalid")
+	}
+	var sources []completionSource
+	if sourcesRaw, present := object["sources"]; present {
+		sources, err = decodeCompletionSources(sourcesRaw)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if len(object) != 1 && object["sources"] == nil {
+		return nil, errors.New("completion projection is invalid")
+	}
+	if object["sources"] == nil {
+		encoded, err := json.Marshal(struct {
+			Text string `json:"text"`
+		}{Text: text})
+		return json.RawMessage(encoded), err
+	}
+	encoded, err := json.Marshal(struct {
+		Text    string             `json:"text"`
+		Sources []completionSource `json:"sources"`
+	}{Text: text, Sources: sources})
+	if err != nil || len(encoded) > maxPublicPayloadBytes {
+		return nil, errors.New("completion projection is invalid")
+	}
+	return json.RawMessage(encoded), nil
+}
+
+func strictRawObject(raw json.RawMessage) (map[string]json.RawMessage, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return nil, errors.New("object is invalid")
+	}
+	object := make(map[string]json.RawMessage)
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		key, ok := keyToken.(string)
+		if err != nil || !ok {
+			return nil, errors.New("object is invalid")
+		}
+		if _, duplicate := object[key]; duplicate {
+			return nil, errors.New("object is invalid")
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return nil, errors.New("object is invalid")
+		}
+		object[key] = value
+	}
+	if token, err = decoder.Token(); err != nil || token != json.Delim('}') {
+		return nil, errors.New("object is invalid")
+	}
+	if _, err = decoder.Token(); !errors.Is(err, io.EOF) {
+		return nil, errors.New("object is invalid")
+	}
+	return object, nil
+}
+
+func decodeCompletionSources(raw json.RawMessage) ([]completionSource, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('[') {
+		return nil, errors.New("completion sources are invalid")
+	}
+	sources := make([]completionSource, 0)
+	for decoder.More() {
+		if len(sources) == 10 {
+			return nil, errors.New("completion sources are invalid")
+		}
+		var sourceRaw json.RawMessage
+		if err := decoder.Decode(&sourceRaw); err != nil {
+			return nil, errors.New("completion sources are invalid")
+		}
+		object, err := strictRawObject(sourceRaw)
+		if err != nil || len(object) != 2 || object["title"] == nil || object["url"] == nil {
+			return nil, errors.New("completion sources are invalid")
+		}
+		var source completionSource
+		if json.Unmarshal(object["title"], &source.Title) != nil || json.Unmarshal(object["url"], &source.URL) != nil || !validCompletionTitle(source.Title) || !validCompletionURL(source.URL) {
+			return nil, errors.New("completion sources are invalid")
+		}
+		sources = append(sources, source)
+	}
+	if token, err = decoder.Token(); err != nil || token != json.Delim(']') {
+		return nil, errors.New("completion sources are invalid")
+	}
+	if _, err = decoder.Token(); !errors.Is(err, io.EOF) {
+		return nil, errors.New("completion sources are invalid")
+	}
+	return sources, nil
+}
+
+func validCompletionTitle(value string) bool {
+	if !utf8.ValidString(value) {
+		return false
+	}
+	count := 0
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return false
+		}
+		count++
+	}
+	return count >= 1 && count <= 256
+}
+
+func validCompletionURL(raw string) bool {
+	if len(raw) < 1 || len(raw) > 2048 || !utf8.ValidString(raw) {
+		return false
+	}
+	for _, character := range raw {
+		if character > unicode.MaxASCII || unicode.IsControl(character) {
+			return false
+		}
+	}
+	decoded, err := url.PathUnescape(raw)
+	if err != nil || !utf8.ValidString(decoded) {
+		return false
+	}
+	for _, character := range decoded {
+		if unicode.IsControl(character) {
+			return false
+		}
+	}
+	parsed, err := url.Parse(raw)
+	return err == nil && parsed.Scheme == "https" && parsed.Host != "" && parsed.Hostname() != "" && parsed.User == nil && parsed.Opaque == ""
+}
 
 func unsupported(event handoff.Event) error {
 	return fmt.Errorf("%w: %s/%s", ErrUnsupportedEvent, event.Kind, event.State)

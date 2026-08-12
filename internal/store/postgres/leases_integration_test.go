@@ -283,6 +283,29 @@ func TestProgressAfterSteerAndRetryReacquireIsRevisionFencedAndReplaySafe(t *tes
 	assert.Equal(t, events, distinct)
 }
 
+func TestAppendProgressPhasePersistsExactStableValueAndRejectsUnknown(t *testing.T) {
+	repo, pool, _ := repositoryHarness(t)
+	record, lease, _ := runningLease(t, repo, "progress-phase")
+	progress := worker.ProgressRecord{MutationID: "searching-phase", ExpectedObjectiveRevision: lease.Job.ObjectiveRevision, Sequence: 1, Phase: worker.ProgressPhaseSearching, Summary: "Searching the web."}
+	require.NoError(t, repo.AppendProgress(t.Context(), lease.Token, progress))
+
+	var payload json.RawMessage
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT payload FROM handoff_events WHERE handoff_id=$1 AND kind='handoff.progress' ORDER BY seq DESC LIMIT 1`, record.HandoffID).Scan(&payload))
+	assert.JSONEq(t, `{"MutationID":"searching-phase","ExpectedObjectiveRevision":0,"InputRevision":0,"Sequence":1,"Phase":"searching","Summary":"Searching the web."}`, string(payload))
+
+	progress.MutationID = "unknown-phase"
+	progress.Sequence = 2
+	progress.Phase = "fetching_private_query"
+	err := repo.AppendProgress(t.Context(), lease.Token, progress)
+	require.ErrorIs(t, err, handoff.ErrInvalidRequest)
+
+	progress.MutationID = "wrong-summary"
+	progress.Phase = worker.ProgressPhaseSearching
+	progress.Summary = "Searching private query terms."
+	err = repo.AppendProgress(t.Context(), lease.Token, progress)
+	require.ErrorIs(t, err, handoff.ErrInvalidRequest)
+}
+
 func TestCancellationPendingAndCommittedBeforeCompletion(t *testing.T) {
 	t.Run("pending", func(t *testing.T) {
 		repo, _, _ := repositoryHarness(t)

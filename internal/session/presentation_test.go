@@ -390,7 +390,7 @@ func TestPresentationSafetyRedactsVisualAndSpeechIndependently(t *testing.T) {
 
 func TestPresentationVisualAndSpeechExposeOnlyBoundedPublicDTO(t *testing.T) {
 	record := worker.CompletionRecord{ExpectedObjectiveRevision: 91, Result: handoff.Result{
-		MutationID: "private-mutation", Summary: "public summary", Structured: json.RawMessage(`{"answer":42}`),
+		MutationID: "private-mutation", Summary: "public summary", Structured: json.RawMessage(`{"text":"public answer","sources":[{"title":"Public docs","url":"https://example.com/docs"}]}`),
 		SafetyDecision: json.RawMessage(`{"private_policy":"deny"}`), Usage: json.RawMessage(`{"private_tokens":999}`),
 	}}
 	payload, err := json.Marshal(record)
@@ -401,7 +401,8 @@ func TestPresentationVisualAndSpeechExposeOnlyBoundedPublicDTO(t *testing.T) {
 	visual := effects[0].ClientEvent.(protocol.LiveHandoffCompletedEvent)
 	combined := string(visual.Details) + string(effects[1].VoiceCommand.Response.Input)
 	assert.Contains(t, combined, "public summary")
-	assert.Contains(t, combined, `\"answer\":42`)
+	assert.Contains(t, combined, `\"text\":\"public answer\"`)
+	assert.Contains(t, combined, `\"url\":\"https://example.com/docs\"`)
 	for _, forbidden := range []string{"private-mutation", "private_policy", "private_tokens", "ExpectedObjectiveRevision", "SafetyDecision", "Usage"} {
 		assert.NotContains(t, combined, forbidden)
 	}

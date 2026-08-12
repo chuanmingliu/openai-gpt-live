@@ -246,6 +246,12 @@ func (r *Repository) AppendProgress(ctx context.Context, token worker.LeaseToken
 	if err := bounded("progress summary", record.Summary, 16*1024, true); err != nil {
 		return err
 	}
+	if record.Phase != "" {
+		summary, ok := worker.StableProgressSummary(record.Phase)
+		if !ok || record.Summary != summary {
+			return fmt.Errorf("%w: progress phase is invalid", handoff.ErrInvalidRequest)
+		}
+	}
 	if record.Sequence > math.MaxInt64 {
 		return fmt.Errorf("%w: progress sequence out of range", handoff.ErrInvalidRequest)
 	}

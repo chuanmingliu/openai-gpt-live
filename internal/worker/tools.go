@@ -18,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/reasoner"
+	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 )
 
 var (
@@ -31,10 +32,42 @@ type ToolExecutionRequest struct {
 	InvocationID   string
 	IdempotencyKey string
 	Arguments      json.RawMessage
+	Policy         toolpolicy.Policy
 }
 
 type ToolExecutor interface {
 	Execute(context.Context, ToolExecutionRequest) (json.RawMessage, error)
+}
+
+type ToolResultProjector interface {
+	Project(json.RawMessage) (json.RawMessage, error)
+}
+
+const (
+	ProgressPhaseSearching       = "searching"
+	ProgressPhaseReadingSources  = "reading_sources"
+	ProgressPhasePreparingAnswer = "preparing_answer"
+)
+
+func StableProgressSummary(phase string) (string, bool) {
+	switch phase {
+	case ProgressPhaseSearching:
+		return "Searching the web.", true
+	case ProgressPhaseReadingSources:
+		return "Reading sources.", true
+	case ProgressPhasePreparingAnswer:
+		return "Preparing the answer.", true
+	default:
+		return "", false
+	}
+}
+
+func validRegisteredPhase(phase string) bool {
+	if phase == "" {
+		return true
+	}
+	_, ok := StableProgressSummary(phase)
+	return ok
 }
 
 type RegisteredTool struct {
@@ -43,7 +76,10 @@ type RegisteredTool struct {
 	ReadOnly          bool
 	ParallelSafe      bool
 	StableIdempotency bool
+	StartedPhase      string
+	CompletedPhase    string
 	Executor          ToolExecutor
+	Projector         ToolResultProjector
 }
 
 type ToolRegistry interface {
@@ -65,7 +101,7 @@ func NewToolRegistry(versions map[string][]RegisteredTool) (ToolRegistry, error)
 		}
 		byName := make(map[string]RegisteredTool, len(tools))
 		for _, tool := range tools {
-			if nilValue(tool.Executor) || (tool.SideEffecting && (!tool.StableIdempotency || tool.ReadOnly)) || (tool.ParallelSafe && (!tool.ReadOnly || tool.SideEffecting)) {
+			if nilValue(tool.Executor) || (tool.Projector != nil && nilValue(tool.Projector)) || !validRegisteredPhase(tool.StartedPhase) || !validRegisteredPhase(tool.CompletedPhase) || (tool.SideEffecting && (!tool.StableIdempotency || tool.ReadOnly)) || (tool.ParallelSafe && (!tool.ReadOnly || tool.SideEffecting)) {
 				return nil, errors.New("worker tool metadata is invalid")
 			}
 			definition := tool.Definition.Clone()

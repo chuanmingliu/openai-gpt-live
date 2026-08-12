@@ -22,7 +22,7 @@ func successfulExecutor(t *testing.T) *Executor {
 
 func TestExecuteAcceptsOnlyCanonicalClosedWorldArguments(t *testing.T) {
 	executor := successfulExecutor(t)
-	output, err := executor.Execute(t.Context(), worker.ToolExecutionRequest{Arguments: json.RawMessage(" { \n \t \"query\" : \"golang\" } ")})
+	output, err := executor.Execute(t.Context(), worker.ToolExecutionRequest{Arguments: json.RawMessage(" { \n \t \"query\" : \"golang\" } "), Policy: toolpolicy.DefaultPolicy()})
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"query":"golang","results":[{"title":"Go & Docs","snippet":"Go documentation","url":"https://go.dev/doc/"}]}`, string(output))
 
@@ -46,9 +46,15 @@ func TestExecuteAcceptsOnlyCanonicalClosedWorldArguments(t *testing.T) {
 
 func TestExecuteUsesServerPolicyNotArgumentPolicyFields(t *testing.T) {
 	executor := successfulExecutor(t)
-	_, err := executor.Execute(t.Context(), worker.ToolExecutionRequest{Arguments: json.RawMessage(`{"query":"golang","timeout_ms":10000}`)})
+	policy := toolpolicy.DefaultPolicy()
+	policy.WebSearch.MaxResults = 2
+	output, err := executor.Execute(t.Context(), worker.ToolExecutionRequest{Arguments: json.RawMessage(`{"query":"golang"}`), Policy: policy})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"query":"golang","results":[{"title":"Go & Docs","snippet":"Go documentation","url":"https://go.dev/doc/"}]}`, string(output))
+
+	_, err = executor.Execute(t.Context(), worker.ToolExecutionRequest{Arguments: json.RawMessage(`{"query":"golang","timeout_ms":10000}`), Policy: policy})
 	require.Error(t, err)
-	_, err = executor.Execute(t.Context(), worker.ToolExecutionRequest{Arguments: json.RawMessage(`{"query":"golang","url":"https://attacker.example/"}`)})
+	_, err = executor.Execute(t.Context(), worker.ToolExecutionRequest{Arguments: json.RawMessage(`{"query":"golang","url":"https://attacker.example/"}`), Policy: policy})
 	require.Error(t, err)
 }
 
@@ -95,7 +101,10 @@ func TestRegisteredToolHasExactSchemaAndReadOnlyMetadata(t *testing.T) {
 	assert.True(t, registered.ReadOnly)
 	assert.True(t, registered.ParallelSafe)
 	assert.True(t, registered.StableIdempotency)
+	assert.Equal(t, worker.ProgressPhaseSearching, registered.StartedPhase)
+	assert.Equal(t, worker.ProgressPhaseReadingSources, registered.CompletedPhase)
 	assert.Same(t, executor, registered.Executor)
+	assert.Same(t, executor, registered.Projector)
 
 	_, err := worker.NewToolRegistry(map[string][]worker.RegisteredTool{"tools-v1": {registered}})
 	require.NoError(t, err)
@@ -105,7 +114,7 @@ func TestExecuteAndProjectErrorsDoNotContainPrivateContent(t *testing.T) {
 	executor := executorWithTransport(roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return nil, errors.New("private dependency result")
 	}))
-	_, err := executor.Execute(t.Context(), worker.ToolExecutionRequest{Arguments: json.RawMessage(`{"query":"private query"}`)})
+	_, err := executor.Execute(t.Context(), worker.ToolExecutionRequest{Arguments: json.RawMessage(`{"query":"private query"}`), Policy: toolpolicy.DefaultPolicy()})
 	require.Error(t, err)
 	assert.NotContains(t, err.Error(), "private query")
 	assert.NotContains(t, err.Error(), "private dependency result")

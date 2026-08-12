@@ -17,6 +17,7 @@ import (
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
 	"github.com/chuanmingliu/openai-gpt-live/internal/config"
+	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 	"github.com/chuanmingliu/openai-gpt-live/internal/worker"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -75,6 +76,34 @@ func TestProductionRuntimeGracefullyDrainsComponents(t *testing.T) {
 	cancel()
 	require.NoError(t, <-done)
 	runtimeUnderTest.Close()
+}
+
+func TestWorkerRegistryRegistersWebSearchOnlyWhenConfigured(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		enabled bool
+		want    bool
+	}{
+		{name: "enabled", enabled: true, want: true},
+		{name: "disabled", enabled: false, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := config.Config{}
+			cfg.Tools.WebSearch.Enabled = test.enabled
+			registry, err := workerRegistryForConfig(cfg, "config-v1", net.DefaultResolver)
+			require.NoError(t, err)
+			registered, ok := registry.Lookup("config-v1", toolpolicy.WebSearchTool)
+			assert.Equal(t, test.want, ok)
+			if test.want {
+				assert.False(t, registered.SideEffecting)
+				assert.True(t, registered.ReadOnly)
+				assert.Equal(t, worker.ProgressPhaseSearching, registered.StartedPhase)
+				assert.Equal(t, worker.ProgressPhaseReadingSources, registered.CompletedPhase)
+			}
+			_, wrongVersion := registry.Lookup("other-config", toolpolicy.WebSearchTool)
+			assert.False(t, wrongVersion)
+		})
+	}
 }
 
 func TestProductionRuntimeDrainTimeoutClosesResourcesEvenWhenComponentIsStuck(t *testing.T) {

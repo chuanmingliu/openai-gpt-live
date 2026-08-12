@@ -33,6 +33,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
 	"github.com/chuanmingliu/openai-gpt-live/internal/store/postgres"
 	"github.com/chuanmingliu/openai-gpt-live/internal/telemetry"
+	"github.com/chuanmingliu/openai-gpt-live/internal/tools/websearch"
 	"github.com/chuanmingliu/openai-gpt-live/internal/worker"
 	"github.com/chuanmingliu/openai-gpt-live/migrations"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -405,7 +406,7 @@ func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecret
 	if err != nil {
 		return nil, err
 	}
-	registry, err := worker.NewToolRegistry(map[string][]worker.RegisteredTool{})
+	registry, err := workerRegistryForConfig(cfg, configHash, net.DefaultResolver)
 	if err != nil {
 		return nil, err
 	}
@@ -543,6 +544,18 @@ func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecret
 		cleanupTimeout: cfg.Shutdown.CleanupTimeout, telemetry: traceRuntime, diagnostics: diagnostics,
 		diagnosticListener: diagnosticListener, metricsServer: metricsServer, metricsListener: metricsListener, gates: gates, featureStore: featureStore, featureInterval: cfg.Features.RefreshInterval}
 	return runtime, nil
+}
+
+func workerRegistryForConfig(cfg config.Config, configHash string, resolver websearch.Resolver) (worker.ToolRegistry, error) {
+	registered := make([]worker.RegisteredTool, 0, 1)
+	if cfg.Tools.WebSearch.Enabled {
+		executor, err := websearch.New(resolver)
+		if err != nil {
+			return nil, fmt.Errorf("configure web search tool: %w", err)
+		}
+		registered = append(registered, websearch.RegisteredTool(executor))
+	}
+	return worker.NewToolRegistry(map[string][]worker.RegisteredTool{configHash: registered})
 }
 
 type workerCapacity struct {

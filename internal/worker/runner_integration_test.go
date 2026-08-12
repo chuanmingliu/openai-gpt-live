@@ -21,6 +21,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
 	"github.com/chuanmingliu/openai-gpt-live/internal/store/postgres"
 	"github.com/chuanmingliu/openai-gpt-live/internal/testkit"
+	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 	"github.com/chuanmingliu/openai-gpt-live/internal/worker"
 	"github.com/chuanmingliu/openai-gpt-live/migrations"
 	"github.com/stretchr/testify/assert"
@@ -261,6 +262,86 @@ func TestRunnerPostgresResumesExactApprovedInvocationBeforeDivergentModelCall(t 
 	assert.Equal(t, 1, approvedSucceeded)
 	assert.Equal(t, 1, divergentPending, "divergent call requires its own approval and inherits no authorization")
 	assert.Zero(t, genericFailures)
+}
+
+func TestRunnerPostgresWebSearchPolicyProjectionAndStableProgressAreDurable(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	pool := testkit.Postgres(t)
+	require.NoError(t, migrations.Up(t.Context(), pool))
+	manual := clock.NewManual(now)
+	policy := toolpolicy.DefaultPolicy()
+	policy.WebSearch.SafeSearch = toolpolicy.SafeSearchStrict
+	policy.WebSearch.MaxResults = 2
+	policyRaw, err := toolpolicy.MarshalCanonical(policy)
+	require.NoError(t, err)
+
+	requests := make(chan worker.ToolExecutionRequest, 1)
+	tool := worker.RegisteredTool{
+		Definition:        reasoner.ToolDefinition{Name: toolpolicy.WebSearchTool, Parameters: json.RawMessage(`{"type":"object"}`)},
+		ReadOnly:          true,
+		ParallelSafe:      true,
+		StableIdempotency: true,
+		StartedPhase:      worker.ProgressPhaseSearching,
+		CompletedPhase:    worker.ProgressPhaseReadingSources,
+		Executor: integrationToolExecutor(func(_ context.Context, request worker.ToolExecutionRequest) (json.RawMessage, error) {
+			requests <- request
+			return json.RawMessage(`{"query":"private","results":[]}`), nil
+		}),
+		Projector: integrationToolProjector(func(json.RawMessage) (json.RawMessage, error) {
+			return json.RawMessage(`{"sources":[{"title":"Docs","url":"https://example.com/docs"}]}`), nil
+		}),
+	}
+	registry, err := worker.NewToolRegistry(map[string][]worker.RegisteredTool{"tools": {tool}})
+	require.NoError(t, err)
+	repo, err := postgres.NewRepository(pool, manual, postgres.WithToolGate(registry))
+	require.NoError(t, err)
+	conversation, handoffID := "conversation-search-progress", "handoff-search-progress"
+	_, err = pool.Exec(t.Context(), `INSERT INTO conversations(tenant_id,id,user_id,retention_until,created_at,updated_at)
+		VALUES('tenant-integration',$1,'user-integration',$2,$3,$3)`, conversation, now.Add(24*time.Hour), now)
+	require.NoError(t, err)
+	_, err = pool.Exec(t.Context(), `INSERT INTO handoffs(tenant_id,conversation_id,id,user_id,session_id,source_turn_id,source_turn_revision,user_request,objective,context_ref,context_hash,deadline,token_budget,tool_allowlist,tool_policy,approval_policy,model_version,prompt_version,tool_registry_version,config_version,idempotency_key,request_hash,ready_at,created_at,updated_at)
+		VALUES('tenant-integration',$1,$2,'user-integration','session','turn',1,'request','objective','context','hash',$3,1024,'["web_search"]'::json,$4::json,'{"mode":"none"}'::json,'model','prompt','tools','config','key-search-progress','hash',$5,$5,$5)`, conversation, handoffID, now.Add(time.Hour), policyRaw, now)
+	require.NoError(t, err)
+	lease, ok, err := repo.LeaseNext(t.Context(), worker.LeaseRequest{WorkerID: "search-progress-worker", LeaseDuration: 9 * time.Second, Now: now})
+	require.NoError(t, err)
+	require.True(t, ok)
+	store := &acquiredLeaseStore{Store: repo, lease: lease}
+	var rounds atomic.Int32
+	runner := integrationRunner(t, repo, manual, registry, "search-progress-worker", integrationStreamer(func(context.Context, reasoner.Request, func(reasoner.Chunk) error) (reasoner.Result, error) {
+		if rounds.Add(1) == 1 {
+			return reasoner.Result{ToolCalls: []reasoner.ToolCall{{ID: "search", Name: toolpolicy.WebSearchTool, Arguments: json.RawMessage(`{"query":"private"}`)}}}, nil
+		}
+		return reasoner.Result{Text: "answer"}, nil
+	}), 1)
+	runner.Store = store
+	runner.ArgumentSealer, err = worker.NewAESArgumentSealer("integration-key", bytes.Repeat([]byte{5}, 32), bytes.NewReader(bytes.Repeat([]byte{1}, 12)))
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+	require.Eventually(t, func() bool {
+		var state string
+		return pool.QueryRow(t.Context(), `SELECT state FROM handoffs WHERE id=$1`, handoffID).Scan(&state) == nil && state == string(handoff.StateSucceeded)
+	}, time.Second, time.Millisecond)
+	cancel()
+	require.NoError(t, <-done)
+	assert.Equal(t, policy, (<-requests).Policy)
+
+	rows, err := pool.Query(t.Context(), `SELECT payload->>'Phase' FROM handoff_events WHERE handoff_id=$1 AND kind='handoff.progress' ORDER BY seq`, handoffID)
+	require.NoError(t, err)
+	defer rows.Close()
+	var phases []string
+	for rows.Next() {
+		var phase string
+		require.NoError(t, rows.Scan(&phase))
+		phases = append(phases, phase)
+	}
+	require.NoError(t, rows.Err())
+	assert.Equal(t, []string{worker.ProgressPhaseSearching, worker.ProgressPhaseReadingSources, worker.ProgressPhasePreparingAnswer}, phases)
+	var structured json.RawMessage
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT structured_result FROM handoffs WHERE id=$1`, handoffID).Scan(&structured))
+	assert.JSONEq(t, `{"text":"answer","sources":[{"title":"Docs","url":"https://example.com/docs"}]}`, string(structured))
+	assert.NotContains(t, string(structured), "private")
 }
 
 func TestRunnerPostgresDeniedAndExpiredApprovalsNeverReachExecutor(t *testing.T) {
@@ -732,4 +813,10 @@ type integrationToolExecutor func(context.Context, worker.ToolExecutionRequest) 
 
 func (f integrationToolExecutor) Execute(ctx context.Context, request worker.ToolExecutionRequest) (json.RawMessage, error) {
 	return f(ctx, request)
+}
+
+type integrationToolProjector func(json.RawMessage) (json.RawMessage, error)
+
+func (f integrationToolProjector) Project(raw json.RawMessage) (json.RawMessage, error) {
+	return f(raw)
 }

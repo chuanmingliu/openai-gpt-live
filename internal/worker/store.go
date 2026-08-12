@@ -75,6 +75,7 @@ type ProgressRecord struct {
 	ExpectedObjectiveRevision uint32
 	InputRevision             uint32
 	Sequence                  uint64
+	Phase                     string
 	Summary                   string
 }
 

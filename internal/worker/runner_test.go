@@ -21,6 +21,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/reasoner"
 	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
+	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -277,7 +278,7 @@ func workerLease() Lease {
 		Job: handoff.Snapshot{ID: "handoff", State: handoff.StateLeased, CreatedAt: now, RetryCount: 0, Request: handoff.CreateRequest{
 			Scope: handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "conversation"}, SessionID: "session", UserRequest: "research this", Objective: "objective sentinel",
 			ContextRef: "context-ref", ContextHash: "context-hash", Deadline: now.Add(time.Hour), TokenBudget: 1024,
-			ToolAllowlist: []string{}, ApprovalPolicy: json.RawMessage(`{"mode":"none"}`), Versions: handoff.Versions{Model: "model-v1", Prompt: "prompt-v1", ToolRegistry: "tools-v1", Config: "config-v1"},
+			ToolAllowlist: []string{}, ToolPolicy: json.RawMessage(`{"web_search":{"enabled":false,"safe_search":"moderate","region":"wt-wt","max_results":5,"timeout_ms":8000}}`), ApprovalPolicy: json.RawMessage(`{"mode":"none"}`), Versions: handoff.Versions{Model: "model-v1", Prompt: "prompt-v1", ToolRegistry: "tools-v1", Config: "config-v1"},
 		}},
 	}
 }
@@ -971,6 +972,286 @@ func toolRunnerFixture(t *testing.T, tools []RegisteredTool, stream reasoner.Str
 	runner := testRunner(store, stream, allowPolicy(), clock.Real{}, fixedJitter(0), registry)
 	runner.ArgumentSealer = sealer
 	return ctx, cancel, store, runner
+}
+
+type toolProjectorFunc func(json.RawMessage) (json.RawMessage, error)
+
+func (f toolProjectorFunc) Project(raw json.RawMessage) (json.RawMessage, error) { return f(raw) }
+
+func canonicalWorkerPolicy(t *testing.T, policy toolpolicy.Policy) json.RawMessage {
+	t.Helper()
+	raw, err := toolpolicy.MarshalCanonical(policy)
+	require.NoError(t, err)
+	return raw
+}
+
+func searchToolForRunner(execute toolExecutorFunc, project toolProjectorFunc) RegisteredTool {
+	return RegisteredTool{
+		Definition:        reasoner.ToolDefinition{Name: toolpolicy.WebSearchTool, Parameters: json.RawMessage(`{"type":"object"}`)},
+		ReadOnly:          true,
+		ParallelSafe:      true,
+		StableIdempotency: true,
+		StartedPhase:      ProgressPhaseSearching,
+		CompletedPhase:    ProgressPhaseReadingSources,
+		Executor:          execute,
+		Projector:         project,
+	}
+}
+
+func searchRunnerForLease(t *testing.T, lease Lease, tool RegisteredTool, stream reasoner.Streamer, policy safety.Policy) (*memoryStore, Runner) {
+	t.Helper()
+	registry, err := NewToolRegistry(map[string][]RegisteredTool{"tools-v1": {tool}})
+	require.NoError(t, err)
+	store := &memoryStore{}
+	runner := testRunner(store, stream, policy, clock.Real{}, fixedJitter(0), registry)
+	runner.ArgumentSealer, err = NewAESArgumentSealer("test-key", bytes.Repeat([]byte{5}, 32), bytes.NewReader(bytes.Repeat([]byte{1}, 12*8)))
+	require.NoError(t, err)
+	return store, runner
+}
+
+func TestRunnerUsesExactPersistedWebSearchPolicyAndEmitsStableProgressPhases(t *testing.T) {
+	lease := workerLease()
+	policy := toolpolicy.DefaultPolicy()
+	policy.WebSearch.SafeSearch = toolpolicy.SafeSearchStrict
+	policy.WebSearch.MaxResults = 3
+	policy.WebSearch.TimeoutMS = 4_000
+	lease.Job.Request.ToolAllowlist = []string{toolpolicy.WebSearchTool}
+	lease.Job.Request.ToolPolicy = canonicalWorkerPolicy(t, policy)
+
+	var observed ToolExecutionRequest
+	tool := searchToolForRunner(func(_ context.Context, request ToolExecutionRequest) (json.RawMessage, error) {
+		observed = request
+		return json.RawMessage(`{"query":"private query","results":[{"title":"Go Docs","snippet":"private snippet","url":"https://go.dev/doc/"}]}`), nil
+	}, func(raw json.RawMessage) (json.RawMessage, error) {
+		assert.Contains(t, string(raw), "private snippet")
+		return json.RawMessage(`{"sources":[{"title":"Go Docs","url":"https://go.dev/doc/"}]}`), nil
+	})
+	var rounds int
+	stream := streamerFunc(func(_ context.Context, request reasoner.Request, onChunk func(reasoner.Chunk) error) (reasoner.Result, error) {
+		rounds++
+		if rounds == 1 {
+			require.NoError(t, onChunk(reasoner.Chunk{ToolCalls: []reasoner.ToolCallDelta{{Arguments: `{"query":"private query"}`}}}))
+			return reasoner.Result{ToolCalls: []reasoner.ToolCall{{ID: "search-call", Name: toolpolicy.WebSearchTool, Arguments: json.RawMessage(`{"query":"private query"}`)}}}, nil
+		}
+		assert.Contains(t, request.Messages[len(request.Messages)-1].Content, "private snippet", "private output remains worker-only model context")
+		require.NoError(t, onChunk(reasoner.Chunk{Text: "public answer"}))
+		return reasoner.Result{Text: "public answer", FinishReason: "stop"}, nil
+	})
+	store, runner := searchRunnerForLease(t, lease, tool, stream, allowPolicy())
+	require.NoError(t, runner.executeLease(t.Context(), lease))
+	assert.Equal(t, policy, observed.Policy)
+	require.Len(t, store.completed, 1)
+	assert.JSONEq(t, `{"text":"public answer","sources":[{"title":"Go Docs","url":"https://go.dev/doc/"}]}`, string(store.completed[0].Structured))
+	assert.NotContains(t, string(store.completed[0].Structured), "private query")
+	assert.NotContains(t, string(store.completed[0].Structured), "private snippet")
+	phases := make([]string, 0, len(store.progress))
+	for _, progress := range store.progress {
+		phases = append(phases, progress.Phase)
+	}
+	assert.Equal(t, []string{ProgressPhaseSearching, ProgressPhaseReadingSources, ProgressPhasePreparingAnswer}, phases)
+}
+
+func TestRunnerFencesLateWebSearchProgressAfterLeaseLoss(t *testing.T) {
+	lease := workerLease()
+	lease.Job.Request.ToolAllowlist = []string{toolpolicy.WebSearchTool}
+	lease.Job.Request.ToolPolicy = canonicalWorkerPolicy(t, toolpolicy.DefaultPolicy())
+	tool := searchToolForRunner(func(context.Context, ToolExecutionRequest) (json.RawMessage, error) {
+		return json.RawMessage(`{"query":"q","results":[]}`), nil
+	}, func(json.RawMessage) (json.RawMessage, error) {
+		return json.RawMessage(`{"sources":[]}`), nil
+	})
+	stream := streamerFunc(func(context.Context, reasoner.Request, func(reasoner.Chunk) error) (reasoner.Result, error) {
+		return reasoner.Result{ToolCalls: []reasoner.ToolCall{{ID: "search", Name: toolpolicy.WebSearchTool, Arguments: json.RawMessage(`{"query":"q"}`)}}}, nil
+	})
+	store, runner := searchRunnerForLease(t, lease, tool, stream, allowPolicy())
+	store.progressResult = func(record ProgressRecord) error {
+		if record.Phase == ProgressPhaseReadingSources {
+			return ErrLeaseLost
+		}
+		return nil
+	}
+	store.heartbeat = func(context.Context, LeaseToken, time.Time) (Control, error) { return Control{}, ErrLeaseLost }
+	err := runner.executeLease(t.Context(), lease)
+	require.ErrorIs(t, err, ErrLeaseLost)
+	var phases []string
+	for _, progress := range store.progress {
+		phases = append(phases, progress.Phase)
+	}
+	assert.Equal(t, []string{ProgressPhaseSearching, ProgressPhaseReadingSources}, phases)
+	assert.Empty(t, store.completed)
+}
+
+func TestRunnerWebSearchReplayProjectsDurableResultWithDeterministicProgressMutations(t *testing.T) {
+	lease := workerLease()
+	lease.Job.Request.ToolAllowlist = []string{toolpolicy.WebSearchTool}
+	lease.Job.Request.ToolPolicy = canonicalWorkerPolicy(t, toolpolicy.DefaultPolicy())
+	var executions atomic.Int32
+	tool := searchToolForRunner(func(context.Context, ToolExecutionRequest) (json.RawMessage, error) {
+		executions.Add(1)
+		return nil, errors.New("must not execute committed result")
+	}, func(json.RawMessage) (json.RawMessage, error) {
+		return json.RawMessage(`{"sources":[{"title":"Replay","url":"https://example.com/replay"}]}`), nil
+	})
+
+	run := func() ([]ProgressRecord, handoff.Result) {
+		rounds := 0
+		stream := streamerFunc(func(context.Context, reasoner.Request, func(reasoner.Chunk) error) (reasoner.Result, error) {
+			rounds++
+			if rounds == 1 {
+				return reasoner.Result{ToolCalls: []reasoner.ToolCall{{ID: "search", Name: toolpolicy.WebSearchTool, Arguments: json.RawMessage(`{"query":"q"}`)}}}, nil
+			}
+			return reasoner.Result{Text: "answer"}, nil
+		})
+		store, runner := searchRunnerForLease(t, lease, tool, stream, allowPolicy())
+		store.beginTool = func(record ToolInvocationRecord) (ToolInvocation, bool, error) {
+			return canonicalInvocation(record, "succeeded", json.RawMessage(`{"query":"q","results":[]}`), false, ApprovalNotRequired), false, nil
+		}
+		require.NoError(t, runner.executeLease(t.Context(), lease))
+		require.Len(t, store.completed, 1)
+		return append([]ProgressRecord(nil), store.progress...), store.completed[0]
+	}
+	firstProgress, firstResult := run()
+	secondProgress, secondResult := run()
+	assert.Zero(t, executions.Load())
+	require.Len(t, firstProgress, 2)
+	assert.Equal(t, []string{ProgressPhaseReadingSources, ProgressPhasePreparingAnswer}, []string{firstProgress[0].Phase, firstProgress[1].Phase})
+	assert.Equal(t, firstProgress[0].MutationID, secondProgress[0].MutationID)
+	assert.Equal(t, firstProgress[1].MutationID, secondProgress[1].MutationID)
+	assert.JSONEq(t, string(firstResult.Structured), string(secondResult.Structured))
+}
+
+func TestJobExecutionProjectionReplayIsIdempotentButSecondProjectionIsRejected(t *testing.T) {
+	execution := &jobExecution{}
+	projection := json.RawMessage(`{"sources":[{"title":"Docs","url":"https://example.com/docs"}]}`)
+	added, err := execution.storeProjection(projection)
+	require.NoError(t, err)
+	assert.True(t, added)
+	added, err = execution.storeProjection(projection)
+	require.NoError(t, err)
+	assert.False(t, added)
+	_, err = execution.storeProjection(json.RawMessage(`{"sources":[{"title":"Other","url":"https://example.com/other"}]}`))
+	require.Error(t, err)
+}
+
+func TestRunnerDoesNotParallelizePhasedWebSearchBehindUnphasedTool(t *testing.T) {
+	lease := workerLease()
+	lease.Job.Request.ToolAllowlist = []string{"alpha", toolpolicy.WebSearchTool}
+	lease.Job.Request.ToolPolicy = canonicalWorkerPolicy(t, toolpolicy.DefaultPolicy())
+	alphaStarted := make(chan struct{})
+	allowAlpha := make(chan struct{})
+	var alphaDone, concurrent atomic.Bool
+	var release sync.Once
+	alpha := RegisteredTool{Definition: reasoner.ToolDefinition{Name: "alpha", Parameters: json.RawMessage(`{"type":"object"}`)}, ReadOnly: true, ParallelSafe: true, Executor: toolExecutorFunc(func(context.Context, ToolExecutionRequest) (json.RawMessage, error) {
+		close(alphaStarted)
+		<-allowAlpha
+		alphaDone.Store(true)
+		return json.RawMessage(`{"ok":true}`), nil
+	})}
+	search := searchToolForRunner(func(context.Context, ToolExecutionRequest) (json.RawMessage, error) {
+		<-alphaStarted
+		if !alphaDone.Load() {
+			concurrent.Store(true)
+		}
+		release.Do(func() { close(allowAlpha) })
+		return json.RawMessage(`{"query":"q","results":[]}`), nil
+	}, func(json.RawMessage) (json.RawMessage, error) { return json.RawMessage(`{"sources":[]}`), nil })
+	go func() {
+		<-alphaStarted
+		time.Sleep(20 * time.Millisecond)
+		release.Do(func() { close(allowAlpha) })
+	}()
+	registry, err := NewToolRegistry(map[string][]RegisteredTool{"tools-v1": {alpha, search}})
+	require.NoError(t, err)
+	store := &memoryStore{}
+	rounds := 0
+	stream := streamerFunc(func(context.Context, reasoner.Request, func(reasoner.Chunk) error) (reasoner.Result, error) {
+		rounds++
+		if rounds == 1 {
+			return reasoner.Result{ToolCalls: []reasoner.ToolCall{{ID: "alpha", Name: "alpha", Arguments: json.RawMessage(`{}`)}, {ID: "search", Name: toolpolicy.WebSearchTool, Arguments: json.RawMessage(`{"query":"q"}`)}}}, nil
+		}
+		return reasoner.Result{Text: "answer"}, nil
+	})
+	runner := testRunner(store, stream, allowPolicy(), clock.Real{}, fixedJitter(0), registry)
+	nonces := append(bytes.Repeat([]byte{1}, 12), bytes.Repeat([]byte{2}, 12)...)
+	runner.ArgumentSealer, err = NewAESArgumentSealer("test-key", bytes.Repeat([]byte{5}, 32), bytes.NewReader(nonces))
+	require.NoError(t, err)
+	require.NoError(t, runner.executeLease(t.Context(), lease))
+	assert.False(t, concurrent.Load())
+}
+
+func TestRunnerRejectsDisabledWebSearchPolicyBeforeInvocation(t *testing.T) {
+	lease := workerLease()
+	lease.Job.Request.ToolAllowlist = []string{toolpolicy.WebSearchTool}
+	var executions atomic.Int32
+	tool := searchToolForRunner(func(context.Context, ToolExecutionRequest) (json.RawMessage, error) {
+		executions.Add(1)
+		return json.RawMessage(`{}`), nil
+	}, func(json.RawMessage) (json.RawMessage, error) { return json.RawMessage(`{"sources":[]}`), nil })
+	stream := streamerFunc(func(context.Context, reasoner.Request, func(reasoner.Chunk) error) (reasoner.Result, error) {
+		return reasoner.Result{ToolCalls: []reasoner.ToolCall{{ID: "search", Name: toolpolicy.WebSearchTool, Arguments: json.RawMessage(`{"query":"q"}`)}}}, nil
+	})
+	store, runner := searchRunnerForLease(t, lease, tool, stream, allowPolicy())
+	require.NoError(t, runner.executeLease(t.Context(), lease))
+	assert.Zero(t, executions.Load())
+	assert.Empty(t, store.progress)
+	assert.Empty(t, store.completed)
+	require.Len(t, store.failed, 1)
+}
+
+func TestRunnerRejectsUnsafeWebSearchProjectionWithoutPersistingPrivateOutput(t *testing.T) {
+	lease := workerLease()
+	lease.Job.Request.ToolAllowlist = []string{toolpolicy.WebSearchTool}
+	lease.Job.Request.ToolPolicy = canonicalWorkerPolicy(t, toolpolicy.DefaultPolicy())
+	tool := searchToolForRunner(func(context.Context, ToolExecutionRequest) (json.RawMessage, error) {
+		return json.RawMessage(`{"query":"private query","results":[]}`), nil
+	}, func(json.RawMessage) (json.RawMessage, error) {
+		return json.RawMessage(`{"query":"private query","sources":[{"title":"private title","url":"http://unsafe.example"}]}`), nil
+	})
+	stream := streamerFunc(func(context.Context, reasoner.Request, func(reasoner.Chunk) error) (reasoner.Result, error) {
+		return reasoner.Result{ToolCalls: []reasoner.ToolCall{{ID: "search", Name: toolpolicy.WebSearchTool, Arguments: json.RawMessage(`{"query":"private query"}`)}}}, nil
+	})
+	store, runner := searchRunnerForLease(t, lease, tool, stream, allowPolicy())
+	require.NoError(t, runner.executeLease(t.Context(), lease))
+	assert.Empty(t, store.completed)
+	require.Len(t, store.failed, 1)
+	assert.NotContains(t, store.failed[0].Message, "private")
+}
+
+func TestRunnerSafetyRedactionOmitsProjectedWebSearchSources(t *testing.T) {
+	lease := workerLease()
+	lease.Job.Request.ToolAllowlist = []string{toolpolicy.WebSearchTool}
+	lease.Job.Request.ToolPolicy = canonicalWorkerPolicy(t, toolpolicy.DefaultPolicy())
+	tool := searchToolForRunner(func(context.Context, ToolExecutionRequest) (json.RawMessage, error) {
+		return json.RawMessage(`{"query":"private query","results":[]}`), nil
+	}, func(json.RawMessage) (json.RawMessage, error) {
+		return json.RawMessage(`{"sources":[{"title":"Source","url":"https://example.com/"}]}`), nil
+	})
+	rounds := 0
+	stream := streamerFunc(func(context.Context, reasoner.Request, func(reasoner.Chunk) error) (reasoner.Result, error) {
+		rounds++
+		if rounds == 1 {
+			return reasoner.Result{ToolCalls: []reasoner.ToolCall{{ID: "search", Name: toolpolicy.WebSearchTool, Arguments: json.RawMessage(`{"query":"private query"}`)}}}, nil
+		}
+		return reasoner.Result{Text: "private answer"}, nil
+	})
+	redact := safetyPolicyFunc(func(context.Context, safety.WorkerResultCandidate) (safety.Decision, error) {
+		return safety.Decision{Action: safety.ActionRedact, SafeSummary: "safe answer", ReasonCode: "redacted"}, nil
+	})
+	store, runner := searchRunnerForLease(t, lease, tool, stream, redact)
+	require.NoError(t, runner.executeLease(t.Context(), lease))
+	require.Len(t, store.completed, 1)
+	assert.Equal(t, "safe answer", store.completed[0].Summary)
+	assert.JSONEq(t, `{}`, string(store.completed[0].Structured))
+	assert.NotContains(t, string(store.completed[0].Structured), "Source")
+}
+
+func TestToolRegistryRejectsUnknownProgressPhase(t *testing.T) {
+	tool := searchToolForRunner(func(context.Context, ToolExecutionRequest) (json.RawMessage, error) {
+		return json.RawMessage(`{}`), nil
+	}, func(json.RawMessage) (json.RawMessage, error) { return json.RawMessage(`{"sources":[]}`), nil })
+	tool.StartedPhase = "running_search_query"
+	_, err := NewToolRegistry(map[string][]RegisteredTool{"tools-v1": {tool}})
+	require.Error(t, err)
 }
 
 func TestRunnerToolReplayReusesSucceededResultAndStableIdempotency(t *testing.T) {

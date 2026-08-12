@@ -34,15 +34,14 @@ type source struct {
 	URL   string `json:"url"`
 }
 
-// Execute implements worker.ToolExecutor. Task 7 attaches the durable policy to
-// each execution request; until then, the only server-owned reviewed preset is
-// the default policy and arguments cannot alter it.
+// Execute implements worker.ToolExecutor using only the durable server-owned
+// policy attached by the worker. Arguments cannot alter execution policy.
 func (e *Executor) Execute(ctx context.Context, request worker.ToolExecutionRequest) (json.RawMessage, error) {
 	query, err := decodeArguments(request.Arguments)
 	if err != nil {
 		return nil, err
 	}
-	results, err := e.Search(ctx, Request{Query: query, Policy: toolpolicy.DefaultPolicy().WebSearch})
+	results, err := e.Search(ctx, Request{Query: query, Policy: request.Policy.WebSearch})
 	if err != nil {
 		return nil, err
 	}
@@ -85,7 +84,10 @@ func RegisteredTool(executor *Executor) worker.RegisteredTool {
 		ReadOnly:          true,
 		ParallelSafe:      true,
 		StableIdempotency: true,
+		StartedPhase:      worker.ProgressPhaseSearching,
+		CompletedPhase:    worker.ProgressPhaseReadingSources,
 		Executor:          executor,
+		Projector:         executor,
 	}
 }
 
