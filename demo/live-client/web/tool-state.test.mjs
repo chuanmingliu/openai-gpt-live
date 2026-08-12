@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+import {toolPolicyStatusText} from './app.js';
 import {ToolState, buildToolPolicyUpdate, normalizeToolPolicy} from './tool-state.mjs';
 
 const DEFAULT_POLICY = {
@@ -46,6 +47,29 @@ test('progress updates one card monotonically', () => {
 test('terminal card rejects a later progress regression', () => {
   const tools = completedToolState();
   tools.consume(progressEvent({sequence_id: 99, phase: 'searching'}));
+  assert.equal(tools.snapshot().cards[0].phase, 'completed');
+});
+
+test('needs-input cards can resume through running phases while terminals remain absorbing', () => {
+  const tools = new ToolState();
+  tools.consume(createdEvent('resume'));
+  tools.consume({
+    type: 'live.handoff.needs_input', handoff_id: 'resume', sequence_id: 2,
+    status: 'needs_input', details: {summary: 'Choose a region.'},
+  });
+  assert.equal(tools.consume({
+    type: 'live.handoff.progress', handoff_id: 'resume', sequence_id: 3,
+    status: 'running', details: {},
+  }).accepted, true);
+  for (const [sequence_id, phase] of [[4, 'searching'], [5, 'reading_sources'], [6, 'preparing_answer']]) {
+    assert.equal(tools.consume(progressEvent({id: 'resume', sequence_id, phase})).accepted, true);
+    assert.equal(tools.snapshot().cards[0].phase, phase);
+  }
+  tools.consume({
+    type: 'live.handoff.completed', handoff_id: 'resume', sequence_id: 7,
+    status: 'succeeded', details: {summary: 'Done.'},
+  });
+  assert.equal(tools.consume(progressEvent({id: 'resume', sequence_id: 8, phase: 'searching'})).accepted, false);
   assert.equal(tools.snapshot().cards[0].phase, 'completed');
 });
 
@@ -149,28 +173,69 @@ test('disabled policy remains canonical and cannot carry executable or unknown f
   assert.throws(() => normalizeToolPolicy({web_search: {...disabled.web_search, max_results: 11}}), /invalid tool policy/);
 });
 
-test('policy save stays pending until the exact gateway acknowledgement', () => {
+test('policy save keeps persisted policy authoritative until its exact gateway acknowledgement', () => {
   const tools = new ToolState();
   const disabled = structuredClone(DEFAULT_POLICY);
   disabled.web_search.enabled = false;
   tools.beginSave(disabled);
-  tools.markPolicySent();
+  assert.deepEqual(tools.snapshot().policy, DEFAULT_POLICY);
+  tools.commitSave(disabled);
+  tools.markPolicySent('policy-2', disabled);
   assert.equal(tools.snapshot().saveStatus, 'awaiting-ack');
-  assert.equal(tools.acceptPolicy(DEFAULT_POLICY, 'deepseek-v4-flash'), false);
+  assert.equal(tools.acceptPolicy('policy-1', disabled, 'deepseek-v4-flash'), false);
   assert.equal(tools.snapshot().saveStatus, 'awaiting-ack');
-  assert.equal(tools.acceptPolicy(disabled, 'deepseek-v4-flash'), true);
+  assert.equal(tools.acceptPolicy('policy-2', DEFAULT_POLICY, 'deepseek-v4-flash'), false);
+  assert.equal(tools.acceptPolicy('policy-2', disabled, 'deepseek-v4-flash'), true);
   assert.equal(tools.snapshot().saveStatus, 'saved');
   assert.equal(tools.snapshot().model, 'deepseek-v4-flash');
 });
 
-test('late initial policy load cannot overwrite a save already in flight', () => {
+test('failed save restores a late persisted load instead of retaining the draft', () => {
+  const tools = new ToolState();
+  const loaded = structuredClone(DEFAULT_POLICY);
+  loaded.web_search.region = 'uk-en';
+  const disabled = structuredClone(DEFAULT_POLICY);
+  disabled.web_search.enabled = false;
+  tools.beginSave(disabled);
+  tools.loadPolicy(loaded);
+  assert.deepEqual(tools.snapshot().policy, DEFAULT_POLICY);
+  assert.equal(tools.snapshot().saveStatus, 'saving');
+  tools.failSave();
+  assert.deepEqual(tools.snapshot().policy, loaded);
+  assert.equal(tools.snapshot().saveStatus, 'error');
+});
+
+test('a policy load failure cannot cancel a save already in flight', () => {
   const tools = new ToolState();
   const disabled = structuredClone(DEFAULT_POLICY);
   disabled.web_search.enabled = false;
   tools.beginSave(disabled);
-  tools.loadPolicy(DEFAULT_POLICY);
-  assert.deepEqual(tools.snapshot().policy, disabled);
+  assert.equal(tools.failLoad(), false);
   assert.equal(tools.snapshot().saveStatus, 'saving');
+  assert.equal(tools.commitSave(disabled), true);
+  assert.deepEqual(tools.snapshot().policy, disabled);
+});
+
+test('the latest operation selects Test then later Save success and failure status', () => {
+  const tools = new ToolState();
+  const disabled = structuredClone(DEFAULT_POLICY);
+  disabled.web_search.enabled = false;
+  tools.beginTest();
+  tools.finishTest(true);
+  assert.equal(toolPolicyStatusText(tools.snapshot()), 'Web Search test passed.');
+
+  tools.beginSave(disabled);
+  assert.equal(toolPolicyStatusText(tools.snapshot()), 'Saving policy…');
+  tools.commitSave(disabled);
+  tools.markPolicySent('policy-success', disabled);
+  tools.acceptPolicy('policy-success', disabled, 'deepseek-v4-flash');
+  assert.equal(toolPolicyStatusText(tools.snapshot()), 'Policy saved and active.');
+
+  tools.beginTest();
+  tools.finishTest(true);
+  tools.beginSave(DEFAULT_POLICY);
+  tools.failSave();
+  assert.equal(toolPolicyStatusText(tools.snapshot()), 'Policy action failed. Try again.');
 });
 
 test('tool policy update is a closed-world canonical WebSocket event', () => {

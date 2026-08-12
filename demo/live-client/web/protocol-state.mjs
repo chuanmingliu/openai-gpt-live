@@ -156,7 +156,7 @@ export class ProtocolState {
     }
     try {
       const update = buildToolPolicyUpdate(event.tools, event.event_id);
-      return [{type: 'tool-policy-accepted', policy: update.tools, model: event.model}];
+      return [{type: 'tool-policy-accepted', event_id: update.event_id, policy: update.tools, model: event.model}];
     } catch {
       return [{type: 'error', code: 'invalid-event'}];
     }

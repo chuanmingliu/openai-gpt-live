@@ -160,7 +160,7 @@ test('tool policy acknowledgement is reduced to a canonical accepted effect', ()
   const tools = {web_search: {enabled: false, safe_search: 'strict', region: 'cn-zh', max_results: 1, timeout_ms: 1000}};
   assert.deepEqual(new ProtocolState().consume({
     type: 'live.tool_policy.updated', event_id: 'policy-1', tools, model: 'deepseek-v4-flash',
-  }), [{type: 'tool-policy-accepted', policy: tools, model: 'deepseek-v4-flash'}]);
+  }), [{type: 'tool-policy-accepted', event_id: 'policy-1', policy: tools, model: 'deepseek-v4-flash'}]);
 });
 
 test('tool policy acknowledgement rejects blank identity and unexpected model', () => {

@@ -48,6 +48,11 @@ const toolTestLabels = {
   error: 'Web Search test failed.',
 };
 
+export function toolPolicyStatusText(tools) {
+  if (tools.lastOperation === 'test') return toolTestLabels[tools.testStatus] ?? '';
+  return toolSaveLabels[tools.saveStatus] ?? '';
+}
+
 const toolPhaseLabels = {
   queued: 'Queued',
   searching: 'Searching',
@@ -176,7 +181,7 @@ if (typeof document !== 'undefined') {
     }
     elements.toolSave.disabled = tools.saveStatus === 'saving' || tools.saveStatus === 'awaiting-ack';
     elements.toolTest.disabled = tools.testStatus === 'running';
-    elements.toolStatus.textContent = toolTestLabels[tools.testStatus] ?? toolSaveLabels[tools.saveStatus] ?? '';
+    elements.toolStatus.textContent = toolPolicyStatusText(tools);
   }
 
   function renderPresentation(snapshot) {

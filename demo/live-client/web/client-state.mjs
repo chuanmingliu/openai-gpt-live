@@ -92,7 +92,7 @@ export class ClientPresentation {
 
     switch (effect.type) {
       case 'tool-policy-accepted':
-        this.tools.acceptPolicy(effect.policy, effect.model);
+        this.tools.acceptPolicy(effect.event_id, effect.policy, effect.model);
         break;
       case 'handoff-card': {
         const result = this.tools.consume(effect.event);

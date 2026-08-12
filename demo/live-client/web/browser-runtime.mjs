@@ -52,6 +52,7 @@ export function createBrowserRuntime(dependencies) {
   let initialPolicySent = false;
   let policyLoadPromise = null;
   let nextPolicyEventID = 1;
+  let policySaveQueue = Promise.resolve();
   let startPromise = null;
   let playbackRevision = 0;
   let captureResumePending = false;
@@ -82,7 +83,7 @@ export function createBrowserRuntime(dependencies) {
       const policy = normalizeToolPolicy(await response.json());
       if (generation === currentGeneration) presentation.tools.loadPolicy(policy);
     } catch {
-      if (generation === currentGeneration) presentation.tools.failSave();
+      if (generation === currentGeneration) presentation.tools.failLoad();
     } finally {
       if (generation === currentGeneration) publishSnapshot();
     }
@@ -92,9 +93,10 @@ export function createBrowserRuntime(dependencies) {
     if (generation !== currentGeneration || socket !== ownedSocket || !streamReady || ownedSocket.readyState !== WebSocket.OPEN) return false;
     if (initial && initialPolicySent) return false;
     const eventID = `browser-policy-${nextPolicyEventID++}`;
-    ownedSocket.send(JSON.stringify(buildToolPolicyUpdate(presentation.tools.snapshot().policy, eventID)));
+    const policy = presentation.tools.snapshot().policy;
+    ownedSocket.send(JSON.stringify(buildToolPolicyUpdate(policy, eventID)));
     if (initial) initialPolicySent = true;
-    presentation.tools.markPolicySent();
+    presentation.tools.markPolicySent(eventID, policy);
     publishSnapshot();
     return true;
   }
@@ -466,24 +468,36 @@ export function createBrowserRuntime(dependencies) {
     oscillator.stop(ownedPlaybackContext.currentTime + 0.2);
   }
 
-  async function saveToolPolicy(policy) {
-    let canonical;
+  async function persistToolPolicy(canonical) {
+    presentation.tools.beginSave(canonical);
+    publishSnapshot();
     try {
-      canonical = normalizeToolPolicy(policy);
-      presentation.tools.beginSave(canonical);
-      publishSnapshot();
       const response = await boundedFetch('/api/tool-policy', {
         method: 'PUT',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify(canonical),
       });
       if (!response.ok) throw new Error('tool policy save failed');
-      presentation.tools.markPolicySent();
+      presentation.tools.commitSave(canonical);
       if (socket) sendCurrentPolicy(generation, socket, false);
     } catch {
       presentation.tools.failSave();
     }
     publishSnapshot();
+  }
+
+  function saveToolPolicy(policy) {
+    let canonical;
+    try {
+      canonical = normalizeToolPolicy(policy);
+    } catch {
+      presentation.tools.failSave();
+      publishSnapshot();
+      return Promise.resolve();
+    }
+    const pending = policySaveQueue.then(() => persistToolPolicy(canonical));
+    policySaveQueue = pending.catch(() => {});
+    return pending;
   }
 
   async function testToolPolicy() {

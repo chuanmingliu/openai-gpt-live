@@ -24,6 +24,7 @@ const SAFE_SEARCH = new Set(['strict', 'moderate']);
 const EVENT_ID_PATTERN = /^[\x20-\x7e]{1,128}$/;
 const HANDOFF_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/;
 const PROGRESS_PHASES = new Set(['queued', 'searching', 'reading_sources', 'preparing_answer']);
+const RESUME_PHASES = new Set(['searching', 'reading_sources', 'preparing_answer']);
 const PHASE_ORDER = new Map([
   ['queued', 0],
   ['searching', 1],
@@ -225,50 +226,106 @@ export class ToolState {
     this.announcements = [];
     this.saveStatus = 'ready';
     this.testStatus = 'idle';
+    this.lastOperation = 'save';
+    this.pendingPolicy = null;
+    this.pendingPolicyEventID = null;
+    this.pendingAcknowledgementPolicy = null;
+    this.deferredLoadedPolicy = null;
     this.model = 'deepseek-v4-flash';
   }
 
   loadPolicy(policy) {
     const loaded = normalizeToolPolicy(policy);
-    if (this.saveStatus === 'saving' || this.saveStatus === 'awaiting-ack') return false;
+    if (this.saveStatus === 'saving') {
+      this.deferredLoadedPolicy = loaded;
+      return false;
+    }
+    if (this.saveStatus === 'awaiting-ack') return false;
     this.policy = loaded;
     this.saveStatus = 'ready';
+    this.lastOperation = 'save';
     return true;
   }
 
   beginSave(policy) {
-    this.policy = normalizeToolPolicy(policy);
+    this.pendingPolicy = normalizeToolPolicy(policy);
+    this.pendingPolicyEventID = null;
+    this.pendingAcknowledgementPolicy = null;
+    this.deferredLoadedPolicy = null;
     this.saveStatus = 'saving';
+    this.lastOperation = 'save';
   }
 
-  markPolicySent() {
+  commitSave(policy) {
+    const persisted = normalizeToolPolicy(policy);
+    if (!this.pendingPolicy || !policiesEqual(persisted, this.pendingPolicy)) return false;
+    this.policy = persisted;
+    this.pendingPolicy = null;
+    this.deferredLoadedPolicy = null;
+    this.saveStatus = 'saved';
+    this.lastOperation = 'save';
+    return true;
+  }
+
+  markPolicySent(eventID, policy = this.policy) {
+    if (typeof eventID !== 'string' || !EVENT_ID_PATTERN.test(eventID)) return false;
+    let sent;
+    try {
+      sent = normalizeToolPolicy(policy);
+    } catch {
+      return false;
+    }
+    if (!policiesEqual(sent, this.policy)) return false;
+    this.pendingPolicyEventID = eventID;
+    this.pendingAcknowledgementPolicy = sent;
     this.saveStatus = 'awaiting-ack';
+    this.lastOperation = 'save';
+    return true;
   }
 
   failSave() {
+    this.pendingPolicy = null;
+    this.pendingPolicyEventID = null;
+    this.pendingAcknowledgementPolicy = null;
+    if (this.deferredLoadedPolicy) this.policy = this.deferredLoadedPolicy;
+    this.deferredLoadedPolicy = null;
     this.saveStatus = 'error';
+    this.lastOperation = 'save';
   }
 
-  acceptPolicy(policy, model) {
+  failLoad() {
+    if (this.saveStatus === 'saving' || this.saveStatus === 'awaiting-ack') return false;
+    this.saveStatus = 'error';
+    this.lastOperation = 'save';
+    return true;
+  }
+
+  acceptPolicy(eventID, policy, model) {
     let accepted;
     try {
       accepted = normalizeToolPolicy(policy);
     } catch {
       return false;
     }
-    if (model !== 'deepseek-v4-flash' || !policiesEqual(accepted, this.policy)) return false;
+    if (eventID !== this.pendingPolicyEventID || model !== 'deepseek-v4-flash'
+        || !this.pendingAcknowledgementPolicy || !policiesEqual(accepted, this.pendingAcknowledgementPolicy)) return false;
     this.policy = accepted;
+    this.pendingPolicyEventID = null;
+    this.pendingAcknowledgementPolicy = null;
     this.model = model;
     this.saveStatus = 'saved';
+    this.lastOperation = 'save';
     return true;
   }
 
   beginTest() {
     this.testStatus = 'running';
+    this.lastOperation = 'test';
   }
 
   finishTest(passed) {
     this.testStatus = passed ? 'passed' : 'error';
+    this.lastOperation = 'test';
   }
 
   consume(rawEvent) {
@@ -283,7 +340,8 @@ export class ToolState {
       return {accepted: false, created: false, phaseChanged: false};
     }
     const nextPhase = event.details.phase ?? current?.phase ?? 'queued';
-    if (current && !TERMINAL_PHASES.has(nextPhase) && PHASE_ORDER.get(nextPhase) < PHASE_ORDER.get(current.phase)) {
+    const resumesFromNeedsInput = current?.phase === 'needs_input' && RESUME_PHASES.has(nextPhase);
+    if (current && !resumesFromNeedsInput && !TERMINAL_PHASES.has(nextPhase) && PHASE_ORDER.get(nextPhase) < PHASE_ORDER.get(current.phase)) {
       return {accepted: false, created: false, phaseChanged: false};
     }
     const created = !current;
@@ -341,6 +399,7 @@ export class ToolState {
       policy: clonePolicy(this.policy),
       saveStatus: this.saveStatus,
       testStatus: this.testStatus,
+      lastOperation: this.lastOperation,
       model: this.model,
       cards: this.cards.map(cloneCard),
       totalTextBytes: this.totalTextBytes(),

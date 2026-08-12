@@ -392,6 +392,86 @@ test('policy request failures expose only stable state and never private respons
   await runtime.stop();
 });
 
+test('overlapping saves serialize persistence and leave BFF browser and gateway on the latest accepted policy', async () => {
+  const first = structuredClone(DEFAULT_TOOL_POLICY);
+  first.web_search.region = 'uk-en';
+  const second = structuredClone(DEFAULT_TOOL_POLICY);
+  second.web_search.region = 'cn-zh';
+  let resolveFirst;
+  let resolveSecond;
+  const firstResponse = new Promise((resolve) => { resolveFirst = resolve; });
+  const secondResponse = new Promise((resolve) => { resolveSecond = resolve; });
+  let putCount = 0;
+  const harness = new BrowserHarness({fetchHandler: async (path, options) => {
+    if (path === '/api/tool-policy' && options.method === 'GET') return {ok: true, json: async () => structuredClone(DEFAULT_TOOL_POLICY)};
+    if (path === '/api/tool-policy' && options.method === 'PUT') return putCount++ === 0 ? firstResponse : secondResponse;
+    return {ok: true, json: async () => ({ok: true})};
+  }});
+  const runtime = createBrowserRuntime(harness.dependencies());
+  await runtime.start();
+  harness.server({type: 'session.created'});
+  harness.server({type: 'session.updated'});
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const saveFirst = runtime.saveToolPolicy(first);
+  await new Promise((resolve) => setImmediate(resolve));
+  const saveSecond = runtime.saveToolPolicy(second);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.requests.filter(({options}) => options.method === 'PUT').length, 1);
+
+  resolveFirst({ok: true});
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.requests.filter(({options}) => options.method === 'PUT').length, 2);
+  resolveSecond({ok: true});
+  await Promise.all([saveFirst, saveSecond]);
+
+  const puts = harness.requests.filter(({options}) => options.method === 'PUT').map(({options}) => JSON.parse(options.body));
+  assert.deepEqual(puts, [first, second]);
+  const updates = harness.sent.filter(({type}) => type === 'live.tool_policy.update');
+  assert.deepEqual(updates.slice(-2).map(({tools}) => tools), [first, second]);
+  assert.deepEqual(harness.presentation.snapshot().tools.policy, second);
+
+  harness.server({
+    type: 'live.tool_policy.updated', event_id: updates.at(-2).event_id,
+    tools: second, model: 'deepseek-v4-flash',
+  });
+  assert.equal(harness.presentation.snapshot().tools.saveStatus, 'awaiting-ack');
+  harness.server({
+    type: 'live.tool_policy.updated', event_id: updates.at(-1).event_id,
+    tools: second, model: 'deepseek-v4-flash',
+  });
+  assert.equal(harness.presentation.snapshot().tools.saveStatus, 'saved');
+  await runtime.stop();
+});
+
+test('session acceptance during a failed save sends only the last persisted policy', async () => {
+  const draft = structuredClone(DEFAULT_TOOL_POLICY);
+  draft.web_search.enabled = false;
+  let rejectSave;
+  const failedResponse = new Promise((_resolve, reject) => { rejectSave = reject; });
+  const harness = new BrowserHarness({fetchHandler: async (path, options) => {
+    if (path === '/api/tool-policy' && options.method === 'GET') return {ok: true, json: async () => structuredClone(DEFAULT_TOOL_POLICY)};
+    if (path === '/api/tool-policy' && options.method === 'PUT') return failedResponse;
+    return {ok: true, json: async () => ({ok: true})};
+  }});
+  const runtime = createBrowserRuntime(harness.dependencies());
+  await runtime.start();
+  const save = runtime.saveToolPolicy(draft);
+  await new Promise((resolve) => setImmediate(resolve));
+  harness.server({type: 'session.created'});
+  harness.server({type: 'session.updated'});
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const updates = harness.sent.filter(({type}) => type === 'live.tool_policy.update');
+  assert.equal(updates.length, 1);
+  assert.deepEqual(updates[0].tools, DEFAULT_TOOL_POLICY);
+  rejectSave(new Error('private failure body'));
+  await save;
+  assert.deepEqual(harness.presentation.snapshot().tools.policy, DEFAULT_TOOL_POLICY);
+  assert.equal(harness.presentation.snapshot().tools.saveStatus, 'error');
+  await runtime.stop();
+});
+
 test('handoff progress updates no playback worklet state and leaves voice status unchanged', async () => {
   const harness = new BrowserHarness();
   const runtime = createBrowserRuntime(harness.dependencies());
