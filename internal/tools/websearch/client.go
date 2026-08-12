@@ -413,8 +413,15 @@ var nonPublicPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("::1/128"),
 	netip.MustParsePrefix("64:ff9b:1::/48"),
 	netip.MustParsePrefix("100::/64"),
+	netip.MustParsePrefix("100:0:0:1::/64"),
+	// The IETF protocol-assignment block contains mixed-purpose exceptions.
+	// This fixed-destination adapter does not need any of them, so the whole
+	// block stays conservatively unavailable to DNS answers.
+	netip.MustParsePrefix("2001::/23"),
 	netip.MustParsePrefix("2001:db8::/32"),
 	netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("3fff::/20"),
+	netip.MustParsePrefix("5f00::/16"),
 	netip.MustParsePrefix("fc00::/7"),
 	netip.MustParsePrefix("fe80::/10"),
 	netip.MustParsePrefix("ff00::/8"),

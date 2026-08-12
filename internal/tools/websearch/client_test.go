@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"net"
@@ -127,8 +128,8 @@ func TestSecureDialRejectsEveryNonPublicAddressBeforeDial(t *testing.T) {
 		"0.0.0.0", "10.0.0.1", "100.64.0.1", "127.0.0.1", "169.254.169.254",
 		"172.16.0.1", "192.0.0.1", "192.0.2.1", "192.168.0.1", "198.18.0.1",
 		"198.51.100.1", "203.0.113.1", "224.0.0.1", "240.0.0.1", "255.255.255.255",
-		"::", "::1", "::ffff:127.0.0.1", "64:ff9b:1::1", "100::1", "2001:db8::1",
-		"fc00::1", "fe80::1", "ff02::1",
+		"::", "::1", "::ffff:127.0.0.1", "64:ff9b:1::1", "100::1", "100:0:0:1::1",
+		"2001:2::1", "2001:db8::1", "3fff::1", "5f00::1", "fc00::1", "fe80::1", "ff02::1",
 	}
 	for _, address := range addresses {
 		t.Run(address, func(t *testing.T) {
@@ -147,18 +148,84 @@ func TestSecureDialRejectsEveryNonPublicAddressBeforeDial(t *testing.T) {
 	}
 }
 
+func TestPublicAddressRejectsCompleteCurrentIANASpecialIPv6Ranges(t *testing.T) {
+	for _, test := range []struct {
+		prefix string
+		first  string
+		last   string
+	}{
+		{"100:0:0:1::/64", "100:0:0:1::", "100:0:0:1:ffff:ffff:ffff:ffff"},
+		{"2001:2::/48", "2001:2::", "2001:2:0:ffff:ffff:ffff:ffff:ffff"},
+		{"3fff::/20", "3fff::", "3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff"},
+		{"5f00::/16", "5f00::", "5f00:ffff:ffff:ffff:ffff:ffff:ffff:ffff"},
+	} {
+		t.Run(test.prefix, func(t *testing.T) {
+			prefix := netip.MustParsePrefix(test.prefix)
+			for _, parsed := range []netip.Addr{netip.MustParseAddr(test.first), prefix.Addr().Next(), netip.MustParseAddr(test.last)} {
+				require.True(t, prefix.Contains(parsed))
+				assert.False(t, publicAddress(parsed))
+			}
+		})
+	}
+	for _, address := range []string{"2001::1", "2001:1::1", "2001:3::1", "2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff"} {
+		assert.False(t, publicAddress(netip.MustParseAddr(address)), address)
+	}
+	assert.True(t, publicAddress(netip.MustParseAddr("2606:4700:4700::1111")))
+}
+
 func TestSecureDialRejectsMixedResolutionBeforeAnyDial(t *testing.T) {
-	var dialed bool
+	for _, address := range []string{"127.0.0.1", "100:0:0:1::1", "2001:2::1", "3fff::1", "5f00::1"} {
+		t.Run(address, func(t *testing.T) {
+			var dialed bool
+			executor, err := newExecutor(resolverFunc(func(context.Context, string, string) ([]netip.Addr, error) {
+				return []netip.Addr{netip.MustParseAddr("93.184.216.34"), netip.MustParseAddr(address)}, nil
+			}), func(context.Context, string, string) (net.Conn, error) {
+				dialed = true
+				return nil, nil
+			})
+			require.NoError(t, err)
+			_, err = executor.dialContext(t.Context(), "tcp", "html.duckduckgo.com:443")
+			require.Error(t, err)
+			assert.False(t, dialed)
+		})
+	}
+}
+
+func TestNewLocksProductionRedirectProxyAndTLSHostPolicy(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:65535")
+	serverName := make(chan string, 1)
 	executor, err := newExecutor(resolverFunc(func(context.Context, string, string) ([]netip.Addr, error) {
-		return []netip.Addr{netip.MustParseAddr("93.184.216.34"), netip.MustParseAddr("127.0.0.1")}, nil
+		return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
 	}), func(context.Context, string, string) (net.Conn, error) {
-		dialed = true
-		return nil, nil
+		clientConnection, serverConnection := net.Pipe()
+		go func() {
+			defer serverConnection.Close()
+			server := tls.Server(serverConnection, &tls.Config{
+				GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+					serverName <- hello.ServerName
+					return nil, errors.New("test TLS stopped after ClientHello")
+				},
+			})
+			_ = server.Handshake()
+		}()
+		return clientConnection, nil
 	})
 	require.NoError(t, err)
-	_, err = executor.dialContext(t.Context(), "tcp", "html.duckduckgo.com:443")
+
+	transport, ok := executor.client.Transport.(*http.Transport)
+	require.True(t, ok)
+	assert.Nil(t, transport.Proxy, "production transport must not honor proxy environment variables")
+	assert.Nil(t, transport.TLSClientConfig, "nil preserves normal hostname certificate verification")
+
+	redirectRequest, err := http.NewRequest(http.MethodGet, "https://example.com/redirected", nil)
+	require.NoError(t, err)
+	assert.ErrorIs(t, executor.client.CheckRedirect(redirectRequest, nil), http.ErrUseLastResponse)
+
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodGet, searchEndpoint, nil)
+	require.NoError(t, err)
+	_, err = executor.client.Do(request)
 	require.Error(t, err)
-	assert.False(t, dialed)
+	assert.Equal(t, searchHost, <-serverName, "the fixed hostname must be the production TLS SNI")
 }
 
 func TestSecureDialResolvesAndValidatesAgainOnEveryDial(t *testing.T) {
