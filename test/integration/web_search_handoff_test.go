@@ -58,6 +58,32 @@ func TestDurableWebSearchProgressAndVoiceRemainIndependent(t *testing.T) {
 	assert.Zero(t, client.AudioOrderingFailures())
 }
 
+func TestDurableWebSearchDuplicateProgressDeliveryUpdatesOneTimelinePhase(t *testing.T) {
+	boundary := newReconnectClient()
+	client := &durableSearchClient{cards: make(map[string]*durableSearchCard)}
+	events := []protocol.ServerEvent{
+		protocol.LiveHandoffCreatedEvent{Type: "live.handoff.created", EventID: "created", SequenceID: 1, HandoffID: "handoff-duplicate", Status: "pending", Details: json.RawMessage(`{}`)},
+		protocol.LiveHandoffProgressEvent{Type: "live.handoff.progress", EventID: "searching", SequenceID: 2, HandoffID: "handoff-duplicate", Status: "running", Details: json.RawMessage(`{"phase":"searching","summary":"Searching the web."}`)},
+		protocol.LiveHandoffProgressEvent{Type: "live.handoff.progress", EventID: "searching", SequenceID: 2, HandoffID: "handoff-duplicate", Status: "running", Details: json.RawMessage(`{"phase":"searching","summary":"Searching the web."}`)},
+		protocol.LiveHandoffProgressEvent{Type: "live.handoff.progress", EventID: "searching-newer", SequenceID: 3, HandoffID: "handoff-duplicate", Status: "running", Details: json.RawMessage(`{"phase":"searching","summary":"Searching the web."}`)},
+		protocol.LiveHandoffProgressEvent{Type: "live.handoff.progress", EventID: "reading", SequenceID: 4, HandoffID: "handoff-duplicate", Status: "running", Details: json.RawMessage(`{"phase":"reading_sources","summary":"Reading sources."}`)},
+		protocol.LiveHandoffCompletedEvent{Type: "live.handoff.completed", EventID: "completed", SequenceID: 5, HandoffID: "handoff-duplicate", Status: "succeeded", Details: json.RawMessage(`{"summary":"done","structured":{"text":"done","sources":[]}}`)},
+	}
+	for _, event := range events {
+		require.NoError(t, boundary.Write(t.Context(), event))
+		client.consumeServerEvent(t, readReconnectEvent(t, boundary))
+	}
+
+	assert.Equal(t, []deliveredProgress{
+		{Sequence: 2, EventID: "searching", Phase: "searching"},
+		{Sequence: 2, EventID: "searching", Phase: "searching"},
+		{Sequence: 3, EventID: "searching-newer", Phase: "searching"},
+		{Sequence: 4, EventID: "reading", Phase: "reading_sources"},
+	}, client.DeliveredProgress(), "the assertion observes duplicates before sequence/phase normalization")
+	assert.Equal(t, []string{"handoff-duplicate"}, client.cardOrder)
+	assert.Equal(t, []string{"queued", "searching", "reading_sources", "completed"}, client.cards["handoff-duplicate"].Phases)
+}
+
 func TestDurableWebSearchCancellationFencesLateFakeResult(t *testing.T) {
 	executor := fakesearch.New(fakesearch.Controlled(), fakesearch.IgnoreCancellation())
 	harness := newDurableSearchHarness(t, withSearchExecutor(executor))
@@ -451,6 +477,12 @@ type durableSearchCard struct {
 	Sources  []durableSearchSource
 }
 
+type deliveredProgress struct {
+	Sequence int64
+	EventID  string
+	Phase    string
+}
+
 type durableSearchClient struct {
 	harness      *durableSearchHarness
 	conn         *websocket.Conn
@@ -458,6 +490,7 @@ type durableSearchClient struct {
 	cards        map[string]*durableSearchCard
 	cardOrder    []string
 	rawFrames    []json.RawMessage
+	progressSeen []deliveredProgress
 	policy       toolpolicy.Policy
 	responseID   string
 	epoch        identity.ResponseEpoch
@@ -595,6 +628,10 @@ func (c *durableSearchClient) WaitForTerminalCard(t *testing.T, handoffID string
 
 func (c *durableSearchClient) AudioOrderingFailures() int { return int(c.audioFailure.Load()) }
 
+func (c *durableSearchClient) DeliveredProgress() []deliveredProgress {
+	return append([]deliveredProgress(nil), c.progressSeen...)
+}
+
 func (c *durableSearchClient) readType(t *testing.T, wanted string) json.RawMessage {
 	t.Helper()
 	deadline := time.Now().Add(integrationTimeout)
@@ -629,6 +666,7 @@ func (c *durableSearchClient) consumeCard(t *testing.T, eventType string, raw js
 	t.Helper()
 	var event struct {
 		HandoffID  string          `json:"handoff_id"`
+		EventID    string          `json:"event_id"`
 		SequenceID int64           `json:"sequence_id"`
 		Status     string          `json:"status"`
 		Details    json.RawMessage `json:"details"`
@@ -640,6 +678,16 @@ func (c *durableSearchClient) consumeCard(t *testing.T, eventType string, raw js
 		}
 	default:
 		return
+	}
+	progressPhase := ""
+	if eventType == "live.handoff.progress" {
+		var details struct {
+			Phase string `json:"phase"`
+		}
+		if json.Unmarshal(event.Details, &details) == nil && details.Phase != "" {
+			progressPhase = details.Phase
+			c.progressSeen = append(c.progressSeen, deliveredProgress{Sequence: event.SequenceID, EventID: event.EventID, Phase: details.Phase})
+		}
 	}
 	card := c.cards[event.HandoffID]
 	if card == nil {
@@ -657,11 +705,8 @@ func (c *durableSearchClient) consumeCard(t *testing.T, eventType string, raw js
 		card.Phases = appendPhase(card.Phases, "queued")
 	case "live.handoff.progress":
 		card.Status = event.Status
-		var details struct {
-			Phase string `json:"phase"`
-		}
-		if json.Unmarshal(event.Details, &details) == nil && details.Phase != "" {
-			card.Phases = appendPhase(card.Phases, details.Phase)
+		if progressPhase != "" {
+			card.Phases = appendPhase(card.Phases, progressPhase)
 		}
 	case "live.handoff.completed":
 		card.Status = "completed"
