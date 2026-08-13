@@ -423,7 +423,11 @@ func (runner *localOperatorRunner) runCompose(ctx context.Context, verb string, 
 		if queryErr != nil {
 			return commandFailure(ctx)
 		}
-		if !exists {
+		if exists {
+			if !runner.composeOwnershipMatches(component, before) {
+				return errOperatorProcessExited
+			}
+		} else {
 			before = ""
 		}
 	}
@@ -467,6 +471,14 @@ func (runner *localOperatorRunner) runCompose(ctx context.Context, verb string, 
 		runner.mu.Unlock()
 	}
 	return err
+}
+
+func (runner *localOperatorRunner) composeOwnershipMatches(component operatorComponent, id string) bool {
+	runner.mu.Lock()
+	ownedID := runner.composeOwned[component]
+	ephemeral := runner.composeEphemeral[component] == id
+	runner.mu.Unlock()
+	return id != "" && ownedID == id && (ephemeral || runner.ownerMatches(component, id))
 }
 
 func (runner *localOperatorRunner) stopCompose(ctx context.Context, component operatorComponent) error {

@@ -348,12 +348,14 @@ func TestLocalOperatorRunnerSupervisorPendingCleanupWaitsPastOneAbsenceForLateId
 	assert.NotContains(t, fmt.Sprint(status), "sentinel")
 }
 
-func TestLocalOperatorRunnerNeverClaimsKnownPreExistingIdentityAfterTransientAbsence(t *testing.T) {
+func TestLocalOperatorRunnerRejectsKnownPreExistingBeforeMutationOrPostDiscovery(t *testing.T) {
 	setRequiredOperatorEnvironment(t)
 	var identityCalls atomic.Int32
+	var startCalls atomic.Int32
 	var stopCalls atomic.Int32
 	runner := newTestLocalOperatorRunner(t, func(ctx context.Context, _ string, args ...string) *exec.Cmd {
 		if len(args) == 1 && args[0] == "postgres-start" {
+			startCalls.Add(1)
 			return exec.CommandContext(ctx, "/usr/bin/false")
 		}
 		if len(args) == 1 && args[0] == "postgres-stop" {
@@ -364,22 +366,72 @@ func TestLocalOperatorRunnerNeverClaimsKnownPreExistingIdentityAfterTransientAbs
 	runner.identityTimeout = 15 * time.Millisecond
 	runner.identityRetryWait = time.Millisecond
 	runner.composeIdentity = func(context.Context, operatorComponent) (string, bool, error) {
-		switch identityCalls.Add(1) {
-		case 1:
-			return "postgres-pre-existing", true, nil
-		case 2:
-			return "", false, nil
-		default:
-			return "postgres-concurrent-pre-existing", true, nil
-		}
+		identityCalls.Add(1)
+		return "postgres-pre-existing", true, nil
 	}
 
 	status := newOperatorSupervisor(runner, 100*time.Millisecond).Apply(t.Context(), componentPostgres, actionStart)
 	assert.Equal(t, "failed", status.State)
 	assert.Equal(t, "process_exited", status.Code)
-	assert.GreaterOrEqual(t, identityCalls.Load(), int32(3))
+	assert.EqualValues(t, 1, identityCalls.Load())
+	assert.Zero(t, startCalls.Load())
 	assert.Zero(t, stopCalls.Load())
 	assert.False(t, runner.Owned(componentPostgres))
+}
+
+func TestLocalOperatorRunnerSupervisorPreventsSuccessfulUnownedOldIDToNewIDMutation(t *testing.T) {
+	setRequiredOperatorEnvironment(t)
+	var identityMu sync.Mutex
+	identity := "postgres-unowned-old"
+	var startCalls atomic.Int32
+	runner := newTestLocalOperatorRunner(t, func(ctx context.Context, _ string, args ...string) *exec.Cmd {
+		if len(args) == 1 && args[0] == "postgres-start" {
+			startCalls.Add(1)
+			identityMu.Lock()
+			identity = "postgres-new-from-forbidden-mutation"
+			identityMu.Unlock()
+		}
+		return exec.CommandContext(ctx, "/usr/bin/true")
+	})
+	runner.composeIdentity = func(context.Context, operatorComponent) (string, bool, error) {
+		identityMu.Lock()
+		defer identityMu.Unlock()
+		return identity, true, nil
+	}
+
+	status := newOperatorSupervisor(runner, 100*time.Millisecond).Apply(t.Context(), componentPostgres, actionStart)
+	assert.Equal(t, "failed", status.State)
+	assert.Equal(t, "process_exited", status.Code)
+	assert.Zero(t, startCalls.Load(), "an unowned existing service must be rejected before the fixed Start command")
+	identityMu.Lock()
+	assert.Equal(t, "postgres-unowned-old", identity)
+	identityMu.Unlock()
+	assert.False(t, runner.Owned(componentPostgres))
+}
+
+func TestLocalOperatorRunnerAllowsSafeFixedStartForOwnedExistingComposeService(t *testing.T) {
+	setRequiredOperatorEnvironment(t)
+	runner := newTestLocalOperatorRunner(t, nil)
+	const ownedID = "postgres-owned-existing"
+	require.NoError(t, runner.writeOwner(componentPostgres, ownedID))
+	runner.mu.Lock()
+	runner.composeOwned[componentPostgres] = ownedID
+	runner.mu.Unlock()
+	runner.composeIdentity = func(context.Context, operatorComponent) (string, bool, error) {
+		return ownedID, true, nil
+	}
+	var startCalls atomic.Int32
+	runner.newCommand = func(ctx context.Context, _ string, args ...string) *exec.Cmd {
+		if len(args) == 1 && args[0] == "postgres-start" {
+			startCalls.Add(1)
+		}
+		return exec.CommandContext(ctx, "/usr/bin/true")
+	}
+
+	status := newOperatorSupervisor(runner, 100*time.Millisecond).Apply(t.Context(), componentPostgres, actionStart)
+	assert.Equal(t, "ready", status.State)
+	assert.EqualValues(t, 1, startCalls.Load())
+	assert.True(t, runner.Owned(componentPostgres))
 }
 
 func TestLocalOperatorRunnerPreIdentityFailureNeverStartsService(t *testing.T) {
