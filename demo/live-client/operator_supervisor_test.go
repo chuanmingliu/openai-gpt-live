@@ -111,6 +111,49 @@ func TestOperatorSupervisorTimeoutCleansOnlyNewlyOwnedProcess(t *testing.T) {
 	assert.Equal(t, 0, runner.callsFor(componentSpeech, actionStop))
 }
 
+func TestOperatorSupervisorKeepsTimedOutStartBusyUntilCleanupCompletes(t *testing.T) {
+	runner := newFakeOperatorRunner()
+	runner.startOwnsThenWaits = true
+	runner.stopBlock = make(chan struct{})
+	supervisor := newOperatorSupervisor(runner, 100*time.Millisecond)
+
+	firstDone := make(chan componentStatus, 1)
+	go func() { firstDone <- supervisor.Apply(context.Background(), componentSpeech, actionStart) }()
+	require.Eventually(t, func() bool { return runner.callsFor(componentSpeech, actionStop) == 1 }, time.Second, time.Millisecond)
+
+	second := supervisor.Apply(t.Context(), componentSpeech, actionStart)
+	assert.Equal(t, "operation_in_progress", second.Code)
+	assert.True(t, second.Busy)
+	assert.Equal(t, 1, runner.callsFor(componentSpeech, actionStart))
+	assert.Equal(t, 1, runner.callsFor(componentSpeech, actionStop))
+
+	close(runner.stopBlock)
+	assert.Equal(t, "startup_timeout", (<-firstDone).Code)
+}
+
+func TestOperatorSupervisorRejectsStopWhileDependantIsStarting(t *testing.T) {
+	runner := newFakeOperatorRunner()
+	supervisor := newOperatorSupervisor(runner, time.Second)
+	runner.setReady(componentSpeech, true)
+	runner.setOwned(componentSpeech, true)
+	runner.setReady(componentPostgres, true)
+	runner.setOwned(componentPostgres, true)
+	assert.Equal(t, "ready", supervisor.Apply(t.Context(), componentPostgres, actionMigrate).State)
+	runner.block = make(chan struct{})
+
+	gatewayDone := make(chan componentStatus, 1)
+	go func() { gatewayDone <- supervisor.Apply(context.Background(), componentGateway, actionStart) }()
+	require.Eventually(t, func() bool { return runner.callsFor(componentGateway, actionStart) == 1 }, time.Second, time.Millisecond)
+
+	assert.Equal(t, "dependency_running", supervisor.Apply(t.Context(), componentSpeech, actionStop).Code)
+	assert.Equal(t, "dependency_running", supervisor.Apply(t.Context(), componentPostgres, actionStop).Code)
+	assert.Equal(t, 0, runner.callsFor(componentSpeech, actionStop))
+	assert.Equal(t, 0, runner.callsFor(componentPostgres, actionStop))
+
+	close(runner.block)
+	assert.Equal(t, "ready", (<-gatewayDone).State)
+}
+
 func TestOperatorSupervisorRejectsStopOfUnownedComponent(t *testing.T) {
 	supervisor := newOperatorSupervisor(newFakeOperatorRunner(), 100*time.Millisecond)
 
@@ -144,6 +187,7 @@ type fakeOperatorRunner struct {
 	calls              map[fixedOperation]int
 	err                error
 	block              chan struct{}
+	stopBlock          chan struct{}
 	startOwnsThenWaits bool
 }
 
@@ -163,14 +207,21 @@ func (runner *fakeOperatorRunner) Run(ctx context.Context, operation fixedOperat
 		runner.owned[operation.Component] = false
 		runner.ready[operation.Component] = false
 	}
-	err, block, wait := runner.err, runner.block, runner.startOwnsThenWaits
+	err, block, stopBlock, wait := runner.err, runner.block, runner.stopBlock, runner.startOwnsThenWaits
 	runner.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	if block != nil {
+	if block != nil && operation.Action != actionStop {
 		select {
 		case <-block:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if operation.Action == actionStop && stopBlock != nil {
+		select {
+		case <-stopBlock:
 		case <-ctx.Done():
 			return ctx.Err()
 		}

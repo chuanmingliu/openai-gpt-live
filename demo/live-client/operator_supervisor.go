@@ -106,19 +106,27 @@ func (supervisor *operatorSupervisor) Apply(ctx context.Context, component opera
 	cancel()
 
 	supervisor.mu.Lock()
-	delete(supervisor.inFlight, component)
 	if err == nil && action == actionMigrate {
 		supervisor.migrated = true
 	}
 	if err != nil {
 		supervisor.failed[component] = operationCode(err)
 	}
+	needsCleanup := err != nil && action == actionStart && !wasOwned && supervisor.runner.Owned(component)
+	if needsCleanup {
+		supervisor.inFlight[component] = actionStop
+	} else {
+		delete(supervisor.inFlight, component)
+	}
 	supervisor.mu.Unlock()
 
-	if err != nil && action == actionStart && !wasOwned && supervisor.runner.Owned(component) {
+	if needsCleanup {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), supervisor.timeout)
 		_ = supervisor.runner.Run(cleanupCtx, fixedOperation{Component: component, Action: actionStop})
 		cleanupCancel()
+		supervisor.mu.Lock()
+		delete(supervisor.inFlight, component)
+		supervisor.mu.Unlock()
 	}
 	return supervisor.status(ctx, component)
 }
@@ -151,6 +159,9 @@ func (supervisor *operatorSupervisor) dependencyCodeLocked(ctx context.Context, 
 			return "process_exited"
 		}
 		for _, dependant := range dependants[component] {
+			if dependantAction, busy := supervisor.inFlight[dependant]; busy && dependantAction != actionStop {
+				return "dependency_running"
+			}
 			if supervisor.runner.Ready(ctx, dependant) {
 				return "dependency_running"
 			}
