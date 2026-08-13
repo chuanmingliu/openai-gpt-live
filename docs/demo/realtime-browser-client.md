@@ -1,5 +1,10 @@
 # Realtime durable Web Search operator guide
 
+For an interactive first run, use the [concise client quick
+start](../../demo/live-client/README.md) and run `make demo-wizard`. Continue
+with this guide when you need the complete manual acceptance, idle-pool,
+privacy, or troubleshooting procedure.
+
 This is the complete loopback `development_durable` path: speech-to-speech,
 PostgreSQL schema v8, the durable gateway and worker, the browser BFF, and the
 server-owned Web Search preset. Run commands from the repository root in one

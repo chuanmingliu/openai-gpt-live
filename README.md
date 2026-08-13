@@ -68,10 +68,17 @@ go run ./cmd/live-worker config-hash --config deploy/config/local.yaml
 The repository includes a loopback browser BFF that streams microphone PCM
 through `live-gateway`, plays configured speech-provider audio, shows live user
 and assistant transcripts, and clears queued playback on a server speech-start
-event. Follow the [realtime browser operator
-guide](docs/demo/realtime-browser-client.md) for the exact speech/gateway/BFF
-configuration, hidden credential prompts, health checks, owned-process stop
-commands, and manual audible-playback/barge-in checklist.
+event. For the shortest path, follow the [interactive client quick
+start](demo/live-client/README.md) and run:
+
+```sh
+make demo-wizard
+```
+
+The wizard can start the full durable demo, start only the browser client,
+check readiness, or stop wizard-owned services. Use the [complete realtime
+browser operator guide](docs/demo/realtime-browser-client.md) for manual
+audible-playback/barge-in acceptance, pool-idle checks, and troubleshooting.
 
 For realtime-only voice, you need a speech service, the local gateway, and the
 browser BFF. You do not need a DeepSeek API key, PostgreSQL handoff

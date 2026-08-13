@@ -28,6 +28,31 @@ func TestRealtimeBrowserOperatorGuideHasExactStepsWithoutSecrets(t *testing.T) {
 	assert.False(t, hasCredentialLiteralAssignment(text))
 }
 
+func TestRealtimeBrowserQuickStartUsesInteractiveWizardWithoutPersistingSecrets(t *testing.T) {
+	quickStart := readQuickStart(t)
+	for _, exact := range []string{
+		"make demo-wizard",
+		"Full durable demo",
+		"Client only",
+		"Check status",
+		"Stop demo",
+		"http://127.0.0.1:3000/",
+		"microphone and speaker",
+		"current wizard session",
+		"../../docs/demo/realtime-browser-client.md",
+	} {
+		assert.Contains(t, quickStart, exact)
+	}
+	assert.False(t, hasCredentialLiteralAssignment(quickStart))
+
+	repositoryReadme, err := os.ReadFile("../../README.md")
+	require.NoError(t, err)
+	assert.Contains(t, string(repositoryReadme), "demo/live-client/README.md")
+
+	operatorGuide := readOperatorGuide(t)
+	assert.Contains(t, operatorGuide, "../../demo/live-client/README.md")
+}
+
 func TestCredentialLiteralAssignmentDetector(t *testing.T) {
 	tests := []struct {
 		name string
@@ -149,6 +174,13 @@ func TestRealtimeGuideDocumentsDurableStartupPolicyAndManualAcceptance(t *testin
 func readOperatorGuide(t *testing.T) string {
 	t.Helper()
 	content, err := os.ReadFile("../../docs/demo/realtime-browser-client.md")
+	require.NoError(t, err)
+	return string(content)
+}
+
+func readQuickStart(t *testing.T) string {
+	t.Helper()
+	content, err := os.ReadFile("README.md")
 	require.NoError(t, err)
 	return string(content)
 }

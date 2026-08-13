@@ -1,4 +1,4 @@
-.PHONY: test test-race vet fmt verify-deploy verify-deploy-static smoke-deploy durable-demo-migrate durable-demo-up durable-demo-down test-durable-web-search load-unit chaos capacity barge soak load-smoke load-evidence release-gate release-gate-verify demo-live-client test-demo-live-client
+.PHONY: test test-race vet fmt verify-deploy verify-deploy-static smoke-deploy durable-demo-migrate durable-demo-up durable-demo-down test-durable-web-search load-unit chaos capacity barge soak load-smoke load-evidence release-gate release-gate-verify demo-wizard demo-live-client test-demo-live-client
 
 test:
 	go test ./...
@@ -11,6 +11,9 @@ vet:
 
 fmt:
 	gofmt -w $$(find . -name '*.go' -not -path './.worktrees/*')
+
+demo-wizard:
+	./deploy/scripts/demo-wizard.sh
 
 demo-live-client:
 	@test -n "$$LIVE_DEMO_BEARER"
