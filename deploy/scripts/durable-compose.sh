@@ -21,7 +21,7 @@ export DATABASE_URL
 unset encoded_password
 
 [ "$#" -eq 1 ] || {
-  echo "usage: deploy/scripts/durable-compose.sh {migrate-up|migrate-check|up|down}" >&2
+  echo "usage: deploy/scripts/durable-compose.sh {postgres-start|postgres-migrate|postgres-ready|postgres-id|postgres-stop|gateway-start|gateway-id|gateway-stop|worker-start|worker-id|worker-stop}" >&2
   exit 2
 }
 case "${1:-}" in
@@ -36,6 +36,39 @@ case "${1:-}" in
     ;;
   down)
     set -- down
+    ;;
+  postgres-start)
+    set -- up --build --wait --no-deps postgres
+    ;;
+  postgres-migrate)
+    set -- run --rm --no-deps migrate
+    ;;
+  postgres-ready)
+    set -- run --rm --no-deps migrate -check
+    ;;
+  postgres-id)
+    set -- ps -q postgres
+    ;;
+  postgres-stop)
+    set -- rm --stop --force postgres
+    ;;
+  gateway-start)
+    set -- up --build --wait --no-deps gateway
+    ;;
+  gateway-id)
+    set -- ps -q gateway
+    ;;
+  gateway-stop)
+    set -- rm --stop --force gateway
+    ;;
+  worker-start)
+    set -- up --build --wait --no-deps worker
+    ;;
+  worker-id)
+    set -- ps -q worker
+    ;;
+  worker-stop)
+    set -- rm --stop --force worker
     ;;
   *)
     echo "usage: deploy/scripts/durable-compose.sh {migrate-up|migrate-check|up|down}" >&2

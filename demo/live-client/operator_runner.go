@@ -31,6 +31,7 @@ type operatorConfig struct {
 	SpeechCommand  string
 	SpeechProfile  string
 	Readiness      map[operatorComponent]string
+	ClientStop     func(context.Context) error
 }
 
 type commandFactory func(context.Context, string, ...string) *exec.Cmd
@@ -43,7 +44,8 @@ type localOperatorRunner struct {
 
 	mu           sync.Mutex
 	children     map[operatorComponent]*ownedChild
-	composeOwned map[operatorComponent]bool
+	composeOwned map[operatorComponent]string
+	clientOwned  bool
 }
 
 type ownedChild struct {
@@ -57,6 +59,12 @@ func newLocalOperatorRunner(cfg operatorConfig, factory commandFactory, probe re
 	if err := cfg.validate(); err != nil {
 		return nil, errOperatorMissingConfiguration
 	}
+	root, _ := filepath.EvalSymlinks(cfg.RepositoryRoot)
+	speechCommand, _ := filepath.EvalSymlinks(cfg.SpeechCommand)
+	speechProfile, _ := filepath.EvalSymlinks(cfg.SpeechProfile)
+	stateParent, _ := filepath.EvalSymlinks(filepath.Dir(cfg.StateDir))
+	cfg.RepositoryRoot, cfg.SpeechCommand, cfg.SpeechProfile = root, speechCommand, speechProfile
+	cfg.StateDir = filepath.Join(stateParent, filepath.Base(cfg.StateDir))
 	if err := prepareOperatorStateDir(cfg.StateDir); err != nil {
 		return nil, errOperatorMissingConfiguration
 	}
@@ -73,7 +81,7 @@ func newLocalOperatorRunner(cfg operatorConfig, factory commandFactory, probe re
 	cfg.Readiness = readiness
 	return &localOperatorRunner{
 		cfg: cfg, newCommand: factory, probe: probe,
-		children: make(map[operatorComponent]*ownedChild), composeOwned: make(map[operatorComponent]bool),
+		children: make(map[operatorComponent]*ownedChild), composeOwned: make(map[operatorComponent]string), clientOwned: cfg.ClientStop != nil,
 	}, nil
 }
 
@@ -103,7 +111,7 @@ func (cfg operatorConfig) validate() error {
 			return err
 		}
 	}
-	if info, err := os.Stat(cfg.StateDir); err == nil && (!info.IsDir() || info.Mode().Perm()&0o007 != 0) {
+	if info, err := os.Lstat(cfg.StateDir); err == nil && (!info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0) {
 		return errors.New("operator configuration unavailable")
 	} else if err != nil && !os.IsNotExist(err) {
 		return errors.New("operator configuration unavailable")
@@ -144,14 +152,29 @@ func validateOperatorEndpoint(raw string) error {
 }
 
 func prepareOperatorStateDir(stateDir string) error {
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		return err
-	}
-	info, err := os.Stat(stateDir)
-	if err != nil || !info.IsDir() || info.Mode().Perm()&0o007 != 0 {
+	parent, err := filepath.EvalSymlinks(filepath.Dir(stateDir))
+	if err != nil {
 		return errors.New("unsafe operator state directory")
 	}
-	return os.Chmod(stateDir, 0o700)
+	for parent != "." && parent != string(filepath.Separator) {
+		info, err := os.Lstat(parent)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 {
+			return errors.New("unsafe operator state directory")
+		}
+		next := filepath.Dir(parent)
+		if next == parent {
+			break
+		}
+		parent = next
+	}
+	if err := os.Mkdir(stateDir, 0o700); err != nil && !os.IsExist(err) {
+		return err
+	}
+	info, err := os.Lstat(stateDir)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
+		return errors.New("unsafe operator state directory")
+	}
+	return nil
 }
 
 func (runner *localOperatorRunner) Run(ctx context.Context, operation fixedOperation) error {
@@ -164,9 +187,24 @@ func (runner *localOperatorRunner) Run(ctx context.Context, operation fixedOpera
 	switch operation.Component {
 	case componentClient:
 		if operation.Action == actionStart {
+			if runner.cfg.ClientStop == nil || !runner.Ready(ctx, componentClient) {
+				return errOperatorMissingConfiguration
+			}
+			runner.mu.Lock()
+			runner.clientOwned = true
+			runner.mu.Unlock()
 			return nil
 		}
-		return errOperatorProcessExited
+		if runner.cfg.ClientStop == nil {
+			return errOperatorProcessExited
+		}
+		if err := runner.cfg.ClientStop(ctx); err != nil {
+			return commandFailure(ctx)
+		}
+		runner.mu.Lock()
+		runner.clientOwned = false
+		runner.mu.Unlock()
+		return nil
 	case componentSpeech:
 		if operation.Action == actionStart {
 			return runner.startSpeech(ctx)
@@ -174,14 +212,14 @@ func (runner *localOperatorRunner) Run(ctx context.Context, operation fixedOpera
 		return runner.stopSpeech(ctx)
 	case componentPostgres:
 		if operation.Action == actionMigrate {
-			return runner.runCompose(ctx, "migrate-check", "")
+			return runner.runCompose(ctx, "postgres-migrate", "")
 		}
 		if operation.Action == actionStart {
-			return runner.runCompose(ctx, "migrate-up", componentPostgres)
+			return runner.runCompose(ctx, "postgres-start", componentPostgres)
 		}
 	case componentGateway, componentWorker:
 		if operation.Action == actionStart {
-			return runner.runCompose(ctx, "up", operation.Component)
+			return runner.runCompose(ctx, string(operation.Component)+"-start", operation.Component)
 		}
 	}
 	return runner.stopCompose(ctx, operation.Component)
@@ -194,7 +232,7 @@ func (runner *localOperatorRunner) Ready(ctx context.Context, component operator
 	readyCtx, cancel := context.WithTimeout(nonNilContext(ctx), operatorReadinessTimeout)
 	defer cancel()
 	if component == componentPostgres {
-		return runner.runFixed(readyCtx, runner.composeCommand(), "migrate-check") == nil
+		return runner.requiredEnvironment(fixedOperation{Component: componentPostgres, Action: actionStart}) && runner.runFixed(readyCtx, runner.composeCommand(), "postgres-ready") == nil
 	}
 	endpoint, ok := runner.cfg.Readiness[component]
 	return ok && runner.probe(readyCtx, endpoint)
@@ -207,7 +245,11 @@ func (runner *localOperatorRunner) Owned(component operatorComponent) bool {
 		_, owned := runner.children[component]
 		return owned
 	}
-	return runner.composeOwned[component]
+	if component == componentClient {
+		return runner.clientOwned
+	}
+	_, owned := runner.composeOwned[component]
+	return owned
 }
 
 func (runner *localOperatorRunner) startSpeech(ctx context.Context) error {
@@ -218,7 +260,10 @@ func (runner *localOperatorRunner) startSpeech(ctx context.Context) error {
 	}
 	runner.mu.Unlock()
 
-	cmd := runner.newCommand(ctx, runner.cfg.SpeechCommand, runner.cfg.SpeechProfile)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	cmd := runner.newCommand(context.Background(), runner.cfg.SpeechCommand, runner.cfg.SpeechProfile)
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	if err := cmd.Start(); err != nil {
 		return commandFailure(ctx)
@@ -279,33 +324,75 @@ func (runner *localOperatorRunner) stopSpeech(ctx context.Context) error {
 }
 
 func (runner *localOperatorRunner) runCompose(ctx context.Context, verb string, component operatorComponent) error {
-	if err := runner.runFixed(ctx, runner.composeCommand(), verb); err != nil {
+	operation := fixedOperation{Component: component, Action: actionStart}
+	if component == "" {
+		operation = fixedOperation{Component: componentPostgres, Action: actionMigrate}
+	}
+	if !runner.requiredEnvironment(operation) {
+		return errOperatorMissingConfiguration
+	}
+	before := ""
+	if component != "" {
+		before = runner.composeID(ctx, component)
+	}
+	err := runner.runFixed(ctx, runner.composeCommand(), verb)
+	if component == "" {
 		return err
 	}
-	if component != "" {
+	after := runner.composeID(context.Background(), component)
+	if after != "" && after != before {
+		if writeErr := runner.writeOwner(component, after); writeErr != nil {
+			return errOperatorProcessExited
+		}
 		runner.mu.Lock()
-		runner.composeOwned[component] = true
+		runner.composeOwned[component] = after
 		runner.mu.Unlock()
 	}
-	return nil
+	return err
 }
 
 func (runner *localOperatorRunner) stopCompose(ctx context.Context, component operatorComponent) error {
 	runner.mu.Lock()
-	owned := runner.composeOwned[component]
+	id, owned := runner.composeOwned[component]
 	runner.mu.Unlock()
-	if !owned {
+	if !owned || id == "" || !runner.ownerMatches(component, id) || runner.composeID(ctx, component) != id {
 		return errOperatorProcessExited
 	}
-	if err := runner.runFixed(ctx, runner.composeCommand(), "down"); err != nil {
+	if !runner.requiredEnvironment(fixedOperation{Component: component, Action: actionStop}) {
+		return errOperatorMissingConfiguration
+	}
+	if err := runner.runFixed(ctx, runner.composeCommand(), string(component)+"-stop"); err != nil {
 		return err
 	}
 	runner.mu.Lock()
-	for _, composeComponent := range []operatorComponent{componentPostgres, componentGateway, componentWorker} {
-		delete(runner.composeOwned, composeComponent)
-	}
+	delete(runner.composeOwned, component)
 	runner.mu.Unlock()
+	_ = os.Remove(runner.ownerPath(component))
 	return nil
+}
+
+func (runner *localOperatorRunner) composeID(ctx context.Context, component operatorComponent) string {
+	cmd := runner.newCommand(ctx, runner.composeCommand(), string(component)+"-id")
+	output, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(output))
+}
+
+var operatorRequiredEnvironment = map[operatorComponent][]string{
+	componentPostgres: {"POSTGRES_PASSWORD"},
+	componentGateway:  {"POSTGRES_PASSWORD", "S2S_API_KEY", "LIVE_STATIC_BEARER_TOKEN", "LIVE_ADMIN_BEARER_TOKEN", "LIVE_PRIVACY_HMAC_KEY", "LIVE_RETENTION_HMAC_KEY", "LIVE_RECONNECT_HMAC_KEY", "LIVE_TOOL_ENCRYPTION_KEY", "LIVE_EXPECTED_CONFIG_HASH", "S2S_IMAGE", "S2S_CONFIG_PATH"},
+	componentWorker:   {"POSTGRES_PASSWORD", "DEEPSEEK_API_KEY", "LIVE_STATIC_BEARER_TOKEN", "LIVE_ADMIN_BEARER_TOKEN", "LIVE_PRIVACY_HMAC_KEY", "LIVE_RETENTION_HMAC_KEY", "LIVE_TOOL_ENCRYPTION_KEY", "LIVE_EXPECTED_CONFIG_HASH", "S2S_IMAGE", "S2S_CONFIG_PATH"},
+}
+
+func (runner *localOperatorRunner) requiredEnvironment(operation fixedOperation) bool {
+	for _, name := range operatorRequiredEnvironment[operation.Component] {
+		if value, ok := os.LookupEnv(name); !ok || value == "" {
+			return false
+		}
+	}
+	return true
 }
 
 func (runner *localOperatorRunner) composeCommand() string {
@@ -332,8 +419,50 @@ func (runner *localOperatorRunner) pidPath(component operatorComponent) string {
 	return filepath.Join(runner.cfg.StateDir, string(component)+".pid")
 }
 
+func (runner *localOperatorRunner) ownerPath(component operatorComponent) string {
+	return filepath.Join(runner.cfg.StateDir, string(component)+".owner")
+}
+
+func (runner *localOperatorRunner) writeOwner(component operatorComponent, id string) error {
+	file, err := os.OpenFile(runner.ownerPath(component), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if _, err := file.WriteString(id + "\n"); err != nil {
+		return err
+	}
+	info, err := file.Stat()
+	if err != nil || info.Mode().Perm() != 0o600 {
+		return errors.New("unsafe operator ownership record")
+	}
+	return nil
+}
+
+func (runner *localOperatorRunner) ownerMatches(component operatorComponent, id string) bool {
+	info, err := os.Lstat(runner.ownerPath(component))
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		return false
+	}
+	data, err := os.ReadFile(runner.ownerPath(component))
+	return err == nil && string(data) == id+"\n"
+}
+
 func (runner *localOperatorRunner) writePID(component operatorComponent, child *ownedChild) error {
-	return os.WriteFile(runner.pidPath(component), []byte(strconv.Itoa(child.pid)+" "+child.marker+"\n"), 0o600)
+	path := runner.pidPath(component)
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if _, err := file.Write([]byte(strconv.Itoa(child.pid) + " " + child.marker + "\n")); err != nil {
+		return err
+	}
+	info, err := file.Stat()
+	if err != nil || info.Mode().Perm() != 0o600 {
+		return errors.New("unsafe operator pid record")
+	}
+	return nil
 }
 
 func (runner *localOperatorRunner) pidMatches(component operatorComponent, child *ownedChild) bool {
@@ -360,7 +489,7 @@ func newOperatorMarker() (string, error) {
 func probeLocalReadiness(ctx context.Context, endpoint string) bool {
 	dialer := net.Dialer{Timeout: operatorConnectTimeout}
 	transport := &http.Transport{DialContext: dialer.DialContext}
-	client := &http.Client{Transport: transport, Timeout: operatorReadinessTimeout}
+	client := &http.Client{Transport: transport, Timeout: operatorReadinessTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return false
