@@ -85,3 +85,9 @@ func TestResolveBearerRequiresNonemptyBoundedValueWithoutEchoingIt(t *testing.T)
 	_, err = resolveBearer(cfg, func(string) (string, bool) { return string(make([]byte, (16<<10)+1)), true })
 	assert.EqualError(t, err, "configured demo bearer is invalid")
 }
+
+func TestParseConfigRequiresCompleteSafeOperatorStartupConfiguration(t *testing.T) {
+	_, err := parseConfig([]string{"-operator"})
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "operator")
+}
