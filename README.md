@@ -76,7 +76,15 @@ make demo-wizard
 ```
 
 The wizard can start the full durable demo, start only the browser client,
-check readiness, or stop wizard-owned services. Use the [complete realtime
+open the **Browser control panel**, check readiness, or stop wizard-owned
+services. The explicit control-panel choice opens
+[http://127.0.0.1:3000/setup](http://127.0.0.1:3000/setup). Credentials remain
+in the terminal or server environment, and the browser can operate only fixed
+services. Worker is optional for voice-only use and required for durable
+asynchronous tools. Stop dependencies in this order: Client, Worker, Gateway,
+PostgreSQL, then Speech. Shutdown does not delete the PostgreSQL volume.
+`/setup` is for local development only, never a production admin surface or
+release-evidence controller. Use the [complete realtime
 browser operator guide](docs/demo/realtime-browser-client.md) for manual
 audible-playback/barge-in acceptance, pool-idle checks, and troubleshooting.
 

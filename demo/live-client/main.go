@@ -4,6 +4,8 @@ import (
 	"context"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 )
 
 func main() {
@@ -16,7 +18,9 @@ func main() {
 		log.Fatal(err)
 	}
 	defer clear(bearer)
-	if err := run(context.Background(), cfg, bearer); err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx, cfg, bearer); err != nil {
 		log.Fatal("demo server stopped")
 	}
 }

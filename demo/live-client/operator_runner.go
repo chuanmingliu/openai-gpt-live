@@ -29,6 +29,7 @@ type operatorConfig struct {
 	Enabled        bool
 	StateDir       string
 	RepositoryRoot string
+	SpeechRoot     string
 	SpeechCommand  string
 	SpeechProfile  string
 	Readiness      map[operatorComponent]string
@@ -82,12 +83,16 @@ func newLocalOperatorRunner(cfg operatorConfig, factory commandFactory, probe re
 		return nil, errOperatorMissingConfiguration
 	}
 	root, _ := filepath.EvalSymlinks(cfg.RepositoryRoot)
+	speechRoot := root
+	if cfg.SpeechRoot != "" {
+		speechRoot, _ = filepath.EvalSymlinks(cfg.SpeechRoot)
+	}
 	speechCommand, _ := filepath.EvalSymlinks(cfg.SpeechCommand)
 	speechProfile, _ := filepath.EvalSymlinks(cfg.SpeechProfile)
 	speechFile, _ := os.Stat(speechCommand)
 	profileFile, _ := os.Stat(speechProfile)
 	stateParent, _ := filepath.EvalSymlinks(filepath.Dir(cfg.StateDir))
-	cfg.RepositoryRoot, cfg.SpeechCommand, cfg.SpeechProfile = root, speechCommand, speechProfile
+	cfg.RepositoryRoot, cfg.SpeechRoot, cfg.SpeechCommand, cfg.SpeechProfile = root, speechRoot, speechCommand, speechProfile
 	cfg.StateDir = filepath.Join(stateParent, filepath.Base(cfg.StateDir))
 	if err := prepareOperatorStateDir(cfg.StateDir); err != nil {
 		return nil, errOperatorMissingConfiguration
@@ -169,7 +174,21 @@ func (cfg operatorConfig) validate() error {
 	if err := validateOperatorPath(root, cfg.SpeechCommand, true); err != nil {
 		return err
 	}
-	if err := validateOperatorPath(root, cfg.SpeechProfile, false); err != nil {
+	speechRoot := root
+	if cfg.SpeechRoot != "" {
+		if !filepath.IsAbs(cfg.SpeechRoot) {
+			return errors.New("operator configuration unavailable")
+		}
+		info, err := os.Lstat(cfg.SpeechRoot)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("operator configuration unavailable")
+		}
+		speechRoot, err = filepath.EvalSymlinks(cfg.SpeechRoot)
+		if err != nil {
+			return errors.New("operator configuration unavailable")
+		}
+	}
+	if err := validateOperatorPath(speechRoot, cfg.SpeechProfile, false); err != nil {
 		return err
 	}
 	if err := validateOperatorPath(root, filepath.Join(root, "deploy", "scripts", "durable-compose.sh"), true); err != nil {
@@ -623,8 +642,8 @@ func (runner *localOperatorRunner) discoverComposeIdentity(ctx context.Context, 
 var operatorRequiredEnvironment = map[operatorComponent][]string{
 	componentSpeech:   {"S2S_API_KEY"},
 	componentPostgres: {"POSTGRES_PASSWORD"},
-	componentGateway:  {"POSTGRES_PASSWORD", "S2S_API_KEY", "LIVE_STATIC_BEARER_TOKEN", "LIVE_ADMIN_BEARER_TOKEN", "LIVE_PRIVACY_HMAC_KEY", "LIVE_RETENTION_HMAC_KEY", "LIVE_RECONNECT_HMAC_KEY", "LIVE_TOOL_ENCRYPTION_KEY", "LIVE_EXPECTED_CONFIG_HASH", "S2S_IMAGE", "S2S_CONFIG_PATH"},
-	componentWorker:   {"POSTGRES_PASSWORD", "DEEPSEEK_API_KEY", "LIVE_STATIC_BEARER_TOKEN", "LIVE_ADMIN_BEARER_TOKEN", "LIVE_PRIVACY_HMAC_KEY", "LIVE_RETENTION_HMAC_KEY", "LIVE_TOOL_ENCRYPTION_KEY", "LIVE_EXPECTED_CONFIG_HASH", "S2S_IMAGE", "S2S_CONFIG_PATH"},
+	componentGateway:  {"POSTGRES_PASSWORD", "S2S_API_KEY", "LIVE_STATIC_BEARER_TOKEN", "LIVE_ADMIN_BEARER_TOKEN", "LIVE_PRIVACY_HMAC_KEY", "LIVE_RETENTION_HMAC_KEY", "LIVE_RECONNECT_HMAC_KEY", "LIVE_TOOL_ENCRYPTION_KEY", "LIVE_EXPECTED_CONFIG_HASH"},
+	componentWorker:   {"POSTGRES_PASSWORD", "DEEPSEEK_API_KEY", "LIVE_STATIC_BEARER_TOKEN", "LIVE_ADMIN_BEARER_TOKEN", "LIVE_PRIVACY_HMAC_KEY", "LIVE_RETENTION_HMAC_KEY", "LIVE_TOOL_ENCRYPTION_KEY", "LIVE_EXPECTED_CONFIG_HASH"},
 }
 
 func (runner *localOperatorRunner) requiredEnvironment(operation fixedOperation) bool {

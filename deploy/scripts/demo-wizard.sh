@@ -148,6 +148,39 @@ start_bff() {
   wait_ready browser-bff http://127.0.0.1:3000/health/ready
 }
 
+start_operator_bff() {
+  local speech_root="$1" speech_profile="$2"
+  stop_current_bff
+  rm -f "$state_dir/live-client.calls"
+  go build -o "$state_dir/live-client" ./demo/live-client
+  env -i PATH="$PATH" \
+    LIVE_DEMO_BEARER="$LIVE_DEMO_BEARER" \
+    POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
+    S2S_API_KEY="$S2S_API_KEY" \
+    DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY" \
+    LIVE_STATIC_BEARER_TOKEN="$LIVE_STATIC_BEARER_TOKEN" \
+    LIVE_ADMIN_BEARER_TOKEN="$LIVE_ADMIN_BEARER_TOKEN" \
+    LIVE_PRIVACY_HMAC_KEY="$LIVE_PRIVACY_HMAC_KEY" \
+    LIVE_RETENTION_HMAC_KEY="$LIVE_RETENTION_HMAC_KEY" \
+    LIVE_RECONNECT_HMAC_KEY="$LIVE_RECONNECT_HMAC_KEY" \
+    LIVE_TOOL_ENCRYPTION_KEY="$LIVE_TOOL_ENCRYPTION_KEY" \
+    LIVE_EXPECTED_CONFIG_HASH="$LIVE_EXPECTED_CONFIG_HASH" \
+    "$state_dir/live-client" \
+    -gateway-url ws://127.0.0.1:18080/v1/realtime \
+    -model gpt-live-simulator \
+    -operator \
+    -operator-state-dir "$state_dir/operator" \
+    -operator-repository-root "$root" \
+    -operator-speech-root "$speech_root" \
+    -operator-speech-command "$root/deploy/scripts/operator-speech-launcher.py" \
+    -operator-speech-profile "$speech_profile" \
+    -operator-speech-ready-url http://127.0.0.1:8766/v1/pool \
+    >/dev/null 2>&1 &
+  bff_pid=$!
+  printf '%s\n' "$bff_pid" >"$state_dir/bff.pid"
+  wait_ready browser-bff http://127.0.0.1:3000/health/ready
+}
+
 print_success() {
   startup_complete=true
   trap - EXIT HUP INT TERM
@@ -252,13 +285,70 @@ run_stop() {
   startup_complete=true
 }
 
+run_control_panel() {
+  local speech_root speech_profile speech_environment speech_executable permissions
+  TOTAL_STAGES=2
+  for command in go curl openssl stat; do require_command "$command"; done
+
+  stage "Server-side configuration"
+  say "Credentials stay in this terminal and the BFF environment; the browser receives none."
+  ask_secret POSTGRES_PASSWORD "Disposable PostgreSQL password:"
+  ask_secret LIVE_STATIC_BEARER_TOKEN "New local gateway bearer:"
+  ask_secret S2S_API_KEY "Gateway-to-speech bearer:"
+  ask_secret DEEPSEEK_API_KEY "Worker DeepSeek bearer:"
+  require_nonempty "PostgreSQL password" "$POSTGRES_PASSWORD"
+  require_nonempty "local gateway bearer" "$LIVE_STATIC_BEARER_TOKEN"
+  require_nonempty "gateway-to-speech bearer" "$S2S_API_KEY"
+  require_nonempty "DeepSeek bearer" "$DEEPSEEK_API_KEY"
+
+  speech_root=${DEMO_OPERATOR_SPEECH_ROOT:-/Users/chuanmingliu/speech-to-speech/.worktrees/provider-native-streaming}
+  speech_profile=${DEMO_OPERATOR_SPEECH_PROFILE:-$speech_root/configs/tencent-deepseek-minimax.json}
+  speech_environment=${DEMO_OPERATOR_SPEECH_ENV:-/Users/chuanmingliu/speech-to-speech/.env.local}
+  speech_executable=${DEMO_OPERATOR_SPEECH_EXECUTABLE:-/Users/chuanmingliu/speech-to-speech/.venv/bin/speech-to-speech}
+  [[ -d "$speech_root" && ! -L "$speech_root" && -f "$speech_profile" && ! -L "$speech_profile" ]] || {
+    printf 'fixed speech root/profile is unavailable\n' >&2
+    exit 1
+  }
+  [[ -f "$speech_environment" && ! -L "$speech_environment" && -x "$speech_executable" && ! -L "$speech_executable" ]] || {
+    printf 'fixed speech executable/environment is unavailable\n' >&2
+    exit 1
+  }
+  permissions=$(stat -f '%Lp' "$speech_environment" 2>/dev/null || stat -c '%a' "$speech_environment" 2>/dev/null || true)
+  [[ "$permissions" == 600 ]] || {
+    printf 'fixed speech environment must be private mode 600\n' >&2
+    exit 1
+  }
+
+  export POSTGRES_PASSWORD S2S_API_KEY DEEPSEEK_API_KEY LIVE_STATIC_BEARER_TOKEN
+  export LIVE_DEMO_BEARER="$LIVE_STATIC_BEARER_TOKEN"
+  export LIVE_ADMIN_BEARER_TOKEN="$LIVE_STATIC_BEARER_TOKEN"
+  export LIVE_PRIVACY_HMAC_KEY="$(openssl rand -hex 32)"
+  export LIVE_RETENTION_HMAC_KEY="$(openssl rand -base64 32)"
+  export LIVE_RECONNECT_HMAC_KEY="$(openssl rand -base64 32)"
+  export LIVE_TOOL_ENCRYPTION_KEY="$(openssl rand -base64 32)"
+  export LIVE_EXPECTED_CONFIG_HASH="$(go run ./cmd/live-gateway config-hash --config deploy/config/development-control-panel.yaml)"
+  require_nonempty "control-panel config hash" "$LIVE_EXPECTED_CONFIG_HASH"
+
+  stage "Browser control panel"
+  say "The BFF starts now; services start only after an explicit action on /setup."
+  start_operator_bff "$speech_root" "$speech_profile"
+  startup_complete=true
+  trap - EXIT HUP INT TERM
+  printf '\n%s%s✓ Browser control panel ready%s\n' "$BOLD" "$GREEN" "$RESET"
+  printf '  Open: http://127.0.0.1:3000/setup\n'
+  printf '  Worker is optional for voice-only; use it for durable asynchronous tools.\n'
+  printf '  Stop dependencies in this order: Client, Worker, Gateway, PostgreSQL, then Speech.\n'
+  printf '  Stops preserve the PostgreSQL volume. This surface is for local development only.\n\n'
+}
+
 _clear
 printf '\n%s%sGPT Live realtime demo%s\n' "$BOLD" "$BLUE" "$RESET"
 printf '  1) Full durable demo\n'
 printf '  2) Client only\n'
 printf '  3) Check status\n'
 printf '  4) Stop demo\n\n'
-printf '  Select [1-4]: '
+printf '  5) Browser control panel\n\n'
+printf '  Select [1-5]: '
 read -r choice || true
 
 case "$choice" in
@@ -266,5 +356,6 @@ case "$choice" in
   2) run_client ;;
   3) run_status ;;
   4) run_stop ;;
-  *) printf 'select 1, 2, 3, or 4\n' >&2; exit 2 ;;
+  5) run_control_panel ;;
+  *) printf 'select 1, 2, 3, 4, or 5\n' >&2; exit 2 ;;
 esac

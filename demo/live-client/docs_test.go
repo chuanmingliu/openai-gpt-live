@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"regexp"
 	"strings"
 	"testing"
@@ -51,6 +52,63 @@ func TestRealtimeBrowserQuickStartUsesInteractiveWizardWithoutPersistingSecrets(
 
 	operatorGuide := readOperatorGuide(t)
 	assert.Contains(t, operatorGuide, "../../demo/live-client/README.md")
+}
+
+func TestRealtimeBrowserQuickStartDocumentsControlPanelBoundary(t *testing.T) {
+	quickStart := readQuickStart(t)
+	repositoryReadme, err := os.ReadFile("../../README.md")
+	require.NoError(t, err)
+	operatorGuide := readOperatorGuide(t)
+	for name, text := range map[string]string{
+		"client quick start":     quickStart,
+		"repository quick start": string(repositoryReadme),
+		"operator guide":         operatorGuide,
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.Contains(t, text, "Browser control panel")
+			assert.Contains(t, text, "http://127.0.0.1:3000/setup")
+			assert.Regexp(t, `terminal or server\s+environment`, text)
+			assert.Regexp(t, `fixed\s+services`, text)
+			assert.Regexp(t, `Worker is optional\s+for\s+voice-only`, text)
+			assert.Regexp(t, `Client, Worker, Gateway,\s+PostgreSQL, then Speech`, text)
+			assert.Regexp(t, `does not delete the PostgreSQL volume`, text)
+			assert.Regexp(t, `local\s+development only`, text)
+			if name != "repository quick start" {
+				assert.False(t, hasCredentialLiteralAssignment(text))
+			}
+		})
+	}
+}
+
+func TestRealtimeBrowserControlPanelTopologyIsFixedAndHashCompatible(t *testing.T) {
+	config, err := os.ReadFile("../../deploy/config/development-control-panel.yaml")
+	require.NoError(t, err)
+	text := string(config)
+	assert.Contains(t, text, "url: ws://host.docker.internal:8766/v1/realtime")
+	assert.Contains(t, text, "model: deepseek-v4-flash")
+	assert.NotContains(t, text, "host.docker.internal:8766/v1/realtime?")
+	assert.NotRegexp(t, `(?m)^\s*(password|token|api_key):`, text)
+
+	compose, err := os.ReadFile("../../deploy/compose.development-control-panel.yml")
+	require.NoError(t, err)
+	composeText := string(compose)
+	assert.Contains(t, composeText, "./config/development-control-panel.yaml:/etc/live/config.yaml:ro")
+	assert.Contains(t, composeText, `host.docker.internal:host-gateway`)
+	assert.NotContains(t, composeText, "8766:")
+	assert.NotRegexp(t, `(?ms)postgres:.*?ports:`, composeText)
+
+	gatewayHash := controlPanelConfigHash(t, "live-gateway")
+	workerHash := controlPanelConfigHash(t, "live-worker")
+	assert.Equal(t, gatewayHash, workerHash)
+	assert.Regexp(t, `^v1:[0-9a-f]{64}$`, gatewayHash)
+}
+
+func controlPanelConfigHash(t *testing.T, binary string) string {
+	t.Helper()
+	command := exec.Command("go", "run", "../../cmd/"+binary, "config-hash", "--config", "../../deploy/config/development-control-panel.yaml")
+	output, err := command.CombinedOutput()
+	require.NoError(t, err, string(output))
+	return strings.TrimSpace(string(output))
 }
 
 func TestCredentialLiteralAssignmentDetector(t *testing.T) {

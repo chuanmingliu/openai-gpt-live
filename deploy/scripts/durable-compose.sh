@@ -73,8 +73,20 @@ case "$operation" in
     ;;
 esac
 
-exec docker compose \
-  --project-name gpt-live-durable-demo \
-  -f deploy/docker-compose.yml \
-  -f deploy/compose.development-durable.yml \
-  "$@"
+case "$operation" in
+  postgres-*|gateway-*|worker-*)
+    exec docker compose \
+      --project-name gpt-live-durable-demo \
+      -f deploy/docker-compose.yml \
+      -f deploy/compose.development-durable.yml \
+      -f deploy/compose.development-control-panel.yml \
+      "$@"
+    ;;
+  *)
+    exec docker compose \
+      --project-name gpt-live-durable-demo \
+      -f deploy/docker-compose.yml \
+      -f deploy/compose.development-durable.yml \
+      "$@"
+    ;;
+esac

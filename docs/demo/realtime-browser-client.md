@@ -11,6 +11,29 @@ server-owned Web Search preset. Run commands from the repository root in one
 `zsh` session. This mode is for development and acceptance only; it is not
 production or release evidence.
 
+## Browser control panel
+
+Choose **Browser control panel** in `make demo-wizard` to explicitly enable the
+loopback operator surface, then open
+[http://127.0.0.1:3000/setup](http://127.0.0.1:3000/setup). Credentials remain
+in the terminal or server environment. The page can operate only the fixed
+services Speech, PostgreSQL, Gateway, Worker, and Client; it cannot submit a
+command, path, URL, environment name, model, or credential. Worker is optional
+for voice-only use and required for durable asynchronous tools. PostgreSQL
+must be started and migrated before Gateway or Worker, and Gateway additionally
+requires Speech. Stop dependencies in this order: Client, Worker, Gateway,
+PostgreSQL, then Speech. Graceful shutdown stops only demonstrably owned
+processes and does not delete the PostgreSQL volume.
+
+The fixed local speech launcher reads
+`/Users/chuanmingliu/speech-to-speech/.env.local` only after requiring private
+mode `0600`, loads the reviewed profile beneath the fixed external trust root,
+and creates a private ephemeral copy pinned to `127.0.0.1:8766`. The dedicated
+non-secret control-panel gateway configuration reaches the same service at
+`ws://host.docker.internal:8766/v1/realtime`; neither endpoint is browser
+configurable. `/setup` is for local development only. It is not production
+administration, a deployment controller, or release evidence.
+
 The speech service and worker both use `deepseek-v4-flash` with thinking
 disabled. The worker enforces `{"thinking":{"type":"disabled"}}` on its
 initial and tool-follow-up requests and discards provider reasoning content.

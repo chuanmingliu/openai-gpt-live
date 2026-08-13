@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -90,4 +92,23 @@ func TestParseConfigRequiresCompleteSafeOperatorStartupConfiguration(t *testing.
 	_, err := parseConfig([]string{"-operator"})
 	require.Error(t, err)
 	assert.NotContains(t, err.Error(), "operator")
+}
+
+func TestParseConfigAcceptsSeparateFixedSpeechTrustRoot(t *testing.T) {
+	repository, command, _ := newRunnerRepository(t)
+	speechRoot := t.TempDir()
+	profile := filepath.Join(speechRoot, "provider-profile.json")
+	require.NoError(t, os.WriteFile(profile, []byte("{}\n"), 0o600))
+	cfg, err := parseConfig([]string{
+		"-operator",
+		"-operator-state-dir", filepath.Join(t.TempDir(), "state"),
+		"-operator-repository-root", repository,
+		"-operator-speech-root", speechRoot,
+		"-operator-speech-command", command,
+		"-operator-speech-profile", profile,
+		"-operator-speech-ready-url", "http://127.0.0.1:8766/v1/pool",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, speechRoot, cfg.Operator.SpeechRoot)
+	assert.Equal(t, "http://127.0.0.1:8766/v1/pool", cfg.Operator.Readiness[componentSpeech])
 }

@@ -1,0 +1,10 @@
+services:
+  gateway:
+    volumes:
+      - ./config/development-control-panel.yaml:/etc/live/config.yaml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  worker:
+    volumes:
+      - ./config/development-control-panel.yaml:/etc/live/config.yaml:ro

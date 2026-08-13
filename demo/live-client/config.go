@@ -38,7 +38,7 @@ func parseConfig(args []string) (demoConfig, error) {
 		BearerEnv:     "LIVE_DEMO_BEARER",
 		MaxFrameBytes: 64 << 10,
 		Operator: operatorConfig{Readiness: map[operatorComponent]string{
-			componentSpeech:  "http://127.0.0.1:8765/v1/pool",
+			componentSpeech:  "http://127.0.0.1:8766/v1/pool",
 			componentGateway: "http://127.0.0.1:19090/health/ready",
 			componentWorker:  "http://127.0.0.1:19091/health/ready",
 			componentClient:  "http://127.0.0.1:3000/health/ready",
@@ -58,6 +58,7 @@ func parseConfig(args []string) (demoConfig, error) {
 	flags.BoolVar(&cfg.Operator.Enabled, "operator", false, "enable fixed local demo operator controls")
 	flags.StringVar(&cfg.Operator.StateDir, "operator-state-dir", "", "private operator state directory")
 	flags.StringVar(&cfg.Operator.RepositoryRoot, "operator-repository-root", "", "fixed repository root")
+	flags.StringVar(&cfg.Operator.SpeechRoot, "operator-speech-root", "", "fixed external speech trust root")
 	flags.StringVar(&cfg.Operator.SpeechCommand, "operator-speech-command", "", "fixed speech launcher")
 	flags.StringVar(&cfg.Operator.SpeechProfile, "operator-speech-profile", "", "fixed speech profile")
 	flags.StringVar(&speechReady, "operator-speech-ready-url", speechReady, "fixed speech readiness endpoint")

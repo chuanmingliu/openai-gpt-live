@@ -3,19 +3,144 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestOperatorMainClientStopEndsExplicitLocalServer(t *testing.T) {
+	cfg := testOperatorMainConfig(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, cfg, []byte("operator-main-bearer")) }()
+	waitForOperatorMainReady(t, cfg.Origin)
+
+	request, err := http.NewRequest(http.MethodPost, cfg.Origin+"/api/operator/action", strings.NewReader(`{"component":"client","action":"stop"}`))
+	require.NoError(t, err)
+	request.Header.Set("Origin", cfg.Origin)
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, response.StatusCode)
+	_ = response.Body.Close()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("client stop did not end the operator server")
+	}
+}
+
+func TestOperatorMainGracefulShutdownStopsOwnedSpeech(t *testing.T) {
+	cfg := testOperatorMainConfig(t)
+	speechReady := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(speechReady.Close)
+	cfg.Operator.Readiness[componentSpeech] = speechReady.URL + "/v1/pool"
+	t.Setenv("S2S_API_KEY", "operator-main-speech-secret")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, cfg, []byte("operator-main-bearer")) }()
+	waitForOperatorMainReady(t, cfg.Origin)
+
+	request, err := http.NewRequest(http.MethodPost, cfg.Origin+"/api/operator/action", strings.NewReader(`{"component":"speech","action":"start"}`))
+	require.NoError(t, err)
+	request.Header.Set("Origin", cfg.Origin)
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, response.StatusCode)
+	_ = response.Body.Close()
+
+	pidPath := filepath.Join(cfg.Operator.StateDir, "speech.pid")
+	var pid int
+	require.Eventually(t, func() bool {
+		content, err := os.ReadFile(pidPath)
+		if err != nil {
+			return false
+		}
+		fields := strings.Fields(string(content))
+		if len(fields) != 2 {
+			return false
+		}
+		pid, err = strconv.Atoi(fields[0])
+		return err == nil && pid > 0
+	}, time.Second, 10*time.Millisecond)
+
+	cancel()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("graceful shutdown did not complete")
+	}
+	require.Eventually(t, func() bool {
+		process, err := os.FindProcess(pid)
+		return err != nil || process.Signal(syscall.Signal(0)) != nil
+	}, 2*time.Second, 10*time.Millisecond, "operator-owned speech process survived BFF shutdown")
+}
+
+func testOperatorMainConfig(t *testing.T) demoConfig {
+	t.Helper()
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	address := listener.Addr().String()
+	require.NoError(t, listener.Close())
+
+	repository := t.TempDir()
+	compose := filepath.Join(repository, "deploy", "scripts", "durable-compose.sh")
+	require.NoError(t, os.MkdirAll(filepath.Dir(compose), 0o700))
+	require.NoError(t, os.WriteFile(compose, []byte("#!/bin/sh\nexit 0\n"), 0o700))
+	speech := filepath.Join(repository, "speech-launcher.sh")
+	require.NoError(t, os.WriteFile(speech, []byte("#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n"), 0o700))
+	profile := filepath.Join(repository, "speech-profile.yaml")
+	require.NoError(t, os.WriteFile(profile, []byte("transport: websocket\n"), 0o600))
+
+	cfg, err := parseConfig([]string{
+		"-listen", address,
+		"-origin", "http://" + address,
+		"-operator",
+		"-operator-state-dir", filepath.Join(repository, "operator-state"),
+		"-operator-repository-root", repository,
+		"-operator-speech-command", speech,
+		"-operator-speech-profile", profile,
+		"-operator-client-ready-url", "http://" + address + "/health/ready",
+	})
+	require.NoError(t, err)
+	return cfg
+}
+
+func waitForOperatorMainReady(t *testing.T, origin string) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		response, err := http.Get(origin + "/health/ready")
+		if err != nil {
+			return false
+		}
+		_ = response.Body.Close()
+		return response.StatusCode == http.StatusOK
+	}, 2*time.Second, 10*time.Millisecond, fmt.Sprintf("operator server %s did not become ready", origin))
+}
 
 func TestStaticAssetsCarryStrictHeadersWithoutBearer(t *testing.T) {
 	handler := mustTestHandler(t, nil, []byte("sentinel-browser-secret"))

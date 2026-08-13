@@ -1,0 +1,88 @@
+# Non-secret loopback composition for the local browser control panel. Fields
+# ending in _env are environment-variable names, never credential values.
+mode: development_durable
+gateway:
+  advertised_model: gpt-live-simulator
+  listen_addr: :8080
+  behind_ingress: false
+  voice:
+    role: realtime_voice
+    provider: speech_to_speech
+    url: ws://host.docker.internal:8766/v1/realtime
+    model: deepseek-v4-flash
+    api_key_env: S2S_API_KEY
+  audio:
+    sample_rate: 24000
+    channels: 1
+    bytes_per_sample: 2
+    frame_bytes: 960
+  storage_grace: 30s
+  reconnect:
+    max_retries: 2
+    retry_base: 100ms
+    retry_max: 1s
+    hmac_key_env: LIVE_RECONNECT_HMAC_KEY
+    hmac_key_id: development-durable-reconnect-v1
+    credential_ttl: 5m
+store:
+  database_url_env: DATABASE_URL
+  retention:
+    conversation_ttl: 720h
+    sweep_interval: 1m
+    deletion_batch: 100
+    approval_ttl: 5m
+    hmac_key_env: LIVE_RETENTION_HMAC_KEY
+    hmac_key_id: development-durable-retention-v1
+auth:
+  static_bearer_env: LIVE_STATIC_BEARER_TOKEN
+  static_tenant_id: development
+  static_user_id: durable-browser-demo
+  static_scopes: [realtime, live.admin]
+  allowed_origins: [http://127.0.0.1:3000]
+admission:
+  max_sessions: 250
+  max_sessions_per_tenant: 100
+  max_sessions_per_user: 10
+safety:
+  policy_version: static-v1
+  mode: enforce
+  privacy_hmac_key_env: LIVE_PRIVACY_HMAC_KEY
+telemetry:
+  service_name: gpt-live
+  protocol: http/protobuf
+admin:
+  listen_addr: 127.0.0.1:9090
+shutdown:
+  gateway_drain_timeout: 30s
+  worker_drain_timeout: 120s
+  cleanup_timeout: 5s
+worker:
+  concurrency: 4
+  lease_duration: 30s
+  heartbeat_interval: 10s
+  poll_interval: 1s
+  request_timeout: 30s
+  retry_base: 1s
+  retry_max: 30s
+  max_retries: 3
+  max_output_bytes: 1048576
+  max_tool_rounds: 8
+  reasoner:
+    role: async_gpt_5_5
+    provider: deepseek
+    base_url: https://api.deepseek.com
+    model: deepseek-v4-flash
+    api_key_env: DEEPSEEK_API_KEY
+features:
+  handoffs: true
+  side_effecting_tools: false
+  tool_encryption_key_env: LIVE_TOOL_ENCRYPTION_KEY
+  tool_encryption_key_id: development-durable-tools-v1
+  runtime_refresh_interval: 1s
+tools:
+  web_search:
+    enabled: true
+    force_strict: true
+    regions: [wt-wt, us-en, uk-en, au-en, ca-en, cn-zh]
+    max_results: 5
+    timeout: 8s

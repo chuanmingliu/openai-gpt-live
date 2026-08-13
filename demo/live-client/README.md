@@ -15,6 +15,18 @@ The interactive menu offers:
 3. **Check status** — checks browser, gateway, and worker readiness.
 4. **Stop demo** — stops the wizard-owned browser and, when authorized, the
    durable Compose services without deleting the PostgreSQL volume.
+5. **Browser control panel** — explicitly starts the local-only BFF operator
+   surface at **[http://127.0.0.1:3000/setup](http://127.0.0.1:3000/setup)**;
+   services remain stopped until you choose a fixed action in the page.
+
+The Browser control panel keeps every credential in the terminal or server
+environment. The browser can control only the fixed services Speech,
+PostgreSQL, Gateway, Worker, and Client; it cannot choose a command, path,
+URL, model, environment name, or credential. Worker is optional for
+voice-only use and is required for durable asynchronous tools. Stop owned
+dependencies in this order: Client, Worker, Gateway, PostgreSQL, then Speech.
+Shutdown does not delete the PostgreSQL volume. `/setup` is for local
+development only, not production administration or release evidence.
 
 ## Recommended first run
 
@@ -56,6 +68,10 @@ gateway connection.
 Full mode requires Go, Docker Compose, `curl`, `jq`, `openssl`, a reviewed
 speech-service image/configuration, and valid speech/DeepSeek credentials.
 Client-only mode requires Go, `curl`, and an already-running loopback gateway.
+Control-panel mode additionally uses the fixed external speech installation
+at `ws://127.0.0.1:8766/v1/realtime`. Its private `.env.local` must be mode
+`0600`; the checked-in launcher creates and removes a private non-secret
+runtime profile pinned to loopback port 8766.
 
 For manual audio/barge-in acceptance, idle-pool checks, troubleshooting, and
 security details, use the

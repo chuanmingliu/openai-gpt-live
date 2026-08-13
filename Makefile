@@ -22,6 +22,9 @@ demo-live-client:
 test-demo-live-client:
 	go test -race -count=1 ./demo/live-client
 	node --test demo/live-client/web/*.test.mjs
+	python3 deploy/scripts/test-operator-speech-launcher.py
+	./deploy/scripts/test-demo-wizard.sh
+	./deploy/scripts/test-durable-compose.sh
 
 # Builds and validates every deployable artifact. Tool absence is an explicit
 # prerequisite failure; the validator never silently skips a deployment gate.

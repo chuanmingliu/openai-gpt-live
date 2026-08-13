@@ -16,6 +16,16 @@ grep -F 'demo-wizard:' "$root/Makefile" >/dev/null || fail "Makefile demo-wizard
 mkdir -p "$scratch/bin" "$scratch/state"
 speech_config="$scratch/speech.yaml"
 printf '%s\n' 'transport: websocket' >"$speech_config"
+operator_speech_root="$scratch/operator-speech"
+mkdir -p "$operator_speech_root/configs" "$operator_speech_root/bin"
+operator_speech_profile="$operator_speech_root/configs/tencent-deepseek-minimax.json"
+operator_speech_env="$operator_speech_root/.env.local"
+operator_speech_executable="$operator_speech_root/bin/speech-to-speech"
+printf '%s\n' '{"mode":"realtime","ws_port":8765}' >"$operator_speech_profile"
+printf '%s\n' 'DEEPSEEK_API_KEY=test-only' >"$operator_speech_env"
+printf '%s\n' '#!/bin/sh' 'exit 0' >"$operator_speech_executable"
+chmod 600 "$operator_speech_profile" "$operator_speech_env"
+chmod 700 "$operator_speech_executable"
 
 cat >"$scratch/bin/go" <<'EOF'
 #!/usr/bin/env bash
@@ -25,6 +35,10 @@ if [[ "$*" == 'run ./cmd/live-gateway config-hash --config deploy/config/develop
   printf '%s\n' 'v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
   exit 0
 fi
+if [[ "$*" == 'run ./cmd/live-gateway config-hash --config deploy/config/development-control-panel.yaml' ]]; then
+  printf '%s\n' 'v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+  exit 0
+fi
 if [[ "${1:-}" == 'build' && "${2:-}" == '-o' ]]; then
   output=$3
   cat >"$output" <<'SCRIPT'
@@ -32,10 +46,17 @@ if [[ "${1:-}" == 'build' && "${2:-}" == '-o' ]]; then
 set -euo pipefail
 printf '%s\n' "live-client $*" >>"${0}.calls"
 [[ -n "${LIVE_DEMO_BEARER:-}" ]] || exit 91
-for forbidden in POSTGRES_PASSWORD S2S_API_KEY DEEPSEEK_API_KEY LIVE_STATIC_BEARER_TOKEN LIVE_ADMIN_BEARER_TOKEN LIVE_PRIVACY_HMAC_KEY LIVE_RETENTION_HMAC_KEY LIVE_RECONNECT_HMAC_KEY LIVE_TOOL_ENCRYPTION_KEY; do
-  [[ -z "${!forbidden:-}" ]] || exit 94
-done
+if [[ "$*" != *'-operator'* ]]; then
+  for forbidden in POSTGRES_PASSWORD S2S_API_KEY DEEPSEEK_API_KEY LIVE_STATIC_BEARER_TOKEN LIVE_ADMIN_BEARER_TOKEN LIVE_PRIVACY_HMAC_KEY LIVE_RETENTION_HMAC_KEY LIVE_RECONNECT_HMAC_KEY LIVE_TOOL_ENCRYPTION_KEY; do
+    [[ -z "${!forbidden:-}" ]] || exit 94
+  done
+fi
 [[ "$*" == *'-model gpt-live-simulator'* || "$*" == *'-model client-model'* ]] || exit 92
+if [[ "$*" == *'-operator'* ]]; then
+  for required in POSTGRES_PASSWORD S2S_API_KEY DEEPSEEK_API_KEY LIVE_STATIC_BEARER_TOKEN LIVE_ADMIN_BEARER_TOKEN LIVE_PRIVACY_HMAC_KEY LIVE_RETENTION_HMAC_KEY LIVE_RECONNECT_HMAC_KEY LIVE_TOOL_ENCRYPTION_KEY LIVE_EXPECTED_CONFIG_HASH; do
+    [[ -n "${!required:-}" ]] || exit 95
+  done
+fi
 trap 'exit 0' TERM INT
 while :; do sleep 1; done
 SCRIPT
@@ -108,6 +129,10 @@ run_wizard() {
   : >"$scratch/$name.calls"
   DEMO_TEST_CALLS="$scratch/$name.calls" \
   DEMO_WIZARD_STATE_DIR="$scratch/state-$name" \
+  DEMO_OPERATOR_SPEECH_ROOT="$operator_speech_root" \
+  DEMO_OPERATOR_SPEECH_PROFILE="$operator_speech_profile" \
+  DEMO_OPERATOR_SPEECH_ENV="$operator_speech_env" \
+  DEMO_OPERATOR_SPEECH_EXECUTABLE="$operator_speech_executable" \
   PATH="$scratch/bin:/usr/bin:/bin" \
   "$root/deploy/scripts/demo-wizard.sh" \
     >"$scratch/$name.out" 2>"$scratch/$name.err" <<<"$input"
@@ -145,6 +170,22 @@ grep -F 'worker: ready' "$scratch/status.out" >/dev/null || fail "status omitted
 
 run_wizard stop $'4\npostgres-password-sentinel\n'
 grep -Fx 'durable-demo-down' "$scratch/stop.calls" >/dev/null || fail "stop mode skipped durable shutdown"
+
+control_input=$(printf '5\n%s\n%s\n%s\n%s\n' \
+  'postgres-password-sentinel' 'local-bearer-sentinel' 'speech-key-sentinel' 'deepseek-key-sentinel')
+run_wizard control "$control_input"
+grep -F 'http://127.0.0.1:3000/setup' "$scratch/control.out" >/dev/null || fail "control-panel mode omitted the setup URL"
+grep -F -- '-operator -operator-state-dir' "$scratch/state-control/live-client.calls" >/dev/null || fail "control-panel mode did not explicitly enable local operator controls"
+grep -F -- '-operator-speech-ready-url http://127.0.0.1:8766/v1/pool' "$scratch/state-control/live-client.calls" >/dev/null || fail "control-panel mode did not fix external speech readiness"
+grep -F -- '-operator-repository-root' "$scratch/state-control/live-client.calls" >/dev/null || fail "control-panel mode omitted the fixed repository root"
+if grep -F 'durable-demo-' "$scratch/control.calls" >/dev/null || grep -F 'docker ' "$scratch/control.calls" >/dev/null; then
+  fail "control-panel mode performed live service operations before browser authorization"
+fi
+for secret in postgres-password-sentinel local-bearer-sentinel speech-key-sentinel deepseek-key-sentinel; do
+  if grep -F "$secret" "$scratch/state-control/live-client.calls" "$scratch/control.out" "$scratch/control.err"; then
+    fail "control-panel mode placed a secret in argv or output"
+  fi
+done
 
 : >"$scratch/failure.calls"
 if DEMO_TEST_CALLS="$scratch/failure.calls" DEMO_TEST_CURL_EXIT=22 \

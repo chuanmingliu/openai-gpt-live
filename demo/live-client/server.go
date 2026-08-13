@@ -261,10 +261,26 @@ func defaultDialUpstream(ctx context.Context, endpoint *url.URL, header http.Hea
 }
 
 func run(ctx context.Context, cfg demoConfig, bearer []byte) error {
-	handler, err := newHandlerWithContext(ctx, cfg, bearer, defaultDialUpstream)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	serverContext, stopServer := context.WithCancel(ctx)
+	defer stopServer()
+	if cfg.Operator.Enabled {
+		cfg.Operator.ClientStop = func(context.Context) error {
+			stopServer()
+			return nil
+		}
+	}
+	handler, err := newHandlerWithContext(serverContext, cfg, bearer, defaultDialUpstream)
 	if err != nil {
 		return err
 	}
+	demo, ok := handler.(*demoHandler)
+	if !ok {
+		return errors.New("demo handler unavailable")
+	}
+	defer closeOperatorRunner(demo.operator)
 	listener, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
 		return errors.New("listen demo server")
@@ -278,17 +294,40 @@ func run(ctx context.Context, cfg demoConfig, bearer []byte) error {
 	shutdownComplete := make(chan struct{})
 	go func() {
 		defer close(shutdownComplete)
-		<-ctx.Done()
+		<-serverContext.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = server.Shutdown(shutdown)
 	}()
 	serveErr := server.Serve(listener)
-	if ctx.Err() != nil {
+	if serverContext.Err() != nil {
 		<-shutdownComplete
+		shutdownOwnedOperator(demo.operator)
 	}
-	if errors.Is(serveErr, http.ErrServerClosed) && ctx.Err() != nil {
+	if errors.Is(serveErr, http.ErrServerClosed) && serverContext.Err() != nil {
 		return nil
 	}
 	return serveErr
+}
+
+func shutdownOwnedOperator(supervisor *operatorSupervisor) {
+	if supervisor == nil || supervisor.runner == nil {
+		return
+	}
+	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, component := range []operatorComponent{componentWorker, componentGateway, componentPostgres, componentSpeech} {
+		if supervisor.runner.Owned(component) {
+			_ = supervisor.Apply(shutdown, component, actionStop)
+		}
+	}
+}
+
+func closeOperatorRunner(supervisor *operatorSupervisor) {
+	if supervisor == nil {
+		return
+	}
+	if runner, ok := supervisor.runner.(*localOperatorRunner); ok && runner.stateRoot != nil {
+		_ = runner.stateRoot.Close()
+	}
 }

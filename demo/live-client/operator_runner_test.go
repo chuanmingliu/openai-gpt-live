@@ -112,11 +112,24 @@ func TestLocalOperatorRunnerRejectsUnsafeStartupConfiguration(t *testing.T) {
 			componentSpeech: "http://127.0.0.1:8765/v1/pool", componentGateway: "http://127.0.0.1:19090/health/ready", componentWorker: "http://127.0.0.1:19091/health/ready", componentClient: "http://127.0.0.1:3000/health/ready",
 		},
 	}
+	externalRoot := t.TempDir()
+	externalProfile := filepath.Join(externalRoot, "external-profile.yaml")
+	require.NoError(t, os.WriteFile(externalProfile, []byte("{}\n"), 0o600))
 	for name, mutate := range map[string]func(*operatorConfig){
 		"remote readiness":             func(cfg *operatorConfig) { cfg.Readiness[componentSpeech] = "https://example.com/secret-url" },
 		"relative executable":          func(cfg *operatorConfig) { cfg.SpeechCommand = "tools/speech-launcher.sh" },
 		"out of root profile":          func(cfg *operatorConfig) { cfg.SpeechProfile = filepath.Join(t.TempDir(), "outside-profile") },
 		"missing server configuration": func(cfg *operatorConfig) { cfg.SpeechProfile = "" },
+		"profile outside fixed speech root": func(cfg *operatorConfig) {
+			cfg.SpeechRoot = externalRoot
+			cfg.SpeechProfile = profile
+		},
+		"symlinked speech trust root": func(cfg *operatorConfig) {
+			link := filepath.Join(t.TempDir(), "speech-root-link")
+			require.NoError(t, os.Symlink(externalRoot, link))
+			cfg.SpeechRoot = link
+			cfg.SpeechProfile = externalProfile
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg := base
@@ -846,6 +859,32 @@ func TestLocalOperatorRunnerClassifiesEveryMissingStartupRequirementWithoutSecre
 	}
 }
 
+func TestLocalOperatorRunnerControlPanelGatewayDoesNotRequireContainerSpeechInputs(t *testing.T) {
+	root, speech, profile := newRunnerRepository(t)
+	for _, name := range []string{"POSTGRES_PASSWORD", "S2S_API_KEY", "LIVE_STATIC_BEARER_TOKEN", "LIVE_ADMIN_BEARER_TOKEN", "LIVE_PRIVACY_HMAC_KEY", "LIVE_RETENTION_HMAC_KEY", "LIVE_RECONNECT_HMAC_KEY", "LIVE_TOOL_ENCRYPTION_KEY", "LIVE_EXPECTED_CONFIG_HASH"} {
+		t.Setenv(name, "test-only")
+	}
+	_ = os.Unsetenv("S2S_IMAGE")
+	_ = os.Unsetenv("S2S_CONFIG_PATH")
+	var calls atomic.Int32
+	runnerInterface, err := newLocalOperatorRunner(operatorConfig{Enabled: true, StateDir: filepath.Join(t.TempDir(), "state"), RepositoryRoot: root, SpeechCommand: speech, SpeechProfile: profile, Readiness: fixedReadiness()}, func(context.Context, string, ...string) *exec.Cmd {
+		calls.Add(1)
+		return exec.Command("sh", "-c", "exit 0")
+	}, func(context.Context, string) bool { return true })
+	require.NoError(t, err)
+	runner := runnerInterface.(*localOperatorRunner)
+	var identityCalls atomic.Int32
+	runner.composeIdentity = func(context.Context, operatorComponent) (string, bool, error) {
+		if identityCalls.Add(1) == 1 {
+			return "", false, nil
+		}
+		return "fixed-control-panel-gateway-id", true, nil
+	}
+	runner.identityTimeout = 20 * time.Millisecond
+	require.NoError(t, runner.Run(t.Context(), fixedOperation{Component: componentGateway, Action: actionStart}))
+	assert.Positive(t, calls.Load())
+}
+
 func TestLocalOperatorRunnerStopPathsNeedNoStartupCredentials(t *testing.T) {
 	setRequiredOperatorEnvironment(t)
 	runner := newTestLocalOperatorRunner(t, nil)
@@ -1044,7 +1083,10 @@ func TestLocalOperatorRunnerFreshPostgresStartReadyMigrateWithoutDocker(t *testi
 	require.NoError(t, err)
 	runner := runnerInterface.(*localOperatorRunner)
 	t.Cleanup(func() { _ = runner.stateRoot.Close() })
-	supervisor := newOperatorSupervisor(runner, 5*time.Second)
+	// The full repository race suite can heavily delay subprocess scheduling on
+	// constrained hosts; keep the product deadlines unchanged and give this
+	// fake-process integration boundary enough test-only headroom.
+	supervisor := newOperatorSupervisor(runner, 20*time.Second)
 	startStatus := supervisor.Apply(t.Context(), componentPostgres, actionStart)
 	assert.Equal(t, "ready", startStatus.State, startStatus)
 	migrateStatus := supervisor.Apply(t.Context(), componentPostgres, actionMigrate)
