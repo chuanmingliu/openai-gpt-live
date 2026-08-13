@@ -33,7 +33,7 @@ const STATE_COPY = Object.freeze({
 const UNKNOWN = Object.freeze({state: 'unknown', code: 'unknown', ready: false, busy: false});
 
 function initialSnapshot() {
-  return {migrated: false, components: new Map(COMPONENTS.map((component) => [component, {...UNKNOWN}]))};
+  return new Map(COMPONENTS.map((component) => [component, {...UNKNOWN}]));
 }
 
 function statusIsValid(value, expectedComponent) {
@@ -49,7 +49,7 @@ function statusIsValid(value, expectedComponent) {
 
 function decodeSnapshot(value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)
-      || Object.keys(value).length !== 2 || typeof value.migrated !== 'boolean' || !Array.isArray(value.components)
+      || Object.keys(value).length !== 1 || !Array.isArray(value.components)
       || value.components.length !== COMPONENTS.length) return null;
   const result = new Map();
   for (const status of value.components) {
@@ -59,7 +59,7 @@ function decodeSnapshot(value) {
       state: status.state, code: status.code, ready: status.ready, busy: status.busy,
     });
   }
-  return result.size === COMPONENTS.length ? {migrated: value.migrated, components: result} : null;
+  return result.size === COMPONENTS.length ? result : null;
 }
 
 function decodeActionStatus(value) {
@@ -68,17 +68,17 @@ function decodeActionStatus(value) {
   return {component: value.component, status: {state: value.state, code: value.code, ready: value.ready, busy: value.busy}};
 }
 
-function createModel(snapshot, localBusy) {
-  const ready = (component) => snapshot.components.get(component)?.ready === true;
+function createModel(snapshot, localBusy, migrationConfirmed) {
+  const ready = (component) => snapshot.get(component)?.ready === true;
   const actionInFlight = localBusy.size > 0;
   return {
     components: COMPONENTS.map((component) => {
-      const status = snapshot.components.get(component) || UNKNOWN;
+      const status = snapshot.get(component) || UNKNOWN;
       const busy = localBusy.has(component) || status.busy;
       const dependenciesReady = DEPENDENCIES[component].every(ready)
-        && (!['gateway', 'worker'].includes(component) || snapshot.migrated);
+        && (!['gateway', 'worker'].includes(component) || migrationConfirmed);
       const dependantsStopped = DEPENDANTS[component].every((dependant) => !ready(dependant)
-        && !localBusy.has(dependant) && !snapshot.components.get(dependant)?.busy);
+        && !localBusy.has(dependant) && !snapshot.get(dependant)?.busy);
       const actions = {
         start: !actionInFlight && !busy && !status.ready && dependenciesReady,
         stop: !actionInFlight && !busy && status.ready && dependantsStopped,
@@ -97,9 +97,9 @@ function createModel(snapshot, localBusy) {
   };
 }
 
-function fixedFailure(dom, snapshot, localBusy, message) {
+function fixedFailure(dom, snapshot, localBusy, migrationConfirmed, message) {
   dom.announce(message);
-  dom.render(createModel(snapshot, localBusy));
+  dom.render(createModel(snapshot, localBusy, migrationConfirmed));
   dom.setVoiceDemo(false);
 }
 
@@ -110,6 +110,7 @@ export function createSetupController({fetch, timers, dom}) {
     throw new TypeError('setup controller requires fetch, timer, and DOM ports');
   }
   let snapshot = initialSnapshot();
+  let migrationConfirmed = false;
   const localBusy = new Set();
   const actionControllers = new Set();
   let poll = null;
@@ -119,7 +120,7 @@ export function createSetupController({fetch, timers, dom}) {
   let destroyed = false;
 
   const render = () => {
-    const model = createModel(snapshot, localBusy);
+    const model = createModel(snapshot, localBusy, migrationConfirmed);
     dom.render(model);
     dom.setVoiceDemo(model.readyForVoiceDemo);
   };
@@ -132,7 +133,8 @@ export function createSetupController({fetch, timers, dom}) {
   };
   const failClosed = (message) => {
     snapshot = initialSnapshot();
-    fixedFailure(dom, snapshot, localBusy, message);
+    migrationConfirmed = false;
+    fixedFailure(dom, snapshot, localBusy, migrationConfirmed, message);
   };
   const applySnapshot = (value) => {
     const decoded = decodeSnapshot(value);
@@ -141,6 +143,7 @@ export function createSetupController({fetch, timers, dom}) {
       return false;
     }
     snapshot = decoded;
+    migrationConfirmed = false;
     render();
     return true;
   };
@@ -188,8 +191,13 @@ export function createSetupController({fetch, timers, dom}) {
           failClosed('Setup action is unavailable.');
           return;
         }
-        snapshot.components.set(decoded.component, decoded.status);
-        if (action === 'migrate' && result.ok && decoded.status.ready && decoded.status.code === 'ready') snapshot.migrated = true;
+        snapshot.set(decoded.component, decoded.status);
+        if (component === 'postgres' && (!decoded.status.ready || decoded.status.state === 'stopped' || decoded.status.state === 'failed')) {
+          migrationConfirmed = false;
+        }
+        if (action === 'migrate') {
+          migrationConfirmed = result.ok && decoded.status.ready && decoded.status.code === 'ready';
+        }
         if (!result.ok) dom.announce(CODE_COPY[decoded.status.code] || 'Setup action is unavailable.');
       } else if (!destroyed && requestEpoch === epoch) {
         failClosed('Setup action is unavailable.');
@@ -221,6 +229,7 @@ export function createSetupController({fetch, timers, dom}) {
     actionControllers.clear();
     localBusy.clear();
     snapshot = initialSnapshot();
+    migrationConfirmed = false;
     render();
   };
   render();

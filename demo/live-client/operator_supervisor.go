@@ -79,14 +79,6 @@ func (supervisor *operatorSupervisor) Snapshot(ctx context.Context) []componentS
 	return statuses
 }
 
-// Migrated reports only the supervisor's fixed local database-migration state.
-// It intentionally exposes no command, configuration, or database detail.
-func (supervisor *operatorSupervisor) Migrated() bool {
-	supervisor.mu.Lock()
-	defer supervisor.mu.Unlock()
-	return supervisor.migrated
-}
-
 func (supervisor *operatorSupervisor) Apply(ctx context.Context, component operatorComponent, action operatorAction) componentStatus {
 	if !validOperation(component, action) || supervisor.runner == nil {
 		return componentStatus{Component: component, State: "failed", Code: "operation_failed"}

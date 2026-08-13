@@ -8,7 +8,6 @@ function snapshot(overrides = {}) {
   const busy = new Set(overrides.busy || []);
   const codes = overrides.codes || {};
   return {
-    migrated: overrides.migrated === true,
     components: COMPONENTS.map((component) => ({
       component,
       state: ready.has(component) ? 'ready' : busy.has(component) ? 'starting' : 'stopped',
@@ -93,10 +92,10 @@ test('polls no faster than every two seconds with only one status request in fli
   assert.equal(timers.take().delay, 2000);
 });
 
-test('requires a migration-ready snapshot before enabling gateway or worker starts', async () => {
+test('status snapshots alone never enable migration-gated starts', async () => {
   const dom = fakeDOM();
   const controller = createSetupController({
-    fetch: async () => response(snapshot({ready: ['speech', 'postgres'], busy: ['gateway']})),
+    fetch: async () => response(snapshot({ready: ['speech', 'postgres']})),
     timers: fakeTimers(), dom,
   });
 
@@ -108,18 +107,27 @@ test('requires a migration-ready snapshot before enabling gateway or worker star
   assert.equal(cards.find((item) => item.component === 'client').actions.start, false);
 });
 
-test('enables durable starts only after migration and keeps stop disabled while a dependant is busy', async () => {
+test('successful current-generation migrate unlocks durable starts, while a busy dependant keeps stops disabled', async () => {
   const dom = fakeDOM();
+  const actions = [response({component: 'postgres', state: 'ready', code: 'ready', ready: true, busy: false})];
   const controller = createSetupController({
-    fetch: async () => response(snapshot({ready: ['speech', 'postgres'], migrated: true, busy: ['gateway']})),
+    fetch: async (url) => url.endsWith('/status')
+      ? response(snapshot({ready: ['speech', 'postgres'], busy: ['gateway']}))
+      : actions.shift(),
     timers: fakeTimers(), dom,
   });
 
+  await controller.applySnapshot(snapshot({ready: ['speech', 'postgres']}));
+  await controller.act('postgres', 'migrate');
+
+  let cards = dom.renders.at(-1).components;
+  assert.equal(cards.find((item) => item.component === 'gateway').actions.start, true);
+  assert.equal(cards.find((item) => item.component === 'worker').actions.start, true);
+
   await controller.refresh();
 
-  const cards = dom.renders.at(-1).components;
+  cards = dom.renders.at(-1).components;
   assert.equal(cards.find((item) => item.component === 'gateway').actions.start, false);
-  assert.equal(cards.find((item) => item.component === 'worker').actions.start, true);
   assert.equal(cards.find((item) => item.component === 'speech').actions.stop, false);
   assert.equal(cards.find((item) => item.component === 'postgres').actions.stop, false);
 });
@@ -167,27 +175,62 @@ test('suppresses double clicks and fences a late poll behind a newer action resp
   assert.equal(dom.renders.at(-1).components[0].state, 'ready');
 });
 
-test('keeps migration-gated starts enabled after a successful migrate action despite a late stale poll', async () => {
+test('failed or late migrate responses never unlock durable starts', async () => {
   const dom = fakeDOM();
   const timers = fakeTimers();
-  const poll = deferred();
+  const delayedMigrate = deferred();
   const controller = createSetupController({
     fetch: (url) => {
-      if (url.endsWith('/status')) return poll.promise;
-      return Promise.resolve(response({component: 'postgres', state: 'ready', code: 'ready', ready: true, busy: false}));
+      if (url.endsWith('/status')) return Promise.resolve(response(snapshot({ready: ['speech', 'postgres']})));
+      return delayedMigrate.promise;
     }, timers, dom,
   });
 
   await controller.applySnapshot(snapshot({ready: ['speech', 'postgres']}));
-  controller.refresh();
-  await controller.act('postgres', 'migrate');
-  poll.resolve(response(snapshot({ready: ['speech', 'postgres']})));
-  await Promise.resolve();
-  await Promise.resolve();
+  const migrate = controller.act('postgres', 'migrate');
+  controller.destroy();
+  delayedMigrate.resolve(response({component: 'postgres', state: 'ready', code: 'ready', ready: true, busy: false}));
+  await migrate;
 
-  const cards = dom.renders.at(-1).components;
-  assert.equal(cards.find((item) => item.component === 'gateway').actions.start, true);
-  assert.equal(cards.find((item) => item.component === 'worker').actions.start, true);
+  let cards = dom.renders.at(-1).components;
+  assert.equal(cards.find((item) => item.component === 'gateway').actions.start, false);
+  assert.equal(cards.find((item) => item.component === 'worker').actions.start, false);
+
+  const failed = createSetupController({
+    fetch: async () => response({component: 'postgres', state: 'failed', code: 'operation_failed', ready: false, busy: false}, false),
+    timers: fakeTimers(), dom: fakeDOM(),
+  });
+  await failed.applySnapshot(snapshot({ready: ['speech', 'postgres']}));
+  await failed.act('postgres', 'migrate');
+
+  cards = failed.dom.renders.at(-1).components;
+  assert.equal(cards.find((item) => item.component === 'gateway').actions.start, false);
+  assert.equal(cards.find((item) => item.component === 'worker').actions.start, false);
+});
+
+test('a fresh status poll and postgres loss relock a prior migration confirmation', async () => {
+  const dom = fakeDOM();
+  const snapshots = [
+    snapshot({ready: ['speech', 'postgres']}),
+    snapshot({ready: ['speech', 'postgres']}),
+    snapshot({ready: ['speech']}),
+  ];
+  const controller = createSetupController({
+    fetch: async (url) => url.endsWith('/status')
+      ? response(snapshots.shift())
+      : response({component: 'postgres', state: 'ready', code: 'ready', ready: true, busy: false}),
+    timers: fakeTimers(), dom,
+  });
+
+  await controller.refresh();
+  await controller.act('postgres', 'migrate');
+  assert.equal(dom.renders.at(-1).components.find((item) => item.component === 'gateway').actions.start, true);
+  await controller.refresh();
+  assert.equal(dom.renders.at(-1).components.find((item) => item.component === 'gateway').actions.start, false);
+  await controller.act('postgres', 'migrate');
+  await controller.refresh();
+  await Promise.resolve();
+  assert.equal(dom.renders.at(-1).components.find((item) => item.component === 'gateway').actions.start, false);
 });
 
 test('uses a valid non-success action status for the requested component but fails closed for another component', async () => {
