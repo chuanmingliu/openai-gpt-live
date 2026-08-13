@@ -9,15 +9,15 @@ cat >"$scratch/docker" <<'EOF'
 #!/bin/sh
 set -eu
 
-expected_database_url='postgres://live:p%40ss%3A%2F%3F%23%25%20with%20space@postgres:5432/live?sslmode=disable'
-[ "${DATABASE_URL-}" = "$expected_database_url" ] || {
-  echo "durable Compose wrapper did not RFC 3986-encode the password" >&2
-  exit 1
-}
+case "$*" in
+  *' ps -q '*|*' rm --stop '*) [ -z "${DATABASE_URL-}" ] || exit 1 ;;
+  *) expected_database_url='postgres://live:p%40ss%3A%2F%3F%23%25%20with%20space@postgres:5432/live?sslmode=disable'; [ "${DATABASE_URL-}" = "$expected_database_url" ] || { echo "durable Compose wrapper did not RFC 3986-encode the password" >&2; exit 1; } ;;
+esac
 case "$*" in
   'compose --project-name gpt-live-durable-demo -f deploy/docker-compose.yml -f deploy/compose.development-durable.yml run --rm --no-deps migrate -check'|\
   'compose --project-name gpt-live-durable-demo -f deploy/docker-compose.yml -f deploy/compose.development-durable.yml up --build --wait --no-deps postgres'|\
   'compose --project-name gpt-live-durable-demo -f deploy/docker-compose.yml -f deploy/compose.development-durable.yml run --rm --no-deps migrate'|\
+  'compose --project-name gpt-live-durable-demo -f deploy/docker-compose.yml -f deploy/compose.development-durable.yml exec postgres pg_isready -U live -d live'|\
   'compose --project-name gpt-live-durable-demo -f deploy/docker-compose.yml -f deploy/compose.development-durable.yml ps -q postgres'|\
   'compose --project-name gpt-live-durable-demo -f deploy/docker-compose.yml -f deploy/compose.development-durable.yml rm --stop --force postgres'|\
   'compose --project-name gpt-live-durable-demo -f deploy/docker-compose.yml -f deploy/compose.development-durable.yml up --build --wait --no-deps gateway'|\
@@ -34,7 +34,7 @@ chmod +x "$scratch/docker"
 PATH="$scratch:$PATH" POSTGRES_PASSWORD='p@ss:/?#% with space' \
   "$root/deploy/scripts/durable-compose.sh" migrate-check
 
-for verb in postgres-start postgres-migrate postgres-id postgres-stop gateway-start gateway-id gateway-stop worker-start worker-id worker-stop; do
+for verb in postgres-start postgres-migrate postgres-ready postgres-id postgres-stop gateway-start gateway-id gateway-stop worker-start worker-id worker-stop; do
   PATH="$scratch:$PATH" POSTGRES_PASSWORD='p@ss:/?#% with space' \
     "$root/deploy/scripts/durable-compose.sh" "$verb"
 done

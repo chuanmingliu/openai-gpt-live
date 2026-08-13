@@ -42,10 +42,13 @@ type localOperatorRunner struct {
 	newCommand commandFactory
 	probe      readinessProbe
 
-	mu           sync.Mutex
-	children     map[operatorComponent]*ownedChild
-	composeOwned map[operatorComponent]string
-	clientOwned  bool
+	mu               sync.Mutex
+	children         map[operatorComponent]*ownedChild
+	composeOwned     map[operatorComponent]string
+	composeEphemeral map[operatorComponent]string
+	clientOwned      bool
+	speechFile       os.FileInfo
+	profileFile      os.FileInfo
 }
 
 type ownedChild struct {
@@ -62,6 +65,8 @@ func newLocalOperatorRunner(cfg operatorConfig, factory commandFactory, probe re
 	root, _ := filepath.EvalSymlinks(cfg.RepositoryRoot)
 	speechCommand, _ := filepath.EvalSymlinks(cfg.SpeechCommand)
 	speechProfile, _ := filepath.EvalSymlinks(cfg.SpeechProfile)
+	speechFile, _ := os.Stat(speechCommand)
+	profileFile, _ := os.Stat(speechProfile)
 	stateParent, _ := filepath.EvalSymlinks(filepath.Dir(cfg.StateDir))
 	cfg.RepositoryRoot, cfg.SpeechCommand, cfg.SpeechProfile = root, speechCommand, speechProfile
 	cfg.StateDir = filepath.Join(stateParent, filepath.Base(cfg.StateDir))
@@ -81,7 +86,7 @@ func newLocalOperatorRunner(cfg operatorConfig, factory commandFactory, probe re
 	cfg.Readiness = readiness
 	return &localOperatorRunner{
 		cfg: cfg, newCommand: factory, probe: probe,
-		children: make(map[operatorComponent]*ownedChild), composeOwned: make(map[operatorComponent]string), clientOwned: cfg.ClientStop != nil,
+		children: make(map[operatorComponent]*ownedChild), composeOwned: make(map[operatorComponent]string), composeEphemeral: make(map[operatorComponent]string), clientOwned: cfg.ClientStop != nil, speechFile: speechFile, profileFile: profileFile,
 	}, nil
 }
 
@@ -158,7 +163,8 @@ func prepareOperatorStateDir(stateDir string) error {
 	}
 	for parent != "." && parent != string(filepath.Separator) {
 		info, err := os.Lstat(parent)
-		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 {
+		unsafeWritable := info.Mode().Perm()&0o022 != 0 && !(info.Mode()&os.ModeSticky != 0 && parent == filepath.Clean(os.TempDir()))
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || unsafeWritable {
 			return errors.New("unsafe operator state directory")
 		}
 		next := filepath.Dir(parent)
@@ -263,6 +269,9 @@ func (runner *localOperatorRunner) startSpeech(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if !runner.revalidateSpeechFiles() {
+		return errOperatorMissingConfiguration
+	}
 	cmd := runner.newCommand(context.Background(), runner.cfg.SpeechCommand, runner.cfg.SpeechProfile)
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	if err := cmd.Start(); err != nil {
@@ -333,15 +342,35 @@ func (runner *localOperatorRunner) runCompose(ctx context.Context, verb string, 
 	}
 	before := ""
 	if component != "" {
-		before = runner.composeID(ctx, component)
+		var exists bool
+		var queryErr error
+		before, exists, queryErr = runner.composeID(ctx, component)
+		if queryErr != nil {
+			return commandFailure(ctx)
+		}
+		if !exists {
+			before = ""
+		}
 	}
 	err := runner.runFixed(ctx, runner.composeCommand(), verb)
 	if component == "" {
 		return err
 	}
-	after := runner.composeID(context.Background(), component)
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), operatorReadinessTimeout)
+	defer cancel()
+	after, exists, queryErr := runner.composeID(cleanupCtx, component)
+	if queryErr != nil {
+		return err
+	}
+	if !exists {
+		after = ""
+	}
 	if after != "" && after != before {
 		if writeErr := runner.writeOwner(component, after); writeErr != nil {
+			runner.mu.Lock()
+			runner.composeOwned[component] = after
+			runner.composeEphemeral[component] = after
+			runner.mu.Unlock()
 			return errOperatorProcessExited
 		}
 		runner.mu.Lock()
@@ -355,29 +384,35 @@ func (runner *localOperatorRunner) stopCompose(ctx context.Context, component op
 	runner.mu.Lock()
 	id, owned := runner.composeOwned[component]
 	runner.mu.Unlock()
-	if !owned || id == "" || !runner.ownerMatches(component, id) || runner.composeID(ctx, component) != id {
-		return errOperatorProcessExited
-	}
 	if !runner.requiredEnvironment(fixedOperation{Component: component, Action: actionStop}) {
 		return errOperatorMissingConfiguration
+	}
+	current, exists, queryErr := runner.composeID(ctx, component)
+	runner.mu.Lock()
+	ephemeral := runner.composeEphemeral[component] == id
+	runner.mu.Unlock()
+	if !owned || id == "" || (!runner.ownerMatches(component, id) && !ephemeral) || queryErr != nil || !exists || current != id {
+		return errOperatorProcessExited
 	}
 	if err := runner.runFixed(ctx, runner.composeCommand(), string(component)+"-stop"); err != nil {
 		return err
 	}
 	runner.mu.Lock()
 	delete(runner.composeOwned, component)
+	delete(runner.composeEphemeral, component)
 	runner.mu.Unlock()
 	_ = os.Remove(runner.ownerPath(component))
 	return nil
 }
 
-func (runner *localOperatorRunner) composeID(ctx context.Context, component operatorComponent) string {
+func (runner *localOperatorRunner) composeID(ctx context.Context, component operatorComponent) (string, bool, error) {
 	cmd := runner.newCommand(ctx, runner.composeCommand(), string(component)+"-id")
 	output, err := cmd.Output()
 	if err != nil {
-		return ""
+		return "", false, err
 	}
-	return strings.TrimSpace(string(output))
+	id := strings.TrimSpace(string(output))
+	return id, id != "", nil
 }
 
 var operatorRequiredEnvironment = map[operatorComponent][]string{
@@ -387,6 +422,9 @@ var operatorRequiredEnvironment = map[operatorComponent][]string{
 }
 
 func (runner *localOperatorRunner) requiredEnvironment(operation fixedOperation) bool {
+	if operation.Action == actionStop {
+		return true
+	}
 	for _, name := range operatorRequiredEnvironment[operation.Component] {
 		if value, ok := os.LookupEnv(name); !ok || value == "" {
 			return false
@@ -412,7 +450,13 @@ func commandFailure(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return errOperatorProcessExited
+	return errors.New("operator operation failed")
+}
+
+func (runner *localOperatorRunner) revalidateSpeechFiles() bool {
+	commandInfo, commandErr := os.Stat(runner.cfg.SpeechCommand)
+	profileInfo, profileErr := os.Stat(runner.cfg.SpeechProfile)
+	return commandErr == nil && profileErr == nil && os.SameFile(commandInfo, runner.speechFile) && os.SameFile(profileInfo, runner.profileFile) && commandInfo.Mode().Perm()&0o111 != 0 && profileInfo.Mode().IsRegular()
 }
 
 func (runner *localOperatorRunner) pidPath(component operatorComponent) string {
