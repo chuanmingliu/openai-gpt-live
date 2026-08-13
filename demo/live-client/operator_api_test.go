@@ -24,8 +24,22 @@ func TestOperatorAPIStatusReturnsOnlyFixedSnapshotSchema(t *testing.T) {
 	require.Equal(t, http.StatusOK, response.Code)
 	assert.Equal(t, "application/json; charset=utf-8", response.Header().Get("Content-Type"))
 	assert.Equal(t, "no-store", response.Header().Get("Cache-Control"))
-	assert.JSONEq(t, `{"components":[{"component":"speech","state":"ready","code":"ready","ready":true,"busy":false},{"component":"postgres","state":"stopped","code":"stopped","ready":false,"busy":false},{"component":"gateway","state":"stopped","code":"stopped","ready":false,"busy":false},{"component":"worker","state":"stopped","code":"stopped","ready":false,"busy":false},{"component":"client","state":"stopped","code":"stopped","ready":false,"busy":false}]}`, response.Body.String())
+	assert.JSONEq(t, `{"migrated":false,"components":[{"component":"speech","state":"ready","code":"ready","ready":true,"busy":false},{"component":"postgres","state":"stopped","code":"stopped","ready":false,"busy":false},{"component":"gateway","state":"stopped","code":"stopped","ready":false,"busy":false},{"component":"worker","state":"stopped","code":"stopped","ready":false,"busy":false},{"component":"client","state":"stopped","code":"stopped","ready":false,"busy":false}]}`, response.Body.String())
 	assertContentFreeOperatorResponse(t, response, "sentinel-browser-secret")
+}
+
+func TestOperatorAPIStatusReportsOnlyMigrationReadiness(t *testing.T) {
+	handler, runner := newOperatorAPIHandler(t)
+	runner.ready[componentPostgres] = true
+
+	response := makeOperatorActionRequest(handler, http.MethodPost, `{"component":"postgres","action":"migrate"}`, "http://127.0.0.1:3000", "application/json")
+	require.Equal(t, http.StatusOK, response.Code)
+
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/operator/status", nil))
+	require.Equal(t, http.StatusOK, response.Code)
+	assert.Contains(t, response.Body.String(), `"migrated":true`)
+	assert.NotContains(t, response.Body.String(), "sentinel-browser-secret")
 }
 
 func TestOperatorAPIActionAcceptsOnlyExactValidJSON(t *testing.T) {

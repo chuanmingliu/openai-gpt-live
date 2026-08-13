@@ -8,6 +8,7 @@ function snapshot(overrides = {}) {
   const busy = new Set(overrides.busy || []);
   const codes = overrides.codes || {};
   return {
+    migrated: overrides.migrated === true,
     components: COMPONENTS.map((component) => ({
       component,
       state: ready.has(component) ? 'ready' : busy.has(component) ? 'starting' : 'stopped',
@@ -92,7 +93,7 @@ test('polls no faster than every two seconds with only one status request in fli
   assert.equal(timers.take().delay, 2000);
 });
 
-test('disables actions while the component is busy and only enables starts after dependencies are ready', async () => {
+test('requires a migration-ready snapshot before enabling gateway or worker starts', async () => {
   const dom = fakeDOM();
   const controller = createSetupController({
     fetch: async () => response(snapshot({ready: ['speech', 'postgres'], busy: ['gateway']})),
@@ -103,8 +104,24 @@ test('disables actions while the component is busy and only enables starts after
 
   const cards = dom.renders.at(-1).components;
   assert.equal(cards.find((item) => item.component === 'gateway').actions.start, false);
-  assert.equal(cards.find((item) => item.component === 'worker').actions.start, true);
+  assert.equal(cards.find((item) => item.component === 'worker').actions.start, false);
   assert.equal(cards.find((item) => item.component === 'client').actions.start, false);
+});
+
+test('enables durable starts only after migration and keeps stop disabled while a dependant is busy', async () => {
+  const dom = fakeDOM();
+  const controller = createSetupController({
+    fetch: async () => response(snapshot({ready: ['speech', 'postgres'], migrated: true, busy: ['gateway']})),
+    timers: fakeTimers(), dom,
+  });
+
+  await controller.refresh();
+
+  const cards = dom.renders.at(-1).components;
+  assert.equal(cards.find((item) => item.component === 'gateway').actions.start, false);
+  assert.equal(cards.find((item) => item.component === 'worker').actions.start, true);
+  assert.equal(cards.find((item) => item.component === 'speech').actions.stop, false);
+  assert.equal(cards.find((item) => item.component === 'postgres').actions.stop, false);
 });
 
 test('uses fixed error-code copy and never renders unknown response strings', async () => {
@@ -148,6 +165,46 @@ test('suppresses double clicks and fences a late poll behind a newer action resp
 
   assert.equal(actionCalls, 1);
   assert.equal(dom.renders.at(-1).components[0].state, 'ready');
+});
+
+test('keeps migration-gated starts enabled after a successful migrate action despite a late stale poll', async () => {
+  const dom = fakeDOM();
+  const timers = fakeTimers();
+  const poll = deferred();
+  const controller = createSetupController({
+    fetch: (url) => {
+      if (url.endsWith('/status')) return poll.promise;
+      return Promise.resolve(response({component: 'postgres', state: 'ready', code: 'ready', ready: true, busy: false}));
+    }, timers, dom,
+  });
+
+  await controller.applySnapshot(snapshot({ready: ['speech', 'postgres']}));
+  controller.refresh();
+  await controller.act('postgres', 'migrate');
+  poll.resolve(response(snapshot({ready: ['speech', 'postgres']})));
+  await Promise.resolve();
+  await Promise.resolve();
+
+  const cards = dom.renders.at(-1).components;
+  assert.equal(cards.find((item) => item.component === 'gateway').actions.start, true);
+  assert.equal(cards.find((item) => item.component === 'worker').actions.start, true);
+});
+
+test('uses a valid non-success action status for the requested component but fails closed for another component', async () => {
+  const dom = fakeDOM();
+  const responses = [
+    response({component: 'gateway', state: 'failed', code: 'dependency_not_ready', ready: false, busy: false}, false),
+    response({component: 'postgres', state: 'ready', code: 'ready', ready: true, busy: false}),
+  ];
+  const controller = createSetupController({fetch: async () => responses.shift(), timers: fakeTimers(), dom});
+
+  await controller.act('gateway', 'start');
+  assert.equal(dom.renders.at(-1).components.find((item) => item.component === 'gateway').status, 'A required service is not ready.');
+  assert.equal(dom.announcements.at(-1), 'A required service is not ready.');
+
+  await controller.act('speech', 'start');
+  assert.equal(dom.renders.at(-1).components.find((item) => item.component === 'postgres').state, 'unknown');
+  assert.equal(dom.announcements.at(-1), 'Setup action is unavailable.');
 });
 
 test('aborts on teardown and recovers from network and malformed response failures without using response content', async () => {

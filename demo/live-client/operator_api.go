@@ -30,6 +30,7 @@ type operatorAPIStatus struct {
 
 type operatorAPISnapshot struct {
 	Components []operatorAPIStatus `json:"components"`
+	Migrated   bool                `json:"migrated"`
 }
 
 func newConfiguredOperatorSupervisor(cfg demoConfig) (*operatorSupervisor, error) {
@@ -53,7 +54,7 @@ func (handler *demoHandler) serveOperatorStatus(writer http.ResponseWriter, requ
 		return
 	}
 	statuses := handler.operator.Snapshot(request.Context())
-	response := operatorAPISnapshot{Components: make([]operatorAPIStatus, 0, len(statuses))}
+	response := operatorAPISnapshot{Components: make([]operatorAPIStatus, 0, len(statuses)), Migrated: handler.operator.Migrated()}
 	for _, status := range statuses {
 		response.Components = append(response.Components, operatorAPIStatus(status))
 	}
