@@ -256,6 +256,17 @@ test('a policy load failure cannot cancel a save already in flight', () => {
   assert.deepEqual(tools.snapshot().policy, disabled);
 });
 
+test('a current load failure replaces a previously enabled policy with the disabled strict fallback', () => {
+  const tools = new ToolState(DEFAULT_POLICY);
+  const loadGeneration = tools.beginPolicyLoad();
+
+  assert.equal(tools.failLoad(loadGeneration), true);
+  assert.deepEqual(tools.snapshot().policy, {
+    web_search: {enabled: false, safe_search: 'strict', region: 'wt-wt', max_results: 5, timeout_ms: 8000},
+  });
+  assert.equal(tools.snapshot().saveStatus, 'error');
+});
+
 test('the latest operation selects Test then later Save success and failure status', () => {
   const tools = new ToolState();
   const disabled = structuredClone(DEFAULT_POLICY);

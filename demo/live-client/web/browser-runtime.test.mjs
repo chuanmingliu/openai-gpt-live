@@ -404,6 +404,58 @@ test('failed policy restore sends disabled fail-closed policy and resumes only a
 	await runtime.stop();
 });
 
+test('a new-session restore failure cannot resend a previously enabled policy or open capture before disabled ack', async () => {
+  let policyLoads = 0;
+  const harness = new BrowserHarness({fetchHandler: async (path) => {
+    if (path !== '/api/tool-policy') return {ok: true, json: async () => ({ok: true})};
+    policyLoads += 1;
+    if (policyLoads === 1) return {ok: true, json: async () => structuredClone(DEFAULT_TOOL_POLICY)};
+    throw new Error('current session restore failure');
+  }});
+  const runtime = createBrowserRuntime(harness.dependencies());
+
+  await runtime.start();
+  harness.server({type: 'session.created'});
+  harness.server({type: 'session.updated'});
+  await new Promise((resolve) => setImmediate(resolve));
+  const enabledUpdate = harness.socket.sent.find(({type}) => type === 'live.tool_policy.update');
+  assert.deepEqual(enabledUpdate.tools, DEFAULT_TOOL_POLICY);
+  harness.server({
+    type: 'live.tool_policy.updated', event_id: enabledUpdate.event_id,
+    tools: enabledUpdate.tools, model: 'deepseek-v4-flash',
+  });
+  await runtime.stop();
+
+  await runtime.start();
+  const second = harness.socket;
+  harness.server({type: 'session.created'}, second);
+  harness.server({type: 'session.updated'}, second);
+  await new Promise((resolve) => setImmediate(resolve));
+  const updates = second.sent.filter(({type}) => type === 'live.tool_policy.update');
+  assert.equal(updates.length, 1);
+  assert.deepEqual(updates[0].tools, {
+    web_search: {enabled: false, safe_search: 'strict', region: 'wt-wt', max_results: 5, timeout_ms: 8000},
+  });
+  assert.equal(updates.some(({tools}) => tools.web_search.enabled), false);
+
+  harness.capture({type: 'frame', pcm: new ArrayBuffer(960)});
+  assert.equal(second.sent.filter(({type}) => type === 'input_audio_buffer.append').length, 0);
+  harness.server({
+    type: 'live.tool_policy.updated', event_id: updates[0].event_id,
+    tools: DEFAULT_TOOL_POLICY, model: 'deepseek-v4-flash',
+  }, second);
+  harness.capture({type: 'frame', pcm: new ArrayBuffer(960)});
+  assert.equal(second.sent.filter(({type}) => type === 'input_audio_buffer.append').length, 0);
+
+  harness.server({
+    type: 'live.tool_policy.updated', event_id: updates[0].event_id,
+    tools: updates[0].tools, model: 'deepseek-v4-flash',
+  }, second);
+  harness.capture({type: 'frame', pcm: new ArrayBuffer(960)});
+  assert.equal(second.sent.filter(({type}) => type === 'input_audio_buffer.append').length, 1);
+  await runtime.stop();
+});
+
 test('gateway canonical SafeSearch tightening activates the exact saved policy', async () => {
 	const requested = structuredClone(DEFAULT_TOOL_POLICY);
 	requested.web_search.safe_search = 'moderate';

@@ -332,7 +332,13 @@ export class ToolState {
 
   failLoad(loadGeneration = this.policyCommitGeneration) {
     if (loadGeneration !== this.policyCommitGeneration) return false;
-    if (this.saveStatus === 'saving' || this.saveStatus === 'awaiting-ack') return false;
+    if (this.saveStatus === 'saving') return false;
+    this.policy = normalizeToolPolicy(DEFAULT_POLICY);
+    this.policyCommitGeneration += 1;
+    this.pendingPolicyEventID = null;
+    this.pendingAcknowledgementPolicy = null;
+    this.pendingAcknowledgementOperation = null;
+    this.deferredLoadedPolicy = null;
     this.saveStatus = 'error';
     return true;
   }
