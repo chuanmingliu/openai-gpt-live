@@ -143,7 +143,8 @@ export function createSetupController({fetch, timers, dom}) {
       return false;
     }
     snapshot = decoded;
-    migrationConfirmed = false;
+    const postgres = snapshot.get('postgres');
+    if (!postgres.ready || postgres.state === 'stopped' || postgres.state === 'failed') migrationConfirmed = false;
     render();
     return true;
   };

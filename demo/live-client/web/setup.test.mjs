@@ -43,9 +43,20 @@ function fakeTimers() {
       callbacks[id - 1] = null;
     },
     take() {
-      return callbacks.shift();
+      while (callbacks.length > 0) {
+        const callback = callbacks.shift();
+        if (callback !== null) return callback;
+      }
+      return null;
     },
   };
+}
+
+async function settle() {
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
 }
 
 function fakeDOM() {
@@ -208,13 +219,38 @@ test('failed or late migrate responses never unlock durable starts', async () =>
   assert.equal(cards.find((item) => item.component === 'worker').actions.start, false);
 });
 
-test('a fresh status poll and postgres loss relock a prior migration confirmation', async () => {
+test('a periodic poll after two seconds preserves migration confirmation while a fresh controller starts locked', async () => {
   const dom = fakeDOM();
+  const timers = fakeTimers();
   const snapshots = [
     snapshot({ready: ['speech', 'postgres']}),
     snapshot({ready: ['speech', 'postgres']}),
-    snapshot({ready: ['speech']}),
   ];
+  const controller = createSetupController({
+    fetch: async (url) => url.endsWith('/status')
+      ? response(snapshots.shift())
+      : response({component: 'postgres', state: 'ready', code: 'ready', ready: true, busy: false}),
+    timers, dom,
+  });
+
+  controller.start();
+  await settle();
+  await controller.act('postgres', 'migrate');
+  assert.equal(dom.renders.at(-1).components.find((item) => item.component === 'gateway').actions.start, true);
+  const timer = timers.take();
+  assert.equal(timer.delay, 2000);
+  timer.callback();
+  await settle();
+  assert.equal(dom.renders.at(-1).components.find((item) => item.component === 'gateway').actions.start, true);
+
+  const fresh = createSetupController({fetch: async () => response(snapshot({ready: ['speech', 'postgres']})), timers: fakeTimers(), dom: fakeDOM()});
+  await fresh.refresh();
+  assert.equal(fresh.dom.renders.at(-1).components.find((item) => item.component === 'gateway').actions.start, false);
+});
+
+test('postgres loss in a later status poll relocks a prior migration confirmation', async () => {
+  const dom = fakeDOM();
+  const snapshots = [snapshot({ready: ['speech', 'postgres']}), snapshot({ready: ['speech']})];
   const controller = createSetupController({
     fetch: async (url) => url.endsWith('/status')
       ? response(snapshots.shift())
@@ -226,10 +262,6 @@ test('a fresh status poll and postgres loss relock a prior migration confirmatio
   await controller.act('postgres', 'migrate');
   assert.equal(dom.renders.at(-1).components.find((item) => item.component === 'gateway').actions.start, true);
   await controller.refresh();
-  assert.equal(dom.renders.at(-1).components.find((item) => item.component === 'gateway').actions.start, false);
-  await controller.act('postgres', 'migrate');
-  await controller.refresh();
-  await Promise.resolve();
   assert.equal(dom.renders.at(-1).components.find((item) => item.component === 'gateway').actions.start, false);
 });
 
