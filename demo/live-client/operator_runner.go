@@ -161,10 +161,17 @@ func prepareOperatorStateDir(stateDir string) error {
 	if err != nil {
 		return errors.New("unsafe operator state directory")
 	}
+	trustedTemp, tempErr := filepath.EvalSymlinks(os.TempDir())
+	if tempErr != nil {
+		return errors.New("unsafe operator state directory")
+	}
 	for parent != "." && parent != string(filepath.Separator) {
 		info, err := os.Lstat(parent)
-		unsafeWritable := info.Mode().Perm()&0o022 != 0 && !(info.Mode()&os.ModeSticky != 0 && parent == filepath.Clean(os.TempDir()))
-		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || unsafeWritable {
+		if err != nil || info == nil {
+			return errors.New("unsafe operator state directory")
+		}
+		unsafeWritable := info.Mode().Perm()&0o022 != 0 && !(info.Mode()&os.ModeSticky != 0 && parent == trustedTemp)
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || unsafeWritable {
 			return errors.New("unsafe operator state directory")
 		}
 		next := filepath.Dir(parent)
@@ -360,7 +367,10 @@ func (runner *localOperatorRunner) runCompose(ctx context.Context, verb string, 
 	defer cancel()
 	after, exists, queryErr := runner.composeID(cleanupCtx, component)
 	if queryErr != nil {
-		return err
+		if err != nil {
+			return err
+		}
+		return errOperatorProcessExited
 	}
 	if !exists {
 		after = ""
@@ -450,7 +460,7 @@ func commandFailure(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return errors.New("operator operation failed")
+	return errOperatorProcessExited
 }
 
 func (runner *localOperatorRunner) revalidateSpeechFiles() bool {
@@ -468,16 +478,21 @@ func (runner *localOperatorRunner) ownerPath(component operatorComponent) string
 }
 
 func (runner *localOperatorRunner) writeOwner(component operatorComponent, id string) error {
-	file, err := os.OpenFile(runner.ownerPath(component), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	path := runner.ownerPath(component)
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 	if _, err := file.WriteString(id + "\n"); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
 		return err
 	}
 	info, err := file.Stat()
 	if err != nil || info.Mode().Perm() != 0o600 {
+		_ = file.Close()
+		_ = os.Remove(path)
 		return errors.New("unsafe operator ownership record")
 	}
 	return nil
@@ -500,10 +515,14 @@ func (runner *localOperatorRunner) writePID(component operatorComponent, child *
 	}
 	defer file.Close()
 	if _, err := file.Write([]byte(strconv.Itoa(child.pid) + " " + child.marker + "\n")); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
 		return err
 	}
 	info, err := file.Stat()
 	if err != nil || info.Mode().Perm() != 0o600 {
+		_ = file.Close()
+		_ = os.Remove(path)
 		return errors.New("unsafe operator pid record")
 	}
 	return nil

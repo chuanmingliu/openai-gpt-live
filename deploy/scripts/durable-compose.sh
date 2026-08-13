@@ -29,7 +29,7 @@ case "${1:-}" in
     set -- run --rm --no-deps migrate
     ;;
   postgres-ready)
-    set -- exec postgres pg_isready -U live -d live
+    set -- exec -T postgres pg_isready -U live -d live
     ;;
   postgres-id)
     set -- ps -q postgres
