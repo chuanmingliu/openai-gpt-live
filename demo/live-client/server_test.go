@@ -61,6 +61,24 @@ func TestJavaScriptAssetsAreServedAsNoStoreJavaScript(t *testing.T) {
 	}
 }
 
+func TestSetupAssetsAreNoStoreAndRejectMutations(t *testing.T) {
+	handler := mustTestHandler(t, nil, []byte("sentinel-browser-secret"))
+	for _, path := range []string{"/setup", "/setup.css", "/setup.mjs"} {
+		path := path
+		t.Run(path, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "http://127.0.0.1:3000"+path, nil))
+			assert.Equal(t, http.StatusMethodNotAllowed, response.Code)
+			assert.Equal(t, "no-store", response.Header().Get("Cache-Control"))
+			assert.Contains(t, response.Header().Get("Content-Security-Policy"), "connect-src 'self'")
+			assert.Empty(t, response.Header().Get("Access-Control-Allow-Origin"))
+			assert.NotContains(t, response.Body.String()+fmtHeaders(response.Header()), "sentinel-browser-secret")
+			assert.NotContains(t, response.Body.String()+fmtHeaders(response.Header()), "postgres://")
+			assert.NotContains(t, response.Body.String()+fmtHeaders(response.Header()), "S2S_API_KEY")
+		})
+	}
+}
+
 func TestStaticPageKeepsVoiceControlsVisibleBesideAccessibleToolsDrawer(t *testing.T) {
 	handler := mustTestHandler(t, nil, []byte("sentinel"))
 	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:3000/", nil)

@@ -25,6 +25,7 @@ type demoHandler struct {
 	websocketOrigin string
 	dial            dialUpstream
 	tools           *toolPolicyStore
+	operator        *operatorSupervisor
 }
 
 func newHandler(cfg demoConfig, bearer []byte, dial dialUpstream) (http.Handler, error) {
@@ -61,6 +62,10 @@ func newHandlerWithToolSearch(cfg demoConfig, bearer []byte, dial dialUpstream, 
 	if err != nil {
 		return nil, err
 	}
+	operator, err := newConfiguredOperatorSupervisor(cfg)
+	if err != nil {
+		return nil, errors.New("demo operator is unavailable")
+	}
 	return &demoHandler{
 		cfg:             cfg,
 		bearer:          append([]byte(nil), bearer...),
@@ -68,12 +73,17 @@ func newHandlerWithToolSearch(cfg demoConfig, bearer []byte, dial dialUpstream, 
 		websocketOrigin: websocketScheme + "://" + origin.Host,
 		dial:            dial,
 		tools:           tools,
+		operator:        operator,
 	}, nil
 }
 
 func (handler *demoHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	setBrowserHeaders(writer.Header(), handler.websocketOrigin)
 	switch request.URL.Path {
+	case "/api/operator/status":
+		handler.serveOperatorStatus(writer, request)
+	case "/api/operator/action":
+		handler.serveOperatorAction(writer, request)
 	case "/api/tool-policy":
 		handler.serveToolPolicy(writer, request)
 	case "/api/tool-policy/test":
@@ -90,6 +100,24 @@ func (handler *demoHandler) ServeHTTP(writer http.ResponseWriter, request *http.
 			return
 		}
 		handler.serveAsset(writer, "web/styles.css", "text/css; charset=utf-8")
+	case "/setup":
+		if request.Method != http.MethodGet {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		handler.serveAsset(writer, "web/setup.html", "text/html; charset=utf-8")
+	case "/setup.css":
+		if request.Method != http.MethodGet {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		handler.serveAsset(writer, "web/setup.css", "text/css; charset=utf-8")
+	case "/setup.mjs":
+		if request.Method != http.MethodGet {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		handler.serveAsset(writer, "web/setup.mjs", "text/javascript; charset=utf-8")
 	case "/audio-core.mjs":
 		if request.Method != http.MethodGet {
 			writer.WriteHeader(http.StatusMethodNotAllowed)
