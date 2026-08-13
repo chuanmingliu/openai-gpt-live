@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Voice demo setup</title>
+  <link rel="stylesheet" href="/setup.css">
+  <script type="module" src="/setup.mjs"></script>
+</head>
+<body>
+  <main class="setup-shell">
+    <header>
+      <p class="eyebrow">LOCAL DEMO SETUP</p>
+      <h1>Bring the voice demo online</h1>
+      <p class="lede">Start the local services in order. This page only controls the reviewed local operator.</p>
+    </header>
+    <p id="setup-announcement" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
+    <ol class="setup-grid" aria-label="Local demo components">
+      <li class="setup-card" data-component="speech" data-state="unknown" aria-busy="false">
+        <h2>Speech</h2><p data-status>Status unavailable.</p>
+        <div class="actions"><button type="button" data-action="start" disabled>Start</button><button type="button" data-action="stop" disabled>Stop</button></div>
+      </li>
+      <li class="setup-card" data-component="postgres" data-state="unknown" aria-busy="false">
+        <h2>PostgreSQL</h2><p data-status>Status unavailable.</p>
+        <div class="actions"><button type="button" data-action="start" disabled>Start</button><button type="button" data-action="migrate" disabled>Migrate</button><button type="button" data-action="stop" disabled>Stop</button></div>
+      </li>
+      <li class="setup-card" data-component="gateway" data-state="unknown" aria-busy="false">
+        <h2>Gateway</h2><p data-status>Status unavailable.</p>
+        <div class="actions"><button type="button" data-action="start" disabled>Start</button><button type="button" data-action="stop" disabled>Stop</button></div>
+      </li>
+      <li class="setup-card" data-component="worker" data-state="unknown" aria-busy="false">
+        <h2>Worker <span>(optional)</span></h2><p data-status>Status unavailable.</p>
+        <div class="actions"><button type="button" data-action="start" disabled>Start</button><button type="button" data-action="stop" disabled>Stop</button></div>
+      </li>
+      <li class="setup-card" data-component="client" data-state="unknown" aria-busy="false">
+        <h2>Client</h2><p data-status>Status unavailable.</p>
+        <div class="actions"><button type="button" data-action="start" disabled>Start</button><button type="button" data-action="stop" disabled>Stop</button></div>
+      </li>
+    </ol>
+    <p class="voice-link"><a id="open-voice-demo" aria-disabled="true" tabindex="-1">Open voice demo</a></p>
+  </main>
+</body>
+</html>
