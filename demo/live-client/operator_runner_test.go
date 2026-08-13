@@ -434,6 +434,192 @@ func TestLocalOperatorRunnerAllowsSafeFixedStartForOwnedExistingComposeService(t
 	assert.True(t, runner.Owned(componentPostgres))
 }
 
+func TestLocalOperatorRunnerSupervisorTransfersOwnedRecreationAndStopsOnlyNewIdentity(t *testing.T) {
+	setRequiredOperatorEnvironment(t)
+	const oldID = "worker-owned-old"
+	const newID = "worker-owned-new"
+	var identityMu sync.Mutex
+	identity := oldID
+	var stopCalls atomic.Int32
+	var stoppedID string
+	runner := newTestLocalOperatorRunner(t, func(ctx context.Context, _ string, args ...string) *exec.Cmd {
+		if len(args) == 1 && args[0] == "worker-start" {
+			identityMu.Lock()
+			identity = newID
+			identityMu.Unlock()
+		}
+		if len(args) == 1 && args[0] == "worker-stop" {
+			stopCalls.Add(1)
+			identityMu.Lock()
+			stoppedID = identity
+			identity = ""
+			identityMu.Unlock()
+		}
+		return exec.CommandContext(ctx, "/usr/bin/true")
+	})
+	require.NoError(t, runner.writeOwner(componentWorker, oldID))
+	runner.mu.Lock()
+	runner.composeOwned[componentWorker] = oldID
+	runner.mu.Unlock()
+	runner.composeIdentity = func(context.Context, operatorComponent) (string, bool, error) {
+		identityMu.Lock()
+		defer identityMu.Unlock()
+		return identity, identity != "", nil
+	}
+	runner.probe = func(context.Context, string) bool {
+		identityMu.Lock()
+		defer identityMu.Unlock()
+		return identity != ""
+	}
+	supervisor := newOperatorSupervisor(runner, 100*time.Millisecond)
+	supervisor.migrated = true
+
+	startStatus := supervisor.Apply(t.Context(), componentWorker, actionStart)
+	assert.Equal(t, "ready", startStatus.State, startStatus)
+	assert.True(t, runner.ownerMatches(componentWorker, newID))
+	assert.False(t, runner.ownerMatches(componentWorker, oldID))
+
+	identityMu.Lock()
+	identity = oldID
+	identityMu.Unlock()
+	staleStop := supervisor.Apply(t.Context(), componentWorker, actionStop)
+	assert.Equal(t, "failed", staleStop.State, staleStop)
+	assert.Equal(t, "process_exited", staleStop.Code, staleStop)
+	assert.Zero(t, stopCalls.Load(), "stale ownership must never invoke the fixed Stop command")
+
+	identityMu.Lock()
+	identity = newID
+	identityMu.Unlock()
+	newStop := supervisor.Apply(t.Context(), componentWorker, actionStop)
+	assert.Equal(t, "stopped", newStop.State, newStop)
+	assert.EqualValues(t, 1, stopCalls.Load())
+	assert.Equal(t, newID, stoppedID)
+	assert.False(t, runner.Owned(componentWorker))
+	assert.NoFileExists(t, runner.ownerPath(componentWorker))
+}
+
+func TestLocalOperatorRunnerSupervisorTransfersOwnedRecreationAfterFailureOrTimeout(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		command    string
+		arguments  []string
+		timeout    time.Duration
+		statusCode string
+	}{
+		{name: "failed start", command: "/usr/bin/false", timeout: 100 * time.Millisecond, statusCode: "process_exited"},
+		{name: "timed out start", command: "/bin/sleep", arguments: []string{"5"}, timeout: 15 * time.Millisecond, statusCode: "startup_timeout"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			setRequiredOperatorEnvironment(t)
+			const oldID = "worker-owned-old"
+			const newID = "worker-owned-new-after-partial-start"
+			var identityMu sync.Mutex
+			identity := oldID
+			var stopCalls atomic.Int32
+			runner := newTestLocalOperatorRunner(t, func(ctx context.Context, _ string, args ...string) *exec.Cmd {
+				if len(args) == 1 && args[0] == "worker-start" {
+					identityMu.Lock()
+					identity = newID
+					identityMu.Unlock()
+					return exec.CommandContext(ctx, test.command, test.arguments...)
+				}
+				if len(args) == 1 && args[0] == "worker-stop" {
+					stopCalls.Add(1)
+					identityMu.Lock()
+					identity = ""
+					identityMu.Unlock()
+				}
+				return exec.CommandContext(ctx, "/usr/bin/true")
+			})
+			require.NoError(t, runner.writeOwner(componentWorker, oldID))
+			runner.mu.Lock()
+			runner.composeOwned[componentWorker] = oldID
+			runner.mu.Unlock()
+			runner.composeIdentity = func(context.Context, operatorComponent) (string, bool, error) {
+				identityMu.Lock()
+				defer identityMu.Unlock()
+				return identity, identity != "", nil
+			}
+			runner.probe = func(context.Context, string) bool {
+				identityMu.Lock()
+				defer identityMu.Unlock()
+				return identity != ""
+			}
+			supervisor := newOperatorSupervisor(runner, test.timeout)
+			supervisor.migrated = true
+
+			status := supervisor.Apply(t.Context(), componentWorker, actionStart)
+			assert.Equal(t, "failed", status.State, status)
+			assert.Equal(t, test.statusCode, status.Code, status)
+			assert.Zero(t, stopCalls.Load(), "an already-owned partial recreation remains owned for an explicit Stop")
+			assert.True(t, runner.ownerMatches(componentWorker, newID))
+			assert.False(t, runner.ownerMatches(componentWorker, oldID))
+
+			stopStatus := supervisor.Apply(t.Context(), componentWorker, actionStop)
+			assert.Equal(t, "stopped", stopStatus.State, stopStatus)
+			assert.EqualValues(t, 1, stopCalls.Load())
+			assert.False(t, runner.Owned(componentWorker))
+			assert.NoFileExists(t, runner.ownerPath(componentWorker))
+		})
+	}
+}
+
+func TestLocalOperatorRunnerSupervisorFencesUnresolvedOwnedRecreation(t *testing.T) {
+	setRequiredOperatorEnvironment(t)
+	const oldID = "worker-owned-old"
+	const newID = "worker-owned-new-after-unresolved-start"
+	var identityCalls atomic.Int32
+	var startCalls atomic.Int32
+	var allowResolution atomic.Bool
+	var stopCalls atomic.Int32
+	runner := newTestLocalOperatorRunner(t, func(ctx context.Context, _ string, args ...string) *exec.Cmd {
+		if len(args) == 1 && args[0] == "worker-start" {
+			startCalls.Add(1)
+		}
+		if len(args) == 1 && args[0] == "worker-stop" {
+			stopCalls.Add(1)
+		}
+		return exec.CommandContext(ctx, "/usr/bin/true")
+	})
+	require.NoError(t, runner.writeOwner(componentWorker, oldID))
+	runner.mu.Lock()
+	runner.composeOwned[componentWorker] = oldID
+	runner.mu.Unlock()
+	runner.composeIdentity = func(context.Context, operatorComponent) (string, bool, error) {
+		if identityCalls.Add(1) == 1 {
+			return oldID, true, nil
+		}
+		if allowResolution.Load() {
+			return newID, true, nil
+		}
+		return "", false, errors.New("sentinel unresolved owned recreation")
+	}
+	runner.probe = func(context.Context, string) bool { return true }
+	supervisor := newOperatorSupervisor(runner, 100*time.Millisecond)
+	supervisor.migrated = true
+
+	status := supervisor.Apply(t.Context(), componentWorker, actionStart)
+	assert.Equal(t, "failed", status.State, status)
+	assert.Equal(t, "process_exited", status.Code, status)
+	runner.mu.Lock()
+	pending := runner.composePending[componentWorker]
+	runner.mu.Unlock()
+	assert.True(t, pending)
+	assert.EqualValues(t, 1, startCalls.Load())
+
+	retryStatus := supervisor.Apply(t.Context(), componentWorker, actionStart)
+	assert.Equal(t, "failed", retryStatus.State, retryStatus)
+	assert.Equal(t, "process_exited", retryStatus.Code, retryStatus)
+	assert.EqualValues(t, 1, startCalls.Load(), "pending ownership must fence a second Start before mutation")
+
+	allowResolution.Store(true)
+	stopStatus := supervisor.Apply(t.Context(), componentWorker, actionStop)
+	assert.EqualValues(t, 1, stopCalls.Load())
+	assert.False(t, runner.Owned(componentWorker))
+	assert.NoFileExists(t, runner.ownerPath(componentWorker))
+	assert.NotContains(t, fmt.Sprint(status, retryStatus, stopStatus), "sentinel")
+}
+
 func TestLocalOperatorRunnerPreIdentityFailureNeverStartsService(t *testing.T) {
 	setRequiredOperatorEnvironment(t)
 	var commandCalls atomic.Int32

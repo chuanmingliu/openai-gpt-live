@@ -56,6 +56,7 @@ type localOperatorRunner struct {
 	composeOwned     map[operatorComponent]string
 	composeEphemeral map[operatorComponent]string
 	composePending   map[operatorComponent]bool
+	composeStale     map[operatorComponent]string
 	clientOwned      bool
 	speechFile       os.FileInfo
 	profileFile      os.FileInfo
@@ -72,6 +73,7 @@ type operatorRecordOperations struct {
 	write         func(*os.File, []byte) error
 	syncFile      func(*os.File) error
 	install       func(*os.Root, string, string) error
+	replace       func(*os.Root, string, string) error
 	syncDirectory func(*os.Root) error
 }
 
@@ -119,7 +121,7 @@ func newLocalOperatorRunner(cfg operatorConfig, factory commandFactory, probe re
 		cfg: cfg, newCommand: factory, probe: probe,
 		stateRoot: stateRoot, stateFile: stateFile, records: defaultOperatorRecordOperations(),
 		identityTimeout: operatorReadinessTimeout, identityRetryWait: operatorIdentityRetry, terminateWait: operatorTerminateWait,
-		children: make(map[operatorComponent]*ownedChild), composeOwned: make(map[operatorComponent]string), composeEphemeral: make(map[operatorComponent]string), composePending: make(map[operatorComponent]bool), clientOwned: cfg.ClientStop != nil, speechFile: speechFile, profileFile: profileFile,
+		children: make(map[operatorComponent]*ownedChild), composeOwned: make(map[operatorComponent]string), composeEphemeral: make(map[operatorComponent]string), composePending: make(map[operatorComponent]bool), composeStale: make(map[operatorComponent]string), clientOwned: cfg.ClientStop != nil, speechFile: speechFile, profileFile: profileFile,
 	}
 	runner.composeIdentity = runner.queryComposeIdentity
 	return runner, nil
@@ -137,6 +139,9 @@ func defaultOperatorRecordOperations() operatorRecordOperations {
 		syncFile: (*os.File).Sync,
 		install: func(root *os.Root, temporary, final string) error {
 			return root.Link(temporary, final)
+		},
+		replace: func(root *os.Root, temporary, final string) error {
+			return root.Rename(temporary, final)
 		},
 		syncDirectory: func(root *os.Root) error {
 			directory, err := root.Open(".")
@@ -439,11 +444,9 @@ func (runner *localOperatorRunner) runCompose(ctx context.Context, verb string, 
 	defer cancel()
 	after, exists, queryErr := runner.discoverComposeIdentity(cleanupCtx, component)
 	if queryErr != nil {
-		if before == "" {
-			runner.mu.Lock()
-			runner.composePending[component] = true
-			runner.mu.Unlock()
-		}
+		runner.mu.Lock()
+		runner.composePending[component] = true
+		runner.mu.Unlock()
 		if err != nil {
 			return err
 		}
@@ -470,7 +473,35 @@ func (runner *localOperatorRunner) runCompose(ctx context.Context, verb string, 
 		delete(runner.composePending, component)
 		runner.mu.Unlock()
 	}
+	if before != "" && after != "" && after != before {
+		if transferErr := runner.transferComposeOwnership(component, before, after); transferErr != nil {
+			return errOperatorProcessExited
+		}
+	}
 	return err
+}
+
+func (runner *localOperatorRunner) transferComposeOwnership(component operatorComponent, before, after string) error {
+	runner.mu.Lock()
+	runner.composeOwned[component] = after
+	runner.composeEphemeral[component] = after
+	delete(runner.composePending, component)
+	runner.mu.Unlock()
+	if err := runner.replaceOwner(component, before, after); err != nil {
+		runner.mu.Lock()
+		if runner.composeOwned[component] == after {
+			runner.composeStale[component] = before
+		}
+		runner.mu.Unlock()
+		return err
+	}
+	runner.mu.Lock()
+	if runner.composeOwned[component] == after && runner.composeEphemeral[component] == after {
+		delete(runner.composeEphemeral, component)
+		delete(runner.composeStale, component)
+	}
+	runner.mu.Unlock()
+	return nil
 }
 
 func (runner *localOperatorRunner) composeOwnershipMatches(component operatorComponent, id string) bool {
@@ -505,12 +536,17 @@ func (runner *localOperatorRunner) stopCompose(ctx context.Context, component op
 			runner.mu.Unlock()
 			return nil
 		}
+		if owned && id != "" && current != id {
+			_ = runner.transferComposeOwnership(component, id, current)
+		} else {
+			id, owned = current, true
+			runner.mu.Lock()
+			runner.composeOwned[component] = id
+			runner.composeEphemeral[component] = id
+			delete(runner.composePending, component)
+			runner.mu.Unlock()
+		}
 		id, owned = current, true
-		runner.mu.Lock()
-		runner.composeOwned[component] = id
-		runner.composeEphemeral[component] = id
-		delete(runner.composePending, component)
-		runner.mu.Unlock()
 	} else {
 		current, exists, queryErr = runner.composeID(ctx, component)
 	}
@@ -524,11 +560,16 @@ func (runner *localOperatorRunner) stopCompose(ctx context.Context, component op
 		return err
 	}
 	runner.mu.Lock()
+	staleID := runner.composeStale[component]
 	delete(runner.composeOwned, component)
 	delete(runner.composeEphemeral, component)
 	delete(runner.composePending, component)
+	delete(runner.composeStale, component)
 	runner.mu.Unlock()
 	runner.removeRecordIfMatch(string(component)+".owner", id+"\n")
+	if staleID != "" && staleID != id {
+		runner.removeRecordIfMatch(string(component)+".owner", staleID+"\n")
+	}
 	return nil
 }
 
@@ -636,6 +677,10 @@ func (runner *localOperatorRunner) writeOwner(component operatorComponent, id st
 	return runner.writeRecord(string(component)+".owner", []byte(id+"\n"))
 }
 
+func (runner *localOperatorRunner) replaceOwner(component operatorComponent, before, after string) error {
+	return runner.replaceRecord(string(component)+".owner", before+"\n", []byte(after+"\n"))
+}
+
 func (runner *localOperatorRunner) ownerMatches(component operatorComponent, id string) bool {
 	return runner.recordMatches(string(component)+".owner", id+"\n")
 }
@@ -717,6 +762,72 @@ func (runner *localOperatorRunner) writeRecord(final string, data []byte) error 
 			_ = runner.stateRoot.Remove(final)
 			_ = runner.records.syncDirectory(runner.stateRoot)
 		}
+		return errors.New("operator record unavailable")
+	}
+	return nil
+}
+
+func (runner *localOperatorRunner) replaceRecord(final, expected string, data []byte) error {
+	if !runner.stateUnchanged() {
+		return errors.New("unsafe operator record directory")
+	}
+	existing, err := runner.stateRoot.OpenFile(final, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return errors.New("operator record unavailable")
+	}
+	existingInfo, statErr := existing.Stat()
+	existingData, readErr := io.ReadAll(io.LimitReader(existing, int64(len(expected)+1)))
+	closeErr := existing.Close()
+	if statErr != nil || readErr != nil || closeErr != nil || !existingInfo.Mode().IsRegular() || existingInfo.Mode().Perm() != 0o600 || string(existingData) != expected {
+		return errors.New("unsafe operator record")
+	}
+	marker, err := newOperatorMarker()
+	if err != nil {
+		return errors.New("operator record unavailable")
+	}
+	temporary := "." + final + "." + marker + ".tmp"
+	file, err := runner.stateRoot.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return errors.New("operator record unavailable")
+	}
+	temporaryPresent := true
+	defer func() {
+		_ = file.Close()
+		if temporaryPresent {
+			_ = runner.stateRoot.Remove(temporary)
+		}
+	}()
+	if err := file.Chmod(0o600); err != nil {
+		return errors.New("operator record unavailable")
+	}
+	if err := runner.records.write(file, data); err != nil {
+		return errors.New("operator record unavailable")
+	}
+	temporaryInfo, err := file.Stat()
+	if err != nil || !temporaryInfo.Mode().IsRegular() || temporaryInfo.Mode().Perm() != 0o600 {
+		return errors.New("unsafe operator record")
+	}
+	if err := runner.records.syncFile(file); err != nil {
+		return errors.New("operator record unavailable")
+	}
+	if err := file.Close(); err != nil {
+		return errors.New("operator record unavailable")
+	}
+	currentInfo, currentErr := runner.stateRoot.Lstat(final)
+	if !runner.stateUnchanged() || currentErr != nil || !os.SameFile(existingInfo, currentInfo) {
+		return errors.New("unsafe operator record")
+	}
+	replaceErr := runner.records.replace(runner.stateRoot, temporary, final)
+	finalInfo, finalErr := runner.stateRoot.Lstat(final)
+	installed := finalErr == nil && os.SameFile(temporaryInfo, finalInfo) && finalInfo.Mode().IsRegular() && finalInfo.Mode().Perm() == 0o600
+	if replaceErr != nil && !installed {
+		return errors.New("operator record unavailable")
+	}
+	if !installed {
+		return errors.New("unsafe operator record")
+	}
+	temporaryPresent = false
+	if err := runner.records.syncDirectory(runner.stateRoot); err != nil {
 		return errors.New("operator record unavailable")
 	}
 	return nil
