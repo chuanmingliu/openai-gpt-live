@@ -451,7 +451,7 @@ func (runner *localOperatorRunner) runCompose(ctx context.Context, verb string, 
 	if after == "" && err == nil {
 		return errOperatorProcessExited
 	}
-	if after != "" && after != before {
+	if before == "" && after != "" {
 		if writeErr := runner.writeOwner(component, after); writeErr != nil {
 			runner.mu.Lock()
 			runner.composeOwned[component] = after
@@ -535,12 +535,21 @@ func (runner *localOperatorRunner) composeID(ctx context.Context, component oper
 }
 
 func (runner *localOperatorRunner) discoverComposeIdentity(ctx context.Context, component operatorComponent) (string, bool, error) {
+	consecutiveAbsences := 0
 	for {
 		id, exists, err := runner.composeID(ctx, component)
+		if err == nil && exists {
+			return id, true, nil
+		}
 		if err == nil {
-			return id, exists, nil
+			consecutiveAbsences++
+		} else {
+			consecutiveAbsences = 0
 		}
 		if ctx.Err() != nil {
+			if consecutiveAbsences >= 2 {
+				return "", false, nil
+			}
 			return "", false, ctx.Err()
 		}
 		timer := time.NewTimer(runner.identityRetryWait)
@@ -548,6 +557,9 @@ func (runner *localOperatorRunner) discoverComposeIdentity(ctx context.Context, 
 		case <-ctx.Done():
 			if !timer.Stop() {
 				<-timer.C
+			}
+			if consecutiveAbsences >= 2 {
+				return "", false, nil
 			}
 			return "", false, ctx.Err()
 		case <-timer.C:

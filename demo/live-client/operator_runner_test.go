@@ -270,6 +270,118 @@ func TestLocalOperatorRunnerSupervisorCleansOnlyNewComposeAfterIdentityFailures(
 	}
 }
 
+func TestLocalOperatorRunnerSupervisorCleansFailedStartAfterAbsentThenLateIdentity(t *testing.T) {
+	setRequiredOperatorEnvironment(t)
+	var identityCalls atomic.Int32
+	var stopCalls atomic.Int32
+	runner := newTestLocalOperatorRunner(t, func(ctx context.Context, _ string, args ...string) *exec.Cmd {
+		if len(args) == 1 && args[0] == "postgres-start" {
+			return exec.CommandContext(ctx, "/usr/bin/false")
+		}
+		if len(args) == 1 && args[0] == "postgres-stop" {
+			stopCalls.Add(1)
+		}
+		return exec.CommandContext(ctx, "/usr/bin/true")
+	})
+	runner.identityTimeout = 15 * time.Millisecond
+	runner.identityRetryWait = time.Millisecond
+	runner.composeIdentity = func(context.Context, operatorComponent) (string, bool, error) {
+		switch identityCalls.Add(1) {
+		case 1, 2:
+			return "", false, nil
+		default:
+			return "postgres-late-after-absence", true, nil
+		}
+	}
+
+	status := newOperatorSupervisor(runner, 100*time.Millisecond).Apply(t.Context(), componentPostgres, actionStart)
+	assert.Equal(t, "failed", status.State)
+	assert.Equal(t, "process_exited", status.Code)
+	assert.EqualValues(t, 1, stopCalls.Load())
+	assert.False(t, runner.Owned(componentPostgres))
+}
+
+func TestLocalOperatorRunnerSupervisorPendingCleanupWaitsPastOneAbsenceForLateIdentity(t *testing.T) {
+	setRequiredOperatorEnvironment(t)
+	var identityMu sync.Mutex
+	var initialPostContext context.Context
+	var totalCalls int
+	var cleanupCalls int
+	var stopCalls atomic.Int32
+	runner := newTestLocalOperatorRunner(t, func(ctx context.Context, _ string, args ...string) *exec.Cmd {
+		if len(args) == 1 && args[0] == "postgres-start" {
+			return exec.CommandContext(ctx, "/usr/bin/false")
+		}
+		if len(args) == 1 && args[0] == "postgres-stop" {
+			stopCalls.Add(1)
+		}
+		return exec.CommandContext(ctx, "/usr/bin/true")
+	})
+	runner.identityTimeout = 8 * time.Millisecond
+	runner.identityRetryWait = time.Millisecond
+	runner.composeIdentity = func(ctx context.Context, _ operatorComponent) (string, bool, error) {
+		identityMu.Lock()
+		defer identityMu.Unlock()
+		totalCalls++
+		if totalCalls == 1 {
+			return "", false, nil
+		}
+		if initialPostContext == nil {
+			initialPostContext = ctx
+		}
+		if ctx == initialPostContext {
+			return "", false, errors.New("sentinel initial discovery unavailable")
+		}
+		cleanupCalls++
+		if cleanupCalls == 1 {
+			return "", false, nil
+		}
+		return "postgres-late-after-pending-absence", true, nil
+	}
+
+	status := newOperatorSupervisor(runner, 100*time.Millisecond).Apply(t.Context(), componentPostgres, actionStart)
+	assert.Equal(t, "failed", status.State)
+	assert.Equal(t, "process_exited", status.Code)
+	assert.GreaterOrEqual(t, cleanupCalls, 2)
+	assert.EqualValues(t, 1, stopCalls.Load())
+	assert.False(t, runner.Owned(componentPostgres))
+	assert.NotContains(t, fmt.Sprint(status), "sentinel")
+}
+
+func TestLocalOperatorRunnerNeverClaimsKnownPreExistingIdentityAfterTransientAbsence(t *testing.T) {
+	setRequiredOperatorEnvironment(t)
+	var identityCalls atomic.Int32
+	var stopCalls atomic.Int32
+	runner := newTestLocalOperatorRunner(t, func(ctx context.Context, _ string, args ...string) *exec.Cmd {
+		if len(args) == 1 && args[0] == "postgres-start" {
+			return exec.CommandContext(ctx, "/usr/bin/false")
+		}
+		if len(args) == 1 && args[0] == "postgres-stop" {
+			stopCalls.Add(1)
+		}
+		return exec.CommandContext(ctx, "/usr/bin/true")
+	})
+	runner.identityTimeout = 15 * time.Millisecond
+	runner.identityRetryWait = time.Millisecond
+	runner.composeIdentity = func(context.Context, operatorComponent) (string, bool, error) {
+		switch identityCalls.Add(1) {
+		case 1:
+			return "postgres-pre-existing", true, nil
+		case 2:
+			return "", false, nil
+		default:
+			return "postgres-concurrent-pre-existing", true, nil
+		}
+	}
+
+	status := newOperatorSupervisor(runner, 100*time.Millisecond).Apply(t.Context(), componentPostgres, actionStart)
+	assert.Equal(t, "failed", status.State)
+	assert.Equal(t, "process_exited", status.Code)
+	assert.GreaterOrEqual(t, identityCalls.Load(), int32(3))
+	assert.Zero(t, stopCalls.Load())
+	assert.False(t, runner.Owned(componentPostgres))
+}
+
 func TestLocalOperatorRunnerPreIdentityFailureNeverStartsService(t *testing.T) {
 	setRequiredOperatorEnvironment(t)
 	var commandCalls atomic.Int32
