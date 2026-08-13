@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -113,6 +114,64 @@ func TestOperatorAPIReportsDependencyAndInFlightConflicts(t *testing.T) {
 	<-completed
 }
 
+func TestOperatorAPIFailedActionsUseUnavailableStatus(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		code string
+	}{
+		{name: "missing configuration", err: errOperatorMissingConfiguration, code: "missing_configuration"},
+		{name: "startup timeout", err: context.DeadlineExceeded, code: "startup_timeout"},
+		{name: "operation failure", err: errors.New("private runner output"), code: "operation_failed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler, runner := newOperatorAPIHandler(t)
+			runner.err = test.err
+
+			response := makeOperatorActionRequest(handler, http.MethodPost, `{"component":"speech","action":"start"}`, "http://127.0.0.1:3000", "application/json")
+
+			assert.Equal(t, http.StatusServiceUnavailable, response.Code)
+			assert.JSONEq(t, `{"component":"speech","state":"failed","code":"`+test.code+`","ready":false,"busy":false}`, response.Body.String())
+		})
+	}
+
+	handler, _ := newOperatorAPIHandler(t)
+	response := makeOperatorActionRequest(handler, http.MethodPost, `{"component":"speech","action":"stop"}`, "http://127.0.0.1:3000", "application/json")
+	assert.Equal(t, http.StatusConflict, response.Code)
+	assert.JSONEq(t, `{"component":"speech","state":"failed","code":"process_exited","ready":false,"busy":false}`, response.Body.String())
+}
+
+func TestOperatorAPIActionOutlivesDisconnectedRequest(t *testing.T) {
+	handler, runner := newOperatorAPIHandler(t)
+	serverContext, stopServer := context.WithCancel(context.Background())
+	t.Cleanup(stopServer)
+	handler.operatorContext = serverContext
+	runner.block = make(chan struct{})
+
+	requestContext, disconnect := context.WithCancel(context.Background())
+	request := httptest.NewRequest(http.MethodPost, "/api/operator/action", strings.NewReader(`{"component":"speech","action":"start"}`)).WithContext(requestContext)
+	request.Header.Set("Origin", "http://127.0.0.1:3000")
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	completed := make(chan struct{})
+	go func() {
+		defer close(completed)
+		handler.ServeHTTP(response, request)
+	}()
+	<-runner.started
+	disconnect()
+
+	close(runner.block)
+	select {
+	case <-completed:
+	case <-time.After(time.Second):
+		t.Fatal("operator request did not complete")
+	}
+	assert.Equal(t, http.StatusOK, response.Code)
+	assert.True(t, runner.Ready(context.Background(), componentSpeech))
+	assert.Equal(t, []fixedOperation{{Component: componentSpeech, Action: actionStart}}, runner.operations())
+}
+
 func TestOperatorAPIDisabledModeFailsClosed(t *testing.T) {
 	disabled := mustTestHandler(t, nil, []byte("sentinel-browser-secret"))
 	for _, path := range []string{"/api/operator/status"} {
@@ -182,7 +241,7 @@ func (runner *operatorAPIRunner) Run(ctx context.Context, operation fixedOperati
 	started := runner.started
 	err := runner.err
 	runner.mu.Unlock()
-	if block != nil {
+	if block != nil && operation.Action == actionStart {
 		close(started)
 		select {
 		case <-block:

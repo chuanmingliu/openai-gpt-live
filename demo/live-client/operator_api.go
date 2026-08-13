@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -87,7 +88,11 @@ func (handler *demoHandler) serveOperatorAction(writer http.ResponseWriter, requ
 		writer.WriteHeader(http.StatusUnprocessableEntity)
 		return
 	}
-	status := handler.operator.Apply(request.Context(), action.Component, action.Action)
+	operatorContext := handler.operatorContext
+	if operatorContext == nil {
+		operatorContext = context.Background()
+	}
+	status := handler.operator.Apply(operatorContext, action.Component, action.Action)
 	writeOperatorJSON(writer, operatorActionResponseStatus(status), operatorAPIStatus(status))
 }
 
@@ -154,12 +159,14 @@ func decodeOperatorActionString(decoder *json.Decoder) (string, error) {
 
 func operatorActionResponseStatus(status componentStatus) int {
 	switch status.Code {
+	case "ready", "stopped":
+		return http.StatusOK
 	case "dependency_not_ready", "dependency_running", "operation_in_progress", "process_exited":
 		return http.StatusConflict
-	case "missing_configuration":
+	case "missing_configuration", "startup_timeout", "operation_failed":
 		return http.StatusServiceUnavailable
 	default:
-		return http.StatusOK
+		return http.StatusServiceUnavailable
 	}
 }
 

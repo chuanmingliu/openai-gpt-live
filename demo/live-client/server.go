@@ -26,17 +26,29 @@ type demoHandler struct {
 	dial            dialUpstream
 	tools           *toolPolicyStore
 	operator        *operatorSupervisor
+	operatorContext context.Context
 }
 
 func newHandler(cfg demoConfig, bearer []byte, dial dialUpstream) (http.Handler, error) {
+	return newHandlerWithContext(context.Background(), cfg, bearer, dial)
+}
+
+func newHandlerWithContext(operatorContext context.Context, cfg demoConfig, bearer []byte, dial dialUpstream) (http.Handler, error) {
 	search, err := websearch.New(net.DefaultResolver)
 	if err != nil {
 		return nil, errors.New("demo tool search is unavailable")
 	}
-	return newHandlerWithToolSearch(cfg, bearer, dial, search)
+	return newHandlerWithToolSearchContext(operatorContext, cfg, bearer, dial, search)
 }
 
 func newHandlerWithToolSearch(cfg demoConfig, bearer []byte, dial dialUpstream, search toolSearcher) (http.Handler, error) {
+	return newHandlerWithToolSearchContext(context.Background(), cfg, bearer, dial, search)
+}
+
+func newHandlerWithToolSearchContext(operatorContext context.Context, cfg demoConfig, bearer []byte, dial dialUpstream, search toolSearcher) (http.Handler, error) {
+	if operatorContext == nil {
+		operatorContext = context.Background()
+	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -74,6 +86,7 @@ func newHandlerWithToolSearch(cfg demoConfig, bearer []byte, dial dialUpstream, 
 		dial:            dial,
 		tools:           tools,
 		operator:        operator,
+		operatorContext: operatorContext,
 	}, nil
 }
 
@@ -248,7 +261,7 @@ func defaultDialUpstream(ctx context.Context, endpoint *url.URL, header http.Hea
 }
 
 func run(ctx context.Context, cfg demoConfig, bearer []byte) error {
-	handler, err := newHandler(cfg, bearer, defaultDialUpstream)
+	handler, err := newHandlerWithContext(ctx, cfg, bearer, defaultDialUpstream)
 	if err != nil {
 		return err
 	}
