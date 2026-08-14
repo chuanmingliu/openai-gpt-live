@@ -131,7 +131,7 @@ func TestCurrentSessionOfferFailsReplayablyWhenDisconnectWinsAcceptance(t *testi
 	assert.ErrorIs(t, err, handoff.ErrNoLiveSession)
 }
 
-func TestCurrentSessionReplacementCannotWinBetweenLookupAndVisualAcceptance(t *testing.T) {
+func TestCurrentSessionReplacementAfterEnqueueMakesOldAcceptanceReplayable(t *testing.T) {
 	manager := presentationManager(newSubscriptionRecorder())
 	manager.cfg.EgressBlockTimeout = time.Second
 	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "conversation"}
@@ -155,12 +155,21 @@ func TestCurrentSessionReplacementCannotWinBetweenLookupAndVisualAcceptance(t *t
 	go func() { replaced <- manager.register(newRuntime) }()
 	select {
 	case err := <-replaced:
-		t.Fatalf("replacement won before visual acceptance: %v", err)
-	case <-time.After(20 * time.Millisecond):
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("replacement did not publish after bounded old-runtime enqueue")
 	}
-	message.done <- nil
-	require.NoError(t, <-offered)
-	require.NoError(t, <-replaced)
+	oldRuntime.mu.Lock()
+	require.False(t, oldRuntime.accepting)
+	require.NotEqual(t, message.acceptanceGeneration, oldRuntime.acceptanceGeneration)
+	oldRuntime.mu.Unlock()
+	select {
+	case err := <-offered:
+		t.Fatalf("stale offer completed before the old consumer rejected it: %v", err)
+	default:
+	}
+	message.done <- handoff.ErrNoLiveSession
+	require.ErrorIs(t, <-offered, handoff.ErrNoLiveSession)
 }
 
 func TestCurrentSessionRegistrationAndUnregistrationAreRaceSafe(t *testing.T) {

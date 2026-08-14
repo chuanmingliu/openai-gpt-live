@@ -43,6 +43,21 @@ const (
 	recentPresentationCorrelationLimit   = 8
 )
 
+type ClientEffectCompletedInput struct {
+	Sequence uint64
+	Err      error
+}
+
+func (ClientEffectCompletedInput) isSessionInput() {}
+
+type DurableEffectCompletedInput struct {
+	Sequence uint64
+	Kind     string
+	Err      error
+}
+
+func (DurableEffectCompletedInput) isSessionInput() {}
+
 var (
 	ErrInvalidTransition         = errors.New("invalid session transition")
 	ErrUnsupportedInput          = errors.New("unsupported session input")
@@ -267,6 +282,16 @@ func (r *Reactor) ApplyContext(ctx context.Context, input Input) ([]Effect, erro
 		return effects, err
 	case VoiceCommandCompletedInput:
 		return r.applyVoiceCommandCompleted(typed)
+	case ClientEffectCompletedInput:
+		if typed.Err != nil {
+			return nil, fmt.Errorf("client effect %d failed: %w", typed.Sequence, typed.Err)
+		}
+		return nil, nil
+	case DurableEffectCompletedInput:
+		if typed.Err != nil {
+			return nil, fmt.Errorf("durable %s effect %d failed: %w", typed.Kind, typed.Sequence, typed.Err)
+		}
+		return nil, nil
 	case DurableInput:
 		return r.applyDurable(typed)
 	case TurnCommittedInput:

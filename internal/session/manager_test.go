@@ -2610,7 +2610,10 @@ func TestDispatchFlushFencesActiveAndQueuedResponseControlsBeforeCancelOrTermina
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			client := &gatedResponseControlClient{started: make(chan struct{}), writes: make(chan string, 2), closed: make(chan struct{})}
-			voice := &recordingVoice{sent: make(chan realtime.Command, 2)}
+			// Keep provider Send blocked until the assertion observes it. This
+			// makes the required cancel-before-client-write composition order
+			// deterministic instead of relying on scheduler timing.
+			voice := &recordingVoice{sent: make(chan realtime.Command)}
 			ids := IDs{SessionID: "session", ConversationID: "conversation", Incarnation: 1}
 			state := newRunState(cfg, ids, voice, client, cancel)
 			epoch := state.fence.Advance()
@@ -2762,17 +2765,13 @@ func TestShadowFromStartSuppressesEveryHandoffAcceptanceReinjectionAndReconciles
 	cfg, err := normalizeManagerConfig(Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second, FeatureGates: gates})
 	require.NoError(t, err)
 	state := newRunState(cfg, testIDs(), voice, client, func() {})
-	err = state.dispatchEffectsReconciled(t.Context(), effects, 0, 0, func(completed VoiceCommandCompletedInput) error {
-		_, applyErr := reactor.Apply(completed)
-		return applyErr
-	})
+	err = state.dispatchEffects(t.Context(), effects, 0, 0)
 	require.NoError(t, err)
-	for len(state.inbox) != 0 {
-		message := <-state.inbox
+	for len(state.completions) != 0 {
+		message := <-state.completions
 		completed, ok := message.input.(VoiceCommandCompletedInput)
 		require.True(t, ok)
 		applyOK(t, reactor, completed)
-		state.inboxSlots <- struct{}{}
 	}
 	require.Equal(t, ResponseTerminal, reactor.Snapshot().Response)
 	require.Empty(t, applyOK(t, reactor, accepted), "acceptance durable state must remain resolved")
@@ -2804,7 +2803,7 @@ func TestQueuedHandoffAcceptanceSuppressionReconcilesBeforeProviderSend(t *testi
 	done := make(chan error, 1)
 	go func() { done <- state.voiceWriter(ctx) }()
 	for range 2 {
-		message := <-state.inbox
+		message := <-state.completions
 		completed, ok := message.input.(VoiceCommandCompletedInput)
 		require.True(t, ok)
 		require.True(t, completed.Suppressed)
@@ -3296,6 +3295,115 @@ func TestResponseCreateWaitsForBlockedBargeCancelCompletion(t *testing.T) {
 	cancel()
 	require.ErrorIs(t, <-reactorDone, context.Canceled)
 	require.ErrorIs(t, <-writerDone, context.Canceled)
+}
+
+func TestClientWriterPublishesTypedCompletionOnReservedLane(t *testing.T) {
+	cfg, err := normalizeManagerConfig(Config{ControlEvents: 1, WriterControlEvents: 1, IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := newChannelClient(2)
+	state := newRunState(cfg, testIDs(), &recordingVoice{sent: make(chan realtime.Command, 1)}, client, cancel)
+	<-state.inboxSlots
+	done := make(chan error, 1)
+	go func() { done <- state.clientWriter(ctx) }()
+	_, err = state.dispatchEffectsQueued(ctx, []Effect{{ClientEvent: protocol.SessionCreatedEvent{Type: "session.created"}}}, 0, 0, true)
+	require.NoError(t, err)
+	select {
+	case <-client.writes:
+	case <-time.After(time.Second):
+		t.Fatal("client effect was not written")
+	}
+	select {
+	case completion := <-state.completions:
+		typed, ok := completion.input.(ClientEffectCompletedInput)
+		require.True(t, ok)
+		require.NotZero(t, typed.Sequence)
+		require.NoError(t, typed.Err)
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("client writer did not publish a typed reserved completion")
+	}
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestDurableWriterPublishesTypedCompletionOnReservedLane(t *testing.T) {
+	cfg, err := normalizeManagerConfig(Config{ControlEvents: 1, WriterControlEvents: 1, IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second})
+	require.NoError(t, err)
+	dispatcher := &durableDispatcherFake{
+		trusted: make(chan TrustedSessionContext, 1), transcripts: make(chan TranscriptRequestedEffect, 1), handoffs: make(chan HandoffRequestedEffect, 1),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	state := newRunState(cfg, testIDs(), &recordingVoice{sent: make(chan realtime.Command, 1)}, newChannelClient(1), cancel)
+	state.dispatcher = dispatcher
+	<-state.inboxSlots
+	done := make(chan error, 1)
+	go func() { done <- state.durableWriter(ctx) }()
+	transcript := TranscriptRequestedEffect{Turn: identity.TurnKey{ID: "turn", Revision: 1}, Sequence: 3, Role: "assistant", FinalText: "done"}
+	_, err = state.dispatchEffectsQueued(ctx, []Effect{{Transcript: &transcript}}, 0, 0, true)
+	require.NoError(t, err)
+	select {
+	case <-dispatcher.transcripts:
+	case <-time.After(time.Second):
+		t.Fatal("durable effect was not dispatched")
+	}
+	select {
+	case completion := <-state.completions:
+		typed, ok := completion.input.(DurableEffectCompletedInput)
+		require.True(t, ok)
+		require.NotZero(t, typed.Sequence)
+		require.Equal(t, "transcript", typed.Kind)
+		require.NoError(t, typed.Err)
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("durable writer did not publish a typed reserved completion")
+	}
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestClientWriterPublishesTypedFailureCompletion(t *testing.T) {
+	cfg, err := normalizeManagerConfig(Config{ControlEvents: 1, WriterControlEvents: 1, IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second})
+	require.NoError(t, err)
+	writeErr := errors.New("client write failed")
+	client := &failureClient{reads: make(chan protocol.ClientEvent), readErr: make(chan error), writeErr: make(chan error, 1)}
+	client.writeErr <- writeErr
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	state := newRunState(cfg, testIDs(), &recordingVoice{sent: make(chan realtime.Command, 1)}, client, cancel)
+	done := make(chan error, 1)
+	go func() { done <- state.clientWriter(ctx) }()
+	_, err = state.dispatchEffectsQueued(ctx, []Effect{{ClientEvent: protocol.SessionCreatedEvent{Type: "session.created"}}}, 0, 0, true)
+	require.NoError(t, err)
+	completion := <-state.completions
+	typed, ok := completion.input.(ClientEffectCompletedInput)
+	require.True(t, ok)
+	require.ErrorIs(t, typed.Err, writeErr)
+	require.NoError(t, <-done, "writer failure is reconciled through the typed reactor input")
+}
+
+func TestDurableWriterPublishesTypedFailureCompletion(t *testing.T) {
+	cfg, err := normalizeManagerConfig(Config{ControlEvents: 1, WriterControlEvents: 1, IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second})
+	require.NoError(t, err)
+	dispatchErr := errors.New("durable dispatch failed")
+	dispatcher := &durableDispatcherFake{
+		trusted: make(chan TrustedSessionContext, 1), transcripts: make(chan TranscriptRequestedEffect, 1),
+		handoffs: make(chan HandoffRequestedEffect, 1), err: dispatchErr,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	state := newRunState(cfg, testIDs(), &recordingVoice{sent: make(chan realtime.Command, 1)}, newChannelClient(1), cancel)
+	state.dispatcher = dispatcher
+	done := make(chan error, 1)
+	go func() { done <- state.durableWriter(ctx) }()
+	transcript := TranscriptRequestedEffect{Turn: identity.TurnKey{ID: "turn", Revision: 1}, Sequence: 3, Role: "assistant", FinalText: "done"}
+	_, err = state.dispatchEffectsQueued(ctx, []Effect{{Transcript: &transcript}}, 0, 0, true)
+	require.NoError(t, err)
+	completion := <-state.completions
+	typed, ok := completion.input.(DurableEffectCompletedInput)
+	require.True(t, ok)
+	require.ErrorIs(t, typed.Err, dispatchErr)
+	require.NoError(t, <-done, "dispatcher failure is reconciled through the typed reactor input")
 }
 
 func TestManagerTransportFailureClosesOnceUnregistersAndPreservesCause(t *testing.T) {
@@ -3960,18 +4068,19 @@ type durableDispatcherFake struct {
 	trusted     chan TrustedSessionContext
 	transcripts chan TranscriptRequestedEffect
 	handoffs    chan HandoffRequestedEffect
+	err         error
 }
 
 func (f *durableDispatcherFake) DispatchTranscript(_ context.Context, trusted TrustedSessionContext, effect TranscriptRequestedEffect) error {
 	f.trusted <- trusted
 	f.transcripts <- effect
-	return nil
+	return f.err
 }
 
 func (f *durableDispatcherFake) DispatchHandoff(_ context.Context, trusted TrustedSessionContext, effect HandoffRequestedEffect) error {
 	f.trusted <- trusted
 	f.handoffs <- effect
-	return nil
+	return f.err
 }
 
 func TestManagerDispatchesTypedDurableEffectsWithTrustedRuntimeIdentity(t *testing.T) {

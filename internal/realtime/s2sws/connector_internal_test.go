@@ -2,6 +2,7 @@ package s2sws
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -99,4 +100,30 @@ func TestMappingLoopServicesCorrelationWhileEventDeliveryIsBackpressured(t *test
 			t.Fatalf("mapped event %d was silently dropped", index)
 		}
 	}
+}
+
+func TestConcurrentTerminationDrainsAcceptedMappedFIFO(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	session := &voiceSession{
+		ctx: ctx, cancel: cancel,
+		reads: make(chan socketRead), correlations: make(chan correlationRequest),
+		events: make(chan realtime.Event, 1), closing: make(chan struct{}), done: make(chan struct{}),
+		responses: make(map[string]*responseCorrelation), pending: make(map[identity.ResponseEpoch]struct{}),
+		maxFrameBytes: 1 << 20, closeNow: func() error { return nil },
+	}
+	go session.mappingLoop()
+	for index := 1; index <= 3; index++ {
+		raw := []byte(fmt.Sprintf(`{"type":"input_audio_buffer.speech_started","event_id":"tail-%d","item_id":"item-%d","audio_start_ms":%d}`, index, index, index))
+		session.reads <- socketRead{messageType: websocket.MessageText, raw: raw}
+		require.NoError(t, session.correlate(t.Context(), correlationRequest{kind: correlationRegister, epoch: identity.ResponseEpoch(index)}))
+	}
+	session.terminate(errors.New("concurrent writer failure"))
+
+	for index := 1; index <= 3; index++ {
+		event, err := session.Receive(t.Context())
+		require.NoError(t, err)
+		require.Equal(t, fmt.Sprintf("tail-%d", index), event.ProviderEventID)
+	}
+	_, err := session.Receive(t.Context())
+	require.EqualError(t, err, "concurrent writer failure")
 }

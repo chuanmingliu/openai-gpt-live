@@ -68,14 +68,16 @@ func (s *deliveryStore) AdvanceDeliveryCursor(ctx context.Context, _ string, _ h
 }
 
 type deliveryClient struct {
-	done           chan struct{}
-	sessionStarted chan struct{}
-	sessionRelease chan struct{}
-	visualStarted  chan protocol.ServerEvent
-	visualRelease  chan struct{}
-	visualErr      error
-	closeOnce      sync.Once
-	sessionOnce    sync.Once
+	done             chan struct{}
+	sessionStarted   chan struct{}
+	sessionRelease   chan struct{}
+	visualStarted    chan protocol.ServerEvent
+	visualRelease    chan struct{}
+	visualErr        error
+	reconnectStarted chan protocol.SessionReconnectUpdatedEvent
+	reconnectRelease chan struct{}
+	closeOnce        sync.Once
+	sessionOnce      sync.Once
 }
 
 func newDeliveryClient() *deliveryClient {
@@ -115,6 +117,19 @@ func (c *deliveryClient) Write(ctx context.Context, event protocol.ServerEvent) 
 		select {
 		case <-c.visualRelease:
 			return c.visualErr
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if typed, ok := event.(protocol.SessionReconnectUpdatedEvent); ok && c.reconnectStarted != nil {
+		select {
+		case c.reconnectStarted <- typed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		select {
+		case <-c.reconnectRelease:
+			return nil
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -609,8 +624,8 @@ func TestReactorLoopAppliesAcceptedOfferWithSessionContextAfterCallerExpiry(t *t
 	case <-time.After(time.Second):
 		t.Fatal("accepted offer did not reach the client queue")
 	}
-	require.NotNil(t, control.written)
-	control.written <- nil
+	require.NotZero(t, control.completionSequence)
+	require.NoError(t, state.enqueueCompletion(runCtx, ClientEffectCompletedInput{Sequence: control.completionSequence}))
 	require.NoError(t, <-messageDone)
 	stop()
 	require.ErrorIs(t, <-loopDone, context.Canceled)
@@ -727,8 +742,8 @@ func TestOfferDeadlineBoundsReconnectRotationAdmission(t *testing.T) {
 	}()
 	select {
 	case control := <-state.clientCtl:
-		require.NotNil(t, control.written)
-		control.written <- nil
+		require.NotZero(t, control.completionSequence)
+		require.NoError(t, state.enqueueCompletion(ctx, ClientEffectCompletedInput{Sequence: control.completionSequence}))
 	case <-time.After(time.Second):
 		t.Fatal("visual write was not admitted")
 	}
@@ -740,4 +755,224 @@ func TestOfferDeadlineBoundsReconnectRotationAdmission(t *testing.T) {
 	}
 	cancel()
 	require.ErrorIs(t, <-loopDone, context.Canceled)
+}
+
+func TestExpiredOfferRotationWriteKeepsSessionAndCredentialRetryable(t *testing.T) {
+	manual := clock.NewManual(time.Now().UTC())
+	credentials, err := NewReconnectCredentials([]byte(strings.Repeat("w", 32)), manual)
+	require.NoError(t, err)
+	owners := NewMemoryReconnectOwners(manual)
+	connector := testkit.NewFakeConnector(4)
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: 20 * time.Millisecond,
+		HandoffConsumerID: "public-client", HandoffSubscriptions: &signalingSubscriptions{},
+		PresentationPolicy: presentation.NewPolicy(presentation.Config{}), SafetyPolicy: &presentationSafety{},
+		ReconnectCredentials: credentials, ReconnectOwners: owners, ReconnectOwnerID: "rotation-write",
+		ReconnectCredentialTTL: time.Minute, Clock: manual,
+	}, connector, managerIDs{session: "rotation-write-session", conversation: "rotation-write-conversation"})
+	require.NoError(t, manager.validationErr)
+	release := make(chan struct{})
+	client := newDeliveryClient()
+	client.reconnectStarted = make(chan protocol.SessionReconnectUpdatedEvent, 2)
+	client.reconnectRelease = release
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.Run(ctx, OpenRequest{Subject: Subject{
+			TenantID: "tenant", UserID: "user", ExpiresAt: manual.Now().Add(time.Hour),
+		}, RequestedModel: "provider-model"}, client)
+	}()
+	_, err = connector.NextSession(t.Context())
+	require.NoError(t, err)
+	<-client.sessionStarted
+	require.Eventually(t, func() bool { return manager.ActiveSessions() == 1 }, time.Second, time.Millisecond)
+	manager.activeMu.RLock()
+	var runtime *sessionRuntime
+	for _, active := range manager.active {
+		runtime = active
+	}
+	manager.activeMu.RUnlock()
+	require.NotNil(t, runtime)
+	event := handoff.Event{
+		Seq: 7, EventID: "rotation-write-event", HandoffID: "handoff", TenantID: "tenant",
+		ConversationID: runtime.state.ids.ConversationID, Kind: "tool.approval_required", State: handoff.StateNeedsInput,
+		Payload: json.RawMessage(`{"invocation_id":"invoke","handoff_id":"handoff","action_summary":"approve","expires_at":"2099-01-01T00:00:00Z","risk_class":"low"}`),
+	}
+	first := make(chan error, 1)
+	go func() { first <- manager.OfferHandoffEvent(context.Background(), runtime.handoffScope(), event) }()
+	var attempted protocol.SessionReconnectUpdatedEvent
+	select {
+	case attempted = <-client.reconnectStarted:
+	case <-time.After(time.Second):
+		t.Fatal("post-rotate credential delivery did not start")
+	}
+	require.ErrorIs(t, <-first, ErrControlOverflow)
+	select {
+	case runErr := <-done:
+		t.Fatalf("offer timeout terminated the live session: %v", runErr)
+	case <-time.After(50 * time.Millisecond):
+	}
+	require.Equal(t, int64(1), manager.ActiveSessions())
+	close(release)
+	require.Eventually(t, func() bool {
+		runtime.reconnectMu.Lock()
+		defer runtime.reconnectMu.Unlock()
+		return runtime.reconnectDelivered
+	}, time.Second, time.Millisecond)
+	require.NoError(t, manager.OfferHandoffEvent(t.Context(), runtime.handoffScope(), event))
+	runtime.reconnectMu.Lock()
+	require.Equal(t, attempted.Reconnect.Credential, runtime.reconnect.Credential)
+	runtime.reconnectMu.Unlock()
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestCommittedRotationRetriesSameCredentialAfterClientQueueOverflow(t *testing.T) {
+	manual := clock.NewManual(time.Now().UTC())
+	credentials, err := NewReconnectCredentials([]byte(strings.Repeat("y", 32)), manual)
+	require.NoError(t, err)
+	owners := &reconnectOwnersProbe{
+		MemoryReconnectOwners: NewMemoryReconnectOwners(manual), rotateStarted: make(chan struct{}), rotateRelease: make(chan struct{}),
+	}
+	manager := NewManager(Config{
+		IngressFrames: 1, EgressFrames: 1, ControlEvents: 2, WriterControlEvents: 1,
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		ReconnectCredentials: credentials, ReconnectOwners: owners, ReconnectOwnerID: "rotation-overflow",
+		ReconnectCredentialTTL: time.Minute, Clock: manual,
+	}, testkit.NewFakeConnector(1), managerIDs{})
+	require.NoError(t, manager.validationErr)
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "rotation-overflow"}
+	subject := Subject{TenantID: scope.TenantID, UserID: scope.UserID, ExpiresAt: manual.Now().Add(time.Hour)}
+	issued, owner, err := manager.issueReconnectCredential(subject, scope, "rotation-overflow", 1, 0, "provider-model", ReconnectOwnerEstablishing)
+	require.NoError(t, err)
+	_, err = owners.Create(t.Context(), owner, manager.cfg.ReconnectOwnerLeaseDuration)
+	require.NoError(t, err)
+	_, err = owners.Publish(t.Context(), owner.Key(), 0, true, manager.cfg.ReconnectOwnerLeaseDuration)
+	require.NoError(t, err)
+
+	release := make(chan struct{})
+	client := newDeliveryClient()
+	client.reconnectStarted = make(chan protocol.SessionReconnectUpdatedEvent, 2)
+	client.reconnectRelease = release
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	state := newRunState(manager.cfg, IDs{SessionID: "rotation-overflow", ConversationID: scope.ConversationID, Incarnation: 1},
+		&recordingVoice{sent: make(chan realtime.Command, 1)}, client, cancel)
+	state.subject = subject
+	runtime := &sessionRuntime{
+		key: runtimeKey{sessionID: "rotation-overflow", incarnation: 1}, subject: subject,
+		state: state, inbox: state.inbox, inboxSlots: state.inboxSlots, done: ctx.Done(), accepting: true,
+		reconnect: &issued, reconnectDelivered: true, reconnectLossDeadline: manual.Now().Add(time.Minute),
+	}
+	state.runtime = runtime
+	reactorDone := make(chan error, 1)
+	writerDone := make(chan error, 1)
+	go func() { reactorDone <- state.reactorLoop(ctx) }()
+	go func() { writerDone <- state.clientWriter(ctx) }()
+
+	first := make(chan error, 1)
+	go func() { first <- manager.rotateReconnectCredential(context.Background(), runtime, 7, false) }()
+	select {
+	case <-owners.rotateStarted:
+	case <-time.After(time.Second):
+		t.Fatal("durable rotation did not start")
+	}
+	fake := protocol.SessionReconnectUpdatedEvent{Type: "session.reconnect.updated", EventID: "fake",
+		Reconnect: protocol.ReconnectMetadata{Credential: "fake"}}
+	require.NoError(t, state.enqueueClientControl(clientControl{event: fake}))
+	select {
+	case attempted := <-client.reconnectStarted:
+		require.Equal(t, "fake", attempted.Reconnect.Credential)
+	case <-time.After(time.Second):
+		t.Fatal("client queue blocker did not reach writer")
+	}
+	close(owners.rotateRelease)
+	require.ErrorIs(t, <-first, ErrControlOverflow)
+	runtime.reconnectMu.Lock()
+	committed := *runtime.reconnect
+	require.Equal(t, int64(7), committed.Claims.Cursor)
+	require.False(t, runtime.reconnectDelivered)
+	runtime.reconnectMu.Unlock()
+	close(release)
+	require.Eventually(t, func() bool { return len(state.clientSlots) == 1 }, time.Second, time.Millisecond)
+
+	require.NoError(t, manager.rotateReconnectCredential(t.Context(), runtime, 7, false))
+	select {
+	case retried := <-client.reconnectStarted:
+		require.Equal(t, committed.Credential, retried.Reconnect.Credential)
+	case <-time.After(time.Second):
+		t.Fatal("committed credential was not re-delivered on same-cursor retry")
+	}
+	cancel()
+	require.ErrorIs(t, <-reactorDone, context.Canceled)
+	require.ErrorIs(t, <-writerDone, context.Canceled)
+}
+
+func TestFailedInitialSameScopePublicationRestoresPriorRuntime(t *testing.T) {
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "rollback-initial"}
+	manager := NewManager(Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second}, testkit.NewFakeConnector(1), managerIDs{})
+	require.NoError(t, manager.validationErr)
+	previous, _, previousDone := currentRuntime(scope, "previous")
+	defer close(previousDone)
+	require.NoError(t, manager.register(previous))
+	previous.mu.Lock()
+	originalGeneration := previous.acceptanceGeneration
+	previous.mu.Unlock()
+
+	replacement, _, replacementDone := currentRuntime(scope, "replacement")
+	defer close(replacementDone)
+	require.NoError(t, manager.register(replacement))
+	manager.activeMu.RLock()
+	logical := manager.logical[replacement.key.sessionID]
+	manager.activeMu.RUnlock()
+	require.NotNil(t, logical)
+	manager.rollbackInitialPublication(replacement, logical)
+
+	manager.activeMu.RLock()
+	require.Same(t, previous, manager.current[scope])
+	manager.activeMu.RUnlock()
+	previous.mu.Lock()
+	require.True(t, previous.accepting)
+	require.Equal(t, originalGeneration, previous.acceptanceGeneration)
+	previous.mu.Unlock()
+}
+
+func TestFailedReconnectSameScopePublicationRestoresPriorRuntime(t *testing.T) {
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "rollback-reconnect"}
+	manager := NewManager(Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second}, testkit.NewFakeConnector(1), managerIDs{})
+	require.NoError(t, manager.validationErr)
+	previous, _, previousDone := currentRuntime(scope, "session")
+	defer close(previousDone)
+	previous.key.incarnation = 1
+	previous.state.ids.Incarnation = 1
+	replayAfter := int64(0)
+	replacement, _, replacementDone := currentRuntime(scope, "session")
+	defer close(replacementDone)
+	replacement.key.incarnation = 2
+	replacement.state.ids.Incarnation = 2
+	replacement.replayAfter = &replayAfter
+	logical := &logicalSession{
+		scope: scope, subject: cloneSubject(previous.subject), highWater: 1,
+		state: logicalTombstoned, reconnecting: true, turnBoundary: true,
+	}
+	manager.activeMu.Lock()
+	manager.active[previous.key] = previous
+	manager.current[scope] = previous
+	manager.logical[previous.key.sessionID] = logical
+	manager.activeMu.Unlock()
+	previous.mu.Lock()
+	originalGeneration := previous.acceptanceGeneration
+	previous.mu.Unlock()
+
+	require.NoError(t, manager.registerReplacement(replacement, logical, 1))
+	manager.rollbackReplacementPublication(replacement, logical, 1, 0)
+
+	manager.activeMu.RLock()
+	require.Same(t, previous, manager.current[scope])
+	manager.activeMu.RUnlock()
+	previous.mu.Lock()
+	require.True(t, previous.accepting)
+	require.Equal(t, originalGeneration, previous.acceptanceGeneration)
+	previous.mu.Unlock()
 }

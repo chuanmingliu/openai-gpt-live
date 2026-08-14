@@ -200,16 +200,18 @@ type voiceSession struct {
 	mappedEvents           []realtime.Event
 	mappingActive          bool
 
-	terminalOnce      sync.Once
-	terminalMu        sync.RWMutex
-	terminalErr       error
-	closeOnce         sync.Once
-	closeCompleteOnce sync.Once
-	closeStateMu      sync.Mutex
-	closeResultMu     sync.RWMutex
-	closeResult       error
-	activeWriteMu     sync.Mutex
-	activeWriteCancel context.CancelFunc
+	terminalOnce        sync.Once
+	terminalMu          sync.RWMutex
+	terminalErr         error
+	closeOnce           sync.Once
+	closeCompleteOnce   sync.Once
+	closeStateMu        sync.Mutex
+	closeResultMu       sync.RWMutex
+	closeResult         error
+	activeWriteMu       sync.Mutex
+	activeWriteCancel   context.CancelFunc
+	terminalRequestOnce sync.Once
+	terminalRequests    chan error
 }
 
 func (s *voiceSession) Send(ctx context.Context, command realtime.Command) error {
@@ -445,7 +447,7 @@ drain:
 	if errors.Is(err, net.ErrClosed) {
 		err = nil
 	}
-	s.terminate(ErrSessionClosed)
+	s.publishTerminal(ErrSessionClosed)
 	s.completeClose(err)
 }
 
@@ -528,6 +530,7 @@ func (s *voiceSession) correlate(ctx context.Context, request correlationRequest
 func (s *voiceSession) mappingLoop() {
 	s.mappingActive = true
 	var terminalReadErr error
+	terminalRequests := s.terminationRequests()
 	defer func() {
 		s.mappingActive = false
 		s.releaseAllImplicitBuffers()
@@ -538,7 +541,7 @@ func (s *voiceSession) mappingLoop() {
 	}()
 	for {
 		if terminalReadErr != nil && len(s.mappedEvents) == 0 {
-			s.terminate(terminalReadErr)
+			s.publishTerminal(terminalReadErr)
 			return
 		}
 		var reads <-chan socketRead
@@ -552,6 +555,10 @@ func (s *voiceSession) mappingLoop() {
 			next = s.mappedEvents[0]
 		}
 		select {
+		case err := <-terminalRequests:
+			if terminalReadErr == nil {
+				terminalReadErr = err
+			}
 		case read := <-reads:
 			if read.err != nil {
 				terminalReadErr = read.err
@@ -924,6 +931,21 @@ func (s *voiceSession) deliver(ctx context.Context, event realtime.Event) error 
 }
 
 func (s *voiceSession) terminate(err error) {
+	if err == nil {
+		err = io.EOF
+	}
+	select {
+	case s.terminationRequests() <- err:
+	default:
+	}
+}
+
+func (s *voiceSession) terminationRequests() chan error {
+	s.terminalRequestOnce.Do(func() { s.terminalRequests = make(chan error, 1) })
+	return s.terminalRequests
+}
+
+func (s *voiceSession) publishTerminal(err error) {
 	if err == nil {
 		err = io.EOF
 	}
