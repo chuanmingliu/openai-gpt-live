@@ -26,10 +26,11 @@ type State struct {
 }
 
 type Snapshot struct {
-	IDs            IDs
-	Response       ResponseState
-	ResponseEpoch  identity.ResponseEpoch
-	UserSpeaking   bool
-	CommittedTurn  *identity.TurnKey
-	LastDurableSeq uint64
+	IDs                     IDs
+	Response                ResponseState
+	ResponseEpoch           identity.ResponseEpoch
+	UserSpeaking            bool
+	InputAudioCommitPending bool
+	CommittedTurn           *identity.TurnKey
+	LastDurableSeq          uint64
 }

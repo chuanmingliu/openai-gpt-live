@@ -335,6 +335,7 @@ func TestPCMFramerReturnsIndependentFrames(t *testing.T) {
 
 func TestServerEventsRoundTripEverySupportedType(t *testing.T) {
 	session := json.RawMessage(`{"id":"sess-1","provider_extra":{"kept":true}}`)
+	previousItemID := "assistant-or-tool-item"
 	response := ResponsePayload{
 		ID:     "resp-1",
 		Status: "completed",
@@ -345,6 +346,8 @@ func TestServerEventsRoundTripEverySupportedType(t *testing.T) {
 		SessionCreatedEvent{Type: "session.created", EventID: "e1", Session: session},
 		SessionUpdatedEvent{Type: "session.updated", EventID: "e2", Session: session},
 		ErrorEvent{Type: "error", EventID: "e3", Error: ProtocolError{Type: "invalid_request_error", Code: "bad", Message: "bad request", Param: "audio", EventID: "source"}},
+		InputAudioBufferCommittedEvent{Type: "input_audio_buffer.committed", EventID: "e3-committed", PreviousItemID: &previousItemID, ItemID: "item-committed"},
+		InputAudioBufferCommittedEvent{Type: "input_audio_buffer.committed", EventID: "e3-committed-null", PreviousItemID: nil, ItemID: "item-first"},
 		InputAudioBufferSpeechStartedEvent{Type: "input_audio_buffer.speech_started", EventID: "e4", AudioStartMS: 120, ItemID: "item-1"},
 		InputAudioBufferSpeechStoppedEvent{Type: "input_audio_buffer.speech_stopped", EventID: "e5", AudioEndMS: 420, ItemID: "item-1"},
 		ConversationItemInputAudioTranscriptionDeltaEvent{Type: "conversation.item.input_audio_transcription.delta", EventID: "e6", ItemID: "item-1", ContentIndex: 0, Delta: "hel"},

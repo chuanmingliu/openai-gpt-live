@@ -21,6 +21,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/presentation"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
+	"github.com/chuanmingliu/openai-gpt-live/internal/realtime/s2sws"
 	"github.com/chuanmingliu/openai-gpt-live/internal/testkit"
 	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 	"github.com/stretchr/testify/require"
@@ -2569,6 +2570,227 @@ func TestManagerFramesAppendAndFlushesEvenTailBeforeCommit(t *testing.T) {
 
 	cancel()
 	require.ErrorIs(t, <-runResult, context.Canceled)
+}
+
+func TestManagerRejectsSecondCommitUntilAckAndOrdersAckBeforeTranscript(t *testing.T) {
+	connector := testkit.NewFakeConnector(32)
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second,
+		EgressBlockTimeout:  time.Second,
+	}, connector, managerIDs{session: "session-commit-ack", conversation: "conversation-commit-ack"})
+	client := newChannelClient(32)
+	ctx, cancel := context.WithCancel(context.Background())
+	runResult := make(chan error, 1)
+	go func() {
+		runResult <- manager.Run(ctx, OpenRequest{Subject: Subject{
+			TenantID: "tenant", UserID: "user", ExpiresAt: time.Now().Add(time.Hour),
+		}}, client)
+	}()
+	voice, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	commandCtx, stop := context.WithTimeout(t.Context(), time.Second)
+	defer stop()
+
+	appendAndExpect := func(fill byte) {
+		client.reads <- protocol.InputAudioBufferAppendEvent{
+			Type: "input_audio_buffer.append", Audio: base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{fill}, 960)),
+		}
+		command, commandErr := voice.NextCommand(commandCtx)
+		require.NoError(t, commandErr)
+		require.Equal(t, realtime.CommandAppendAudio, command.Kind)
+	}
+	commitAndExpect := func() realtime.Command {
+		client.reads <- protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}
+		command, commandErr := voice.NextCommand(commandCtx)
+		require.NoError(t, commandErr)
+		require.Equal(t, realtime.CommandCommitAudio, command.Kind)
+		return command
+	}
+	releaseAndExpect := func(itemID string, commitSequence uint64) {
+		command, commandErr := voice.NextCommand(commandCtx)
+		require.NoError(t, commandErr)
+		require.Equal(t, realtime.CommandAcknowledgeAudioCommit, command.Kind)
+		require.Equal(t, itemID, command.InputItemID)
+		require.Equal(t, commitSequence, command.InputAudioCommitSequence)
+	}
+	nextClientType := func(want string) protocol.ServerEvent {
+		for {
+			select {
+			case event := <-client.writes:
+				if event.EventType() == want {
+					return event
+				}
+			case runErr := <-runResult:
+				t.Fatalf("manager stopped before %s: %v", want, runErr)
+			case <-commandCtx.Done():
+				t.Fatalf("timed out waiting for %s", want)
+			}
+		}
+	}
+
+	appendAndExpect(0x11)
+	firstCommit := commitAndExpect()
+	appendAndExpect(0x22)
+	client.reads <- protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}
+	semantic := nextClientType("error").(protocol.ErrorEvent)
+	require.Equal(t, "input_audio_buffer_commit_in_flight", semantic.Error.Code)
+	require.Equal(t, "input audio commit acknowledgement is pending", semantic.Error.Message)
+	require.NotContains(t, semantic.Error.Message, "0x22")
+
+	require.NoError(t, voice.Emit(commandCtx, realtime.Event{
+		Kind: realtime.EventInputAudioCommitted, ProviderEventID: "ack-a", ItemID: "input-a", InputAudioCommitCandidate: true,
+		InputAudioCommitSequence: firstCommit.Sequence,
+	}))
+	releaseAndExpect("input-a", firstCommit.Sequence)
+	require.NoError(t, voice.Emit(commandCtx, realtime.Event{
+		Kind: realtime.EventTranscriptionDelta, ProviderEventID: "delta-a", ItemID: "input-a", Text: "partial",
+	}))
+	committed := nextClientType("input_audio_buffer.committed").(protocol.InputAudioBufferCommittedEvent)
+	require.Equal(t, "input-a", committed.ItemID)
+	delta := nextClientType("conversation.item.input_audio_transcription.delta").(protocol.ConversationItemInputAudioTranscriptionDeltaEvent)
+	require.Equal(t, "input-a", delta.ItemID, "the sync ack boundary must open the exact item before its transcript")
+
+	secondCommit := commitAndExpect()
+	require.NoError(t, voice.Emit(commandCtx, realtime.Event{
+		Kind: realtime.EventInputAudioCommitted, ProviderEventID: "duplicate-ack-a", ItemID: "input-a", InputAudioCommitCandidate: true,
+		InputAudioCommitSequence: secondCommit.Sequence,
+	}))
+	appendAndExpect(0x33)
+	client.reads <- protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}
+	duplicateSemantic := nextClientType("error").(protocol.ErrorEvent)
+	require.Equal(t, "input_audio_buffer_commit_in_flight", duplicateSemantic.Error.Code,
+		"a historical ack must not release the later commit")
+	require.NoError(t, voice.Emit(commandCtx, realtime.Event{
+		Kind: realtime.EventInputAudioCommitted, ProviderEventID: "ack-b", ItemID: "input-b", InputAudioCommitCandidate: true,
+		InputAudioCommitSequence: secondCommit.Sequence,
+	}))
+	releaseAndExpect("input-b", secondCommit.Sequence)
+	nextClientType("input_audio_buffer.committed")
+	thirdCommit := commitAndExpect()
+	require.NoError(t, voice.Emit(commandCtx, realtime.Event{
+		Kind: realtime.EventInputAudioCommitted, ProviderEventID: "ack-c", ItemID: "input-c", InputAudioCommitCandidate: true,
+		InputAudioCommitSequence: thirdCommit.Sequence,
+	}))
+	releaseAndExpect("input-c", thirdCommit.Sequence)
+	nextClientType("input_audio_buffer.committed")
+
+	cancel()
+	require.ErrorIs(t, <-runResult, context.Canceled)
+}
+
+func TestManagerSubmitReturnsCommitInFlightWithoutTerminatingSession(t *testing.T) {
+	connector := testkit.NewFakeConnector(16)
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second,
+		EgressBlockTimeout:  time.Second,
+	}, connector, managerIDs{session: "session-submit-commit", conversation: "conversation-submit-commit"})
+	client := newChannelClient(16)
+	ctx, cancel := context.WithCancel(context.Background())
+	runResult := make(chan error, 1)
+	go func() {
+		runResult <- manager.Run(ctx, OpenRequest{Subject: Subject{
+			TenantID: "tenant", UserID: "user", ExpiresAt: time.Now().Add(time.Hour),
+		}}, client)
+	}()
+	voice, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	waitForActiveRuntime(t, manager, "session-submit-commit", 1)
+
+	commit := ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}}
+	require.NoError(t, manager.Submit(t.Context(), "session-submit-commit", 1, commit))
+	first, err := voice.NextCommand(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, realtime.CommandCommitAudio, first.Kind)
+
+	err = manager.Submit(t.Context(), "session-submit-commit", 1, commit)
+	require.ErrorIs(t, err, ErrAudioCommitInFlight)
+	require.Equal(t, int64(1), manager.ActiveSessions(), "a semantic rejection must not terminate the runtime")
+
+	require.NoError(t, voice.Emit(t.Context(), realtime.Event{
+		Kind: realtime.EventInputAudioCommitted, ProviderEventID: "ack-submit-a", ItemID: "submit-a", InputAudioCommitCandidate: true,
+		InputAudioCommitSequence: first.Sequence,
+	}))
+	release, err := voice.NextCommand(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, realtime.CommandAcknowledgeAudioCommit, release.Kind)
+	require.Equal(t, "submit-a", release.InputItemID)
+	require.Equal(t, first.Sequence, release.InputAudioCommitSequence)
+	for {
+		event := <-client.writes
+		if event.EventType() == "input_audio_buffer.committed" {
+			break
+		}
+	}
+	require.NoError(t, manager.Submit(t.Context(), "session-submit-commit", 1, commit))
+	second, err := voice.NextCommand(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, realtime.CommandCommitAudio, second.Kind)
+
+	cancel()
+	require.ErrorIs(t, <-runResult, context.Canceled)
+}
+
+func TestClientCommitSemanticErrorDispatchOverflowRemainsFatal(t *testing.T) {
+	cfg, err := normalizeManagerConfig(Config{
+		ControlEvents: 2, WriterControlEvents: 1,
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+	})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(t.Context())
+	state := newRunState(cfg, testIDs(), &recordingVoice{sent: make(chan realtime.Command, 1)}, newChannelClient(1), cancel)
+	loopResult := make(chan error, 1)
+	go func() { loopResult <- state.reactorLoop(ctx) }()
+
+	first := reactorMessage{
+		input: ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}},
+		done:  make(chan error, 1),
+	}
+	require.NoError(t, state.enqueueReactor(first))
+	require.NoError(t, <-first.done)
+	<-state.clientSlots
+
+	second := reactorMessage{
+		input:             ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}},
+		clientAudioCommit: true,
+		done:              make(chan error, 1),
+	}
+	require.NoError(t, state.enqueueReactor(second))
+	require.ErrorIs(t, <-second.done, ErrControlOverflow)
+	select {
+	case loopErr := <-loopResult:
+		require.ErrorIs(t, loopErr, ErrControlOverflow)
+	case <-time.After(20 * time.Millisecond):
+		cancel()
+		require.ErrorIs(t, <-loopResult, ErrControlOverflow)
+	}
+}
+
+func TestManagerCommitAckTimeoutTearsDownRuntimeAndPreservesCause(t *testing.T) {
+	connector := testkit.NewFakeConnector(8)
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second,
+		EgressBlockTimeout:  time.Second,
+	}, connector, managerIDs{session: "session-commit-timeout", conversation: "conversation-commit-timeout"})
+	client := newChannelClient(8)
+	runResult := make(chan error, 1)
+	go func() {
+		runResult <- manager.Run(t.Context(), OpenRequest{Subject: Subject{
+			TenantID: "tenant", UserID: "user", ExpiresAt: time.Now().Add(time.Hour),
+		}}, client)
+	}()
+	voice, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	waitForActiveRuntime(t, manager, "session-commit-timeout", 1)
+	require.NoError(t, manager.Submit(t.Context(), "session-commit-timeout", 1,
+		ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}}))
+	command, err := voice.NextCommand(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, realtime.CommandCommitAudio, command.Kind)
+
+	voice.Fail(s2sws.ErrAudioCommitAckTimeout)
+	require.ErrorIs(t, <-runResult, s2sws.ErrAudioCommitAckTimeout)
+	require.Zero(t, manager.ActiveSessions())
+	require.ErrorIs(t, manager.Submit(t.Context(), "session-commit-timeout", 1, DurableInput{Sequence: 1}), ErrSessionNotActive)
 }
 
 func TestManagerRejectsExpiredSubjectBeforeConnect(t *testing.T) {

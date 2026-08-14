@@ -407,6 +407,9 @@ func (r *sessionRuntime) atTurnBoundary() bool {
 	if snapshot.UserSpeaking {
 		return false
 	}
+	if snapshot.InputAudioCommitPending {
+		return false
+	}
 	return snapshot.Response == ResponseIdle || snapshot.Response == ResponseTerminal
 }
 
@@ -421,6 +424,7 @@ type reactorMessage struct {
 	completion           bool
 	acceptanceChecked    bool
 	acceptanceGeneration uint64
+	clientAudioCommit    bool
 }
 
 type ingressFrame struct {
@@ -719,6 +723,7 @@ type runState struct {
 	boundaryMu       sync.RWMutex
 	boundary         Snapshot
 	partialInput     atomic.Bool
+	commitPending    atomic.Bool
 	ingressCompleted atomic.Uint64
 	controlAccepted  atomic.Uint64
 	controlApplied   atomic.Uint64
@@ -2819,8 +2824,19 @@ func (s *runState) clientReader(ctx context.Context) error {
 					}
 				}
 			case protocol.InputAudioBufferCommitEvent:
+				if !s.commitPending.CompareAndSwap(false, true) {
+					return true, s.enqueueClientControl(clientControl{event: protocol.ErrorEvent{
+						Type:    "error",
+						EventID: s.nextManagerEventID(),
+						Error: protocol.ProtocolError{
+							Type: "invalid_request_error", Code: "input_audio_buffer_commit_in_flight",
+							Message: "input audio commit acknowledgement is pending",
+						},
+					}})
+				}
 				tail, flushErr := framer.Flush()
 				if flushErr != nil {
+					s.commitPending.Store(false)
 					return true, s.enqueueClientControl(clientControl{event: protocol.ErrorEvent{
 						Type:    "error",
 						EventID: s.nextManagerEventID(),
@@ -2835,7 +2851,10 @@ func (s *runState) clientReader(ctx context.Context) error {
 						return false, enqueueErr
 					}
 				}
-				if enqueueErr := s.enqueueReactor(reactorMessage{input: ClientInput{Event: typed}, ingressAfter: latestSequence}); enqueueErr != nil {
+				if enqueueErr := s.enqueueReactor(reactorMessage{
+					input: ClientInput{Event: typed}, ingressAfter: latestSequence, clientAudioCommit: true,
+				}); enqueueErr != nil {
+					s.commitPending.Store(false)
 					return false, enqueueErr
 				}
 				s.partialInput.Store(false)
@@ -3060,6 +3079,11 @@ func (s *runState) voiceWriter(ctx context.Context) error {
 			}
 			err := s.voice.Send(ctx, control.command)
 			s.releaseVoiceSlot()
+			if err == nil && control.command.Kind == realtime.CommandAcknowledgeAudioCommit {
+				// Open client admission only after the exact semantic release has
+				// completed at the transport, and before its client-write barrier.
+				s.commitPending.Store(false)
+			}
 			control.barrier.complete(err)
 			if control.sent != nil {
 				control.sent <- err
@@ -3182,7 +3206,7 @@ func (s *runState) voiceReader(ctx context.Context) error {
 			input: VoiceInput{Incarnation: s.ids.Incarnation, Event: event}, egressAfter: latest,
 		}
 		var enqueueErr error
-		if event.Kind == realtime.EventResponseCreated || event.Kind == realtime.EventSpeechStarted {
+		if event.Kind == realtime.EventResponseCreated || event.Kind == realtime.EventSpeechStarted || event.Kind == realtime.EventInputAudioCommitted {
 			// Establish a new stream or speech fence before accepting later
 			// provider media into the output order. This waits only for pure
 			// reactor apply and bounded effect admission, never for provider or
@@ -3308,6 +3332,19 @@ func (s *runState) reactorLoop(ctx context.Context) error {
 				}
 			}
 			effects, err := reactor.ApplyContext(ctx, message.input)
+			recoverableCommitError := errors.Is(err, ErrAudioCommitInFlight)
+			if recoverableCommitError && message.clientAudioCommit {
+				effects = []Effect{{ClientEvent: protocol.ErrorEvent{
+					Type:    "error",
+					EventID: s.nextManagerEventID(),
+					Error: protocol.ProtocolError{
+						Type: "invalid_request_error", Code: "input_audio_buffer_commit_in_flight",
+						Message: "input audio commit acknowledgement is pending",
+					},
+				}}}
+				err = nil
+				recoverableCommitError = false
+			}
 			if err == nil {
 				for index := range effects {
 					async := effects[index].Async
@@ -3355,9 +3392,13 @@ func (s *runState) reactorLoop(ctx context.Context) error {
 				}
 			}
 			if err == nil {
+				snapshot := reactor.Snapshot()
 				s.boundaryMu.Lock()
-				s.boundary = reactor.Snapshot()
+				s.boundary = snapshot
 				s.boundaryMu.Unlock()
+				if snapshot.InputAudioCommitPending {
+					s.commitPending.Store(true)
+				}
 				if completed, ok := message.input.(VoiceCommandCompletedInput); ok {
 					s.completeVoice(completed)
 				}
@@ -3396,7 +3437,7 @@ func (s *runState) reactorLoop(ctx context.Context) error {
 			if presentationLocked {
 				s.runtime.presentationMu.Unlock()
 			}
-			if err != nil {
+			if err != nil && !recoverableCommitError {
 				return err
 			}
 		}

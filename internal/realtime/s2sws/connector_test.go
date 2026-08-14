@@ -561,7 +561,7 @@ func TestSendMapsEveryCommandToGoldenJSON(t *testing.T) {
 			},
 		},
 		{Kind: realtime.CommandAppendAudio, Sequence: 3, Audio: []byte{1, 2}},
-		{Kind: realtime.CommandCommitAudio, AfterSeq: 3},
+		{Kind: realtime.CommandCommitAudio, Sequence: 4, AfterSeq: 3},
 		{Kind: realtime.CommandCreateItem, Item: json.RawMessage(`{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}`)},
 	}
 	for _, command := range commands {
@@ -841,6 +841,7 @@ func sendAndReceiveEvent(t *testing.T, server *testVoiceServer, session realtime
 func TestReceiveMapsEveryProviderEvent(t *testing.T) {
 	server := newTestVoiceServer(t)
 	session := connectTestSession(t, server.URL, nil, realtime.OpenRequest{Model: "model"})
+	previousItemID := "assistant-or-tool-item"
 
 	tests := []struct {
 		wire map[string]any
@@ -857,6 +858,14 @@ func TestReceiveMapsEveryProviderEvent(t *testing.T) {
 		{
 			wire: map[string]any{"type": "input_audio_buffer.speech_started", "event_id": "evt-start", "item_id": "utterance", "audio_start_ms": 17},
 			want: realtime.Event{Kind: realtime.EventSpeechStarted, ProviderEventID: "evt-start", ItemID: "utterance"},
+		},
+		{
+			wire: map[string]any{"type": "input_audio_buffer.committed", "event_id": "evt-committed", "previous_item_id": previousItemID, "item_id": "utterance"},
+			want: realtime.Event{Kind: realtime.EventInputAudioCommitted, ProviderEventID: "evt-committed", ItemID: "utterance", PreviousItemID: &previousItemID},
+		},
+		{
+			wire: map[string]any{"type": "input_audio_buffer.committed", "event_id": "evt-committed-null", "previous_item_id": nil, "item_id": "first-utterance"},
+			want: realtime.Event{Kind: realtime.EventInputAudioCommitted, ProviderEventID: "evt-committed-null", ItemID: "first-utterance"},
 		},
 		{
 			wire: map[string]any{"type": "input_audio_buffer.speech_stopped", "event_id": "evt-stop", "item_id": "utterance", "audio_end_ms": 29},
@@ -877,6 +886,7 @@ func TestReceiveMapsEveryProviderEvent(t *testing.T) {
 		assert.Equal(t, test.want.Kind, got.Kind)
 		assert.Equal(t, test.want.ProviderEventID, got.ProviderEventID)
 		assert.Equal(t, test.want.ItemID, got.ItemID)
+		assert.Equal(t, test.want.PreviousItemID, got.PreviousItemID)
 		assert.Equal(t, test.want.Text, got.Text)
 	}
 
@@ -1394,7 +1404,7 @@ func TestExplicitPendingResponseLimit(t *testing.T) {
 
 		err := session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCreateResponse, Epoch: limit + 1})
 		require.ErrorIs(t, err, s2sws.ErrPendingResponseLimit)
-		require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio}))
+		require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio, Sequence: 1}))
 		assert.JSONEq(t, `{"type":"input_audio_buffer.commit"}`, string(server.nextClientFrame(t)))
 	})
 
@@ -1568,7 +1578,7 @@ func TestSendRejectsMalformedOrOversizedCommands(t *testing.T) {
 			server := newTestVoiceServer(t)
 			session := connectTestSession(t, server.URL, test.mutate, realtime.OpenRequest{Model: "model"})
 			require.Error(t, session.Send(t.Context(), test.command))
-			require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio}))
+			require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio, Sequence: 1}))
 			assert.JSONEq(t, `{"type":"input_audio_buffer.commit"}`, string(server.nextClientFrame(t)))
 		})
 	}
@@ -1583,10 +1593,12 @@ func TestReceiveRejectsMalformedProviderData(t *testing.T) {
 		raw      []byte
 	}{
 		{name: "malformed JSON", raw: []byte(`{"type":`)},
+		{name: "invalid UTF-8", raw: []byte{'{', '"', 't', 'y', 'p', 'e', '"', ':', '"', 0xff, '"', '}'}},
 		{name: "invalid base64", raw: []byte(`{"type":"response.output_audio.delta","response_id":"missing","delta":"!!!="}`)},
 		{name: "unpadded base64", raw: []byte(`{"type":"response.output_audio.delta","response_id":"missing","delta":"AAE"}`)},
 		{name: "non-canonical base64", raw: []byte(`{"type":"response.output_audio.delta","response_id":"missing","delta":"AB=="}`)},
 		{name: "malformed function arguments", raw: []byte(`{"type":"response.function_call_arguments.done","response_id":"missing","arguments":"{"}`)},
+		{name: "committed event missing previous item", raw: []byte(`{"type":"input_audio_buffer.committed","event_id":"missing-previous","item_id":"input"}`)},
 		{name: "oversized frame", maxFrame: 128, raw: bytes.Repeat([]byte("x"), 129)},
 	}
 	for _, test := range tests {
@@ -1617,7 +1629,7 @@ func TestCanceledOperationsDoNotPoisonSession(t *testing.T) {
 	_, err := session.Receive(canceled)
 	require.ErrorIs(t, err, context.Canceled)
 
-	require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio}))
+	require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio, Sequence: 1}))
 	assert.JSONEq(t, `{"type":"input_audio_buffer.commit"}`, string(server.nextClientFrame(t)))
 	server.sendEvent(t, map[string]any{"type": "session.created", "event_id": "still-open", "session": map[string]any{}})
 	assert.Equal(t, "still-open", receiveEvent(t, session).ProviderEventID)

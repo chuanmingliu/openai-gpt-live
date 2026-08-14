@@ -80,6 +80,16 @@ type ErrorEvent struct {
 func (e ErrorEvent) EventType() string { return e.Type }
 func (ErrorEvent) isServerEvent()      {}
 
+type InputAudioBufferCommittedEvent struct {
+	Type           string  `json:"type"`
+	EventID        string  `json:"event_id,omitempty"`
+	PreviousItemID *string `json:"previous_item_id"`
+	ItemID         string  `json:"item_id"`
+}
+
+func (e InputAudioBufferCommittedEvent) EventType() string { return e.Type }
+func (InputAudioBufferCommittedEvent) isServerEvent()      {}
+
 type InputAudioBufferSpeechStartedEvent struct {
 	Type         string `json:"type"`
 	EventID      string `json:"event_id,omitempty"`

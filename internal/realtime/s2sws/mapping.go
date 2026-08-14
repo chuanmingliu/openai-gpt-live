@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
@@ -241,6 +242,7 @@ func validateJSONObject(raw json.RawMessage) error {
 }
 
 func cloneCommand(command realtime.Command) realtime.Command {
+	command.InputItemID = strings.Clone(command.InputItemID)
 	command.Audio = append([]byte(nil), command.Audio...)
 	command.Item = append(json.RawMessage(nil), command.Item...)
 	command.Session.ToolChoice = append(json.RawMessage(nil), command.Session.ToolChoice...)
@@ -265,6 +267,10 @@ func cloneEvent(event realtime.Event) realtime.Event {
 	event.Audio = append([]byte(nil), event.Audio...)
 	event.Arguments = append(json.RawMessage(nil), event.Arguments...)
 	event.Payload = append(json.RawMessage(nil), event.Payload...)
+	if event.PreviousItemID != nil {
+		previous := strings.Clone(*event.PreviousItemID)
+		event.PreviousItemID = &previous
+	}
 	return event
 }
 
@@ -291,6 +297,9 @@ func mapServerEvent(raw []byte, maxFrameBytes int64) (mappedServerEvent, error) 
 	if int64(len(raw)) > maxFrameBytes {
 		return mappedServerEvent{}, fmt.Errorf("provider frame is %d bytes, limit is %d", len(raw), maxFrameBytes)
 	}
+	if !utf8.Valid(raw) {
+		return mappedServerEvent{}, errors.New("provider frame is not valid UTF-8")
+	}
 	var envelope eventEnvelope
 	if err := json.Unmarshal(raw, &envelope); err != nil {
 		return mappedServerEvent{}, fmt.Errorf("decode provider event: %w", err)
@@ -310,6 +319,26 @@ func mapServerEvent(raw []byte, maxFrameBytes int64) (mappedServerEvent, error) 
 		mapped.event.Kind = realtime.EventSessionUpdated
 	case "conversation.item.created":
 		mapped.ignore = true
+	case "input_audio_buffer.committed":
+		var event struct {
+			ItemID         string          `json:"item_id"`
+			PreviousItemID json.RawMessage `json:"previous_item_id"`
+		}
+		if err := json.Unmarshal(raw, &event); err != nil {
+			return mappedServerEvent{}, err
+		}
+		if event.PreviousItemID == nil {
+			return mappedServerEvent{}, errors.New("input_audio_buffer.committed previous_item_id is required")
+		}
+		mapped.event.Kind, mapped.event.ItemID = realtime.EventInputAudioCommitted, event.ItemID
+		if !bytes.Equal(bytes.TrimSpace(event.PreviousItemID), []byte("null")) {
+			var previous string
+			if err := json.Unmarshal(event.PreviousItemID, &previous); err != nil {
+				return mappedServerEvent{}, errors.New("input_audio_buffer.committed previous_item_id must be a string or null")
+			}
+			previous = strings.Clone(previous)
+			mapped.event.PreviousItemID = &previous
+		}
 	case "input_audio_buffer.speech_started":
 		var event struct {
 			ItemID string `json:"item_id"`

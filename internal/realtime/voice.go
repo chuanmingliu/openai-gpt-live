@@ -18,18 +18,24 @@ const (
 	CommandCreateResponse
 	CommandCancelResponse
 	CommandBindResponseEpoch
+	CommandAcknowledgeAudioCommit
 )
 
 type Command struct {
-	Kind       CommandKind
-	Sequence   uint64
-	AfterSeq   uint64
-	Epoch      identity.ResponseEpoch
-	Session    SessionConfig
-	Audio      []byte
-	Item       json.RawMessage
-	Response   ResponseConfig
-	ResponseID string
+	Kind     CommandKind
+	Sequence uint64
+	AfterSeq uint64
+	Epoch    identity.ResponseEpoch
+	// InputItemID is internal audio-commit correlation. CommitAudio sets it when
+	// an explicit speech edge established the provider item; AcknowledgeAudioCommit
+	// sets it to the exact committed item. It is never serialized onto the wire.
+	InputItemID              string
+	InputAudioCommitSequence uint64
+	Session                  SessionConfig
+	Audio                    []byte
+	Item                     json.RawMessage
+	Response                 ResponseConfig
+	ResponseID               string
 }
 
 type OpenRequest struct {
@@ -85,23 +91,31 @@ const (
 	EventFunctionCallDone
 	EventResponseDone
 	EventError
+	EventInputAudioCommitted
 )
 
 type Event struct {
-	Kind              EventKind
-	Epoch             identity.ResponseEpoch
-	ProviderEventID   string
-	ResponseID        string
-	ItemID            string
-	CallID            string
-	Name              string
-	Audio             []byte
-	Text              string
-	Arguments         json.RawMessage
-	Status            string
-	Reason            string
-	Payload           json.RawMessage
-	NeedsEpochBinding bool
+	Kind            EventKind
+	Epoch           identity.ResponseEpoch
+	ProviderEventID string
+	ResponseID      string
+	ItemID          string
+	PreviousItemID  *string
+	// InputAudioCommitCandidate is set only when the transport observed this
+	// committed event after registering the sole outstanding manual commit.
+	// The reactor remains the authority that decides whether it resolves that
+	// generation.
+	InputAudioCommitCandidate bool
+	InputAudioCommitSequence  uint64
+	CallID                    string
+	Name                      string
+	Audio                     []byte
+	Text                      string
+	Arguments                 json.RawMessage
+	Status                    string
+	Reason                    string
+	Payload                   json.RawMessage
+	NeedsEpochBinding         bool
 }
 
 type Session interface {

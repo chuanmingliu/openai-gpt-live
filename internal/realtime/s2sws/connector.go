@@ -10,8 +10,12 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
@@ -19,34 +23,44 @@ import (
 )
 
 const (
-	receiveQueueCapacity     = 256
-	writeQueueCapacity       = 64
-	correlationQueueCapacity = 64
-	explicitPendingLimit     = 64
-	responseHistoryLimit     = 1024
-	implicitEventLimit       = 16
-	implicitByteLimit        = 2 << 20
-	implicitAggregateEvents  = 64
-	implicitAggregateBytes   = 8 << 20
-	implicitUnboundLimit     = 8
+	receiveQueueCapacity       = 256
+	writeQueueCapacity         = 64
+	correlationQueueCapacity   = 64
+	explicitPendingLimit       = 64
+	responseHistoryLimit       = 1024
+	implicitEventLimit         = 16
+	implicitByteLimit          = 2 << 20
+	implicitAggregateEvents    = 64
+	implicitAggregateBytes     = 8 << 20
+	implicitUnboundLimit       = 8
+	defaultCommitAckTimeout    = 5 * time.Second
+	audioCommitItemIDBytes     = 256
+	audioCommitAckHistoryItems = 1024
+	audioCommitAckHistoryBytes = 256 << 10
 )
 
 var (
-	ErrUnknownResponseEpoch  = errors.New("unknown response epoch")
-	ErrImplicitBufferFull    = errors.New("implicit response buffer limit exceeded")
-	ErrImplicitAggregateFull = errors.New("implicit response aggregate buffer limit exceeded")
-	ErrImplicitResponseLimit = errors.New("implicit unbound response limit exceeded")
-	ErrPendingResponseLimit  = errors.New("pending explicit response limit exceeded")
-	ErrAcceptedEventLimit    = errors.New("accepted event queue limit exceeded")
-	ErrSessionClosed         = errors.New("realtime WebSocket session closed")
+	ErrUnknownResponseEpoch        = errors.New("unknown response epoch")
+	ErrImplicitBufferFull          = errors.New("implicit response buffer limit exceeded")
+	ErrImplicitAggregateFull       = errors.New("implicit response aggregate buffer limit exceeded")
+	ErrImplicitResponseLimit       = errors.New("implicit unbound response limit exceeded")
+	ErrPendingResponseLimit        = errors.New("pending explicit response limit exceeded")
+	ErrAcceptedEventLimit          = errors.New("accepted event queue limit exceeded")
+	ErrPendingAudioCommit          = errors.New("input audio commit acknowledgment is pending")
+	ErrAudioCommitAckTimeout       = errors.New("input audio commit acknowledgment timed out")
+	ErrSessionClosed               = errors.New("realtime WebSocket session closed")
+	errInvalidAudioCommitAckItemID = errors.New("input audio commit acknowledgment item ID is invalid")
+	errAudioCommitAckHistoryLimit  = errors.New("input audio commit acknowledgment history limit exceeded")
+	errInvalidAudioCommitSequence  = errors.New("input audio commit sequence must be positive and strictly increasing")
 )
 
 type Config struct {
-	URL            string
-	APIKey         string
-	Model          string
-	ConnectTimeout time.Duration
-	MaxFrameBytes  int64
+	URL              string
+	APIKey           string
+	Model            string
+	ConnectTimeout   time.Duration
+	CommitAckTimeout time.Duration
+	MaxFrameBytes    int64
 }
 
 type Connector struct {
@@ -63,6 +77,12 @@ func New(cfg Config) (*Connector, error) {
 	}
 	if cfg.ConnectTimeout <= 0 {
 		return nil, errors.New("connect timeout must be positive")
+	}
+	if cfg.CommitAckTimeout < 0 {
+		return nil, errors.New("commit acknowledgment timeout must not be negative")
+	}
+	if cfg.CommitAckTimeout == 0 {
+		cfg.CommitAckTimeout = defaultCommitAckTimeout
 	}
 	if cfg.MaxFrameBytes <= 0 {
 		return nil, errors.New("maximum frame size must be positive")
@@ -111,6 +131,7 @@ func (c *Connector) Connect(ctx context.Context, request realtime.OpenRequest) (
 		closeHandshake:   conn.Close,
 		closeNow:         conn.CloseNow,
 		maxFrameBytes:    c.cfg.MaxFrameBytes,
+		commitAckTimeout: c.cfg.CommitAckTimeout,
 		writes:           make(chan writeRequest, writeQueueCapacity),
 		closeWrites:      make(chan struct{}, 1),
 		reads:            make(chan socketRead, 1),
@@ -139,6 +160,7 @@ type socketRead struct {
 	messageType websocket.MessageType
 	raw         []byte
 	err         error
+	sequence    uint64
 }
 
 type correlationKind uint8
@@ -148,14 +170,18 @@ const (
 	correlationBind
 	correlationCancel
 	correlationCancelPending
+	correlationRegisterAudioCommit
+	correlationAcknowledgeAudioCommit
 )
 
 type correlationRequest struct {
-	kind       correlationKind
-	ctx        context.Context
-	epoch      identity.ResponseEpoch
-	responseID string
-	result     chan error
+	kind                     correlationKind
+	ctx                      context.Context
+	epoch                    identity.ResponseEpoch
+	responseID               string
+	inputItemID              string
+	inputAudioCommitSequence uint64
+	result                   chan error
 }
 
 type bufferedResponseEvent struct {
@@ -176,14 +202,57 @@ type responseCorrelation struct {
 	suppressed    bool
 }
 
+type audioCommitAckHistory struct {
+	items map[string]string
+	bytes int
+}
+
+func (h *audioCommitAckHistory) remember(itemID string) (bool, error) {
+	if err := validateAudioCommitAckItemID(itemID); err != nil {
+		return false, err
+	}
+	if _, exists := h.items[itemID]; exists {
+		return true, nil
+	}
+	if len(h.items) >= audioCommitAckHistoryItems || h.bytes > audioCommitAckHistoryBytes ||
+		len(itemID) > audioCommitAckHistoryBytes-h.bytes {
+		return false, errAudioCommitAckHistoryLimit
+	}
+	if h.items == nil {
+		h.items = make(map[string]string)
+	}
+	retained := strings.Clone(itemID)
+	h.items[retained] = retained
+	h.bytes += len(retained)
+	return false, nil
+}
+
+func (h *audioCommitAckHistory) canonical(itemID string) string {
+	return h.items[itemID]
+}
+
+func validateAudioCommitAckItemID(itemID string) error {
+	if itemID == "" || len(itemID) > audioCommitItemIDBytes || !utf8.ValidString(itemID) {
+		return errInvalidAudioCommitAckItemID
+	}
+	for _, character := range itemID {
+		if unicode.IsControl(character) || unicode.IsSpace(character) {
+			return errInvalidAudioCommitAckItemID
+		}
+	}
+	return nil
+}
+
 type voiceSession struct {
-	conn           *websocket.Conn
-	ctx            context.Context
-	cancel         context.CancelFunc
-	writeMessage   func(context.Context, websocket.MessageType, []byte) error
-	closeHandshake func(websocket.StatusCode, string) error
-	closeNow       func() error
-	maxFrameBytes  int64
+	conn             *websocket.Conn
+	ctx              context.Context
+	cancel           context.CancelFunc
+	writeMessage     func(context.Context, websocket.MessageType, []byte) error
+	closeHandshake   func(websocket.StatusCode, string) error
+	closeNow         func() error
+	maxFrameBytes    int64
+	commitAckTimeout time.Duration
+	readSequence     atomic.Uint64
 
 	writes       chan writeRequest
 	closeWrites  chan struct{}
@@ -378,7 +447,7 @@ func (s *voiceSession) startClose() closeStartMode {
 func (s *voiceSession) readLoop() {
 	for {
 		messageType, raw, err := s.conn.Read(s.ctx)
-		result := socketRead{messageType: messageType, raw: raw, err: err}
+		result := socketRead{messageType: messageType, raw: raw, err: err, sequence: s.readSequence.Add(1)}
 		select {
 		case s.reads <- result:
 		case <-s.done:
@@ -413,18 +482,34 @@ func (s *voiceSession) writeLoop() {
 				request.result <- err
 				continue
 			}
-			if request.command.Kind == realtime.CommandBindResponseEpoch {
-				err := s.correlate(request.ctx, correlationRequest{kind: correlationBind, epoch: request.command.Epoch, responseID: request.command.ResponseID})
+			if request.command.Kind == realtime.CommandBindResponseEpoch || request.command.Kind == realtime.CommandAcknowledgeAudioCommit {
+				correlation := correlationRequest{kind: correlationBind, epoch: request.command.Epoch, responseID: request.command.ResponseID}
+				if request.command.Kind == realtime.CommandAcknowledgeAudioCommit {
+					correlation = correlationRequest{
+						kind: correlationAcknowledgeAudioCommit, inputItemID: request.command.InputItemID,
+						inputAudioCommitSequence: request.command.InputAudioCommitSequence,
+					}
+				}
+				err := s.correlate(request.ctx, correlation)
 				request.result <- err
 				continue
 			}
 
 			raw, err := marshalCommand(request.command)
+			correlationCommitted := false
 			if err == nil && int64(len(raw)) > s.maxFrameBytes {
 				err = fmt.Errorf("outbound frame is %d bytes, limit is %d", len(raw), s.maxFrameBytes)
 			}
 			if err == nil && request.command.Kind == realtime.CommandCreateResponse {
 				err = s.correlate(request.ctx, correlationRequest{kind: correlationRegister, epoch: request.command.Epoch})
+				correlationCommitted = err == nil
+			}
+			if err == nil && request.command.Kind == realtime.CommandCommitAudio && s.commitAckTimeout > 0 {
+				err = s.correlate(request.ctx, correlationRequest{
+					kind: correlationRegisterAudioCommit, inputItemID: request.command.InputItemID,
+					inputAudioCommitSequence: request.command.Sequence,
+				})
+				correlationCommitted = err == nil
 			}
 			if err == nil && request.command.Kind == realtime.CommandCancelResponse {
 				if request.command.ResponseID == "" {
@@ -434,10 +519,15 @@ func (s *voiceSession) writeLoop() {
 						kind: correlationCancel, epoch: request.command.Epoch, responseID: request.command.ResponseID,
 					})
 				}
+				correlationCommitted = err == nil
 			}
 			attemptedWrite := false
 			if err == nil {
-				writeContext, finishWrite, ok := s.beginWrite(request.ctx)
+				writeParent := request.ctx
+				if correlationCommitted {
+					writeParent = s.ctx
+				}
+				writeContext, finishWrite, ok := s.beginWrite(writeParent)
 				if !ok {
 					err = ErrSessionClosed
 				} else {
@@ -581,10 +671,6 @@ func (s *voiceSession) correlate(ctx context.Context, request correlationRequest
 	select {
 	case err := <-request.result:
 		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-s.closing:
-		return ErrSessionClosed
 	case <-s.done:
 		return s.sessionError()
 	}
@@ -594,7 +680,33 @@ func (s *voiceSession) mappingLoop() {
 	s.mappingActive = true
 	var terminalReadErr error
 	terminalRequests := s.terminationRequests()
+	var commitAckTimer *time.Timer
+	var commitAckDeadline <-chan time.Time
+	var commitAckItemID string
+	var commitAckSequence uint64
+	var lastCommitSequence uint64
+	var commitAckReadBoundary uint64
+	var commitAckObserved map[string]struct{}
+	var acknowledgedAudioItems audioCommitAckHistory
+	stopCommitAckTimer := func() {
+		commitAckDeadline = nil
+		commitAckItemID = ""
+		commitAckSequence = 0
+		commitAckReadBoundary = 0
+		commitAckObserved = nil
+		if commitAckTimer == nil {
+			return
+		}
+		if !commitAckTimer.Stop() {
+			select {
+			case <-commitAckTimer.C:
+			default:
+			}
+		}
+		commitAckTimer = nil
+	}
 	defer func() {
+		stopCommitAckTimer()
 		s.mappingActive = false
 		s.releaseAllImplicitBuffers()
 		for index := range s.mappedEvents {
@@ -603,6 +715,9 @@ func (s *voiceSession) mappingLoop() {
 		s.mappedEvents = nil
 	}()
 	for {
+		if terminalReadErr != nil {
+			stopCommitAckTimer()
+		}
 		if terminalReadErr != nil && len(s.mappedEvents) == 0 {
 			s.publishTerminal(terminalReadErr)
 			return
@@ -621,6 +736,16 @@ func (s *voiceSession) mappingLoop() {
 			next = s.mappedEvents[0]
 		}
 		select {
+		case <-commitAckDeadline:
+			commitAckDeadline = nil
+			commitAckTimer = nil
+			commitAckItemID = ""
+			commitAckSequence = 0
+			commitAckReadBoundary = 0
+			commitAckObserved = nil
+			if terminalReadErr == nil {
+				terminalReadErr = ErrAudioCommitAckTimeout
+			}
 		case err := <-terminalRequests:
 			if terminalReadErr == nil {
 				terminalReadErr = err
@@ -647,6 +772,23 @@ func (s *voiceSession) mappingLoop() {
 				terminalReadErr = fmt.Errorf("%w: maximum %d", ErrAcceptedEventLimit, receiveQueueCapacity)
 				continue
 			}
+			if mapped.event.Kind == realtime.EventInputAudioCommitted {
+				_, err := acknowledgedAudioItems.remember(mapped.event.ItemID)
+				if err != nil {
+					terminalReadErr = err
+					continue
+				}
+				mapped.event.InputAudioCommitCandidate = commitAckDeadline != nil &&
+					read.sequence > commitAckReadBoundary &&
+					(commitAckItemID == "" || commitAckItemID == mapped.event.ItemID)
+				if mapped.event.InputAudioCommitCandidate {
+					mapped.event.InputAudioCommitSequence = commitAckSequence
+					if commitAckObserved == nil {
+						commitAckObserved = make(map[string]struct{})
+					}
+					commitAckObserved[acknowledgedAudioItems.canonical(mapped.event.ItemID)] = struct{}{}
+				}
+			}
 			if err := s.handleMapped(mapped); err != nil {
 				terminalReadErr = err
 				continue
@@ -666,6 +808,47 @@ func (s *voiceSession) mappingLoop() {
 				err = s.markCancelled(request)
 			case correlationCancelPending:
 				err = s.markPendingCancelled(request.epoch)
+			case correlationRegisterAudioCommit:
+				if terminalReadErr != nil {
+					err = terminalReadErr
+				} else if commitAckDeadline != nil {
+					err = ErrPendingAudioCommit
+				} else if request.inputAudioCommitSequence == 0 || request.inputAudioCommitSequence <= lastCommitSequence {
+					err = errInvalidAudioCommitSequence
+				} else if request.inputItemID != "" {
+					if err = validateAudioCommitAckItemID(request.inputItemID); err == nil {
+						lastCommitSequence = request.inputAudioCommitSequence
+						commitAckItemID = strings.Clone(request.inputItemID)
+						commitAckSequence = request.inputAudioCommitSequence
+						commitAckReadBoundary = s.readSequence.Load()
+						commitAckTimer = time.NewTimer(s.commitAckTimeout)
+						commitAckDeadline = commitAckTimer.C
+					}
+				} else {
+					lastCommitSequence = request.inputAudioCommitSequence
+					commitAckItemID = ""
+					commitAckSequence = request.inputAudioCommitSequence
+					commitAckReadBoundary = s.readSequence.Load()
+					commitAckTimer = time.NewTimer(s.commitAckTimeout)
+					commitAckDeadline = commitAckTimer.C
+				}
+			case correlationAcknowledgeAudioCommit:
+				if terminalReadErr != nil {
+					err = terminalReadErr
+				} else if commitAckDeadline == nil {
+					err = errors.New("input audio commit acknowledgement has no pending commit")
+				} else if request.inputAudioCommitSequence != commitAckSequence {
+					err = errors.New("input audio commit acknowledgement does not match pending generation")
+				} else if err = validateAudioCommitAckItemID(request.inputItemID); err == nil {
+					_, observed := commitAckObserved[request.inputItemID]
+					if !observed {
+						err = errors.New("input audio commit acknowledgement was not observed")
+					} else if commitAckItemID != "" && commitAckItemID != request.inputItemID {
+						err = errors.New("input audio commit acknowledgement does not match pending item")
+					} else {
+						stopCommitAckTimer()
+					}
+				}
 			default:
 				err = errors.New("unknown correlation request")
 			}

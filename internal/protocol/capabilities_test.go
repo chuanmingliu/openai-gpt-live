@@ -29,6 +29,7 @@ func TestCapabilitiesPublishesPinnedFirstReleaseContract(t *testing.T) {
 		"session.reconnect.updated",
 		"session.updated",
 		"error",
+		"input_audio_buffer.committed",
 		"input_audio_buffer.speech_started",
 		"input_audio_buffer.speech_stopped",
 		"conversation.item.input_audio_transcription.delta",

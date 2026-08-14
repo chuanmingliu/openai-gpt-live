@@ -80,6 +80,8 @@ func DecodeServer(raw []byte, limits Limits) (ServerEvent, error) {
 		target = &SessionUpdatedEvent{}
 	case "error":
 		target = &ErrorEvent{}
+	case "input_audio_buffer.committed":
+		target = &InputAudioBufferCommittedEvent{}
 	case "input_audio_buffer.speech_started":
 		target = &InputAudioBufferSpeechStartedEvent{}
 	case "input_audio_buffer.speech_stopped":
@@ -429,6 +431,18 @@ func validateServer(event ServerEvent, raw []byte, limits Limits) error {
 			return err
 		}
 		return requireString(errorFields, "message", true)
+	case InputAudioBufferCommittedEvent:
+		if err := requireString(fields, "item_id", true); err != nil {
+			return err
+		}
+		previous, ok := fields["previous_item_id"]
+		if !ok {
+			return errors.New("previous_item_id is required")
+		}
+		if bytes.Equal(bytes.TrimSpace(previous), []byte("null")) {
+			return nil
+		}
+		return requireString(fields, "previous_item_id", true)
 	case InputAudioBufferSpeechStartedEvent:
 		if err := requireString(fields, "item_id", true); err != nil {
 			return err
