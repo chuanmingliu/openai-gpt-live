@@ -37,6 +37,7 @@ var (
 	ErrImplicitAggregateFull = errors.New("implicit response aggregate buffer limit exceeded")
 	ErrImplicitResponseLimit = errors.New("implicit unbound response limit exceeded")
 	ErrPendingResponseLimit  = errors.New("pending explicit response limit exceeded")
+	ErrAcceptedEventLimit    = errors.New("accepted event queue limit exceeded")
 	ErrSessionClosed         = errors.New("realtime WebSocket session closed")
 )
 
@@ -288,6 +289,9 @@ func (s *voiceSession) Receive(ctx context.Context) (realtime.Event, error) {
 		case <-ctx.Done():
 			return realtime.Event{}, ctx.Err()
 		case <-closing:
+			if s.terminalHandoffActive() {
+				continue
+			}
 			return realtime.Event{}, ErrSessionClosed
 		case <-s.done:
 			select {
@@ -630,6 +634,11 @@ func (s *voiceSession) mappingLoop() {
 			if mapped.ignore {
 				continue
 			}
+			acceptedEvents := len(s.events) + len(s.mappedEvents) + s.implicitBufferedEvents
+			if expansion := s.acceptedEventExpansion(mapped); expansion > receiveQueueCapacity-acceptedEvents {
+				terminalReadErr = fmt.Errorf("%w: maximum %d", ErrAcceptedEventLimit, receiveQueueCapacity)
+				continue
+			}
 			if err := s.handleMapped(mapped); err != nil {
 				terminalReadErr = err
 				continue
@@ -663,6 +672,15 @@ func (s *voiceSession) mappingLoop() {
 			return
 		}
 	}
+}
+
+func (s *voiceSession) acceptedEventExpansion(mapped mappedServerEvent) int {
+	if mapped.responseSpecific && mapped.event.Kind == realtime.EventTranscriptDone && len(s.pending) == 0 {
+		if _, exists := s.responses[mapped.event.ResponseID]; !exists {
+			return 2
+		}
+	}
+	return 1
 }
 
 func (s *voiceSession) registerExplicit(epoch identity.ResponseEpoch) error {

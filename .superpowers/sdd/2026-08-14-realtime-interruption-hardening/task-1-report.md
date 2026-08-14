@@ -119,3 +119,36 @@ All passed with loopback permission where required.
 - Checked aggregate admission leaves enough public-channel capacity for a mapping-owned terminal tail to drain without a receiver; implicit bind moves entries without increasing the aggregate.
 - Checked provider cancel completion precedes dependent client error writes without waiting on the sole reactor.
 - Checked only Task 1 files plus this report are staged.
+
+## Round-four review fixes
+
+RED evidence and root causes:
+
+1. `TestReceiveBlockedBeforeWriterTerminalHandoffPreservesAcceptedTail` held the mapping owner after it accepted a private FIFO tail, proved `Receive` was already blocked, then forced an outbound failure and concurrent `Close`. The prior implementation returned `ErrSessionClosed` before the accepted tail. The receiver had captured the real `closing` channel before `terminalHandedOff` changed, so the earlier post-handoff snapshot fix could not protect that already-running select.
+2. `TestImplicitTerminalTranscriptRespectsAggregateAcceptedEventBound/one_over_boundary_fails_closed_without_partial_expansion` timed out because a terminal transcript admitted at aggregate 255 synthesized `response.created` and buffered the original transcript, reaching 257 instead of failing closed. The exact-boundary sibling demonstrated that aggregate 254 plus the same pair must remain accepted and FIFO at exactly 256.
+
+Completion contracts:
+
+- When a captured normal-close signal wakes `Receive`, it rechecks terminal ownership under the same `closeStateMu` arbitration used by `startClose` and `beginTerminalHandoff`. A handoff winner keeps the already-blocked receiver on the accepted FIFO until the mapping owner publishes the writer cause; a normal-close winner still returns `ErrSessionClosed` immediately.
+- Mapping admission computes the accepted-event expansion of each decoded provider frame before mutating correlation or delivery state. The supported unknown-response terminal-transcript frame reserves two slots for its synthetic `response.created` and original buffered transcript; every other accepted frame reserves one. An expansion that would exceed 256 publishes `ErrAcceptedEventLimit` without exposing a partial synthetic event.
+- The aggregate remains exactly public-channel entries plus mapping FIFO entries plus implicit buffered entries. Bind still transfers ownership without increasing that total, and socket reads still stop at the watermark while correlation requests and FIFO delivery remain selectable.
+
+Round-four verification commands:
+
+```text
+go test -race ./internal/realtime/s2sws -run '^(TestReceiveBlockedBeforeWriterTerminalHandoffPreservesAcceptedTail|TestImplicitTerminalTranscriptRespectsAggregateAcceptedEventBound)$' -count=100 -timeout=240s
+go test ./internal/realtime/s2sws -count=5 -timeout=240s
+go test -race ./internal/realtime/s2sws -count=3 -timeout=300s
+go test -race ./internal/session -count=1 -timeout=300s
+```
+
+All passed with loopback permission where required.
+
+Round-four self-review:
+
+- Replayed both `closeStateMu` orders. A prior writer handoff makes a stale close wake loop back to event/done selection; a prior normal close prevents handoff and preserves the normal `ErrSessionClosed` path.
+- Checked terminal publication still waits only for the mapping FIFO, and the new receiver behavior allows an already-blocked consumer to drain that FIFO before observing the writer error.
+- Checked admission expansion exactly matches the sole compatibility path that creates two accepted events from one frame. The overflow branch runs before `handleMapped`, so it cannot leave a new response correlation, synthetic event, or implicit buffer behind.
+- Checked ordinary one-event frames remain admissible at aggregate 255, while the two-event compatibility frame is admissible at 254 and rejected at 255.
+- Re-ran the complete adapter suites to cover close idempotency, FIFO/no-drop, correlation progress, empty-ID cancel, manager composition, implicit limits, and prior terminal ordering. The session race smoke covers the unchanged manager/reactor invariants and expert-review item 8 remains untouched.
+- Confirmed the pre-existing demo and documentation dirt was neither modified for this round nor included in the Task 1 commit.

@@ -186,3 +186,155 @@ func TestCloseAfterWriterTerminalHandoffCompletes(t *testing.T) {
 	}
 	require.NoError(t, session.Close(t.Context()))
 }
+
+// TestReceiveBlockedBeforeWriterTerminalHandoffPreservesAcceptedTail catches a
+// receiver retaining the normal-close signal after terminal ownership moves to
+// the mapping loop. The correlation result deliberately holds the mapping
+// owner after it accepts the tail so Close cannot race with tail delivery.
+func TestReceiveBlockedBeforeWriterTerminalHandoffPreservesAcceptedTail(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	writeErr := errors.New("outbound write failed")
+	session := &voiceSession{
+		ctx: ctx, cancel: cancel,
+		writeMessage:   func(context.Context, websocket.MessageType, []byte) error { return writeErr },
+		closeHandshake: func(websocket.StatusCode, string) error { return nil }, closeNow: func() error { return nil },
+		maxFrameBytes: 1 << 20,
+		writes:        make(chan writeRequest, 1), closeWrites: make(chan struct{}, 1),
+		reads: make(chan socketRead), correlations: make(chan correlationRequest), events: make(chan realtime.Event, 1),
+		closing: make(chan struct{}), closeDone: make(chan struct{}), done: make(chan struct{}),
+		responses: make(map[string]*responseCorrelation), pending: make(map[identity.ResponseEpoch]struct{}),
+	}
+	go session.mappingLoop()
+	writerExited := make(chan struct{})
+	go func() {
+		session.writeLoop()
+		close(writerExited)
+	}()
+
+	session.events <- realtime.Event{Kind: realtime.EventSessionCreated, ProviderEventID: "public-prefix"}
+	session.reads <- socketRead{
+		messageType: websocket.MessageText,
+		raw:         []byte(`{"type":"input_audio_buffer.speech_started","event_id":"accepted-tail","item_id":"item","audio_start_ms":1}`),
+	}
+	blockerResult := make(chan error)
+	session.correlations <- correlationRequest{
+		kind: correlationRegister, ctx: t.Context(), epoch: 1, result: blockerResult,
+	}
+	require.Equal(t, "public-prefix", (<-session.events).ProviderEventID)
+
+	receiveContext := newCloseWaitContext(t.Context())
+	type receiveOutcome struct {
+		event realtime.Event
+		err   error
+	}
+	receiveResult := make(chan receiveOutcome, 1)
+	go func() {
+		event, err := session.Receive(receiveContext)
+		receiveResult <- receiveOutcome{event: event, err: err}
+	}()
+	<-receiveContext.observed
+
+	require.ErrorIs(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio}), writeErr)
+	select {
+	case <-writerExited:
+	case <-time.After(time.Second):
+		t.Fatal("writer did not finish terminal handoff")
+	}
+	closeResult := make(chan error, 1)
+	go func() { closeResult <- session.Close(t.Context()) }()
+	require.Eventually(t, session.isClosing, time.Second, time.Millisecond)
+
+	var received receiveOutcome
+	select {
+	case received = <-receiveResult:
+	case <-time.After(50 * time.Millisecond):
+	}
+	require.NoError(t, <-blockerResult)
+	if received.event.Kind == 0 && received.err == nil {
+		select {
+		case received = <-receiveResult:
+		case <-time.After(time.Second):
+			t.Fatal("blocked Receive did not resume with the accepted tail")
+		}
+	}
+	require.NoError(t, received.err)
+	require.Equal(t, "accepted-tail", received.event.ProviderEventID)
+
+	_, err := session.Receive(t.Context())
+	require.ErrorIs(t, err, writeErr)
+	require.NoError(t, <-closeResult)
+}
+
+func newAggregateEventBoundSession(t *testing.T, accepted int) *voiceSession {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	session := &voiceSession{
+		ctx: ctx, cancel: cancel,
+		reads: make(chan socketRead), correlations: make(chan correlationRequest),
+		events: make(chan realtime.Event, receiveQueueCapacity), closing: make(chan struct{}), done: make(chan struct{}),
+		responses: make(map[string]*responseCorrelation), pending: make(map[identity.ResponseEpoch]struct{}),
+		maxFrameBytes: 1 << 20, closeNow: func() error { return nil },
+	}
+	for index := range accepted {
+		session.events <- realtime.Event{Kind: realtime.EventSessionUpdated, ProviderEventID: fmt.Sprintf("accepted-%03d", index)}
+	}
+	go session.mappingLoop()
+	t.Cleanup(func() {
+		session.publishTerminal(errors.New("aggregate event bound test cleanup"))
+	})
+	return session
+}
+
+func implicitTerminalTranscriptRead(responseID string) socketRead {
+	return socketRead{
+		messageType: websocket.MessageText,
+		raw: []byte(fmt.Sprintf(
+			`{"type":"response.output_audio_transcript.done","event_id":"implicit-terminal","response_id":%q,"item_id":"assistant-item","transcript":"done"}`,
+			responseID,
+		)),
+	}
+}
+
+// TestImplicitTerminalTranscriptRespectsAggregateAcceptedEventBound catches
+// admission that counts the provider frame but not its synthetic
+// response.created plus original terminal-transcript expansion.
+func TestImplicitTerminalTranscriptRespectsAggregateAcceptedEventBound(t *testing.T) {
+	t.Run("exact boundary accepts both events FIFO", func(t *testing.T) {
+		const existing = receiveQueueCapacity - 2
+		session := newAggregateEventBoundSession(t, existing)
+		session.reads <- implicitTerminalTranscriptRead("exact-boundary")
+
+		require.NoError(t, session.correlate(t.Context(), correlationRequest{
+			kind: correlationBind, epoch: 17, responseID: "exact-boundary",
+		}))
+		require.Eventually(t, func() bool {
+			return len(session.events) == receiveQueueCapacity
+		}, time.Second, time.Millisecond)
+
+		for index := range existing {
+			event := <-session.events
+			require.Equal(t, fmt.Sprintf("accepted-%03d", index), event.ProviderEventID)
+		}
+		created := <-session.events
+		require.Equal(t, realtime.EventResponseCreated, created.Kind)
+		require.Equal(t, "exact-boundary", created.ResponseID)
+		terminal := <-session.events
+		require.Equal(t, realtime.EventTranscriptDone, terminal.Kind)
+		require.Equal(t, "implicit-terminal", terminal.ProviderEventID)
+		require.Equal(t, identity.ResponseEpoch(17), terminal.Epoch)
+	})
+
+	t.Run("one over boundary fails closed without partial expansion", func(t *testing.T) {
+		const existing = receiveQueueCapacity - 1
+		session := newAggregateEventBoundSession(t, existing)
+		session.reads <- implicitTerminalTranscriptRead("over-boundary")
+
+		select {
+		case <-session.done:
+		case <-time.After(100 * time.Millisecond):
+			t.Fatal("aggregate overflow did not fail the session closed")
+		}
+		require.ErrorIs(t, session.sessionError(), ErrAcceptedEventLimit)
+		require.Len(t, session.events, existing, "overflow must not expose only the synthetic half of the frame")
+	})
+}
