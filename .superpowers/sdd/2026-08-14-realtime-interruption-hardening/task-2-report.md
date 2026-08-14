@@ -39,13 +39,20 @@ Review-fix round 1 REDs:
 3. `TestApprovalCoordinatorDoesNotBlockStoreProgressOnOptionalLiveCompletion` timed out waiting for approval B's store call while approval A's optional `Submit` remained blocked.
 4. `TestApprovalCoordinatorStoreDeadlineBeginsWhenQueuedWorkExecutes` observed approval B start with `context deadline exceeded` because queue and completion wait had consumed its admission-time store deadline.
 
+Review-fix round 2 REDs:
+
+1. `TestAudioCommitAfterClientTurnAcceptsNewProviderTranscriptAndKeepsOlderItemsFenced` showed transcript-only provider turn A, client user turn B, then `input_audio_buffer.commit` followed by provider turn C without `speech_started` produced zero effects: B remained permanently authoritative and both C delta and completion were dropped.
+2. `TestCommittedAudioTurnCannotBeClaimedByAnOlderABAItem` showed the missing commit-generation model also allowed an older item B to be accepted as the next turn in an ABA sequence, mutating the active transcript and preventing the genuinely new item D from being admitted.
+3. `TestAudioCommitFencesPriorTranscriptOnlyItemBeforeOpeningNewClaim` isolated the direct compatibility seam: transcript-only A followed by commit allowed a late A completion to consume the open claim, advance A's revision, and block new item B. This proved the commit boundary itself must remember the prior active item, even when no client or speech boundary had previously established provider authority.
+
 ## Implemented contracts
 
 ### Provider input-item fence
 
-- The reactor retains one ephemeral authoritative input-item ID established by `speech_started` or a newer client-created user turn.
+- The reactor retains one ephemeral authoritative input-item ID established by `speech_started` or a newer client-created user turn. Establishing authority also remembers the immediately preceding transcript-only active item, so crossing from no-speech-edge compatibility into explicit ownership does not forget the older item.
 - Once a provider item has been observed, transcription delta/completion for another item is silently rejected before event-ID, revision, effect-sequence, durable-sequence, active-turn, or persistence mutation.
-- Providers without speech edges retain the established transcription-driven item/revision compatibility path. A later transcript cannot supersede an already observed newer provider item.
+- Providers without speech edges retain the established transcription-driven item/revision compatibility path. `input_audio_buffer.commit` opens one new provider-item claim: previously authoritative item IDs remain fenced, while the first unseen transcription item establishes the new turn and closes the claim. Its delta is published and its completion is published and persisted normally.
+- The authoritative item history is capped at 1024 exact IDs and fails closed rather than evicting an older ID and reopening an ABA path. A provider `speech_started` edge can deliberately establish a fresh generation for a reused ID.
 - `speech_started` is synchronously applied at the manager's pure reactor boundary, so later provider media cannot overtake the fence. It still waits for no provider send, client write, store call, or safety call.
 
 ### Implicit response while speaking
@@ -94,6 +101,14 @@ GOCACHE=/private/tmp/gpt-live-task2-go-cache go test -race ./internal/gateway -r
 
 All passed.
 
+Review-fix round 2 mixed-mode and ABA exact repros:
+
+```text
+go test -race ./internal/session -run '^(TestAudioCommitAfterClientTurnAcceptsNewProviderTranscriptAndKeepsOlderItemsFenced|TestAudioCommitFencesPriorTranscriptOnlyItemBeforeOpeningNewClaim|TestCommittedAudioTurnCannotBeClaimedByAnOlderABAItem)$' -count=100 -timeout=240s
+```
+
+PASS.
+
 Focused gateway race tests for bounded approval ownership and the speech fence:
 
 ```text
@@ -126,7 +141,8 @@ All passed. Listener-backed gateway/adapter tests used loopback permission; no l
 ## Self-review
 
 - Checked stale item rejection occurs before all synth-ID, revision, sequence, active-turn, and durable-effect mutation.
-- Checked no-speech-edge compatibility remains covered by final transcript and ABA revision tests.
+- Checked no-speech-edge compatibility remains covered by final transcript and ABA revision tests, including transcript-only A crossing client B and audio commit into transcript-only C.
+- Checked commit-opened provider ownership admits only an unseen item, keeps every exact prior authoritative ID fenced across repeated commits, fails closed at the bounded history limit, and permits intentional ID reuse only through an explicit speech edge.
 - Checked a newer client-created user turn advances the same authoritative item fence without changing providers that have emitted no speech edge and no newer client user item.
 - Checked implicit suppression orders bind before flush/cancel and uses a newer cancel fence; old bind-epoch media is therefore rejected even if binding releases buffered adapter frames.
 - Checked the cancelled-pending structure is explicitly create-epoch correlated, bounded together with pending creates, and never deletes an arbitrary map/oldest epoch.

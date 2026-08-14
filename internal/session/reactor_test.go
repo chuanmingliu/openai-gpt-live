@@ -695,6 +695,119 @@ func TestClientCreatedUserTurnRejectsLateOlderProviderTranscriptsWithoutMutation
 	}
 }
 
+func TestAudioCommitAfterClientTurnAcceptsNewProviderTranscriptAndKeepsOlderItemsFenced(t *testing.T) {
+	reactor, fence := testReactor(1)
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "provider-turn-a", Text: "older transcript-only turn",
+	}))
+	applyOK(t, reactor, ClientInput{Event: protocol.ConversationItemCreateEvent{
+		Type: "conversation.item.create",
+		Item: protocol.ConversationItem{
+			ID: "client-turn-b", Type: "message", Role: "user",
+			Content: json.RawMessage(`[{"type":"input_text","text":"newer user turn"}]`),
+		},
+	}})
+	applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{
+		Type: "input_audio_buffer.commit",
+	}})
+
+	effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionDelta, ItemID: "provider-turn-c", Text: "new partial",
+	}))
+	require.Len(t, effects, 1)
+	assert.Equal(t, "conversation.item.input_audio_transcription.delta", effects[0].ClientEvent.EventType())
+	require.NotNil(t, reactor.activeTurn)
+	assert.Equal(t, identity.TurnKey{ID: "provider-turn-c", Revision: 3}, reactor.activeTurn.key)
+
+	effects = applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "provider-turn-c", Text: "new final",
+	}))
+	require.Len(t, effects, 1)
+	require.NotNil(t, effects[0].Transcript)
+	assert.Equal(t, identity.TurnKey{ID: "provider-turn-c", Revision: 3}, effects[0].Transcript.Turn)
+	assert.Equal(t, "new final", effects[0].Transcript.FinalText)
+
+	for _, itemID := range []string{"provider-turn-a", "client-turn-b"} {
+		before := mutationView(reactor)
+		beforeEpoch := fence.Current()
+		for _, event := range []realtime.Event{
+			{Kind: realtime.EventTranscriptionDelta, ItemID: itemID, Text: "late partial"},
+			{Kind: realtime.EventTranscriptionCompleted, ItemID: itemID, Text: "late final"},
+		} {
+			assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, event)))
+		}
+		assert.Equal(t, before, mutationView(reactor))
+		assert.Equal(t, beforeEpoch, fence.Current())
+	}
+}
+
+func TestAudioCommitFencesPriorTranscriptOnlyItemBeforeOpeningNewClaim(t *testing.T) {
+	reactor, _ := testReactor(1)
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-a", Text: "turn a",
+	}))
+	applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+
+	before := mutationView(reactor)
+	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-a", Text: "late turn a",
+	})))
+	assert.Equal(t, before, mutationView(reactor))
+
+	effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-b", Text: "turn b",
+	}))
+	require.Len(t, effects, 1)
+	require.NotNil(t, effects[0].Transcript)
+	assert.Equal(t, identity.TurnKey{ID: "turn-b", Revision: 2}, effects[0].Transcript.Turn)
+}
+
+func TestCommittedAudioTurnCannotBeClaimedByAnOlderABAItem(t *testing.T) {
+	reactor, _ := testReactor(1)
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventSpeechStarted, ItemID: "turn-a",
+	}))
+	applyOK(t, reactor, ClientInput{Event: protocol.ConversationItemCreateEvent{
+		Type: "conversation.item.create",
+		Item: protocol.ConversationItem{
+			ID: "turn-b", Type: "message", Role: "user",
+			Content: json.RawMessage(`[{"type":"input_text","text":"turn b"}]`),
+		},
+	}})
+	applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-c", Text: "turn c",
+	}))
+	applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+
+	for _, itemID := range []string{"turn-a", "turn-b", "turn-c"} {
+		before := mutationView(reactor)
+		assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+			Kind: realtime.EventTranscriptionCompleted, ItemID: itemID, Text: "late",
+		})))
+		assert.Equal(t, before, mutationView(reactor))
+	}
+
+	effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-d", Text: "turn d",
+	}))
+	require.Len(t, effects, 1)
+	require.NotNil(t, effects[0].Transcript)
+	assert.Equal(t, identity.TurnKey{ID: "turn-d", Revision: 4}, effects[0].Transcript.Turn)
+
+	// An explicit provider speech edge may deliberately establish a fresh ABA
+	// generation even when its item ID was authoritative in the past.
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventSpeechStarted, ItemID: "turn-a",
+	}))
+	effects = applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-a", Text: "fresh turn a",
+	}))
+	require.Len(t, effects, 1)
+	require.NotNil(t, effects[0].Transcript)
+	assert.Equal(t, identity.TurnKey{ID: "turn-a", Revision: 5}, effects[0].Transcript.Turn)
+}
+
 func TestPendingCancelNeverSynthesizesEmptyResponseDone(t *testing.T) {
 	reactor, fence := testReactor(1)
 	createResponse(t, reactor)

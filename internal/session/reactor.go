@@ -41,6 +41,7 @@ const (
 	AsyncKindStartBackgroundTaskRejected = "start_background_task.rejected"
 	asyncKindPresentationSafety          = "presentation.safety"
 	recentPresentationCorrelationLimit   = 8
+	providerInputItemHistoryLimit        = 1024
 )
 
 type ClientEffectCompletedInput struct {
@@ -79,6 +80,7 @@ var (
 	ErrInvalidSessionIDs         = errors.New("invalid session IDs")
 	ErrTurnRevisionExhausted     = errors.New("session turn revision exhausted")
 	ErrTurnRevisionRegression    = errors.New("session turn revision must increase")
+	ErrProviderInputItemLimit    = errors.New("provider input item history limit exceeded")
 )
 
 type terminalMarker struct {
@@ -168,41 +170,43 @@ type Reactor struct {
 	initErr             error
 	handoffToolsEnabled bool
 
-	activeResponseID          string
-	activeResponseEpoch       identity.ResponseEpoch
-	suppressedImplicitID      string
-	terminal                  *terminalMarker
-	pendingSessionUpdates     map[uint64]pendingSessionUpdate
-	pendingSessionUpdateBytes int
-	connected                 bool
-	pendingTools              []pendingTool
-	pendingToolBytes          int
-	activeTurn                *activeInputTurn
-	currentProviderInputItem  string
-	inputTurnRevision         uint32
-	pendingCancelSequence     uint64
-	pendingCreateSequence     uint64
-	synthEventSequence        uint64
-	transcriptSequence        uint64
-	committedTranscript       string
-	handoffCalls              map[string]*handoffCall
-	handoffCallOrder          []string
-	handoffCallBytes          int
-	terminalResponses         map[string]struct{}
-	finalizedAssistantTexts   map[string]finalizedTranscript
-	finalizedAssistantOrder   []string
-	finalizedAssistantBytes   int
-	resolvedHandoffs          map[handoffToken]struct{}
-	resolvedHandoffOrder      []handoffToken
-	presentationPolicy        presentation.Policy
-	safetyPolicy              safety.Policy
-	presentationEpoch         identity.ResponseEpoch
-	presentationEventID       string
-	presentationSequence      int64
-	stagedPresentation        *stagedPresentation
-	recentPresentations       []presentationCorrelation
-	deferPresentationSafety   bool
-	pendingPresentationSafety map[uint64]pendingPresentationSafety
+	activeResponseID           string
+	activeResponseEpoch        identity.ResponseEpoch
+	suppressedImplicitID       string
+	terminal                   *terminalMarker
+	pendingSessionUpdates      map[uint64]pendingSessionUpdate
+	pendingSessionUpdateBytes  int
+	connected                  bool
+	pendingTools               []pendingTool
+	pendingToolBytes           int
+	activeTurn                 *activeInputTurn
+	currentProviderInputItem   string
+	providerInputItemHistory   map[string]struct{}
+	providerInputItemClaimOpen bool
+	inputTurnRevision          uint32
+	pendingCancelSequence      uint64
+	pendingCreateSequence      uint64
+	synthEventSequence         uint64
+	transcriptSequence         uint64
+	committedTranscript        string
+	handoffCalls               map[string]*handoffCall
+	handoffCallOrder           []string
+	handoffCallBytes           int
+	terminalResponses          map[string]struct{}
+	finalizedAssistantTexts    map[string]finalizedTranscript
+	finalizedAssistantOrder    []string
+	finalizedAssistantBytes    int
+	resolvedHandoffs           map[handoffToken]struct{}
+	resolvedHandoffOrder       []handoffToken
+	presentationPolicy         presentation.Policy
+	safetyPolicy               safety.Policy
+	presentationEpoch          identity.ResponseEpoch
+	presentationEventID        string
+	presentationSequence       int64
+	stagedPresentation         *stagedPresentation
+	recentPresentations        []presentationCorrelation
+	deferPresentationSafety    bool
+	pendingPresentationSafety  map[uint64]pendingPresentationSafety
 }
 
 func NewReactor(ids IDs, fence *EpochFence) *Reactor {
@@ -1358,6 +1362,17 @@ func (r *Reactor) applySessionUpdate(event protocol.SessionUpdateEvent) ([]Effec
 }
 
 func (r *Reactor) applyAudioCommit() ([]Effect, error) {
+	// Some providers do not emit speech_started. A successful client commit is
+	// therefore the boundary at which one previously unseen provider item may
+	// establish the new authoritative input turn.
+	if r.activeTurn != nil {
+		activeItemID := r.activeTurn.key.ID
+		if _, exists := r.providerInputItemHistory[activeItemID]; !exists && len(r.providerInputItemHistory) >= providerInputItemHistoryLimit {
+			return nil, ErrProviderInputItemLimit
+		}
+		r.rememberProviderInputItem(activeItemID)
+	}
+	r.providerInputItemClaimOpen = true
 	command := realtime.Command{
 		Kind:     realtime.CommandCommitAudio,
 		Sequence: r.allocateSequence(),
@@ -1378,12 +1393,9 @@ func (r *Reactor) applyConversationItemCreate(event protocol.ConversationItemCre
 		return nil, fmt.Errorf("encode conversation item: %w", err)
 	}
 	if isUserMessage {
-		if err := r.beginInputTurn(event.Item.ID); err != nil {
+		if err := r.establishProviderInputItem(event.Item.ID); err != nil {
 			return nil, err
 		}
-		// The current input-turn item is authoritative even when the newer turn
-		// originated at the client rather than a provider speech edge.
-		r.currentProviderInputItem = event.Item.ID
 	}
 	command := realtime.Command{
 		Kind:     realtime.CommandCreateItem,
@@ -1525,19 +1537,18 @@ func (r *Reactor) applySpeechStarted(event realtime.Event) ([]Effect, error) {
 	r.stagedPresentation = nil
 	if r.state.UserSpeaking {
 		if r.activeTurn != nil && r.activeTurn.key.ID == event.ItemID {
+			r.providerInputItemClaimOpen = false
 			return nil, nil
 		}
-		if err := r.beginInputTurn(event.ItemID); err != nil {
+		if err := r.establishProviderInputItem(event.ItemID); err != nil {
 			return nil, err
 		}
-		r.currentProviderInputItem = event.ItemID
 		return nil, nil
 	}
 
-	if err := r.beginInputTurn(event.ItemID); err != nil {
+	if err := r.establishProviderInputItem(event.ItemID); err != nil {
 		return nil, err
 	}
-	r.currentProviderInputItem = event.ItemID
 	r.clearPresentationResponse()
 	epoch := r.fence.Advance()
 	r.state.UserSpeaking = true
@@ -1681,8 +1692,15 @@ func (r *Reactor) applyInputTranscriptionDelta(event realtime.Event) ([]Effect, 
 	if r.staleProviderInputItem(event.ItemID) {
 		return nil, nil
 	}
+	claim, err := r.preflightProviderInputItemClaim(event.ItemID)
+	if err != nil {
+		return nil, err
+	}
 	if err := r.observeTranscription(event.ItemID, false); err != nil {
 		return nil, err
+	}
+	if claim {
+		r.claimProviderInputItem(event.ItemID)
 	}
 	mapped := protocol.ConversationItemInputAudioTranscriptionDeltaEvent{
 		Type:    "conversation.item.input_audio_transcription.delta",
@@ -1703,6 +1721,10 @@ func (r *Reactor) applyInputTranscriptionCompleted(event realtime.Event) ([]Effe
 	if err := validateDurableID("transcript item ID", event.ItemID); err != nil {
 		return nil, err
 	}
+	claim, err := r.preflightProviderInputItemClaim(event.ItemID)
+	if err != nil {
+		return nil, err
+	}
 	if r.activeTurn != nil && r.activeTurn.key.ID == event.ItemID && r.activeTurn.transcriptComplete && r.activeTurn.transcript == event.Text {
 		mapped := protocol.ConversationItemInputAudioTranscriptionCompletedEvent{
 			Type: "conversation.item.input_audio_transcription.completed", EventID: r.providerOrSynthEventID(event.ProviderEventID),
@@ -1712,6 +1734,9 @@ func (r *Reactor) applyInputTranscriptionCompleted(event realtime.Event) ([]Effe
 	}
 	if err := r.observeTranscription(event.ItemID, true); err != nil {
 		return nil, err
+	}
+	if claim {
+		r.claimProviderInputItem(event.ItemID)
 	}
 	mapped := protocol.ConversationItemInputAudioTranscriptionCompletedEvent{
 		Type:       "conversation.item.input_audio_transcription.completed",
@@ -1732,7 +1757,65 @@ func (r *Reactor) applyInputTranscriptionCompleted(event realtime.Event) ([]Effe
 }
 
 func (r *Reactor) staleProviderInputItem(itemID string) bool {
+	if r.providerInputItemClaimOpen {
+		_, previouslyAuthoritative := r.providerInputItemHistory[itemID]
+		return previouslyAuthoritative
+	}
 	return r.currentProviderInputItem != "" && itemID != r.currentProviderInputItem
+}
+
+func (r *Reactor) preflightProviderInputItemClaim(itemID string) (bool, error) {
+	if !r.providerInputItemClaimOpen {
+		return false, nil
+	}
+	if _, exists := r.providerInputItemHistory[itemID]; exists {
+		return false, nil
+	}
+	if len(r.providerInputItemHistory) >= providerInputItemHistoryLimit {
+		return false, ErrProviderInputItemLimit
+	}
+	return true, nil
+}
+
+func (r *Reactor) claimProviderInputItem(itemID string) {
+	r.rememberProviderInputItem(itemID)
+	r.currentProviderInputItem = itemID
+	r.providerInputItemClaimOpen = false
+}
+
+func (r *Reactor) rememberProviderInputItem(itemID string) {
+	if itemID == "" {
+		return
+	}
+	if r.providerInputItemHistory == nil {
+		r.providerInputItemHistory = make(map[string]struct{})
+	}
+	r.providerInputItemHistory[itemID] = struct{}{}
+}
+
+func (r *Reactor) establishProviderInputItem(itemID string) error {
+	previousItemID := ""
+	if r.activeTurn != nil {
+		previousItemID = r.activeTurn.key.ID
+	}
+	newHistoryEntries := 0
+	if _, exists := r.providerInputItemHistory[itemID]; !exists {
+		newHistoryEntries++
+	}
+	if previousItemID != "" && previousItemID != itemID {
+		if _, exists := r.providerInputItemHistory[previousItemID]; !exists {
+			newHistoryEntries++
+		}
+	}
+	if len(r.providerInputItemHistory)+newHistoryEntries > providerInputItemHistoryLimit {
+		return ErrProviderInputItemLimit
+	}
+	if err := r.beginInputTurn(itemID); err != nil {
+		return err
+	}
+	r.rememberProviderInputItem(previousItemID)
+	r.claimProviderInputItem(itemID)
+	return nil
 }
 
 func (r *Reactor) applyAudioDone(event realtime.Event) ([]Effect, error) {
