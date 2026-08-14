@@ -762,6 +762,215 @@ func TestAudioCommitFencesPriorTranscriptOnlyItemBeforeOpeningNewClaim(t *testin
 	assert.Equal(t, identity.TurnKey{ID: "turn-b", Revision: 2}, effects[0].Transcript.Turn)
 }
 
+func TestClientUserItemCannotReuseHistoricalProviderItemWithoutSpeechEdge(t *testing.T) {
+	reactor, _ := testReactor(1)
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventSpeechStarted, ItemID: "turn-a",
+	}))
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventSpeechStopped, ItemID: "turn-a",
+	}))
+	applyOK(t, reactor, ClientInput{Event: protocol.ConversationItemCreateEvent{
+		Type: "conversation.item.create",
+		Item: protocol.ConversationItem{
+			ID: "turn-b", Type: "message", Role: "user",
+			Content: json.RawMessage(`[{"type":"input_text","text":"turn b"}]`),
+		},
+	}})
+	before := mutationView(reactor)
+
+	effects, err := reactor.Apply(ClientInput{Event: protocol.ConversationItemCreateEvent{
+		Type: "conversation.item.create",
+		Item: protocol.ConversationItem{
+			ID: "turn-a", Type: "message", Role: "user",
+			Content: json.RawMessage(`[{"type":"input_text","text":"reused turn a"}]`),
+		},
+	}})
+	require.ErrorContains(t, err, "historical provider input item")
+	assert.Empty(t, effects)
+	assert.Equal(t, before, mutationView(reactor))
+
+	for _, event := range []realtime.Event{
+		{Kind: realtime.EventTranscriptionDelta, ItemID: "turn-a", Text: "late partial"},
+		{Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-a", Text: "late final"},
+	} {
+		assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, event)))
+	}
+	assert.Equal(t, before, mutationView(reactor))
+}
+
+func TestConsecutiveAudioCommitsRetainOneOrderedClaimPerTurn(t *testing.T) {
+	reactor, _ := testReactor(1)
+	applyOK(t, reactor, ClientInput{Event: protocol.ConversationItemCreateEvent{
+		Type: "conversation.item.create",
+		Item: protocol.ConversationItem{
+			ID: "turn-a", Type: "message", Role: "user",
+			Content: json.RawMessage(`[{"type":"input_text","text":"turn a"}]`),
+		},
+	}})
+	for range 3 {
+		effects := applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+		require.Len(t, effects, 1)
+		assert.Equal(t, realtime.CommandCommitAudio, effects[0].VoiceCommand.Kind)
+	}
+
+	for index, itemID := range []string{"turn-b", "turn-c", "turn-d"} {
+		effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+			Kind: realtime.EventTranscriptionCompleted, ItemID: itemID, Text: itemID,
+		}))
+		require.Len(t, effects, 1, "commit generation %d must remain claimable", index+1)
+		require.NotNil(t, effects[0].Transcript)
+		assert.Equal(t, identity.TurnKey{ID: itemID, Revision: uint32(index + 2)}, effects[0].Transcript.Turn)
+	}
+}
+
+func TestCompletedSpeechGenerationDoesNotConsumeLaterAudioCommit(t *testing.T) {
+	reactor, _ := testReactor(1)
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventSpeechStarted, ItemID: "turn-a",
+	}))
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventSpeechStopped, ItemID: "turn-a",
+	}))
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-a", Text: "turn a",
+	}))
+	applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+
+	effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-b", Text: "turn b",
+	}))
+	require.Len(t, effects, 1)
+	require.NotNil(t, effects[0].Transcript)
+	assert.Equal(t, identity.TurnKey{ID: "turn-b", Revision: 2}, effects[0].Transcript.Turn)
+}
+
+func TestAllTranscriptOnlyHistoryItemsFenceLaterCommitClaim(t *testing.T) {
+	reactor, _ := testReactor(1)
+	for _, itemID := range []string{"turn-a", "turn-b"} {
+		applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+			Kind: realtime.EventTranscriptionCompleted, ItemID: itemID, Text: itemID,
+		}))
+	}
+	applyOK(t, reactor, ClientInput{Event: protocol.ConversationItemCreateEvent{
+		Type: "conversation.item.create",
+		Item: protocol.ConversationItem{
+			ID: "turn-c", Type: "message", Role: "user",
+			Content: json.RawMessage(`[{"type":"input_text","text":"turn c"}]`),
+		},
+	}})
+	applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+	before := mutationView(reactor)
+
+	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-a", Text: "late turn a",
+	})))
+	assert.Equal(t, before, mutationView(reactor))
+
+	effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-d", Text: "turn d",
+	}))
+	require.Len(t, effects, 1)
+	require.NotNil(t, effects[0].Transcript)
+	assert.Equal(t, identity.TurnKey{ID: "turn-d", Revision: 4}, effects[0].Transcript.Turn)
+}
+
+func TestAudioCommitGenerationLedgerFailsClosedAtCapacity(t *testing.T) {
+	reactor, _ := testReactor(1)
+	for range 64 {
+		applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+	}
+	before := mutationView(reactor)
+
+	effects, err := reactor.Apply(ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+	require.ErrorContains(t, err, "provider input generation limit")
+	assert.Empty(t, effects)
+	assert.Equal(t, before, mutationView(reactor))
+}
+
+func TestProviderInputAuthorityLedgerMatchesAdversarialGenerationModel(t *testing.T) {
+	reactor, _ := testReactor(1)
+	for _, itemID := range []string{"turn-a", "turn-b", "turn-a"} {
+		effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+			Kind: realtime.EventTranscriptionCompleted, ItemID: itemID, Text: itemID,
+		}))
+		require.Len(t, effects, 1, "pure transcript-only compatibility permits ABA revisions")
+	}
+	applyOK(t, reactor, ClientInput{Event: protocol.ConversationItemCreateEvent{
+		Type: "conversation.item.create",
+		Item: protocol.ConversationItem{
+			ID: "turn-c", Type: "message", Role: "user",
+			Content: json.RawMessage(`[{"type":"input_text","text":"turn c"}]`),
+		},
+	}})
+	for range 3 {
+		applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+	}
+
+	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-a", Text: "late a",
+	})))
+	delta := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionDelta, ItemID: "turn-d", Text: "partial d",
+	}))
+	require.Len(t, delta, 1)
+	for index, itemID := range []string{"turn-d", "turn-e"} {
+		effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+			Kind: realtime.EventTranscriptionCompleted, ItemID: itemID, Text: itemID,
+		}))
+		require.Len(t, effects, 1)
+		require.NotNil(t, effects[0].Transcript)
+		assert.Equal(t, identity.TurnKey{ID: itemID, Revision: uint32(index + 5)}, effects[0].Transcript.Turn)
+	}
+	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-d", Text: "late d",
+	})))
+	effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-f", Text: "turn-f",
+	}))
+	require.Len(t, effects, 1)
+	require.NotNil(t, effects[0].Transcript)
+	assert.Equal(t, identity.TurnKey{ID: "turn-f", Revision: 7}, effects[0].Transcript.Turn)
+	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-g", Text: "uncommitted g",
+	})))
+
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventSpeechStarted, ItemID: "turn-a",
+	}))
+	effects = applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-a", Text: "intentional reuse",
+	}))
+	require.Len(t, effects, 1)
+	require.NotNil(t, effects[0].Transcript)
+	assert.Equal(t, identity.TurnKey{ID: "turn-a", Revision: 8}, effects[0].Transcript.Turn)
+}
+
+func TestProviderInputGenerationLedgerReusesCapacityAfterRingWrap(t *testing.T) {
+	reactor, _ := testReactor(1)
+	for range 64 {
+		applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+	}
+	for index := range 32 {
+		itemID := fmt.Sprintf("first-%d", index)
+		applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+			Kind: realtime.EventTranscriptionCompleted, ItemID: itemID, Text: itemID,
+		}))
+	}
+	for range 32 {
+		applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+	}
+	for index := range 64 {
+		itemID := fmt.Sprintf("second-%d", index)
+		effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+			Kind: realtime.EventTranscriptionCompleted, ItemID: itemID, Text: itemID,
+		}))
+		require.Len(t, effects, 1)
+	}
+	effects := applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+	require.Len(t, effects, 1, "drained ring capacity must be reusable")
+}
+
 func TestCommittedAudioTurnCannotBeClaimedByAnOlderABAItem(t *testing.T) {
 	reactor, _ := testReactor(1)
 	applyOK(t, reactor, currentVoice(reactor, realtime.Event{

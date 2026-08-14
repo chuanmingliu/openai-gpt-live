@@ -45,14 +45,24 @@ Review-fix round 2 REDs:
 2. `TestCommittedAudioTurnCannotBeClaimedByAnOlderABAItem` showed the missing commit-generation model also allowed an older item B to be accepted as the next turn in an ABA sequence, mutating the active transcript and preventing the genuinely new item D from being admitted.
 3. `TestAudioCommitFencesPriorTranscriptOnlyItemBeforeOpeningNewClaim` isolated the direct compatibility seam: transcript-only A followed by commit allowed a late A completion to consume the open claim, advance A's revision, and block new item B. This proved the commit boundary itself must remember the prior active item, even when no client or speech boundary had previously established provider authority.
 
+Review-fix round 3 REDs:
+
+1. `TestClientUserItemCannotReuseHistoricalProviderItemWithoutSpeechEdge` showed `speech_started(A) -> client B -> client A` succeeded, after which late original A output published and persisted. The shared establishment helper did not distinguish client reuse from an explicit provider speech generation.
+2. `TestConsecutiveAudioCommitsRetainOneOrderedClaimPerTurn` showed three admitted commits collapsed into one boolean: B was accepted, while legitimate C was dropped and could not reach D.
+3. `TestAllTranscriptOnlyHistoryItemsFenceLaterCommitClaim` showed transcript-only A and B followed by client C retained only B/C; late A stole the next commit claim, mutated/persisted revision A:4, and caused genuine D to be dropped.
+4. `TestAudioCommitGenerationLedgerFailsClosedAtCapacity` showed the 65th outstanding commit was still admitted because the boolean had no cardinality or capacity contract.
+5. Self-review added `TestCompletedSpeechGenerationDoesNotConsumeLaterAudioCommit`: after speech-established A had already completed, its stale speech-to-commit marker consumed a later commit for B, causing legitimate B to be dropped. Completion now closes an unmatched speech generation before any later commit boundary.
+
 ## Implemented contracts
 
 ### Provider input-item fence
 
-- The reactor retains one ephemeral authoritative input-item ID established by `speech_started` or a newer client-created user turn. Establishing authority also remembers the immediately preceding transcript-only active item, so crossing from no-speech-edge compatibility into explicit ownership does not forget the older item.
-- Once a provider item has been observed, transcription delta/completion for another item is silently rejected before event-ID, revision, effect-sequence, durable-sequence, active-turn, or persistence mutation.
-- Providers without speech edges retain the established transcription-driven item/revision compatibility path. `input_audio_buffer.commit` opens one new provider-item claim: previously authoritative item IDs remain fenced, while the first unseen transcription item establishes the new turn and closes the claim. Its delta is published and its completion is published and persisted normally.
-- The authoritative item history is capped at 1024 exact IDs and fails closed rather than evicting an older ID and reopening an ABA path. A provider `speech_started` edge can deliberately establish a fresh generation for a reused ID.
+- The reactor now owns an explicit provider-input authority ledger: a 64-entry fixed FIFO of admitted audio-commit generations, the current item/open-completion state, speech-to-commit correlation state, and a 1024-entry exact historical item set.
+- Every commit that is not the matching commit for an already observed `speech_started` edge appends one generation. The first unseen provider item consumes exactly the oldest generation; N consecutive admitted commits therefore retain N ordered claims. The 65th outstanding commit fails before command sequence allocation or ledger mutation, and drained ring capacity is reusable.
+- Every accepted transcript-only, client-created, speech-established, or commit-claimed item enters history. Historical output cannot consume a later commit generation, including the oldest item after multiple transcript-only turns. History never evicts; a new ID at capacity fails closed.
+- Pure providers without speech edges retain transcription-driven ABA revision compatibility while no explicit authority exists. Once client, speech, or committed-audio authority exists, mismatched historical output is a total no-op and an unseen item requires an outstanding committed generation.
+- Client-created user items must use a new historical ID and are rejected while committed audio generations are pending. Only explicit `speech_started` may deliberately establish a new generation for a retained ID; it consumes the oldest pending commit when commit arrived first, or marks the next commit as its matching generation when speech arrived first.
+- A claimed item's delta and matching completion remain admissible while its transcript is open. Once complete, a later outstanding commit fences additional output for that item, preventing a completed prior generation from reopening itself. Completion also closes any unmatched speech-first generation, so a later commit cannot be misclassified as belonging to already completed speech.
 - `speech_started` is synchronously applied at the manager's pure reactor boundary, so later provider media cannot overtake the fence. It still waits for no provider send, client write, store call, or safety call.
 
 ### Implicit response while speaking
@@ -109,6 +119,14 @@ go test -race ./internal/session -run '^(TestAudioCommitAfterClientTurnAcceptsNe
 
 PASS.
 
+Review-fix round 3 architecture, adversarial model, and capacity repros:
+
+```text
+go test -race ./internal/session -run '^(TestClientUserItemCannotReuseHistoricalProviderItemWithoutSpeechEdge|TestConsecutiveAudioCommitsRetainOneOrderedClaimPerTurn|TestCompletedSpeechGenerationDoesNotConsumeLaterAudioCommit|TestAllTranscriptOnlyHistoryItemsFenceLaterCommitClaim|TestAudioCommitGenerationLedgerFailsClosedAtCapacity|TestProviderInputAuthorityLedgerMatchesAdversarialGenerationModel|TestProviderInputGenerationLedgerReusesCapacityAfterRingWrap)$' -count=100 -timeout=240s
+```
+
+PASS.
+
 Focused gateway race tests for bounded approval ownership and the speech fence:
 
 ```text
@@ -141,8 +159,10 @@ All passed. Listener-backed gateway/adapter tests used loopback permission; no l
 ## Self-review
 
 - Checked stale item rejection occurs before all synth-ID, revision, sequence, active-turn, and durable-effect mutation.
-- Checked no-speech-edge compatibility remains covered by final transcript and ABA revision tests, including transcript-only A crossing client B and audio commit into transcript-only C.
-- Checked commit-opened provider ownership admits only an unseen item, keeps every exact prior authoritative ID fenced across repeated commits, fails closed at the bounded history limit, and permits intentional ID reuse only through an explicit speech edge.
+- Checked no-speech-edge compatibility remains covered by final transcript and ABA revision tests, including pure transcript-only A/B/A before explicit authority and transcript-only A crossing client B and audio commit into transcript-only C.
+- Checked the fixed generation FIFO preserves commit cardinality and ordering across three consecutive claims, rejects overflow without sequence or state mutation, and reuses all capacity after head/tail ring wrap.
+- Checked every accepted transcript item enters bounded exact history; oldest late A cannot steal a later claim after transcript-only A/B and client C. Client historical reuse is rejected, while intentional reuse remains available only through `speech_started`.
+- Checked current-item delta/completion remains accepted until complete, while a later committed generation fences repeated output from the completed item.
 - Checked a newer client-created user turn advances the same authoritative item fence without changing providers that have emitted no speech edge and no newer client user item.
 - Checked implicit suppression orders bind before flush/cancel and uses a newer cancel fence; old bind-epoch media is therefore rejected even if binding releases buffered adapter frames.
 - Checked the cancelled-pending structure is explicitly create-epoch correlated, bounded together with pending creates, and never deletes an arbitrary map/oldest epoch.
