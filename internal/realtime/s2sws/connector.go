@@ -206,6 +206,7 @@ type voiceSession struct {
 	closeOnce           sync.Once
 	closeCompleteOnce   sync.Once
 	closeStateMu        sync.Mutex
+	terminalHandedOff   bool
 	closeResultMu       sync.RWMutex
 	closeResult         error
 	activeWriteMu       sync.Mutex
@@ -269,6 +270,13 @@ func (s *voiceSession) Receive(ctx context.Context) (realtime.Event, error) {
 		return realtime.Event{}, errors.New("receive context is nil")
 	}
 	for {
+		closing := s.closing
+		if s.terminalHandoffActive() {
+			// A writer failure owns terminal state even if Close arrives while
+			// its accepted FIFO tail is draining. Keep that tail receivable;
+			// Send still observes closing and rejects new work.
+			closing = nil
+		}
 		select {
 		case event := <-s.events:
 			return cloneEvent(event), nil
@@ -279,7 +287,7 @@ func (s *voiceSession) Receive(ctx context.Context) (realtime.Event, error) {
 			return cloneEvent(event), nil
 		case <-ctx.Done():
 			return realtime.Event{}, ctx.Err()
-		case <-s.closing:
+		case <-closing:
 			return realtime.Event{}, ErrSessionClosed
 		case <-s.done:
 			select {
@@ -304,27 +312,51 @@ func (s *voiceSession) Close(ctx context.Context) error {
 		return s.sharedCloseResult()
 	default:
 	}
-	if !s.startClose() {
+	switch s.startClose() {
+	case closeAlreadyComplete:
 		return nil
-	}
-	select {
-	case <-s.closeDone:
-		return s.sharedCloseResult()
-	case <-ctx.Done():
-		return ctx.Err()
+	case closeWaitTerminal:
+		select {
+		case <-s.done:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	default:
+		select {
+		case <-s.closeDone:
+			return s.sharedCloseResult()
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 }
 
-func (s *voiceSession) startClose() bool {
+type closeStartMode uint8
+
+const (
+	closeAlreadyComplete closeStartMode = iota
+	closeWaitHandshake
+	closeWaitTerminal
+)
+
+func (s *voiceSession) startClose() closeStartMode {
 	s.closeStateMu.Lock()
 	defer s.closeStateMu.Unlock()
 
+	if s.terminalHandedOff {
+		s.closeOnce.Do(func() {
+			close(s.closing)
+			s.cancelActiveWrite()
+		})
+		return closeWaitTerminal
+	}
 	if s.isClosing() {
-		return true
+		return closeWaitHandshake
 	}
 	select {
 	case <-s.done:
-		return false
+		return closeAlreadyComplete
 	default:
 	}
 	s.closeOnce.Do(func() {
@@ -332,7 +364,7 @@ func (s *voiceSession) startClose() bool {
 		s.closeWrites <- struct{}{}
 		s.cancelActiveWrite()
 	})
-	return true
+	return closeWaitHandshake
 }
 
 func (s *voiceSession) readLoop() {
@@ -403,12 +435,10 @@ func (s *voiceSession) writeLoop() {
 				}
 			}
 			request.result <- err
-			if attemptedWrite && err != nil && !s.isClosing() {
-				s.terminate(err)
-				if s.takeCloseAfterTermination() {
-					s.finishClose()
+			if attemptedWrite && err != nil {
+				if s.beginTerminalHandoff(err) {
+					return
 				}
-				return
 			}
 		case <-s.done:
 			if s.takeCloseAfterTermination() {
@@ -417,6 +447,27 @@ func (s *voiceSession) writeLoop() {
 			return
 		}
 	}
+}
+
+// beginTerminalHandoff and startClose share closeStateMu so exactly one path
+// wins: Close either queues work to a live writer, or observes that terminal
+// ownership has moved to the mapping loop and waits for its ordered drain.
+func (s *voiceSession) beginTerminalHandoff(err error) bool {
+	s.closeStateMu.Lock()
+	defer s.closeStateMu.Unlock()
+	if s.isClosing() {
+		return false
+	}
+	s.terminalHandedOff = true
+	s.terminate(err)
+	return true
+}
+
+func (s *voiceSession) terminalHandoffActive() bool {
+	s.closeStateMu.Lock()
+	active := s.terminalHandedOff
+	s.closeStateMu.Unlock()
+	return active
 }
 
 // takeCloseAfterTermination synchronizes a terminal writer exit with close
@@ -545,7 +596,10 @@ func (s *voiceSession) mappingLoop() {
 			return
 		}
 		var reads <-chan socketRead
-		if terminalReadErr == nil && len(s.mappedEvents) < receiveQueueCapacity {
+		// Bound all accepted-but-unreceived events together. This guarantees
+		// the public queue has room for the mapping-owned FIFO after terminal
+		// intake stops, even when no receiver remains to make progress.
+		if terminalReadErr == nil && len(s.events)+len(s.mappedEvents)+s.implicitBufferedEvents < receiveQueueCapacity {
 			reads = s.reads
 		}
 		var deliveries chan<- realtime.Event
@@ -960,7 +1014,7 @@ func (s *voiceSession) publishTerminal(err error) {
 }
 
 func (s *voiceSession) sessionError() error {
-	if s.isClosing() {
+	if s.isClosing() && !s.terminalHandoffActive() {
 		return ErrSessionClosed
 	}
 	s.terminalMu.RLock()

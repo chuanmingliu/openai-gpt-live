@@ -48,10 +48,15 @@ Round-two review REDs, captured before the corresponding production edit:
 5. New client and durable completion tests timed out waiting for typed completion inputs on the reserved lane, including with the ordinary inbox saturated; the two writer results still bypassed the reactor boundary.
 6. During complete race verification, `TestDispatchFlushFencesActiveAndQueuedResponseControlsBeforeCancelOrTerminate/cancel` exposed a client error write racing ahead of provider cancellation. Making the provider observation unbuffered made this RED deterministic.
 
+Round-three review RED:
+
+1. `TestCloseAfterWriterTerminalHandoffCompletes` deterministically placed two events across the public/private FIFO boundary, forced an outbound write failure, waited for the writer's asynchronous terminal handoff and exit, then started eight concurrent closes. The old implementation closed receive visibility before the accepted tail and returned `ErrSessionClosed` instead of the writer cause; each Close had also enqueued to the exited writer and could only finish through its deadline. Root cause was that the one-time close check did not publish a durable writer-to-mapping ownership state, so `startClose` could not distinguish a live writer from an in-progress mapping-owned terminal drain.
+
 ## Completion and linearization contracts
 
 - Adapter mapped events enter a mapping-loop-owned FIFO. FIFO-head delivery and bind/cancel/register correlations remain selectable when public delivery is full. Socket intake stops at the configured watermark.
 - A terminal socket/protocol error or concurrent outbound failure is requested through the mapping owner. It stops further reads, drains all already accepted mapped events in order, then publishes terminal state. Transferred channel storage is detached without scrubbing; only still-owned teardown entries are zeroed.
+- Outbound terminal handoff and normal close admission are arbitrated under `closeStateMu`. If terminal handoff wins, later `Close` calls reject new sends without enqueueing to the exited writer, preserve receive access to the accepted FIFO tail, and wait on the mapping owner's ordered terminal publication. Concurrent callers remain bounded and idempotent.
 - The reactor performs pure apply and bounded queue admission. It never waits for provider send, client write, active-write cancellation, durable dispatch, or safety policy work.
 - Voice sends reconcile through `VoiceCommandCompletedInput` on a reserved completion lane. Outstanding commands are keyed by exact sequence and kind; unmatched/synthetic completion cannot decrement the count.
 - The reserved completion channel is bounded at `ControlEvents + 3*WriterControlEvents`, covering maximum accepted safety, voice, client, and durable work without consuming ordinary reactor credit. Reserved completions receive priority, including while a single create is deferred behind cancel completion.
@@ -66,7 +71,7 @@ Round-two review REDs, captured before the corresponding production edit:
 ## Bounds and ordering
 
 - Public adapter channel: 256 events.
-- Mapping-loop socket FIFO watermark: 256 events. Bind can additionally transfer only the separately bounded implicit aggregate (64 events).
+- Total accepted-but-unreceived adapter events—public channel, mapping FIFO, and implicit correlation buffers combined—are capped at 256. Bind transfers ownership within that same bound, guaranteeing the terminal FIFO can drain into the public channel even if no receiver remains.
 - Reactor ordinary inbox: `ControlEvents`, with explicit slots.
 - Reactor completion lane: `ControlEvents + 3*WriterControlEvents`.
 - Safety work queue: `ControlEvents`.
@@ -90,6 +95,17 @@ go test -race ./internal/realtime/s2sws -count=3 -timeout=300s
 
 All passed. Listener-backed adapter/composition tests used the required loopback permission. No listener test was weakened.
 
+Round-three final commands:
+
+```text
+go test -race ./internal/realtime/s2sws -run '^(TestCloseAfterWriterTerminalHandoffCompletes|TestConcurrentTerminationDrainsAcceptedMappedFIFO|TestCloseIsConcurrentAndIdempotent)$' -count=50 -timeout=240s
+go test ./internal/realtime/s2sws -count=5 -timeout=240s
+go test -race ./internal/realtime/s2sws -count=3 -timeout=300s
+go test -race ./internal/session -count=3 -timeout=300s
+```
+
+All passed with loopback permission where required.
+
 ## Self-review
 
 - Checked presentation/runtime lock order and ensured no external client/provider/store work runs under `activeMu`; the artificial apply gate now runs before the production presentation critical section.
@@ -99,5 +115,7 @@ All passed. Listener-backed adapter/composition tests used the required loopback
 - Checked safety cancellation cannot strand the sole reactor; its bounded pending state is session-owned.
 - Checked reconnect rotation acquisition/store is context-aware, post-commit notification is session-owned, the offer caller observes its local timeout, and same-cursor retry reuses the exact committed credential until delivery completes.
 - Checked accepted adapter FIFO entries drain before read or concurrent-writer terminal errors become visible.
+- Checked the close/terminal lock arbitration in both orders: normal Close queues only while the writer is live; prior writer-terminal handoff makes Close wait for mapping publication without hiding the accepted tail. New sends observe `closing` in both paths.
+- Checked aggregate admission leaves enough public-channel capacity for a mapping-owned terminal tail to drain without a receiver; implicit bind moves entries without increasing the aggregate.
 - Checked provider cancel completion precedes dependent client error writes without waiting on the sole reactor.
 - Checked only Task 1 files plus this report are staged.

@@ -127,3 +127,62 @@ func TestConcurrentTerminationDrainsAcceptedMappedFIFO(t *testing.T) {
 	_, err := session.Receive(t.Context())
 	require.EqualError(t, err, "concurrent writer failure")
 }
+
+// TestCloseAfterWriterTerminalHandoffCompletes catches Close enqueueing work
+// after the outbound writer has handed terminal ownership to the mapping loop
+// and exited. The accepted tail must remain receivable before every concurrent
+// Close completes, and closing must reject any later Send.
+func TestCloseAfterWriterTerminalHandoffCompletes(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	writeErr := errors.New("outbound write failed")
+	session := &voiceSession{
+		ctx: ctx, cancel: cancel,
+		writeMessage:   func(context.Context, websocket.MessageType, []byte) error { return writeErr },
+		closeHandshake: func(websocket.StatusCode, string) error { return nil }, closeNow: func() error { return nil },
+		maxFrameBytes: 1 << 20,
+		writes:        make(chan writeRequest, 1), closeWrites: make(chan struct{}, 1),
+		reads: make(chan socketRead), correlations: make(chan correlationRequest), events: make(chan realtime.Event, 1),
+		closing: make(chan struct{}), closeDone: make(chan struct{}), done: make(chan struct{}),
+		responses: make(map[string]*responseCorrelation), pending: make(map[identity.ResponseEpoch]struct{}),
+	}
+	go session.mappingLoop()
+	writerExited := make(chan struct{})
+	go func() {
+		session.writeLoop()
+		close(writerExited)
+	}()
+
+	for index := 1; index <= 2; index++ {
+		raw := []byte(fmt.Sprintf(`{"type":"input_audio_buffer.speech_started","event_id":"close-tail-%d","item_id":"item-%d","audio_start_ms":%d}`, index, index, index))
+		session.reads <- socketRead{messageType: websocket.MessageText, raw: raw}
+		require.NoError(t, session.correlate(t.Context(), correlationRequest{kind: correlationRegister, epoch: identity.ResponseEpoch(index)}))
+	}
+	require.ErrorIs(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio}), writeErr)
+	select {
+	case <-writerExited:
+	case <-time.After(time.Second):
+		t.Fatal("writer did not finish terminal handoff")
+	}
+
+	closeCtx, closeCancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer closeCancel()
+	const closers = 8
+	closeResults := make(chan error, closers)
+	for range closers {
+		go func() { closeResults <- session.Close(closeCtx) }()
+	}
+	require.Eventually(t, session.isClosing, time.Second, time.Millisecond)
+	require.ErrorIs(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio}), ErrSessionClosed)
+
+	for index := 1; index <= 2; index++ {
+		event, err := session.Receive(t.Context())
+		require.NoError(t, err)
+		require.Equal(t, fmt.Sprintf("close-tail-%d", index), event.ProviderEventID)
+	}
+	_, err := session.Receive(t.Context())
+	require.ErrorIs(t, err, writeErr)
+	for range closers {
+		require.NoError(t, <-closeResults)
+	}
+	require.NoError(t, session.Close(t.Context()))
+}
