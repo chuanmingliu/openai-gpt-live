@@ -139,6 +139,19 @@ func TestNewMapsConfigAndAppliesBoundedTimeoutDefaults(t *testing.T) {
 	require.Equal(t, 29*time.Millisecond, app.managerConfig.EgressBlockTimeout)
 }
 
+func TestNewWiresApprovalResolutionThroughAppOwnedCoordinator(t *testing.T) {
+	store := &blockingApprovalResolutionStore{}
+	app, err := New(validConfig(), testkit.NewFakeConnector(2),
+		WithIDGenerator(deterministicIDs{}), WithApprovalStore(store))
+	require.NoError(t, err)
+	require.NotNil(t, app.approvals)
+	require.Same(t, store, app.approvals.store)
+	require.NotNil(t, app.managerConfig.ApprovalDispatcher)
+	require.Nil(t, app.managerConfig.ApprovalStore, "live manager must not own durable approval storage")
+	require.Equal(t, defaultApprovalQueueCapacity, cap(app.approvals.work))
+	require.Equal(t, defaultApprovalRequestTimeout, app.approvals.requestTimeout)
+}
+
 func TestNewWiresRecoveryStoreAndReconnectRetryConfiguration(t *testing.T) {
 	cfg := validConfig()
 	cfg.Features.Handoffs = true

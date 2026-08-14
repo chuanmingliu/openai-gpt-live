@@ -61,6 +61,7 @@ type App struct {
 	durable         *DurableDependencies
 	handoffs        *HandoffCoordinator
 	transcripts     *TranscriptCoordinator
+	approvals       *ApprovalCoordinator
 	presentation    *HandoffPresentationDependencies
 	eventPump       *handoff.EventPump
 	eventListener   HandoffEventListener
@@ -313,7 +314,11 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 		return nil, errors.New("session ID generator is required")
 	}
 	managerConfig.FeatureGates = app.featureGates
-	managerConfig.ApprovalStore = app.approvalStore
+	var approvals *approvalDispatcher
+	if !isNil(app.approvalStore) {
+		approvals = &approvalDispatcher{}
+		managerConfig.ApprovalDispatcher = approvals
+	}
 
 	if !cfg.Features.Handoffs && app.presentation != nil {
 		return nil, errors.New("handoff presentation dependencies supplied while feature is disabled")
@@ -386,6 +391,15 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 
 	app.managerConfig = managerConfig
 	app.manager = session.NewManager(managerConfig, connector, app.ids)
+	if approvals != nil {
+		app.approvals = NewApprovalCoordinator(
+			app.approvalStore, app.manager, defaultApprovalQueueCapacity, defaultApprovalRequestTimeout,
+		)
+		if app.approvals == nil {
+			return nil, errors.New("durable approval coordinator is invalid")
+		}
+		approvals.coordinator = app.approvals
+	}
 	if app.durable != nil {
 		app.transcripts = NewTranscriptCoordinator(app.durable.ConversationWriter, app.manager, app.durable.TranscriptQueueCapacity)
 		if app.transcripts == nil {
@@ -529,7 +543,7 @@ func (a *App) Run(ctx context.Context) (runErr error) {
 		name string
 		err  error
 	}
-	coordinatorResult := make(chan coordinatorRunResult, 5)
+	coordinatorResult := make(chan coordinatorRunResult, 6)
 	coordinatorDone := make(chan struct{})
 	coordinatorCount := 0
 	var coordinatorWG sync.WaitGroup
@@ -546,6 +560,9 @@ func (a *App) Run(ctx context.Context) (runErr error) {
 	}
 	if a.handoffs != nil {
 		startCoordinator("handoff coordinator", a.handoffs.Run)
+	}
+	if a.approvals != nil {
+		startCoordinator("approval coordinator", a.approvals.Run)
 	}
 	if a.eventListener != nil {
 		startCoordinator("handoff event listener", func(ctx context.Context) error { return a.eventListener.Run(ctx, a.eventWakeups) })

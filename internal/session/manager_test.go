@@ -549,24 +549,23 @@ type failingReconnectConnector struct {
 	calls atomic.Int32
 }
 
-type blockingApprovalStore struct {
-	started chan struct{}
-	release chan struct{}
-	once    sync.Once
+type blockingApprovalDispatcher struct {
+	started   chan struct{}
+	release   chan struct{}
+	completed chan struct{}
+	once      sync.Once
+	trusted   TrustedSessionContext
+	request   ApprovalResolutionRequestedEffect
 }
 
-func (s *blockingApprovalStore) ResolveApproval(ctx context.Context, _ handoff.Scope, _ handoff.ApprovalResolution) error {
-	s.once.Do(func() { close(s.started) })
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-s.release:
-		return nil
-	}
-}
-
-func (*blockingApprovalStore) LoadApproval(context.Context, handoff.Scope, string) (handoff.ToolApproval, error) {
-	return handoff.ToolApproval{}, handoff.ErrNotFound
+func (d *blockingApprovalDispatcher) DispatchApproval(trusted TrustedSessionContext, request ApprovalResolutionRequestedEffect) error {
+	d.trusted, d.request = trusted, request
+	d.once.Do(func() { close(d.started) })
+	go func() {
+		<-d.release
+		close(d.completed)
+	}()
+	return nil
 }
 
 type contextBlockingCloseClient struct {
@@ -1227,12 +1226,12 @@ func TestManagerReconnectEpochUsesQuiescedLiveFenceHighWaterAndStaysMonotonic(t 
 	require.Error(t, <-oldDone)
 }
 
-func TestManagerReconnectWaitsForAcceptedApprovalDurableResolution(t *testing.T) {
+func TestManagerTransfersAcceptedApprovalBeyondSessionDisconnect(t *testing.T) {
 	connector := testkit.NewFakeConnector(8)
 	scope := handoff.Scope{TenantID: "tenant-approval-boundary", UserID: "user", ConversationID: "conversation-approval-boundary"}
-	approvalStore := &blockingApprovalStore{started: make(chan struct{}), release: make(chan struct{})}
+	dispatcher := &blockingApprovalDispatcher{started: make(chan struct{}), release: make(chan struct{}), completed: make(chan struct{})}
 	manager := NewManager(Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
-		RecoveryStore: &recoveryStoreFake{snapshot: RecoverySnapshot{ConversationID: scope.ConversationID}}, ApprovalStore: approvalStore}, connector,
+		RecoveryStore: &recoveryStoreFake{snapshot: RecoverySnapshot{ConversationID: scope.ConversationID}}, ApprovalDispatcher: dispatcher}, connector,
 		managerIDs{session: "approval-boundary-session", conversation: scope.ConversationID})
 	runCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1247,21 +1246,40 @@ func TestManagerReconnectWaitsForAcceptedApprovalDurableResolution(t *testing.T)
 	waitForActiveRuntime(t, manager, "approval-boundary-session", 1)
 	client.reads <- protocol.LiveToolApprovalResolveEvent{Type: "live.tool.approval.resolve", InvocationID: "invocation", Decision: "approved", Reason: "confirmed", IdempotencyKey: "approval-key"}
 	select {
-	case <-approvalStore.started:
+	case <-dispatcher.started:
 	case <-time.After(time.Second):
-		t.Fatal("approval store did not begin durable resolution")
+		t.Fatal("approval dispatcher did not accept durable resolution")
 	}
-	err = manager.Reconnect(t.Context(), ReconnectRequest{Scope: scope, SessionID: "approval-boundary-session", LastIncarnation: 1}, newChannelClient(2))
-	require.ErrorIs(t, err, ErrReconnectNotAtBoundary)
-	close(approvalStore.release)
+	require.Equal(t, scope.TenantID, dispatcher.trusted.Subject.TenantID)
+	require.Equal(t, scope.UserID, dispatcher.trusted.Subject.UserID)
+	require.Equal(t, scope.ConversationID, dispatcher.trusted.IDs.ConversationID)
+	require.Equal(t, "invocation", dispatcher.request.InvocationID)
+	require.Equal(t, handoff.ApprovalApproved, dispatcher.request.Decision)
+	require.Equal(t, "approval-key", dispatcher.request.IdempotencyKey)
+	require.False(t, dispatcher.request.ResolvedAt.IsZero())
+	require.ErrorIs(t, manager.Submit(t.Context(), "approval-boundary-session", 2, ApprovalResolutionCompletedInput{
+		ExternalSequence: dispatcher.request.ExternalSequence, InvocationID: "invocation", Accepted: true,
+	}), ErrSessionNotActive)
+	manager.activeMu.RLock()
+	runtime := manager.active[runtimeKey{sessionID: "approval-boundary-session", incarnation: 1}]
+	manager.activeMu.RUnlock()
+	require.NotNil(t, runtime)
+	require.Equal(t, runtime.state.externalAccepted.Load(), runtime.state.externalApplied.Load(),
+		"app-owned queue admission must complete the session boundary before durable resolution")
+	require.NoError(t, manager.Submit(t.Context(), "approval-boundary-session", 1, ApprovalResolutionCompletedInput{
+		ExternalSequence: dispatcher.request.ExternalSequence, InvocationID: "invocation", Accepted: true,
+	}))
 	require.Eventually(t, func() bool {
-		manager.activeMu.RLock()
-		runtime := manager.active[runtimeKey{sessionID: "approval-boundary-session", incarnation: 1}]
-		manager.activeMu.RUnlock()
-		return runtime != nil && runtime.state.externalAccepted.Load() == runtime.state.externalApplied.Load()
+		return runtime.state.externalApplied.Load() == runtime.state.externalAccepted.Load()
 	}, time.Second, time.Millisecond)
 	cancel()
 	require.Error(t, <-runDone)
+	close(dispatcher.release)
+	select {
+	case <-dispatcher.completed:
+	case <-time.After(time.Second):
+		t.Fatal("app-owned approval work did not survive session disconnect")
+	}
 }
 
 func TestManagerRegistersReservedToolsBeforeFreshAndReconnectedProviderContext(t *testing.T) {
@@ -3895,6 +3913,9 @@ func TestManagerDiscardsInvalidatedProviderTailBeforeNextResponse(t *testing.T) 
 	cancelCommand, err := voice.NextCommand(commandCtx)
 	require.NoError(t, err)
 	require.Equal(t, realtime.CommandCancelResponse, cancelCommand.Kind)
+	require.NoError(t, voice.Emit(commandCtx, realtime.Event{
+		Kind: realtime.EventSpeechStopped, ProviderEventID: "barge-stopped", ItemID: "input-item",
+	}))
 
 	require.NoError(t, voice.Emit(commandCtx, realtime.Event{
 		Kind: realtime.EventResponseCreated, NeedsEpochBinding: true,

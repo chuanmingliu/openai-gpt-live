@@ -104,23 +104,24 @@ func (c *Connector) Connect(ctx context.Context, request realtime.OpenRequest) (
 
 	sessionContext, cancelSession := context.WithCancel(context.Background())
 	session := &voiceSession{
-		conn:           conn,
-		ctx:            sessionContext,
-		cancel:         cancelSession,
-		writeMessage:   conn.Write,
-		closeHandshake: conn.Close,
-		closeNow:       conn.CloseNow,
-		maxFrameBytes:  c.cfg.MaxFrameBytes,
-		writes:         make(chan writeRequest, writeQueueCapacity),
-		closeWrites:    make(chan struct{}, 1),
-		reads:          make(chan socketRead, 1),
-		correlations:   make(chan correlationRequest, correlationQueueCapacity),
-		events:         make(chan realtime.Event, receiveQueueCapacity),
-		closing:        make(chan struct{}),
-		closeDone:      make(chan struct{}),
-		done:           make(chan struct{}),
-		responses:      make(map[string]*responseCorrelation),
-		pending:        make(map[identity.ResponseEpoch]struct{}),
+		conn:             conn,
+		ctx:              sessionContext,
+		cancel:           cancelSession,
+		writeMessage:     conn.Write,
+		closeHandshake:   conn.Close,
+		closeNow:         conn.CloseNow,
+		maxFrameBytes:    c.cfg.MaxFrameBytes,
+		writes:           make(chan writeRequest, writeQueueCapacity),
+		closeWrites:      make(chan struct{}, 1),
+		reads:            make(chan socketRead, 1),
+		correlations:     make(chan correlationRequest, correlationQueueCapacity),
+		events:           make(chan realtime.Event, receiveQueueCapacity),
+		closing:          make(chan struct{}),
+		closeDone:        make(chan struct{}),
+		done:             make(chan struct{}),
+		responses:        make(map[string]*responseCorrelation),
+		pending:          make(map[identity.ResponseEpoch]struct{}),
+		cancelledPending: make(map[identity.ResponseEpoch]identity.ResponseEpoch),
 	}
 	go session.readLoop()
 	go session.mappingLoop()
@@ -146,6 +147,7 @@ const (
 	correlationRegister correlationKind = iota + 1
 	correlationBind
 	correlationCancel
+	correlationCancelPending
 )
 
 type correlationRequest struct {
@@ -171,6 +173,7 @@ type responseCorrelation struct {
 	buffered      []bufferedResponseEvent
 	bufferedBytes int
 	unbound       bool
+	suppressed    bool
 }
 
 type voiceSession struct {
@@ -191,9 +194,10 @@ type voiceSession struct {
 	closeDone    chan struct{}
 	done         chan struct{}
 
-	responses     map[string]*responseCorrelation
-	responseOrder []string
-	pending       map[identity.ResponseEpoch]struct{}
+	responses        map[string]*responseCorrelation
+	responseOrder    []string
+	pending          map[identity.ResponseEpoch]struct{}
+	cancelledPending map[identity.ResponseEpoch]identity.ResponseEpoch
 
 	implicitUnbound        int
 	implicitBufferedEvents int
@@ -422,10 +426,14 @@ func (s *voiceSession) writeLoop() {
 			if err == nil && request.command.Kind == realtime.CommandCreateResponse {
 				err = s.correlate(request.ctx, correlationRequest{kind: correlationRegister, epoch: request.command.Epoch})
 			}
-			if err == nil && request.command.Kind == realtime.CommandCancelResponse && request.command.ResponseID != "" {
-				err = s.correlate(request.ctx, correlationRequest{
-					kind: correlationCancel, epoch: request.command.Epoch, responseID: request.command.ResponseID,
-				})
+			if err == nil && request.command.Kind == realtime.CommandCancelResponse {
+				if request.command.ResponseID == "" {
+					err = s.correlate(request.ctx, correlationRequest{kind: correlationCancelPending, epoch: request.command.Epoch})
+				} else {
+					err = s.correlate(request.ctx, correlationRequest{
+						kind: correlationCancel, epoch: request.command.Epoch, responseID: request.command.ResponseID,
+					})
+				}
 			}
 			attemptedWrite := false
 			if err == nil {
@@ -656,6 +664,8 @@ func (s *voiceSession) mappingLoop() {
 				err = s.bindImplicit(request)
 			case correlationCancel:
 				err = s.markCancelled(request)
+			case correlationCancelPending:
+				err = s.markPendingCancelled(request.epoch)
 			default:
 				err = errors.New("unknown correlation request")
 			}
@@ -690,10 +700,30 @@ func (s *voiceSession) registerExplicit(epoch identity.ResponseEpoch) error {
 	if _, exists := s.pending[epoch]; exists {
 		return fmt.Errorf("response epoch %d is already pending", epoch)
 	}
-	if len(s.pending) >= explicitPendingLimit {
+	if len(s.pending)+len(s.cancelledPending) >= explicitPendingLimit {
 		return fmt.Errorf("%w: maximum %d", ErrPendingResponseLimit, explicitPendingLimit)
 	}
 	s.pending[epoch] = struct{}{}
+	return nil
+}
+
+func (s *voiceSession) markPendingCancelled(cancelEpoch identity.ResponseEpoch) error {
+	if len(s.pending) == 0 {
+		return nil
+	}
+	if cancelEpoch == 0 {
+		return errors.New("pending response cancellation requires a positive epoch")
+	}
+	if len(s.pending) != 1 {
+		return errors.New("empty-ID cancellation requires exactly one pending response")
+	}
+	if s.cancelledPending == nil {
+		s.cancelledPending = make(map[identity.ResponseEpoch]identity.ResponseEpoch)
+	}
+	for createEpoch := range s.pending {
+		delete(s.pending, createEpoch)
+		s.cancelledPending[createEpoch] = cancelEpoch
+	}
 	return nil
 }
 
@@ -722,6 +752,10 @@ func (s *voiceSession) handleMapped(mapped mappedServerEvent) error {
 		// A provider rejection of response.create is terminal for that pending
 		// command even though no response.created will arrive to consume it.
 		delete(s.pending, mapped.event.Epoch)
+		if _, cancelled := s.cancelledPending[mapped.event.Epoch]; cancelled {
+			delete(s.cancelledPending, mapped.event.Epoch)
+			return nil
+		}
 	}
 	if !mapped.responseSpecific {
 		return s.deliver(s.ctx, mapped.event)
@@ -735,6 +769,12 @@ func (s *voiceSession) handleMapped(mapped mappedServerEvent) error {
 			return err
 		}
 		correlation = s.responses[mapped.event.ResponseID]
+	}
+	if correlation.suppressed {
+		if mapped.event.Kind == realtime.EventResponseDone {
+			correlation.terminal = true
+		}
+		return nil
 	}
 	if correlation.bound {
 		mapped.event.Epoch = correlation.epoch
@@ -814,6 +854,16 @@ func (s *voiceSession) handleResponseCreated(mapped mappedServerEvent) error {
 	}
 	if _, exists := s.responses[created.responseID]; exists {
 		return fmt.Errorf("duplicate response.created for %q", created.responseID)
+	}
+	if created.hasEpoch {
+		if cancelEpoch, cancelled := s.cancelledPending[created.epoch]; cancelled {
+			delete(s.cancelledPending, created.epoch)
+			s.responses[created.responseID] = &responseCorrelation{
+				epoch: cancelEpoch, cancelEpoch: cancelEpoch, bound: true, suppressed: true,
+			}
+			s.responseOrder = append(s.responseOrder, created.responseID)
+			return s.trimResponseHistory()
+		}
 	}
 
 	explicit, err := s.resolvePendingExplicit(created.epoch, created.hasEpoch)

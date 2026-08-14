@@ -628,6 +628,73 @@ func TestCancelOmitsAnEmptyResponseID(t *testing.T) {
 	assert.JSONEq(t, `{"type":"response.cancel"}`, string(server.nextClientFrame(t)))
 }
 
+func TestEmptyIDCancelTombstonesExactlyOnePendingCreateAndAllowsNextImplicitResponse(t *testing.T) {
+	server := newTestVoiceServer(t)
+	session := connectTestSession(t, server.URL, nil, realtime.OpenRequest{Model: "model"})
+
+	require.NoError(t, session.Send(t.Context(), realtime.Command{
+		Kind: realtime.CommandCreateResponse, Epoch: 7,
+	}))
+	server.nextClientFrame(t)
+	require.NoError(t, session.Send(t.Context(), realtime.Command{
+		Kind: realtime.CommandCancelResponse, Epoch: 8,
+	}))
+	assert.JSONEq(t, `{"type":"response.cancel","event_id":"live-response-cancel-8"}`, string(server.nextClientFrame(t)))
+
+	server.sendEvent(t, map[string]any{
+		"type": "response.created", "event_id": "late-cancelled-created",
+		"response": map[string]any{"id": "late-cancelled", "status": "in_progress", "metadata": map[string]any{"live_epoch": "7"}},
+	})
+	server.sendEvent(t, map[string]any{
+		"type": "response.done", "event_id": "late-cancelled-done",
+		"response": map[string]any{"id": "late-cancelled", "status": "cancelled"},
+	})
+	server.sendEvent(t, map[string]any{
+		"type": "input_audio_buffer.speech_started", "event_id": "next-speech", "item_id": "next-user",
+	})
+	next := receiveEvent(t, session)
+	assert.Equal(t, realtime.EventSpeechStarted, next.Kind, "late cancelled create/done must be consumed by its tombstone")
+	assert.Equal(t, "next-user", next.ItemID)
+
+	server.sendEvent(t, map[string]any{
+		"type": "response.created", "event_id": "next-implicit-created",
+		"response": map[string]any{"id": "next-implicit", "status": "in_progress"},
+	})
+	implicit := receiveEvent(t, session)
+	assert.Equal(t, realtime.EventResponseCreated, implicit.Kind)
+	assert.Equal(t, "next-implicit", implicit.ResponseID)
+	assert.True(t, implicit.NeedsEpochBinding, "cancelled pending correlation must not poison the next implicit response")
+	require.NoError(t, session.Send(t.Context(), realtime.Command{
+		Kind: realtime.CommandBindResponseEpoch, Epoch: 9, ResponseID: "next-implicit",
+	}))
+}
+
+func TestEmptyIDCancelRefusesAmbiguousPendingCreatesWithoutDeletingEither(t *testing.T) {
+	server := newTestVoiceServer(t)
+	session := connectTestSession(t, server.URL, nil, realtime.OpenRequest{Model: "model"})
+	for _, epoch := range []identity.ResponseEpoch{11, 12} {
+		require.NoError(t, session.Send(t.Context(), realtime.Command{
+			Kind: realtime.CommandCreateResponse, Epoch: epoch,
+		}))
+		server.nextClientFrame(t)
+	}
+
+	err := session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCancelResponse, Epoch: 13})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exactly one pending response")
+
+	for _, epoch := range []identity.ResponseEpoch{11, 12} {
+		created := sendAndReceiveEvent(t, server, session, map[string]any{
+			"type": "response.created",
+			"response": map[string]any{
+				"id": fmt.Sprintf("still-pending-%d", epoch), "status": "in_progress",
+				"metadata": map[string]any{"live_epoch": fmt.Sprint(epoch)},
+			},
+		})
+		assert.Equal(t, epoch, created.Epoch)
+	}
+}
+
 // TestCancelAdvancesOnlyTerminalCorrelation proves that the provider's
 // response.done acknowledgment crosses the cancel fence while stale media
 // remains on the response's pre-cancel epoch for the reactor to suppress.

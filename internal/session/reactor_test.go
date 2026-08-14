@@ -464,6 +464,56 @@ func TestImplicitCreatedAdvancesBindsThenPublishes(t *testing.T) {
 	assert.IsType(t, protocol.ResponseOutputAudioTranscriptDeltaEvent{}, effects[0].ClientEvent)
 }
 
+func TestImplicitCreatedWhileSpeakingBindsCancelsAndNeverPublishes(t *testing.T) {
+	reactor, fence := testReactor(20)
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventSpeechStarted, ItemID: "user-speaking",
+	}))
+	beforeSequence := reactor.nextSeq
+
+	effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind:              realtime.EventResponseCreated,
+		ProviderEventID:   "implicit-created",
+		ResponseID:        "implicit-over-user",
+		Status:            "in_progress",
+		NeedsEpochBinding: true,
+	}))
+
+	assert.Equal(t, []string{
+		fmt.Sprintf("command:%d", realtime.CommandBindResponseEpoch),
+		"flush",
+		fmt.Sprintf("command:%d", realtime.CommandCancelResponse),
+	}, effectOrder(effects))
+	require.Len(t, effects, 3)
+	bind := effects[0].VoiceCommand
+	require.NotNil(t, bind)
+	assert.Equal(t, "implicit-over-user", bind.ResponseID)
+	assert.Equal(t, identity.ResponseEpoch(22), bind.Epoch)
+	assert.Equal(t, identity.ResponseEpoch(23), effects[1].FlushBefore)
+	cancel := effects[2].VoiceCommand
+	require.NotNil(t, cancel)
+	assert.Equal(t, "implicit-over-user", cancel.ResponseID)
+	assert.Equal(t, identity.ResponseEpoch(23), cancel.Epoch)
+	assert.Equal(t, beforeSequence+2, reactor.nextSeq)
+	assert.Equal(t, identity.ResponseEpoch(23), fence.Current())
+	assert.Equal(t, ResponseTerminal, reactor.Snapshot().Response)
+
+	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptDelta, Epoch: bind.Epoch, ResponseID: "implicit-over-user",
+		ItemID: "assistant-over-user", Text: "must not stream",
+	})))
+	assert.Empty(t, applyOK(t, reactor, VoiceCommandCompletedInput{
+		Sequence: cancel.Sequence, Kind: realtime.CommandCancelResponse,
+	}))
+	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventResponseDone, Epoch: cancel.Epoch, ResponseID: "implicit-over-user", Status: "cancelled",
+	})))
+	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventError, Epoch: cancel.Epoch, ProviderEventID: "implicit-cancel-error", Reason: "cancel rejected",
+	})))
+	assert.Equal(t, ResponseTerminal, reactor.Snapshot().Response)
+}
+
 func TestSpeechEdgesAndExplicitCancelFenceInOrder(t *testing.T) {
 	t.Run("idle speech edge flushes once", func(t *testing.T) {
 		reactor, fence := testReactor(1)
@@ -558,6 +608,45 @@ func TestDifferentSpeechItemWhileSpeakingSupersedesCommittedEligibility(t *testi
 	)))
 	require.Len(t, effects, 1)
 	assert.Nil(t, effects[0].Async)
+}
+
+func TestNewSpeechItemRejectsLateOlderInputTranscriptsWithoutMutation(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		kind realtime.EventKind
+		text string
+	}{
+		{name: "delta", kind: realtime.EventTranscriptionDelta, text: "stale partial"},
+		{name: "completion", kind: realtime.EventTranscriptionCompleted, text: "stale final"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			reactor, fence := testReactor(1)
+			applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+				Kind: realtime.EventSpeechStarted, ItemID: "turn-a",
+			}))
+			applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+				Kind: realtime.EventSpeechStarted, ItemID: "turn-b",
+			}))
+			require.NotNil(t, reactor.activeTurn)
+			beforeTurn := *reactor.activeTurn
+			beforeNextSequence := reactor.nextSeq
+			beforeTranscriptSequence := reactor.transcriptSequence
+			beforeSnapshot := reactor.Snapshot()
+			beforeEpoch := fence.Current()
+
+			effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+				Kind: test.kind, ItemID: "turn-a", Text: test.text,
+			}))
+
+			assert.Empty(t, effects, "stale input must not publish or request persistence")
+			require.NotNil(t, reactor.activeTurn)
+			assert.Equal(t, beforeTurn, *reactor.activeTurn, "stale input must not replace the active turn")
+			assert.Equal(t, beforeNextSequence, reactor.nextSeq, "stale input must not allocate an effect sequence")
+			assert.Equal(t, beforeTranscriptSequence, reactor.transcriptSequence, "stale input must not allocate a durable transcript sequence")
+			assert.Equal(t, beforeSnapshot, reactor.Snapshot())
+			assert.Equal(t, beforeEpoch, fence.Current())
+		})
+	}
 }
 
 func TestPendingCancelNeverSynthesizesEmptyResponseDone(t *testing.T) {

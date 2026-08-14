@@ -110,6 +110,7 @@ type Config struct {
 	Jitter                          clock.JitterSource
 	FeatureGates                    interface{ Enabled(string) bool }
 	ApprovalStore                   handoff.ApprovalStore
+	ApprovalDispatcher              ApprovalResolutionDispatcher
 	ConversationProvisioner         ConversationProvisioner
 	ConversationTTL                 time.Duration
 	reactorApplyGate                func(Input) <-chan struct{}
@@ -139,6 +140,19 @@ type TrustedSessionContext struct {
 type DurableEffectDispatcher interface {
 	DispatchTranscript(context.Context, TrustedSessionContext, TranscriptRequestedEffect) error
 	DispatchHandoff(context.Context, TrustedSessionContext, HandoffRequestedEffect) error
+}
+
+type ApprovalResolutionRequestedEffect struct {
+	ExternalSequence uint64
+	InvocationID     string
+	Decision         handoff.ApprovalDecision
+	Reason           string
+	IdempotencyKey   string
+	ResolvedAt       time.Time
+}
+
+type ApprovalResolutionDispatcher interface {
+	DispatchApproval(TrustedSessionContext, ApprovalResolutionRequestedEffect) error
 }
 
 type MetricsHooks struct {
@@ -531,11 +545,6 @@ type clientControl struct {
 	incarnation        identity.Incarnation
 }
 
-type approvalResolutionWork struct {
-	event    protocol.LiveToolApprovalResolveEvent
-	sequence uint64
-}
-
 type durableEffectControl struct {
 	trusted    TrustedSessionContext
 	transcript *TranscriptRequestedEffect
@@ -683,7 +692,6 @@ type runState struct {
 	metrics            MetricsHooks
 	subject            Subject
 	dispatcher         DurableEffectDispatcher
-	approvalWork       chan approvalResolutionWork
 	safetyWork         chan presentationSafetyWork
 	durableCtl         chan durableEffectControl
 	durableSlots       chan struct{}
@@ -1189,7 +1197,6 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	group.Go(runLoop("voice reader", state.voiceReader))
 	group.Go(runLoop("client writer", state.clientWriter))
 	group.Go(runLoop("reactor", state.reactorLoop))
-	group.Go(runLoop("approval resolver", state.approvalLoop))
 	group.Go(runLoop("presentation safety", state.presentationSafetyLoop))
 	group.Go(runLoop("durable dispatcher", state.durableWriter))
 	abortBeforePublication := func(cause error) error {
@@ -2108,7 +2115,6 @@ func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.Canc
 	group.Go(runLoop("voice reader", state.voiceReader))
 	group.Go(runLoop("client writer", state.clientWriter))
 	group.Go(runLoop("reactor", state.reactorLoop))
-	group.Go(runLoop("approval resolver", state.approvalLoop))
 	group.Go(runLoop("presentation safety", state.presentationSafetyLoop))
 	group.Go(runLoop("durable dispatcher", state.durableWriter))
 	abort := func(cause error) error {
@@ -2361,7 +2367,6 @@ func newRunState(cfg Config, ids IDs, voice realtime.Session, client ClientConn,
 		voiceCtl:           make(chan voiceControl, cfg.WriterControlEvents),
 		egress:             make(chan egressFrame, cfg.EgressFrames),
 		clientCtl:          make(chan clientControl, cfg.WriterControlEvents),
-		approvalWork:       make(chan approvalResolutionWork, cfg.ControlEvents),
 		safetyWork:         make(chan presentationSafetyWork, cfg.ControlEvents),
 		durableCtl:         make(chan durableEffectControl, cfg.WriterControlEvents),
 		durableSlots:       make(chan struct{}, cfg.WriterControlEvents),
@@ -2776,12 +2781,25 @@ func (s *runState) clientReader(ctx context.Context) error {
 					Type: "live.tool_policy.updated", EventID: typed.EventID, Tools: canonical, Model: s.cfg.AsyncModel,
 				}})
 			case protocol.LiveToolApprovalResolveEvent:
-				select {
-				case s.approvalWork <- approvalResolutionWork{event: typed, sequence: sequence}:
-					return false, nil
-				default:
+				if isNilInterface(s.cfg.ApprovalDispatcher) {
+					return true, s.enqueueClientControl(clientControl{event: s.approvalProtocolError("approval_unavailable")})
+				}
+				request := ApprovalResolutionRequestedEffect{
+					ExternalSequence: sequence,
+					InvocationID:     typed.InvocationID,
+					Decision:         handoff.ApprovalDecision(typed.Decision),
+					Reason:           typed.Reason,
+					IdempotencyKey:   typed.IdempotencyKey,
+					ResolvedAt:       s.cfg.Clock.Now().UTC(),
+				}
+				trusted := TrustedSessionContext{IDs: s.ids, Subject: cloneSubject(s.subject)}
+				if dispatchErr := s.cfg.ApprovalDispatcher.DispatchApproval(trusted, request); dispatchErr != nil {
 					return true, s.enqueueClientControl(clientControl{event: s.approvalProtocolError("approval_backpressure")})
 				}
+				// The durable boundary is the app-owned queue admission. Store
+				// resolution and optional live UX completion no longer belong to
+				// this session incarnation.
+				return true, nil
 			case protocol.InputAudioBufferAppendEvent:
 				pcm, decodeErr := protocol.DecodePCM24k(typed, s.cfg.IngressFrames*pcmFrameBytes)
 				if decodeErr != nil {
@@ -2828,38 +2846,6 @@ func (s *runState) clientReader(ctx context.Context) error {
 		})
 		if err != nil {
 			return err
-		}
-	}
-}
-
-func (s *runState) approvalLoop(ctx context.Context) error {
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case work := <-s.approvalWork:
-			event := work.event
-			if isNilInterface(s.cfg.ApprovalStore) {
-				if err := s.enqueueClientControl(clientControl{event: s.approvalProtocolError("approval_unavailable")}); err != nil {
-					return err
-				}
-				s.markExternalApplied(work.sequence)
-				continue
-			}
-			decision := handoff.ApprovalDecision(event.Decision)
-			resolution := handoff.ApprovalResolution{
-				InvocationID: event.InvocationID, Decision: decision,
-				ActorTenantID: s.subject.TenantID, ActorUserID: s.subject.UserID,
-				Reason: event.Reason, IdempotencyKey: event.IdempotencyKey,
-				ResolvedAt: s.cfg.Clock.Now().UTC(),
-			}
-			scope := handoff.Scope{TenantID: s.subject.TenantID, UserID: s.subject.UserID, ConversationID: s.ids.ConversationID}
-			if err := s.cfg.ApprovalStore.ResolveApproval(ctx, scope, resolution); err != nil {
-				if enqueueErr := s.enqueueClientControl(clientControl{event: s.approvalProtocolError("approval_rejected")}); enqueueErr != nil {
-					return enqueueErr
-				}
-			}
-			s.markExternalApplied(work.sequence)
 		}
 	}
 }
@@ -3196,10 +3182,11 @@ func (s *runState) voiceReader(ctx context.Context) error {
 			input: VoiceInput{Incarnation: s.ids.Incarnation, Event: event}, egressAfter: latest,
 		}
 		var enqueueErr error
-		if event.Kind == realtime.EventResponseCreated {
-			// Establish the stream before accepting its media into the output
-			// order. This waits only for pure reactor apply and bounded effect
-			// admission, never for provider or client I/O completion.
+		if event.Kind == realtime.EventResponseCreated || event.Kind == realtime.EventSpeechStarted {
+			// Establish a new stream or speech fence before accepting later
+			// provider media into the output order. This waits only for pure
+			// reactor apply and bounded effect admission, never for provider or
+			// client I/O completion.
 			enqueueErr = s.enqueueReactorSync(ctx, message)
 		} else {
 			enqueueErr = s.enqueueReactor(message)
@@ -3377,6 +3364,9 @@ func (s *runState) reactorLoop(ctx context.Context) error {
 			}
 			if completed, ok := message.input.(DurableEffectCompletedInput); ok {
 				s.completeDurableEffect(completed)
+			}
+			if completed, ok := message.input.(ApprovalResolutionCompletedInput); ok && err == nil {
+				s.markExternalApplied(completed.ExternalSequence)
 			}
 			if completed, ok := message.input.(ClientEffectCompletedInput); ok {
 				if waiter, found := s.completeClientEffect(completed); found {

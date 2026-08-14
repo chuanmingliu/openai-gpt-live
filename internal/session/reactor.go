@@ -58,6 +58,14 @@ type DurableEffectCompletedInput struct {
 
 func (DurableEffectCompletedInput) isSessionInput() {}
 
+type ApprovalResolutionCompletedInput struct {
+	ExternalSequence uint64
+	InvocationID     string
+	Accepted         bool
+}
+
+func (ApprovalResolutionCompletedInput) isSessionInput() {}
+
 var (
 	ErrInvalidTransition         = errors.New("invalid session transition")
 	ErrUnsupportedInput          = errors.New("unsupported session input")
@@ -162,6 +170,7 @@ type Reactor struct {
 
 	activeResponseID          string
 	activeResponseEpoch       identity.ResponseEpoch
+	suppressedImplicitID      string
 	terminal                  *terminalMarker
 	pendingSessionUpdates     map[uint64]pendingSessionUpdate
 	pendingSessionUpdateBytes int
@@ -169,6 +178,7 @@ type Reactor struct {
 	pendingTools              []pendingTool
 	pendingToolBytes          int
 	activeTurn                *activeInputTurn
+	currentProviderInputItem  string
 	inputTurnRevision         uint32
 	pendingCancelSequence     uint64
 	pendingCreateSequence     uint64
@@ -292,6 +302,17 @@ func (r *Reactor) ApplyContext(ctx context.Context, input Input) ([]Effect, erro
 			return nil, fmt.Errorf("durable %s effect %d failed: %w", typed.Kind, typed.Sequence, typed.Err)
 		}
 		return nil, nil
+	case ApprovalResolutionCompletedInput:
+		if typed.Accepted {
+			return nil, nil
+		}
+		return []Effect{{ClientEvent: protocol.ErrorEvent{
+			Type:    "error",
+			EventID: r.providerOrSynthEventID(""),
+			Error: protocol.ProtocolError{
+				Type: "invalid_request_error", Code: "approval_rejected", Message: "approval resolution was not accepted",
+			},
+		}}}, nil
 	case DurableInput:
 		return r.applyDurable(typed)
 	case TurnCommittedInput:
@@ -1382,6 +1403,7 @@ func (r *Reactor) applyResponseCreate(event protocol.ResponseCreateEvent) ([]Eff
 	r.state.Response = ResponsePending
 	r.activeResponseID = ""
 	r.activeResponseEpoch = epoch
+	r.suppressedImplicitID = ""
 	r.terminal = nil
 	r.pendingCancelSequence = 0
 	command := realtime.Command{
@@ -1505,12 +1527,14 @@ func (r *Reactor) applySpeechStarted(event realtime.Event) ([]Effect, error) {
 		if err := r.beginInputTurn(event.ItemID); err != nil {
 			return nil, err
 		}
+		r.currentProviderInputItem = event.ItemID
 		return nil, nil
 	}
 
 	if err := r.beginInputTurn(event.ItemID); err != nil {
 		return nil, err
 	}
+	r.currentProviderInputItem = event.ItemID
 	r.clearPresentationResponse()
 	epoch := r.fence.Advance()
 	r.state.UserSpeaking = true
@@ -1595,6 +1619,7 @@ func (r *Reactor) applyImplicitResponseCreated(event realtime.Event) ([]Effect, 
 	r.state.Response = ResponseStreaming
 	r.activeResponseID = event.ResponseID
 	r.activeResponseEpoch = epoch
+	r.suppressedImplicitID = ""
 	r.terminal = nil
 	r.pendingCancelSequence = 0
 	bind := realtime.Command{
@@ -1602,6 +1627,24 @@ func (r *Reactor) applyImplicitResponseCreated(event realtime.Event) ([]Effect, 
 		Sequence:   r.allocateSequence(),
 		Epoch:      epoch,
 		ResponseID: event.ResponseID,
+	}
+	if r.state.UserSpeaking {
+		cancelEpoch := r.fence.Advance()
+		cancel := realtime.Command{
+			Kind:       realtime.CommandCancelResponse,
+			Sequence:   r.allocateSequence(),
+			Epoch:      cancelEpoch,
+			ResponseID: event.ResponseID,
+		}
+		r.state.Response = ResponseTerminal
+		r.activeResponseEpoch = cancelEpoch
+		r.suppressedImplicitID = event.ResponseID
+		r.pendingCancelSequence = cancel.Sequence
+		return []Effect{
+			{VoiceCommand: &bind},
+			{FlushBefore: cancelEpoch},
+			{VoiceCommand: &cancel},
+		}, nil
 	}
 	created := protocol.ResponseCreatedEvent{
 		Type:    "response.created",
@@ -1632,6 +1675,9 @@ func (r *Reactor) applyTranscriptDelta(event realtime.Event) ([]Effect, error) {
 }
 
 func (r *Reactor) applyInputTranscriptionDelta(event realtime.Event) ([]Effect, error) {
+	if r.staleProviderInputItem(event.ItemID) {
+		return nil, nil
+	}
 	if err := r.observeTranscription(event.ItemID, false); err != nil {
 		return nil, err
 	}
@@ -1645,6 +1691,9 @@ func (r *Reactor) applyInputTranscriptionDelta(event realtime.Event) ([]Effect, 
 }
 
 func (r *Reactor) applyInputTranscriptionCompleted(event realtime.Event) ([]Effect, error) {
+	if r.staleProviderInputItem(event.ItemID) {
+		return nil, nil
+	}
 	if err := validateDurableText("user transcript", event.Text); err != nil {
 		return nil, err
 	}
@@ -1677,6 +1726,10 @@ func (r *Reactor) applyInputTranscriptionCompleted(event realtime.Event) ([]Effe
 		Turn: r.activeTurn.key, Sequence: r.transcriptSequence, Role: "user", FinalText: event.Text,
 	}
 	return []Effect{{ClientEvent: mapped, Transcript: &transcript}}, nil
+}
+
+func (r *Reactor) staleProviderInputItem(itemID string) bool {
+	return r.currentProviderInputItem != "" && itemID != r.currentProviderInputItem
 }
 
 func (r *Reactor) applyAudioDone(event realtime.Event) ([]Effect, error) {
@@ -1884,6 +1937,10 @@ func (r *Reactor) applyResponseDone(event realtime.Event) ([]Effect, error) {
 	if !r.currentResponseEvent(event) {
 		return nil, nil
 	}
+	if r.suppressedImplicitID != "" &&
+		(event.ResponseID == r.suppressedImplicitID || (event.ResponseID == "" && event.Epoch == r.activeResponseEpoch)) {
+		return nil, nil
+	}
 	if r.terminal != nil && r.terminal.responseID == event.ResponseID && r.terminal.epoch == event.Epoch {
 		return nil, nil
 	}
@@ -2043,6 +2100,10 @@ func (r *Reactor) applyProviderError(event realtime.Event) ([]Effect, error) {
 		return nil, nil
 	}
 	if event.ResponseID != "" && !r.currentResponseEvent(event) {
+		return nil, nil
+	}
+	if r.suppressedImplicitID != "" &&
+		(event.ResponseID == r.suppressedImplicitID || (event.ResponseID == "" && event.Epoch == r.activeResponseEpoch)) {
 		return nil, nil
 	}
 	mapped := protocol.ErrorEvent{
