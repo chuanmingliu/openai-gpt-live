@@ -21,6 +21,15 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
 )
 
+// DurableEffectCompletedInput correlates bounded durable-dispatch admission
+// with completion on a later reactor turn.
+type DurableEffectCompletedInput struct {
+	Sequence uint64
+	Kind     string
+}
+
+func (DurableEffectCompletedInput) isSessionInput() {}
+
 const (
 	PendingBackgroundToolLimit = 16
 	PendingBackgroundToolBytes = 1 << 20
@@ -244,6 +253,8 @@ func (r *Reactor) ApplyContext(ctx context.Context, input Input) ([]Effect, erro
 		return effects, err
 	case VoiceCommandCompletedInput:
 		return r.applyVoiceCommandCompleted(typed)
+	case DurableEffectCompletedInput:
+		return nil, nil
 	case DurableInput:
 		return r.applyDurable(typed)
 	case TurnCommittedInput:

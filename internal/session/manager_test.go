@@ -2258,6 +2258,32 @@ func (*recordingVoice) Receive(ctx context.Context) (realtime.Event, error) {
 
 func (*recordingVoice) Close(context.Context) error { return nil }
 
+type gatedCancelVoice struct {
+	sent          chan realtime.Command
+	cancelStarted chan struct{}
+	cancelRelease chan struct{}
+}
+
+func (v *gatedCancelVoice) Send(ctx context.Context, command realtime.Command) error {
+	v.sent <- command
+	if command.Kind == realtime.CommandCancelResponse {
+		close(v.cancelStarted)
+		select {
+		case <-v.cancelRelease:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+func (*gatedCancelVoice) Receive(ctx context.Context) (realtime.Event, error) {
+	<-ctx.Done()
+	return realtime.Event{}, ctx.Err()
+}
+
+func (*gatedCancelVoice) Close(context.Context) error { return nil }
+
 type closeErrorConnector struct {
 	voice     *closeErrorVoice
 	connected chan struct{}
@@ -2628,7 +2654,7 @@ func TestDispatchFlushFencesActiveAndQueuedResponseControlsBeforeCancelOrTermina
 	}
 }
 
-func TestDispatchPolicySuppressionWaitsForAllowedSpeechSendSuccess(t *testing.T) {
+func TestDispatchPolicySuppressionDoesNotWaitForAllowedSpeechSend(t *testing.T) {
 	cfg, err := normalizeManagerConfig(Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second})
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(t.Context())
@@ -2641,7 +2667,7 @@ func TestDispatchPolicySuppressionWaitsForAllowedSpeechSendSuccess(t *testing.T)
 	go func() { voiceDone <- state.voiceWriter(ctx) }()
 	command := realtime.Command{Kind: realtime.CommandCreateResponse, Sequence: 1}
 	err = state.dispatchEffects(ctx, []Effect{{VoiceCommand: &command}, {PolicySuppressed: true}}, 0, 0)
-	require.ErrorIs(t, err, providerErr)
+	require.NoError(t, err)
 	require.ErrorIs(t, <-voiceDone, providerErr)
 }
 
@@ -2699,6 +2725,13 @@ func TestShadowFromStartSuppressesEveryHandoffAcceptanceReinjectionAndReconciles
 		return applyErr
 	})
 	require.NoError(t, err)
+	for len(state.inbox) != 0 {
+		message := <-state.inbox
+		completed, ok := message.input.(VoiceCommandCompletedInput)
+		require.True(t, ok)
+		applyOK(t, reactor, completed)
+		state.inboxSlots <- struct{}{}
+	}
 	require.Equal(t, ResponseTerminal, reactor.Snapshot().Response)
 	require.Empty(t, applyOK(t, reactor, accepted), "acceptance durable state must remain resolved")
 	select {
@@ -3010,6 +3043,123 @@ func TestManagerCancelsInFlightStaleAudioBeforeBargeWriteCanRecord(t *testing.T)
 	}
 }
 
+// TestSpeechStartedAdvancesFenceWhileEarlierVisualWriteIsBlocked catches a
+// reactor loop that waits for exact client I/O before applying barge-in.
+func TestSpeechStartedAdvancesFenceWhileEarlierVisualWriteIsBlocked(t *testing.T) {
+	connector := testkit.NewFakeConnector(16)
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+	}, connector, managerIDs{session: "session-async-visual", conversation: "conversation-async-visual"})
+	require.NoError(t, manager.validationErr)
+	client := newDeliveryClient()
+	client.visualRelease = make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.Run(ctx, OpenRequest{Subject: Subject{
+			TenantID: "tenant", UserID: "user", ExpiresAt: time.Now().Add(time.Hour),
+		}}, client)
+	}()
+	voice, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return manager.ActiveSessions() == 1 }, time.Second, time.Millisecond)
+
+	manager.activeMu.RLock()
+	var runtime *sessionRuntime
+	for _, active := range manager.active {
+		runtime = active
+	}
+	manager.activeMu.RUnlock()
+	require.NotNil(t, runtime)
+	require.NoError(t, manager.Submit(t.Context(), runtime.key.sessionID, runtime.key.incarnation, ClientInput{
+		Event: protocol.ResponseCreateEvent{Type: "response.create"},
+	}))
+	command, err := voice.NextCommand(t.Context())
+	require.NoError(t, err)
+	require.NoError(t, voice.Emit(t.Context(), realtime.Event{
+		Kind: realtime.EventResponseCreated, Epoch: command.Epoch, ResponseID: "response-async-visual", Status: "in_progress",
+	}))
+	require.Eventually(t, func() bool { return runtime.state.fence.Current() == command.Epoch }, time.Second, time.Millisecond)
+
+	offered := make(chan error, 1)
+	go func() {
+		offered <- manager.OfferHandoffEvent(context.Background(), runtime.handoffScope(), handoff.Event{
+			Seq: 1, EventID: "visual-blocked", HandoffID: "handoff", TenantID: "tenant",
+			ConversationID: runtime.state.ids.ConversationID, Kind: "tool.approval_required", State: handoff.StateNeedsInput,
+			Payload: json.RawMessage(`{"invocation_id":"invoke","handoff_id":"handoff","action_summary":"approve","expires_at":"2099-01-01T00:00:00Z","risk_class":"low"}`),
+		})
+	}()
+	select {
+	case <-client.visualStarted:
+	case err := <-offered:
+		t.Fatalf("offer failed before visual write: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("visual write did not reach gate")
+	}
+	require.NoError(t, voice.Emit(t.Context(), realtime.Event{
+		Kind: realtime.EventSpeechStarted, ProviderEventID: "speech-async-visual", ItemID: "new-input",
+	}))
+	require.Eventually(t, func() bool { return runtime.state.fence.Current() > command.Epoch }, 100*time.Millisecond, time.Millisecond)
+
+	close(client.visualRelease)
+	select {
+	case <-offered:
+	case <-time.After(time.Second):
+		t.Fatal("offer did not finish after visual release")
+	}
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestResponseCreateWaitsForBlockedBargeCancelCompletion(t *testing.T) {
+	cfg, err := normalizeManagerConfig(Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	voice := &gatedCancelVoice{sent: make(chan realtime.Command, 8), cancelStarted: make(chan struct{}), cancelRelease: make(chan struct{})}
+	state := newRunState(cfg, testIDs(), voice, newChannelClient(8), cancel)
+	reactorDone := make(chan error, 1)
+	writerDone := make(chan error, 1)
+	go func() { reactorDone <- state.reactorLoop(ctx) }()
+	go func() { writerDone <- state.voiceWriter(ctx) }()
+	require.NoError(t, state.enqueueReactorSync(t.Context(), reactorMessage{input: ConnectedInput{ProviderSession: json.RawMessage(`{}`)}}))
+	require.NoError(t, state.enqueueReactorSync(t.Context(), reactorMessage{input: ClientInput{Event: protocol.ResponseCreateEvent{Type: "response.create"}}}))
+	first := <-voice.sent
+	require.Equal(t, realtime.CommandCreateResponse, first.Kind)
+	require.Eventually(t, func() bool { return state.pendingVoice.Load() == 0 }, time.Second, time.Millisecond)
+	require.NoError(t, state.enqueueReactorSync(t.Context(), reactorMessage{input: VoiceInput{Incarnation: state.ids.Incarnation, Event: realtime.Event{
+		Kind: realtime.EventResponseCreated, Epoch: first.Epoch, ResponseID: "response-before-barge", Status: "in_progress",
+	}}}))
+	require.NoError(t, state.enqueueReactorSync(t.Context(), reactorMessage{input: VoiceInput{Incarnation: state.ids.Incarnation, Event: realtime.Event{
+		Kind: realtime.EventSpeechStarted, ItemID: "new-input",
+	}}}))
+	select {
+	case <-voice.cancelStarted:
+	case <-time.After(time.Second):
+		t.Fatal("cancel send did not reach gate")
+	}
+	require.Equal(t, realtime.CommandCancelResponse, (<-voice.sent).Kind)
+	createDone := make(chan error, 1)
+	require.NoError(t, state.enqueueReactor(reactorMessage{input: ClientInput{Event: protocol.ResponseCreateEvent{Type: "response.create"}}, done: createDone}))
+	select {
+	case err := <-createDone:
+		t.Fatalf("response.create completed before cancel: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(voice.cancelRelease)
+	select {
+	case err := <-createDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("response.create did not resume after cancel completion")
+	}
+	second := <-voice.sent
+	require.Equal(t, realtime.CommandCreateResponse, second.Kind)
+	cancel()
+	require.ErrorIs(t, <-reactorDone, context.Canceled)
+	require.ErrorIs(t, <-writerDone, context.Canceled)
+}
+
 func TestManagerTransportFailureClosesOnceUnregistersAndPreservesCause(t *testing.T) {
 	connector := newLifecycleConnector()
 	manager := NewManager(Config{
@@ -3249,6 +3399,8 @@ func TestManagerClientControlAcceptsCapacityAndFailsOnFirstExcessControl(t *test
 	}))
 	select {
 	case <-client.started:
+	case err := <-runResult:
+		t.Fatalf("manager stopped before first post-ready event: %v", err)
 	case <-time.After(time.Second):
 		t.Fatal("client writer did not consume first post-ready event")
 	}
@@ -3812,7 +3964,7 @@ func TestManagerMetricsHooksObserveOverflowAndDroppedAudio(t *testing.T) {
 	require.Equal(t, 960, <-dropped)
 }
 
-func TestManagerReactorAggregateBoundRejectsFirstExcessWhileApplyIsActive(t *testing.T) {
+func TestManagerReactorReleasesAggregateCreditBeforeCancelIOCompletes(t *testing.T) {
 	cfg := Config{
 		IngressFrames: 1, EgressFrames: 1, ControlEvents: 1, WriterControlEvents: 4,
 		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
@@ -3847,18 +3999,16 @@ func TestManagerReactorAggregateBoundRejectsFirstExcessWhileApplyIsActive(t *tes
 	case <-time.After(time.Second):
 		t.Fatal("reactor Apply did not reach flush gate")
 	}
-	require.ErrorIs(t, state.enqueueReactor(reactorMessage{input: DurableInput{Sequence: 1}}), ErrControlOverflow)
-	close(releaseApply)
+	require.NoError(t, <-applyDone)
+	require.NoError(t, state.enqueueReactorSync(context.Background(), reactorMessage{input: DurableInput{Sequence: 1, Kind: "benign-before-ack"}}))
 	cancelControl := <-state.voiceCtl
 	require.Equal(t, realtime.CommandCancelResponse, cancelControl.command.Kind)
-	require.NotNil(t, cancelControl.sent)
+	require.Nil(t, cancelControl.sent)
 	state.releaseVoiceSlot()
-	cancelControl.sent <- nil
-	state.pendingVoice.Add(-1)
-	require.NoError(t, <-applyDone)
-	require.NoError(t, state.enqueueReactorSync(context.Background(), reactorMessage{
-		input: DurableInput{Sequence: 1, Kind: "benign-after-ack"},
-	}), "an observed completion ack must make its aggregate credit immediately reusable")
+	require.NoError(t, state.enqueueReactorSync(context.Background(), reactorMessage{input: VoiceCommandCompletedInput{
+		Sequence: cancelControl.command.Sequence, Kind: cancelControl.command.Kind,
+	}}))
+	close(releaseApply)
 	cancel()
 	require.ErrorIs(t, <-done, context.Canceled)
 }

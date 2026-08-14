@@ -197,6 +197,8 @@ type voiceSession struct {
 	implicitUnbound        int
 	implicitBufferedEvents int
 	implicitBufferedBytes  int
+	mappedEvents           []realtime.Event
+	mappingActive          bool
 
 	terminalOnce      sync.Once
 	terminalMu        sync.RWMutex
@@ -524,10 +526,28 @@ func (s *voiceSession) correlate(ctx context.Context, request correlationRequest
 }
 
 func (s *voiceSession) mappingLoop() {
-	defer s.releaseAllImplicitBuffers()
+	s.mappingActive = true
+	defer func() {
+		s.mappingActive = false
+		s.releaseAllImplicitBuffers()
+		for index := range s.mappedEvents {
+			zeroRealtimeEvent(&s.mappedEvents[index])
+		}
+		s.mappedEvents = nil
+	}()
 	for {
+		var reads <-chan socketRead
+		if len(s.mappedEvents) < receiveQueueCapacity {
+			reads = s.reads
+		}
+		var deliveries chan<- realtime.Event
+		var next realtime.Event
+		if len(s.mappedEvents) != 0 {
+			deliveries = s.events
+			next = s.mappedEvents[0]
+		}
 		select {
-		case read := <-s.reads:
+		case read := <-reads:
 			if read.err != nil {
 				s.terminate(read.err)
 				return
@@ -565,6 +585,14 @@ func (s *voiceSession) mappingLoop() {
 				err = errors.New("unknown correlation request")
 			}
 			request.result <- err
+		case deliveries <- next:
+			// Ownership of the event's backing storage moved to the public
+			// channel. Detach the queue slot without scrubbing transferred data.
+			s.mappedEvents[0] = realtime.Event{}
+			s.mappedEvents = s.mappedEvents[1:]
+			if len(s.mappedEvents) == 0 {
+				s.mappedEvents = nil
+			}
 		case <-s.done:
 			return
 		}
@@ -868,14 +896,26 @@ func (s *voiceSession) trimResponseHistory() error {
 }
 
 func (s *voiceSession) deliver(ctx context.Context, event realtime.Event) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	select {
-	case s.events <- cloneEvent(event):
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
 	case <-s.done:
 		return s.sessionError()
+	default:
 	}
+	if !s.mappingActive {
+		select {
+		case s.events <- cloneEvent(event):
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.done:
+			return s.sessionError()
+		}
+	}
+	s.mappedEvents = append(s.mappedEvents, cloneEvent(event))
+	return nil
 }
 
 func (s *voiceSession) terminate(err error) {

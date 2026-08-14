@@ -298,6 +298,7 @@ type sessionRuntime struct {
 	replayAfter           *int64
 	reconnectMu           sync.Mutex
 	reconnectRotateMu     sync.Mutex
+	presentationMu        sync.Mutex
 	reconnect             *IssuedReconnectCredential
 	reconnectLossDeadline time.Time
 }
@@ -483,6 +484,12 @@ type approvalResolutionWork struct {
 	sequence uint64
 }
 
+type durableEffectControl struct {
+	trusted    TrustedSessionContext
+	transcript *TranscriptRequestedEffect
+	handoff    *HandoffRequestedEffect
+}
+
 type sequenceProgress struct {
 	mu        sync.Mutex
 	completed uint64
@@ -576,6 +583,14 @@ func (a *activeAudioWrite) cancelAndWait() error {
 	}
 }
 
+func (a *activeAudioWrite) cancelActive() {
+	a.mu.Lock()
+	if a.cancel != nil {
+		a.cancel()
+	}
+	a.mu.Unlock()
+}
+
 type runState struct {
 	cfg                Config
 	ids                IDs
@@ -600,6 +615,10 @@ type runState struct {
 	subject            Subject
 	dispatcher         DurableEffectDispatcher
 	approvalWork       chan approvalResolutionWork
+	durableCtl         chan durableEffectControl
+	durableSlots       chan struct{}
+	voiceReadReady     chan struct{}
+	voiceReadReadyOnce sync.Once
 
 	ingressSequence uint64
 	egressSequence  uint64
@@ -1093,6 +1112,7 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	group.Go(runLoop("client writer", state.clientWriter))
 	group.Go(runLoop("reactor", state.reactorLoop))
 	group.Go(runLoop("approval resolver", state.approvalLoop))
+	group.Go(runLoop("durable dispatcher", state.durableWriter))
 	abortBeforePublication := func(cause error) error {
 		cancel()
 		_ = group.Wait()
@@ -1120,6 +1140,7 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 		if err != nil {
 			return abortBeforePublication(fmt.Errorf("establish client session: %w", err))
 		}
+		state.voiceReadReadyOnce.Do(func() { close(state.voiceReadReady) })
 	case <-groupCtx.Done():
 		return abortBeforePublication(groupCtx.Err())
 	}
@@ -1984,6 +2005,7 @@ func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.Canc
 	group.Go(runLoop("client writer", state.clientWriter))
 	group.Go(runLoop("reactor", state.reactorLoop))
 	group.Go(runLoop("approval resolver", state.approvalLoop))
+	group.Go(runLoop("durable dispatcher", state.durableWriter))
 	abort := func(cause error) error {
 		cancel()
 		_ = group.Wait()
@@ -2009,6 +2031,7 @@ func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.Canc
 		if err != nil {
 			return abort(ErrRecoveryUnavailable)
 		}
+		state.voiceReadReadyOnce.Do(func() { close(state.voiceReadReady) })
 	case <-groupCtx.Done():
 		return abort(groupCtx.Err())
 	}
@@ -2184,6 +2207,9 @@ func newRunState(cfg Config, ids IDs, voice realtime.Session, client ClientConn,
 		egress:             make(chan egressFrame, cfg.EgressFrames),
 		clientCtl:          make(chan clientControl, cfg.WriterControlEvents),
 		approvalWork:       make(chan approvalResolutionWork, cfg.ControlEvents),
+		durableCtl:         make(chan durableEffectControl, cfg.WriterControlEvents),
+		durableSlots:       make(chan struct{}, cfg.WriterControlEvents),
+		voiceReadReady:     make(chan struct{}),
 		inboxSlots:         make(chan struct{}, cfg.ControlEvents),
 		voiceSlots:         make(chan struct{}, cfg.WriterControlEvents),
 		clientSlots:        make(chan struct{}, cfg.WriterControlEvents),
@@ -2208,6 +2234,7 @@ func newRunState(cfg Config, ids IDs, voice realtime.Session, client ClientConn,
 	for range cfg.WriterControlEvents {
 		state.voiceSlots <- struct{}{}
 		state.clientSlots <- struct{}{}
+		state.durableSlots <- struct{}{}
 	}
 	for range cfg.EgressFrames {
 		state.egressSlots <- struct{}{}
@@ -2316,12 +2343,19 @@ func (m *Manager) Submit(ctx context.Context, sessionID identity.SessionID, inca
 }
 
 func (m *Manager) register(runtime *sessionRuntime) error {
+	scope := runtime.handoffScope()
+	m.activeMu.RLock()
+	previous := m.current[scope]
+	m.activeMu.RUnlock()
+	if previous != nil && previous != runtime {
+		previous.presentationMu.Lock()
+		defer previous.presentationMu.Unlock()
+	}
 	m.activeMu.Lock()
 	defer m.activeMu.Unlock()
 	if _, exists := m.active[runtime.key]; exists {
 		return ErrSessionAlreadyActive
 	}
-	scope := runtime.handoffScope()
 	if m.logical == nil {
 		m.logical = make(map[identity.SessionID]*logicalSession)
 	}
@@ -2437,11 +2471,12 @@ func (m *Manager) OfferHandoffEvent(ctx context.Context, scope handoff.Scope, ev
 	defer cancel()
 	m.activeMu.RLock()
 	runtime := m.current[scope]
+	m.activeMu.RUnlock()
 	if runtime == nil {
-		m.activeMu.RUnlock()
 		return handoff.ErrNoLiveSession
 	}
-	defer m.activeMu.RUnlock()
+	runtime.presentationMu.Lock()
+	defer runtime.presentationMu.Unlock()
 	select {
 	case <-runtime.inboxSlots:
 	case <-runtime.done:
@@ -2455,7 +2490,6 @@ func (m *Manager) OfferHandoffEvent(ctx context.Context, scope handoff.Scope, ev
 	message := reactorMessage{
 		input:        HandoffEventInput{Scope: scope, Event: handoff.CloneEvent(event)},
 		ingressAfter: runtime.state.latestIngressSequence(), done: make(chan error, 1),
-		offerCtx: offerCtx,
 	}
 	runtime.mu.Lock()
 	if !runtime.accepting {
@@ -2475,18 +2509,13 @@ func (m *Manager) OfferHandoffEvent(ctx context.Context, scope handoff.Scope, ev
 	runtime.mu.Unlock()
 	select {
 	case err := <-message.done:
-		if err != nil && offerCtx.Err() != nil {
-			m.stopAndQuiesceRuntime(runtime)
-		}
 		if (err == nil || err == handoff.ErrPresentationSuppressed) && event.Seq > 0 && m.ReconnectEnabled() {
-			if rotateErr := m.rotateReconnectCredential(offerCtx, runtime, event.Seq, false); rotateErr != nil {
-				m.stopAndQuiesceRuntime(runtime)
+			if rotateErr := m.rotateReconnectCredential(ctx, runtime, event.Seq, false); rotateErr != nil {
 				return rotateErr
 			}
 		}
 		return err
 	case <-runtime.done:
-		m.stopAndQuiesceRuntime(runtime)
 		select {
 		case err := <-message.done:
 			return err
@@ -2496,22 +2525,14 @@ func (m *Manager) OfferHandoffEvent(ctx context.Context, scope handoff.Scope, ev
 	case <-offerCtx.Done():
 		select {
 		case err := <-message.done:
-			if err != nil {
-				m.stopAndQuiesceRuntime(runtime)
-			}
 			return err
 		default:
-			m.stopAndQuiesceRuntime(runtime)
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			return ErrControlOverflow
 		}
 	}
-}
-
-func (m *Manager) stopAndQuiesceRuntime(runtime *sessionRuntime) {
-	_ = m.stopAndQuiesceRuntimeReason(context.Background(), runtime, 1011, "handoff presentation delivery timed out")
 }
 
 func (m *Manager) stopAndQuiesceRuntimeReason(parent context.Context, runtime *sessionRuntime, code int, reason string) error {
@@ -2830,6 +2851,11 @@ func (s *runState) voiceWriter(ctx context.Context) error {
 }
 
 func (s *runState) voiceReader(ctx context.Context) error {
+	select {
+	case <-s.voiceReadReady:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	framer := &outputPCMFramer{}
 	var streamResponse string
 	var streamItem string
@@ -2908,10 +2934,20 @@ func (s *runState) voiceReader(ctx context.Context) error {
 		}
 
 		latest := s.latestEgressSequence()
-		if err := s.enqueueReactorSync(ctx, reactorMessage{
+		message := reactorMessage{
 			input: VoiceInput{Incarnation: s.ids.Incarnation, Event: event}, egressAfter: latest,
-		}); err != nil {
-			return err
+		}
+		var enqueueErr error
+		if event.Kind == realtime.EventResponseCreated {
+			// Establish the stream before accepting its media into the output
+			// order. This waits only for pure reactor apply and bounded effect
+			// admission, never for provider or client I/O completion.
+			enqueueErr = s.enqueueReactorSync(ctx, message)
+		} else {
+			enqueueErr = s.enqueueReactor(message)
+		}
+		if enqueueErr != nil {
+			return enqueueErr
 		}
 	}
 }
@@ -2961,11 +2997,29 @@ func (s *runState) enqueueEgress(ctx context.Context, event realtime.Event, audi
 
 func (s *runState) reactorLoop(ctx context.Context) error {
 	reactor := newReactorWithPresentationAndHandoffTools(s.ids, s.fence, s.cfg.PresentationPolicy, s.cfg.SafetyPolicy, s.cfg.HandoffToolsEnabled)
+	var deferredCreate *reactorMessage
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case message := <-s.inbox:
+		var message reactorMessage
+		if deferredCreate != nil && s.pendingVoice.Load() == 0 {
+			message = *deferredCreate
+			deferredCreate = nil
+		} else {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case message = <-s.inbox:
+			}
+		}
+		if deferredCreate == nil && s.pendingVoice.Load() != 0 && reactor.Snapshot().Response == ResponseCancelRequested {
+			if client, ok := message.input.(ClientInput); ok {
+				if _, create := client.Event.(protocol.ResponseCreateEvent); create {
+					copy := message
+					deferredCreate = &copy
+					continue
+				}
+			}
+		}
+		{
 			if s.cfg.reactorApplyGate != nil {
 				if gate := s.cfg.reactorApplyGate(message.input); gate != nil {
 					select {
@@ -2975,8 +3029,7 @@ func (s *runState) reactorLoop(ctx context.Context) error {
 					}
 				}
 			}
-			dispatchCtx, finishDispatch := offerDispatchContext(ctx, message.offerCtx)
-			effects, err := reactor.ApplyContext(dispatchCtx, message.input)
+			effects, err := reactor.ApplyContext(ctx, message.input)
 			markHandoffPresentationEffects(message.input, effects, s.handoffEpoch.Load())
 			policySuppressed := false
 			for index := range effects {
@@ -2990,16 +3043,24 @@ func (s *runState) reactorLoop(ctx context.Context) error {
 						}
 					}
 				}
-				err = s.dispatchEffectsReconciled(dispatchCtx, effects, message.ingressAfter, message.egressAfter, func(completed VoiceCommandCompletedInput) error {
-					reconciled, reconcileErr := reactor.ApplyContext(dispatchCtx, completed)
-					if reconcileErr != nil {
-						return reconcileErr
-					}
-					if len(reconciled) != 0 {
-						return errors.New("suppressed voice command produced unexpected effects")
-					}
-					return nil
-				})
+				var writeCompleted <-chan error
+				writeCompleted, err = s.dispatchEffectsQueued(ctx, effects, message.ingressAfter, message.egressAfter, true)
+				if err == nil && message.done != nil && writeCompleted != nil {
+					done := message.done
+					suppressed := policySuppressed
+					message.done = nil
+					go func() {
+						select {
+						case writeErr := <-writeCompleted:
+							if writeErr == nil && suppressed {
+								writeErr = handoff.ErrPresentationSuppressed
+							}
+							done <- writeErr
+						case <-ctx.Done():
+							done <- ctx.Err()
+						}
+					}()
+				}
 			}
 			if err == nil {
 				s.boundaryMu.Lock()
@@ -3009,7 +3070,6 @@ func (s *runState) reactorLoop(ctx context.Context) error {
 					s.pendingVoice.Add(-1)
 				}
 			}
-			finishDispatch()
 			s.controlApplied.Store(message.controlSequence)
 			s.inboxSlots <- struct{}{}
 			if message.done != nil {
@@ -3042,72 +3102,49 @@ func markHandoffPresentationEffects(input Input, effects []Effect, handoffEpoch 
 	}
 }
 
-func offerDispatchContext(sessionCtx, offerCtx context.Context) (context.Context, func()) {
-	if offerCtx == nil {
-		return sessionCtx, func() {}
-	}
-	ctx, cancel := context.WithCancel(offerCtx)
-	stop := context.AfterFunc(sessionCtx, cancel)
-	return ctx, func() {
-		stop()
-		cancel()
-	}
-}
-
 func (s *runState) dispatchEffects(ctx context.Context, effects []Effect, ingressAfter, egressAfter uint64) error {
 	return s.dispatchEffectsReconciled(ctx, effects, ingressAfter, egressAfter, nil)
 }
 
 func (s *runState) dispatchEffectsReconciled(ctx context.Context, effects []Effect, ingressAfter, egressAfter uint64, reconcile func(VoiceCommandCompletedInput) error) error {
-	requireVoiceAcks := false
-	for index := range effects {
-		requireVoiceAcks = requireVoiceAcks || effects[index].PolicySuppressed
-	}
+	_, err := s.dispatchEffectsQueued(ctx, effects, ingressAfter, egressAfter, false)
+	return err
+}
+
+func (s *runState) dispatchEffectsQueued(ctx context.Context, effects []Effect, ingressAfter, egressAfter uint64, queueDurable bool) (<-chan error, error) {
+	var writeCompleted <-chan error
 	for _, effect := range effects {
 		if err := ctx.Err(); err != nil {
-			return err
+			return nil, err
 		}
 		// These are the final visual and speech side-effect boundaries. Each
 		// effect re-reads the gate so a transition during dispatch cannot leak.
 		if effect.HandoffPresentation && s.cfg.FeatureGates != nil && s.cfg.FeatureGates.Enabled(feature.ShadowMode) {
-			if effect.VoiceCommand != nil && effect.VoiceCommand.Kind == realtime.CommandCreateResponse && reconcile != nil {
-				if err := reconcile(VoiceCommandCompletedInput{Sequence: effect.VoiceCommand.Sequence, Kind: effect.VoiceCommand.Kind, Suppressed: true}); err != nil {
-					return err
+			if effect.VoiceCommand != nil && effect.VoiceCommand.Kind == realtime.CommandCreateResponse {
+				if err := s.enqueueReactor(reactorMessage{input: VoiceCommandCompletedInput{Sequence: effect.VoiceCommand.Sequence, Kind: effect.VoiceCommand.Kind, Suppressed: true}}); err != nil {
+					return nil, err
 				}
 			}
 			continue
 		}
 		if effect.FlushBefore != 0 {
-			if err := s.activeWrite.cancelAndWait(); err != nil {
-				return err
-			}
-			if err := s.activeControlWrite.cancelAndWait(); err != nil {
-				return err
-			}
+			s.activeWrite.cancelActive()
+			s.activeControlWrite.cancelActive()
 		}
 		if effect.ClientEvent != nil {
 			control := clientControl{afterSeq: egressAfter, event: effect.ClientEvent, writeCtx: ctx, epoch: effect.ResponseEpoch, incarnation: effect.Incarnation}
 			if effect.RequireClientWrite {
 				control.written = make(chan error, 1)
+				writeCompleted = control.written
 			}
 			if err := s.enqueueClientControl(control); err != nil {
-				return err
-			}
-			if control.written != nil {
-				select {
-				case err := <-control.written:
-					if err != nil {
-						return err
-					}
-				case <-ctx.Done():
-					return ctx.Err()
-				}
+				return nil, err
 			}
 		}
 		if effect.Close != nil {
 			closeCopy := *effect.Close
 			if err := s.enqueueClientControl(clientControl{afterSeq: egressAfter, close: &closeCopy}); err != nil {
-				return err
+				return nil, err
 			}
 		}
 		if effect.VoiceCommand != nil {
@@ -3122,50 +3159,92 @@ func (s *runState) dispatchEffectsReconciled(ctx context.Context, effects []Effe
 			case <-s.voiceSlots:
 			default:
 				s.metrics.queueOverflow("voice_control")
-				return ErrControlOverflow
+				return nil, ErrControlOverflow
 			}
 			control := voiceControl{command: command, handoffPresentation: effect.HandoffPresentation}
-			if requireVoiceAcks || command.Kind == realtime.CommandCancelResponse {
-				control.sent = make(chan error, 1)
-			}
 			s.pendingVoice.Add(1)
 			s.voiceCtl <- control
-			if control.sent != nil {
-				select {
-				case err := <-control.sent:
-					if err != nil {
-						return err
-					}
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-			}
 		}
 		if effect.Transcript != nil || effect.Handoff != nil {
 			trusted := TrustedSessionContext{IDs: s.ids, Subject: cloneSubject(s.subject)}
+			if queueDurable {
+				select {
+				case <-s.durableSlots:
+				default:
+					s.metrics.queueOverflow("durable_effect")
+					return nil, ErrControlOverflow
+				}
+				control := durableEffectControl{trusted: trusted}
+				if effect.Transcript != nil {
+					owned := *effect.Transcript
+					control.transcript = &owned
+				}
+				if effect.Handoff != nil {
+					if isNilInterface(s.dispatcher) {
+						s.durableSlots <- struct{}{}
+						return nil, fmt.Errorf("%w: durable handoff effect", ErrUnsupportedAsync)
+					}
+					owned := *effect.Handoff
+					owned.Arguments = append(json.RawMessage(nil), effect.Handoff.Arguments...)
+					owned.ToolPolicy = s.toolPolicySnapshot()
+					control.handoff = &owned
+				}
+				s.durableCtl <- control
+				continue
+			}
 			if effect.Transcript != nil && !isNilInterface(s.dispatcher) {
 				owned := *effect.Transcript
 				if err := s.dispatcher.DispatchTranscript(ctx, trusted, owned); err != nil {
-					return err
+					return nil, err
 				}
 			}
 			if effect.Handoff != nil {
 				if isNilInterface(s.dispatcher) {
-					return fmt.Errorf("%w: durable handoff effect", ErrUnsupportedAsync)
+					return nil, fmt.Errorf("%w: durable handoff effect", ErrUnsupportedAsync)
 				}
 				owned := *effect.Handoff
 				owned.Arguments = append(json.RawMessage(nil), effect.Handoff.Arguments...)
 				owned.ToolPolicy = s.toolPolicySnapshot()
 				if err := s.dispatcher.DispatchHandoff(ctx, trusted, owned); err != nil {
-					return err
+					return nil, err
 				}
 			}
 		}
 		if effect.Async != nil && effect.Handoff == nil {
-			return fmt.Errorf("%w: %s", ErrUnsupportedAsync, effect.Async.Kind)
+			return nil, fmt.Errorf("%w: %s", ErrUnsupportedAsync, effect.Async.Kind)
 		}
 	}
-	return nil
+	return writeCompleted, nil
+}
+
+func (s *runState) durableWriter(ctx context.Context) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case control := <-s.durableCtl:
+			var sequence uint64
+			kind := "handoff"
+			if control.transcript != nil && !isNilInterface(s.dispatcher) {
+				sequence = control.transcript.Sequence
+				kind = "transcript"
+				if err := s.dispatcher.DispatchTranscript(ctx, control.trusted, *control.transcript); err != nil {
+					s.durableSlots <- struct{}{}
+					return err
+				}
+			}
+			if control.handoff != nil {
+				if err := s.dispatcher.DispatchHandoff(ctx, control.trusted, *control.handoff); err != nil {
+					s.durableSlots <- struct{}{}
+					return err
+				}
+			}
+			s.durableSlots <- struct{}{}
+			if err := s.enqueueReactor(reactorMessage{input: DurableEffectCompletedInput{Sequence: sequence, Kind: kind}}); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 func (s *runState) enqueueClientControl(control clientControl) error {
@@ -3241,17 +3320,21 @@ func (s *runState) clientWriter(ctx context.Context) error {
 				}
 				err := s.client.Write(writeCtx, control.event)
 				finish()
-				if control.written != nil {
-					control.written <- err
-				}
 				if err != nil {
+					s.releaseClientSlot()
+					if control.written != nil {
+						control.written <- err
+					}
 					if errors.Is(err, context.Canceled) && control.epoch != 0 && !s.fence.Accept(control.epoch) {
-						s.releaseClientSlot()
 						continue
 					}
-					s.releaseClientSlot()
 					return err
 				}
+				s.releaseClientSlot()
+				if control.written != nil {
+					control.written <- nil
+				}
+				continue
 			}
 			if control.close != nil {
 				s.graceful.Store(true)

@@ -105,7 +105,7 @@ func (c *deliveryClient) Write(ctx context.Context, event protocol.ServerEvent) 
 			return ctx.Err()
 		}
 	}
-	if event.EventType() == "live.handoff.created" || event.EventType() == "live.handoff.needs_input" || event.EventType() == "live.session.degraded" {
+	if event.EventType() == "live.handoff.created" || event.EventType() == "live.handoff.needs_input" || event.EventType() == "live.tool.approval.required" || event.EventType() == "live.session.degraded" {
 		select {
 		case c.visualStarted <- event:
 		case <-ctx.Done():
@@ -389,7 +389,7 @@ func TestEventPumpTimeoutAndWriteFailureKeepCursorReplayable(t *testing.T) {
 	}
 }
 
-func TestTimedOutPresentationQuiescesOldRuntimeBeforeReplacementReplay(t *testing.T) {
+func TestTimedOutPresentationKeepsRuntimeAndStableEventReplayable(t *testing.T) {
 	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "conversation-replace"}
 	store := &deliveryStore{event: handoff.Event{
 		Seq: 7, EventID: "stable-needs-input", HandoffID: "handoff", TenantID: scope.TenantID,
@@ -404,11 +404,11 @@ func TestTimedOutPresentationQuiescesOldRuntimeBeforeReplacementReplay(t *testin
 		IngressBlockTimeout: time.Second, EgressBlockTimeout: 20 * time.Millisecond,
 		HandoffConsumerID: "public-client", HandoffSubscriptions: pump,
 		PresentationPolicy: presentation.NewPolicy(presentation.Config{}), SafetyPolicy: safetyPolicy,
-	}, connector, &deliverySequenceIDs{sessions: []identity.SessionID{"delivery-old", "delivery-replacement"}})
+	}, connector, &deliverySequenceIDs{sessions: []identity.SessionID{"delivery-old"}})
 	sink := &deliveryRecordingSink{manager: manager, results: make(chan error, 8)}
 	pump.Sink = sink
 
-	run := func(client *deliveryClient) (context.CancelFunc, <-chan error, *testkit.FakeVoiceSession) {
+	run := func(client *deliveryClient) (context.CancelFunc, <-chan error) {
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan error, 1)
 		go func() {
@@ -416,9 +416,9 @@ func TestTimedOutPresentationQuiescesOldRuntimeBeforeReplacementReplay(t *testin
 				TenantID: scope.TenantID, UserID: scope.UserID, ExpiresAt: time.Now().Add(time.Hour),
 			}, ConversationID: scope.ConversationID}, client)
 		}()
-		voice, err := connector.NextSession(t.Context())
+		_, err := connector.NextSession(t.Context())
 		require.NoError(t, err)
-		return cancel, done, voice
+		return cancel, done
 	}
 	stop := func(cancel context.CancelFunc, done <-chan error) {
 		cancel()
@@ -431,7 +431,7 @@ func TestTimedOutPresentationQuiescesOldRuntimeBeforeReplacementReplay(t *testin
 
 	oldClient := newDeliveryClient()
 	oldClient.visualRelease = make(chan struct{})
-	oldCancel, oldDone, oldVoice := run(oldClient)
+	oldCancel, oldDone := run(oldClient)
 	defer stop(oldCancel, oldDone)
 	require.Eventually(t, func() bool {
 		manager.activeMu.RLock()
@@ -462,20 +462,26 @@ func TestTimedOutPresentationQuiescesOldRuntimeBeforeReplacementReplay(t *testin
 	case <-time.After(time.Second):
 		t.Fatal("old presentation did not start")
 	}
-
-	replacementClient := newDeliveryClient()
-	replacementCancel, replacementDone, _ := run(replacementClient)
-	defer stop(replacementCancel, replacementDone)
-	require.Eventually(t, func() bool {
-		manager.activeMu.RLock()
-		defer manager.activeMu.RUnlock()
-		return manager.current[scope] != nil && manager.current[scope].key.sessionID == "delivery-replacement"
-	}, time.Second, time.Millisecond)
+	select {
+	case err := <-sink.results:
+		require.ErrorIs(t, err, ErrControlOverflow)
+	case <-time.After(time.Second):
+		t.Fatal("bounded offer did not return")
+	}
+	assert.Equal(t, int64(1), manager.ActiveSessions(), "offer timeout must not quiesce the runtime")
+	store.mu.Lock()
+	assert.Zero(t, store.cursor)
+	store.mu.Unlock()
+	close(oldClient.visualRelease)
 	manual.Advance(time.Second)
-	replacementVisual := <-replacementClient.visualStarted
-
+	var replayed protocol.ServerEvent
+	select {
+	case replayed = <-oldClient.visualStarted:
+	case <-time.After(time.Second):
+		t.Fatal("expired presentation was not replayed")
+	}
 	oldEvent := oldVisual.(protocol.LiveHandoffNeedsInputEvent)
-	replayedEvent := replacementVisual.(protocol.LiveHandoffNeedsInputEvent)
+	replayedEvent := replayed.(protocol.LiveHandoffNeedsInputEvent)
 	assert.Equal(t, oldEvent.EventID, replayedEvent.EventID)
 	assert.Equal(t, int64(7), oldEvent.SequenceID)
 	assert.Equal(t, oldEvent.SequenceID, replayedEvent.SequenceID)
@@ -484,19 +490,9 @@ func TestTimedOutPresentationQuiescesOldRuntimeBeforeReplacementReplay(t *testin
 		defer store.mu.Unlock()
 		return store.cursor == 7 && store.advances == 1
 	}, time.Second, time.Millisecond)
-
-	// Releasing the old write after replacement publication must never allow
-	// its queued voice effect to escape.
-	close(oldClient.visualRelease)
-	commandCtx, commandCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer commandCancel()
-	command, err := oldVoice.NextCommand(commandCtx)
-	if err == nil {
-		t.Fatalf("old runtime emitted command after replacement: %v", command.Kind)
-	}
 }
 
-func TestOfferCancellationReachesSafetyAndQuiescesProviderBeforeReplacement(t *testing.T) {
+func TestOfferTimeoutDoesNotHoldDirectoryLockOrQuiesceProvider(t *testing.T) {
 	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "conversation-context"}
 	policy := &blockingContextSafety{started: make(chan struct{}), cancelled: make(chan struct{})}
 	oldVoice := &cleanupVoice{closeStarted: make(chan struct{}), closeRelease: make(chan struct{}), closeDone: make(chan struct{})}
@@ -531,7 +527,6 @@ func TestOfferCancellationReachesSafetyAndQuiescesProviderBeforeReplacement(t *t
 	defer oldCancel()
 	require.Eventually(t, func() bool { return waitCurrent("context-old") }, time.Second, time.Millisecond)
 	offered := make(chan error, 1)
-	offerStarted := time.Now()
 	go func() {
 		offered <- manager.OfferHandoffEvent(context.Background(), scope, handoff.Event{
 			Seq: 1, EventID: "context-event", HandoffID: "handoff", TenantID: scope.TenantID,
@@ -544,6 +539,17 @@ func TestOfferCancellationReachesSafetyAndQuiescesProviderBeforeReplacement(t *t
 	case <-time.After(time.Second):
 		t.Fatal("presentation safety did not start")
 	}
+	select {
+	case err := <-offered:
+		require.ErrorIs(t, err, ErrControlOverflow)
+	case <-time.After(time.Second):
+		t.Fatal("bounded caller wait did not return")
+	}
+	select {
+	case <-oldVoice.closeStarted:
+		t.Fatal("offer timeout quiesced the provider")
+	default:
+	}
 
 	replacementCancel, replacementDone := run(newDeliveryClient())
 	defer func() {
@@ -555,53 +561,26 @@ func TestOfferCancellationReachesSafetyAndQuiescesProviderBeforeReplacement(t *t
 		}
 	}()
 	select {
+	case <-subscriptions.second:
+	case <-time.After(time.Second):
+		t.Fatal("replacement publication was blocked by the timed-out offer")
+	}
+	require.True(t, waitCurrent("context-replacement"))
+	oldCancel()
+	select {
 	case <-policy.cancelled:
 	case <-time.After(time.Second):
-		t.Fatal("presentation safety did not observe offer cancellation")
+		t.Fatal("old safety work did not stop with its session")
 	}
-	select {
-	case <-oldVoice.closeStarted:
-	case <-time.After(time.Second):
-		t.Fatal("old provider cleanup did not start")
-	}
-	select {
-	case <-subscriptions.second:
-		t.Fatal("replacement published before provider cleanup completed")
-	default:
-	}
-	select {
-	case err := <-offered:
-		t.Fatalf("offer returned before provider cleanup completed: %v", err)
-	default:
-	}
-
 	close(oldVoice.closeRelease)
-	select {
-	case <-oldVoice.closeDone:
-	case <-time.After(time.Second):
-		t.Fatal("old provider cleanup did not finish")
-	}
-	select {
-	case err := <-offered:
-		require.Error(t, err)
-		assert.Less(t, time.Since(offerStarted), time.Second)
-	case <-time.After(time.Second):
-		t.Fatal("bounded offer did not return after cleanup")
-	}
 	select {
 	case <-oldDone:
 	case <-time.After(time.Second):
-		t.Fatal("old manager did not finish after quiescence")
+		t.Fatal("old manager did not stop")
 	}
-	select {
-	case <-subscriptions.second:
-	case <-time.After(time.Second):
-		t.Fatal("replacement did not publish after provider cleanup")
-	}
-	require.True(t, waitCurrent("context-replacement"))
 }
 
-func TestReactorLoopSkipsAlreadyExpiredQueuedOfferBeforeSafetyOrEffects(t *testing.T) {
+func TestReactorLoopAppliesAcceptedOfferWithSessionContextAfterCallerExpiry(t *testing.T) {
 	policy := &countingSafety{}
 	state := newRunState(Config{
 		IngressFrames: 1, EgressFrames: 1, ControlEvents: 1, WriterControlEvents: 1,
@@ -623,11 +602,18 @@ func TestReactorLoopSkipsAlreadyExpiredQueuedOfferBeforeSafetyOrEffects(t *testi
 			Kind: "handoff.needs-input", State: handoff.StateNeedsInput, Payload: json.RawMessage(`{"Prompt":"choose","Schema":{}}`),
 		},
 	}}
-	require.ErrorIs(t, <-messageDone, context.Canceled)
+	var control clientControl
+	select {
+	case control = <-state.clientCtl:
+	case <-time.After(time.Second):
+		t.Fatal("accepted offer did not reach the client queue")
+	}
+	require.NotNil(t, control.written)
+	control.written <- nil
+	require.NoError(t, <-messageDone)
+	stop()
 	require.ErrorIs(t, <-loopDone, context.Canceled)
 	policy.mu.Lock()
-	assert.Zero(t, policy.calls)
+	assert.Positive(t, policy.calls)
 	policy.mu.Unlock()
-	assert.Empty(t, state.clientCtl)
-	assert.Empty(t, state.voiceCtl)
 }
