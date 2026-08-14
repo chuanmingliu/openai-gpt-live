@@ -24,6 +24,45 @@ type blockingApprovalResolutionStore struct {
 	deadline time.Time
 }
 
+type orderedApprovalResolutionStore struct {
+	started chan string
+}
+
+type approvalExecutionObservation struct {
+	invocation string
+	remaining  time.Duration
+	ctxErr     error
+}
+
+type deadlineApprovalResolutionStore struct {
+	observed chan approvalExecutionObservation
+}
+
+func (s *deadlineApprovalResolutionStore) ResolveApproval(ctx context.Context, _ handoff.Scope, value handoff.ApprovalResolution) error {
+	deadline, _ := ctx.Deadline()
+	s.observed <- approvalExecutionObservation{
+		invocation: value.InvocationID, remaining: time.Until(deadline), ctxErr: ctx.Err(),
+	}
+	if value.InvocationID == "approval-a" {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return ctx.Err()
+}
+
+func (*deadlineApprovalResolutionStore) LoadApproval(context.Context, handoff.Scope, string) (handoff.ToolApproval, error) {
+	return handoff.ToolApproval{}, handoff.ErrNotFound
+}
+
+func (s *orderedApprovalResolutionStore) ResolveApproval(_ context.Context, _ handoff.Scope, value handoff.ApprovalResolution) error {
+	s.started <- value.InvocationID
+	return nil
+}
+
+func (*orderedApprovalResolutionStore) LoadApproval(context.Context, handoff.Scope, string) (handoff.ToolApproval, error) {
+	return handoff.ToolApproval{}, handoff.ErrNotFound
+}
+
 func (s *blockingApprovalResolutionStore) ResolveApproval(ctx context.Context, scope handoff.Scope, value handoff.ApprovalResolution) error {
 	s.mu.Lock()
 	s.calls++
@@ -108,6 +147,83 @@ func TestApprovalCoordinatorQueueIsBounded(t *testing.T) {
 	}
 	require.NoError(t, coordinator.Enqueue(work))
 	require.ErrorIs(t, coordinator.Enqueue(work), ErrCoordinatorOverflow)
+}
+
+func TestApprovalCoordinatorDoesNotBlockStoreProgressOnOptionalLiveCompletion(t *testing.T) {
+	store := &orderedApprovalResolutionStore{started: make(chan string, 2)}
+	submit := &blockingSubmitter{
+		started: make(chan struct{}), release: make(chan struct{}), inputs: make(chan session.Input, 2),
+	}
+	coordinator := NewApprovalCoordinator(store, submit, 2, 200*time.Millisecond)
+	require.NotNil(t, coordinator)
+	work := func(invocation string, sequence uint64) ApprovalWork {
+		return ApprovalWork{
+			SessionID: "approval-session", Incarnation: 1, ExternalSequence: sequence,
+			Scope: handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "conversation"},
+			Resolution: handoff.ApprovalResolution{
+				InvocationID: invocation, Decision: handoff.ApprovalApproved,
+				ActorTenantID: "tenant", ActorUserID: "user", IdempotencyKey: "key-" + invocation,
+				ResolvedAt: time.Now().UTC(),
+			},
+		}
+	}
+	require.NoError(t, coordinator.Enqueue(work("approval-a", 1)))
+	require.NoError(t, coordinator.Enqueue(work("approval-b", 2)))
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- coordinator.Run(runCtx) }()
+	defer func() {
+		close(submit.release)
+		cancel()
+		require.NoError(t, <-runDone)
+	}()
+	require.Equal(t, "approval-a", <-store.started)
+	select {
+	case <-submit.started:
+	case <-time.After(time.Second):
+		t.Fatal("optional live completion did not begin")
+	}
+	select {
+	case invocation := <-store.started:
+		require.Equal(t, "approval-b", invocation)
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("optional live completion stalled the next durable approval")
+	}
+}
+
+func TestApprovalCoordinatorStoreDeadlineBeginsWhenQueuedWorkExecutes(t *testing.T) {
+	store := &deadlineApprovalResolutionStore{observed: make(chan approvalExecutionObservation, 2)}
+	coordinator := NewApprovalCoordinator(store, &submitterFake{}, 2, 100*time.Millisecond)
+	require.NotNil(t, coordinator)
+	work := func(invocation string, sequence uint64) ApprovalWork {
+		return ApprovalWork{
+			SessionID: "approval-session", Incarnation: 1, ExternalSequence: sequence,
+			Scope: handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "conversation"},
+			Resolution: handoff.ApprovalResolution{
+				InvocationID: invocation, Decision: handoff.ApprovalApproved,
+				ActorTenantID: "tenant", ActorUserID: "user", IdempotencyKey: "key-" + invocation,
+				ResolvedAt: time.Now().UTC(),
+			},
+		}
+	}
+	require.NoError(t, coordinator.Enqueue(work("approval-a", 1)))
+	require.NoError(t, coordinator.Enqueue(work("approval-b", 2)))
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- coordinator.Run(runCtx) }()
+	defer func() {
+		cancel()
+		require.NoError(t, <-runDone)
+	}()
+	first := <-store.observed
+	require.Equal(t, "approval-a", first.invocation)
+	second := <-store.observed
+	require.Equal(t, "approval-b", second.invocation)
+	require.NoError(t, second.ctxErr)
+	require.Greater(t, second.remaining, 75*time.Millisecond,
+		"queue wait must not consume the next approval's store deadline")
 }
 
 func TestApprovalDispatcherBindsOnlyTrustedScopeAndActor(t *testing.T) {

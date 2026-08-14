@@ -1381,6 +1381,9 @@ func (r *Reactor) applyConversationItemCreate(event protocol.ConversationItemCre
 		if err := r.beginInputTurn(event.Item.ID); err != nil {
 			return nil, err
 		}
+		// The current input-turn item is authoritative even when the newer turn
+		// originated at the client rather than a provider speech edge.
+		r.currentProviderInputItem = event.Item.ID
 	}
 	command := realtime.Command{
 		Kind:     realtime.CommandCreateItem,

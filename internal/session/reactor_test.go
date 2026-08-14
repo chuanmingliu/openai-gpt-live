@@ -649,6 +649,52 @@ func TestNewSpeechItemRejectsLateOlderInputTranscriptsWithoutMutation(t *testing
 	}
 }
 
+func TestClientCreatedUserTurnRejectsLateOlderProviderTranscriptsWithoutMutation(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		kind realtime.EventKind
+		text string
+	}{
+		{name: "delta", kind: realtime.EventTranscriptionDelta, text: "late partial"},
+		{name: "completion", kind: realtime.EventTranscriptionCompleted, text: "late final"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			reactor, fence := testReactor(1)
+			applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+				Kind: realtime.EventSpeechStarted, ItemID: "provider-turn-a",
+			}))
+			applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+				Kind: realtime.EventSpeechStopped, ItemID: "provider-turn-a",
+			}))
+			applyOK(t, reactor, ClientInput{Event: protocol.ConversationItemCreateEvent{
+				Type: "conversation.item.create",
+				Item: protocol.ConversationItem{
+					ID: "client-turn-b", Type: "message", Role: "user",
+					Content: json.RawMessage(`[{"type":"input_text","text":"newer user turn"}]`),
+				},
+			}})
+			require.NotNil(t, reactor.activeTurn)
+			beforeTurn := *reactor.activeTurn
+			beforeNextSequence := reactor.nextSeq
+			beforeTranscriptSequence := reactor.transcriptSequence
+			beforeSnapshot := reactor.Snapshot()
+			beforeEpoch := fence.Current()
+
+			effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+				Kind: test.kind, ItemID: "provider-turn-a", Text: test.text,
+			}))
+
+			assert.Empty(t, effects)
+			require.NotNil(t, reactor.activeTurn)
+			assert.Equal(t, beforeTurn, *reactor.activeTurn)
+			assert.Equal(t, beforeNextSequence, reactor.nextSeq)
+			assert.Equal(t, beforeTranscriptSequence, reactor.transcriptSequence)
+			assert.Equal(t, beforeSnapshot, reactor.Snapshot())
+			assert.Equal(t, beforeEpoch, fence.Current())
+		})
+	}
+}
+
 func TestPendingCancelNeverSynthesizesEmptyResponseDone(t *testing.T) {
 	reactor, fence := testReactor(1)
 	createResponse(t, reactor)

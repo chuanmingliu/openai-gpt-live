@@ -762,7 +762,7 @@ func (s *voiceSession) handleMapped(mapped mappedServerEvent) error {
 	}
 	correlation, exists := s.responses[mapped.event.ResponseID]
 	if !exists {
-		if len(s.pending) != 0 || mapped.event.Kind != realtime.EventTranscriptDone {
+		if len(s.pending) != 0 || len(s.cancelledPending) != 0 || mapped.event.Kind != realtime.EventTranscriptDone {
 			return fmt.Errorf("%w: %q", ErrUnknownResponseEpoch, mapped.event.ResponseID)
 		}
 		if err := s.beginImplicitResponseFromOutput(mapped.event.ResponseID); err != nil {
@@ -854,6 +854,9 @@ func (s *voiceSession) handleResponseCreated(mapped mappedServerEvent) error {
 	}
 	if _, exists := s.responses[created.responseID]; exists {
 		return fmt.Errorf("duplicate response.created for %q", created.responseID)
+	}
+	if !created.hasEpoch && len(s.cancelledPending) != 0 {
+		return fmt.Errorf("%w: metadata-less response.created %q is ambiguous with cancelled pending work", ErrUnknownResponseEpoch, created.responseID)
 	}
 	if created.hasEpoch {
 		if cancelEpoch, cancelled := s.cancelledPending[created.epoch]; cancelled {

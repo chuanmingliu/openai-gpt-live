@@ -695,6 +695,63 @@ func TestEmptyIDCancelRefusesAmbiguousPendingCreatesWithoutDeletingEither(t *tes
 	}
 }
 
+func TestCancelledPendingRejectsMetadataLessCreatedAndTranscriptFirstOutput(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		tombstones int
+		wire       map[string]any
+	}{
+		{
+			name: "one tombstone metadata-less created", tombstones: 1,
+			wire: map[string]any{
+				"type":     "response.created",
+				"response": map[string]any{"id": "ambiguous-created", "status": "in_progress"},
+			},
+		},
+		{
+			name: "one tombstone transcript-first output", tombstones: 1,
+			wire: map[string]any{
+				"type": "response.output_audio_transcript.done", "response_id": "ambiguous-transcript",
+				"item_id": "assistant-item", "transcript": "must not become implicit",
+			},
+		},
+		{
+			name: "multiple tombstones metadata-less created", tombstones: 2,
+			wire: map[string]any{
+				"type":     "response.created",
+				"response": map[string]any{"id": "ambiguous-multiple", "status": "in_progress"},
+			},
+		},
+		{
+			name: "multiple tombstones transcript-first output", tombstones: 2,
+			wire: map[string]any{
+				"type": "response.output_audio_transcript.done", "response_id": "ambiguous-multiple-transcript",
+				"item_id": "assistant-item", "transcript": "must not become implicit",
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := newTestVoiceServer(t)
+			session := connectTestSession(t, server.URL, nil, realtime.OpenRequest{Model: "model"})
+			for index := 0; index < test.tombstones; index++ {
+				createEpoch := identity.ResponseEpoch(20 + index*2)
+				require.NoError(t, session.Send(t.Context(), realtime.Command{
+					Kind: realtime.CommandCreateResponse, Epoch: createEpoch,
+				}))
+				server.nextClientFrame(t)
+				require.NoError(t, session.Send(t.Context(), realtime.Command{
+					Kind: realtime.CommandCancelResponse, Epoch: createEpoch + 1,
+				}))
+				server.nextClientFrame(t)
+			}
+
+			server.sendEvent(t, test.wire)
+			_, err := session.Receive(t.Context())
+			require.Error(t, err, "ambiguous cancelled output must fail closed instead of consuming implicit budget")
+		})
+	}
+}
+
 // TestCancelAdvancesOnlyTerminalCorrelation proves that the provider's
 // response.done acknowledgment crosses the cancel fence while stale media
 // remains on the response's pre-cancel epoch for the reactor to suppress.

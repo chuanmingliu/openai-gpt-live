@@ -32,7 +32,14 @@ type ApprovalCoordinator struct {
 	submit         SessionSubmitter
 	work           chan ApprovalWork
 	slots          chan struct{}
+	completions    chan approvalCompletion
 	requestTimeout time.Duration
+}
+
+type approvalCompletion struct {
+	SessionID   identity.SessionID
+	Incarnation identity.Incarnation
+	Input       session.ApprovalResolutionCompletedInput
 }
 
 func NewApprovalCoordinator(store handoff.ApprovalStore, submit SessionSubmitter, capacity int, requestTimeout time.Duration) *ApprovalCoordinator {
@@ -42,7 +49,8 @@ func NewApprovalCoordinator(store handoff.ApprovalStore, submit SessionSubmitter
 	}
 	return &ApprovalCoordinator{
 		store: store, submit: submit, work: make(chan ApprovalWork, capacity),
-		slots: make(chan struct{}, capacity), requestTimeout: requestTimeout,
+		slots: make(chan struct{}, capacity), completions: make(chan approvalCompletion, capacity),
+		requestTimeout: requestTimeout,
 	}
 }
 
@@ -58,23 +66,32 @@ func (c *ApprovalCoordinator) Enqueue(work ApprovalWork) error {
 	default:
 		return ErrCoordinatorOverflow
 	}
-	work.Deadline = time.Now().UTC().Add(c.requestTimeout)
+	// Store time begins when the app-owned worker executes this item, not while
+	// it waits behind earlier durable work in the bounded queue.
+	work.Deadline = time.Time{}
 	c.work <- work
 	return nil
 }
 
 func (c *ApprovalCoordinator) Run(ctx context.Context) error {
-	if c == nil || c.work == nil || isNil(c.store) || isNil(c.submit) {
+	if c == nil || c.work == nil || c.completions == nil || isNil(c.store) || isNil(c.submit) {
 		return errors.New("approval coordinator is not configured")
 	}
 	if ctx == nil {
 		return errors.New("approval coordinator context is nil")
 	}
+	completionDone := make(chan struct{})
+	go func() {
+		defer close(completionDone)
+		c.runCompletions(ctx)
+	}()
+	defer func() { <-completionDone }()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case work := <-c.work:
+			work.Deadline = time.Now().UTC().Add(c.requestTimeout)
 			requestCtx, cancel := context.WithDeadline(ctx, work.Deadline)
 			err := c.store.ResolveApproval(requestCtx, work.Scope, work.Resolution)
 			cancel()
@@ -82,13 +99,33 @@ func (c *ApprovalCoordinator) Run(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return nil
 			}
-			completionCtx, completionCancel := context.WithTimeout(ctx, c.requestTimeout)
-			_ = c.submit.Submit(completionCtx, work.SessionID, work.Incarnation, session.ApprovalResolutionCompletedInput{
-				ExternalSequence: work.ExternalSequence,
-				InvocationID:     work.Resolution.InvocationID,
-				Accepted:         err == nil,
-			})
-			completionCancel()
+			completion := approvalCompletion{
+				SessionID: work.SessionID, Incarnation: work.Incarnation,
+				Input: session.ApprovalResolutionCompletedInput{
+					ExternalSequence: work.ExternalSequence,
+					InvocationID:     work.Resolution.InvocationID,
+					Accepted:         err == nil,
+				},
+			}
+			select {
+			case c.completions <- completion:
+			default:
+				// Completion is optional UX/high-water bookkeeping. Durable store
+				// progress must never wait for this independently bounded lane.
+			}
+		}
+	}
+}
+
+func (c *ApprovalCoordinator) runCompletions(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case completion := <-c.completions:
+			completionCtx, cancel := context.WithTimeout(ctx, c.requestTimeout)
+			_ = c.submit.Submit(completionCtx, completion.SessionID, completion.Incarnation, completion.Input)
+			cancel()
 		}
 	}
 }
