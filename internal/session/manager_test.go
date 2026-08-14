@@ -18,6 +18,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/feature"
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
+	"github.com/chuanmingliu/openai-gpt-live/internal/presentation"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
 	"github.com/chuanmingliu/openai-gpt-live/internal/testkit"
@@ -2284,6 +2285,28 @@ func (*gatedCancelVoice) Receive(ctx context.Context) (realtime.Event, error) {
 
 func (*gatedCancelVoice) Close(context.Context) error { return nil }
 
+type gatedProviderVoice struct {
+	started chan realtime.Command
+	release chan struct{}
+}
+
+func (v *gatedProviderVoice) Send(ctx context.Context, command realtime.Command) error {
+	v.started <- command
+	select {
+	case <-v.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (*gatedProviderVoice) Receive(ctx context.Context) (realtime.Event, error) {
+	<-ctx.Done()
+	return realtime.Event{}, ctx.Err()
+}
+
+func (*gatedProviderVoice) Close(context.Context) error { return nil }
+
 type closeErrorConnector struct {
 	voice     *closeErrorVoice
 	connected chan struct{}
@@ -2696,6 +2719,25 @@ func TestDispatchShadowRechecksVisualAndSpeechBoundariesSeparately(t *testing.T)
 		t.Fatalf("shadow speech reached provider boundary: %#v", got)
 	default:
 	}
+}
+
+func TestShadowSuppressedVoiceCompletionPreservesExactOutstandingCount(t *testing.T) {
+	gates := sessionShadowGates{feature.ShadowMode: true}
+	cfg, err := normalizeManagerConfig(Config{
+		ControlEvents: 1, WriterControlEvents: 1,
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second, FeatureGates: gates,
+	})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	state := newRunState(cfg, testIDs(), &recordingVoice{sent: make(chan realtime.Command, 1)}, newChannelClient(1), cancel)
+	done := make(chan error, 1)
+	go func() { done <- state.reactorLoop(ctx) }()
+	command := realtime.Command{Kind: realtime.CommandCreateResponse, Sequence: 1, Epoch: 2}
+	_, err = state.dispatchEffectsQueued(ctx, []Effect{{VoiceCommand: &command, HandoffPresentation: true}}, 0, 0, true)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return state.pendingVoice.Load() == 0 }, time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
 }
 
 func handoffAcceptanceEffectsForShadowTest(t *testing.T) (*Reactor, HandoffAcceptedInput, []Effect) {
@@ -3111,8 +3153,104 @@ func TestSpeechStartedAdvancesFenceWhileEarlierVisualWriteIsBlocked(t *testing.T
 	require.ErrorIs(t, <-done, context.Canceled)
 }
 
+func TestSpeechStartedAdvancesFenceWhileEarlierProviderSendIsBlocked(t *testing.T) {
+	cfg, err := normalizeManagerConfig(Config{ControlEvents: 2, WriterControlEvents: 2, IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	voice := &gatedProviderVoice{started: make(chan realtime.Command, 2), release: make(chan struct{})}
+	state := newRunState(cfg, testIDs(), voice, newChannelClient(8), cancel)
+	reactorDone := make(chan error, 1)
+	writerDone := make(chan error, 1)
+	go func() { reactorDone <- state.reactorLoop(ctx) }()
+	go func() { writerDone <- state.voiceWriter(ctx) }()
+	require.NoError(t, state.enqueueReactorSync(t.Context(), reactorMessage{input: ConnectedInput{ProviderSession: json.RawMessage(`{}`)}}))
+	require.NoError(t, state.enqueueReactorSync(t.Context(), reactorMessage{input: ClientInput{Event: protocol.ResponseCreateEvent{Type: "response.create"}}}))
+	var create realtime.Command
+	select {
+	case create = <-voice.started:
+		require.Equal(t, realtime.CommandCreateResponse, create.Kind)
+	case <-time.After(time.Second):
+		t.Fatal("provider send did not reach gate")
+	}
+	require.NoError(t, state.enqueueReactorSync(t.Context(), reactorMessage{input: VoiceInput{Incarnation: state.ids.Incarnation, Event: realtime.Event{
+		Kind: realtime.EventSpeechStarted, ProviderEventID: "speech-provider-blocked", ItemID: "new-input",
+	}}}))
+	require.Greater(t, state.fence.Current(), create.Epoch)
+	close(voice.release)
+	cancel()
+	require.ErrorIs(t, <-reactorDone, context.Canceled)
+	require.ErrorIs(t, <-writerDone, context.Canceled)
+}
+
+func TestSpeechStartedAdvancesFenceWhilePresentationSafetyIsBlocked(t *testing.T) {
+	connector := testkit.NewFakeConnector(16)
+	policy := &blockingContextSafety{started: make(chan struct{}), cancelled: make(chan struct{})}
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: 20 * time.Millisecond,
+		HandoffConsumerID: "public-client", HandoffSubscriptions: &signalingSubscriptions{},
+		PresentationPolicy: presentation.NewPolicy(presentation.Config{}), SafetyPolicy: policy,
+	}, connector, managerIDs{session: "session-async-safety", conversation: "conversation-async-safety"})
+	require.NoError(t, manager.validationErr)
+	client := newDeliveryClient()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.Run(ctx, OpenRequest{Subject: Subject{
+			TenantID: "tenant", UserID: "user", ExpiresAt: time.Now().Add(time.Hour),
+		}}, client)
+	}()
+	voice, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return manager.ActiveSessions() == 1 }, time.Second, time.Millisecond)
+
+	manager.activeMu.RLock()
+	var runtime *sessionRuntime
+	for _, active := range manager.active {
+		runtime = active
+	}
+	manager.activeMu.RUnlock()
+	require.NotNil(t, runtime)
+	require.NoError(t, manager.Submit(t.Context(), runtime.key.sessionID, runtime.key.incarnation, ClientInput{
+		Event: protocol.ResponseCreateEvent{Type: "response.create"},
+	}))
+	command, err := voice.NextCommand(t.Context())
+	require.NoError(t, err)
+	require.NoError(t, voice.Emit(t.Context(), realtime.Event{
+		Kind: realtime.EventResponseCreated, Epoch: command.Epoch, ResponseID: "response-async-safety", Status: "in_progress",
+	}))
+	require.Eventually(t, func() bool { return runtime.state.fence.Current() == command.Epoch }, time.Second, time.Millisecond)
+
+	offered := make(chan error, 1)
+	go func() {
+		offered <- manager.OfferHandoffEvent(context.Background(), runtime.handoffScope(), handoff.Event{
+			Seq: 1, EventID: "safety-blocked", HandoffID: "handoff", TenantID: "tenant",
+			ConversationID: runtime.state.ids.ConversationID, Kind: "handoff.needs-input", State: handoff.StateNeedsInput,
+			Payload: json.RawMessage(`{"Prompt":"choose","Schema":{}}`),
+		})
+	}()
+	select {
+	case <-policy.started:
+	case <-time.After(time.Second):
+		t.Fatal("presentation safety did not block")
+	}
+	require.NoError(t, voice.Emit(t.Context(), realtime.Event{
+		Kind: realtime.EventSpeechStarted, ProviderEventID: "speech-async-safety", ItemID: "new-input",
+	}))
+	require.Eventually(t, func() bool { return runtime.state.fence.Current() > command.Epoch }, 100*time.Millisecond, time.Millisecond)
+
+	require.ErrorIs(t, <-offered, ErrControlOverflow)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+	select {
+	case <-policy.cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("presentation safety did not stop with session")
+	}
+}
+
 func TestResponseCreateWaitsForBlockedBargeCancelCompletion(t *testing.T) {
-	cfg, err := normalizeManagerConfig(Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second})
+	cfg, err := normalizeManagerConfig(Config{ControlEvents: 1, IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second})
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

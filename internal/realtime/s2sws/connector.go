@@ -527,6 +527,7 @@ func (s *voiceSession) correlate(ctx context.Context, request correlationRequest
 
 func (s *voiceSession) mappingLoop() {
 	s.mappingActive = true
+	var terminalReadErr error
 	defer func() {
 		s.mappingActive = false
 		s.releaseAllImplicitBuffers()
@@ -536,8 +537,12 @@ func (s *voiceSession) mappingLoop() {
 		s.mappedEvents = nil
 	}()
 	for {
+		if terminalReadErr != nil && len(s.mappedEvents) == 0 {
+			s.terminate(terminalReadErr)
+			return
+		}
 		var reads <-chan socketRead
-		if len(s.mappedEvents) < receiveQueueCapacity {
+		if terminalReadErr == nil && len(s.mappedEvents) < receiveQueueCapacity {
 			reads = s.reads
 		}
 		var deliveries chan<- realtime.Event
@@ -549,24 +554,24 @@ func (s *voiceSession) mappingLoop() {
 		select {
 		case read := <-reads:
 			if read.err != nil {
-				s.terminate(read.err)
-				return
+				terminalReadErr = read.err
+				continue
 			}
 			if read.messageType != websocket.MessageText {
-				s.terminate(errors.New("provider sent non-text WebSocket message"))
-				return
+				terminalReadErr = errors.New("provider sent non-text WebSocket message")
+				continue
 			}
 			mapped, err := mapServerEvent(read.raw, s.maxFrameBytes)
 			if err != nil {
-				s.terminate(err)
-				return
+				terminalReadErr = err
+				continue
 			}
 			if mapped.ignore {
 				continue
 			}
 			if err := s.handleMapped(mapped); err != nil {
-				s.terminate(err)
-				return
+				terminalReadErr = err
+				continue
 			}
 		case request := <-s.correlations:
 			if err := request.ctx.Err(); err != nil {

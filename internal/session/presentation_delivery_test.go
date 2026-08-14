@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -616,4 +617,127 @@ func TestReactorLoopAppliesAcceptedOfferWithSessionContextAfterCallerExpiry(t *t
 	policy.mu.Lock()
 	assert.Positive(t, policy.calls)
 	policy.mu.Unlock()
+}
+
+func TestReplacementFencesTimedOutAcceptedOfferBeforeOldEffects(t *testing.T) {
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "replacement-fence"}
+	applyStarted := make(chan struct{})
+	applyRelease := make(chan struct{})
+	var startedOnce sync.Once
+	cfg := Config{
+		IngressFrames: 1, EgressFrames: 1, ControlEvents: 2, WriterControlEvents: 2,
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: 20 * time.Millisecond,
+		reactorApplyGate: func(input Input) <-chan struct{} {
+			if _, ok := input.(HandoffEventInput); ok {
+				startedOnce.Do(func() { close(applyStarted) })
+				return applyRelease
+			}
+			return nil
+		},
+	}
+	manager := NewManager(cfg, testkit.NewFakeConnector(1), managerIDs{})
+	require.NoError(t, manager.validationErr)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	state := newRunState(manager.cfg, IDs{SessionID: "old", ConversationID: scope.ConversationID, Incarnation: 1},
+		&recordingVoice{sent: make(chan realtime.Command, 2)}, newChannelClient(2), cancel)
+	state.subject = Subject{TenantID: scope.TenantID, UserID: scope.UserID}
+	runtime := &sessionRuntime{
+		key: runtimeKey{sessionID: "old", incarnation: 1}, subject: state.subject,
+		inbox: state.inbox, done: ctx.Done(), state: state, accepting: true, inboxSlots: state.inboxSlots,
+	}
+	state.runtime = runtime
+	require.NoError(t, manager.register(runtime))
+	loopDone := make(chan error, 1)
+	go func() { loopDone <- state.reactorLoop(ctx) }()
+
+	offered := make(chan error, 1)
+	go func() {
+		offered <- manager.OfferHandoffEvent(context.Background(), scope, handoff.Event{
+			Seq: 1, EventID: "stale-offer", HandoffID: "handoff", TenantID: scope.TenantID,
+			ConversationID: scope.ConversationID, Kind: "tool.approval_required", State: handoff.StateNeedsInput,
+			Payload: json.RawMessage(`{"invocation_id":"invoke","handoff_id":"handoff","action_summary":"approve","expires_at":"2099-01-01T00:00:00Z","risk_class":"low"}`),
+		})
+	}()
+	select {
+	case <-applyStarted:
+	case <-time.After(time.Second):
+		t.Fatal("old offer did not reach gated apply")
+	}
+	require.ErrorIs(t, <-offered, ErrControlOverflow)
+
+	replacement, _, replacementDone := currentRuntime(scope, "replacement")
+	defer close(replacementDone)
+	require.NoError(t, manager.register(replacement))
+	close(applyRelease)
+	time.Sleep(20 * time.Millisecond)
+	select {
+	case control := <-state.clientCtl:
+		t.Fatalf("stale accepted offer emitted client effect after replacement: %T", control.event)
+	default:
+	}
+	select {
+	case control := <-state.voiceCtl:
+		t.Fatalf("stale accepted offer emitted provider effect after replacement: %v", control.command.Kind)
+	default:
+	}
+	cancel()
+	require.ErrorIs(t, <-loopDone, context.Canceled)
+}
+
+func TestOfferDeadlineBoundsReconnectRotationAdmission(t *testing.T) {
+	credentials, err := NewReconnectCredentials([]byte(strings.Repeat("q", 32)), clock.Real{})
+	require.NoError(t, err)
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "rotation-deadline"}
+	manager := NewManager(Config{
+		IngressFrames: 1, EgressFrames: 1, ControlEvents: 2, WriterControlEvents: 2,
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: 20 * time.Millisecond,
+		HandoffConsumerID: "public-client", HandoffSubscriptions: &signalingSubscriptions{},
+		PresentationPolicy: presentation.NewPolicy(presentation.Config{}), SafetyPolicy: &presentationSafety{},
+		ReconnectCredentials: credentials, ReconnectOwners: NewMemoryReconnectOwners(clock.Real{}), ReconnectOwnerID: "rotation-test",
+	}, testkit.NewFakeConnector(1), managerIDs{})
+	require.NoError(t, manager.validationErr)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	state := newRunState(manager.cfg, IDs{SessionID: "rotation", ConversationID: scope.ConversationID, Incarnation: 1},
+		&recordingVoice{sent: make(chan realtime.Command, 2)}, newChannelClient(2), cancel)
+	state.subject = Subject{TenantID: scope.TenantID, UserID: scope.UserID}
+	runtime := &sessionRuntime{
+		key: runtimeKey{sessionID: "rotation", incarnation: 1}, subject: state.subject,
+		inbox: state.inbox, done: ctx.Done(), state: state, accepting: true, inboxSlots: state.inboxSlots,
+	}
+	state.runtime = runtime
+	require.NoError(t, manager.register(runtime))
+	runtime.reconnectRotateOnce.Do(func() {
+		runtime.reconnectRotate = make(chan struct{}, 1)
+		runtime.reconnectRotate <- struct{}{}
+	})
+	<-runtime.reconnectRotate
+	defer func() { runtime.reconnectRotate <- struct{}{} }()
+	loopDone := make(chan error, 1)
+	go func() { loopDone <- state.reactorLoop(ctx) }()
+
+	offered := make(chan error, 1)
+	go func() {
+		offered <- manager.OfferHandoffEvent(context.Background(), scope, handoff.Event{
+			Seq: 1, EventID: "rotation-event", HandoffID: "handoff", TenantID: scope.TenantID,
+			ConversationID: scope.ConversationID, Kind: "tool.approval_required", State: handoff.StateNeedsInput,
+			Payload: json.RawMessage(`{"invocation_id":"invoke","handoff_id":"handoff","action_summary":"approve","expires_at":"2099-01-01T00:00:00Z","risk_class":"low"}`),
+		})
+	}()
+	select {
+	case control := <-state.clientCtl:
+		require.NotNil(t, control.written)
+		control.written <- nil
+	case <-time.After(time.Second):
+		t.Fatal("visual write was not admitted")
+	}
+	select {
+	case err := <-offered:
+		require.ErrorIs(t, err, ErrControlOverflow)
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("offer deadline did not bound reconnect rotation admission")
+	}
+	cancel()
+	require.ErrorIs(t, <-loopDone, context.Canceled)
 }

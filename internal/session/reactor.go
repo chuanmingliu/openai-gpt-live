@@ -21,15 +21,6 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
 )
 
-// DurableEffectCompletedInput correlates bounded durable-dispatch admission
-// with completion on a later reactor turn.
-type DurableEffectCompletedInput struct {
-	Sequence uint64
-	Kind     string
-}
-
-func (DurableEffectCompletedInput) isSessionInput() {}
-
 const (
 	PendingBackgroundToolLimit = 16
 	PendingBackgroundToolBytes = 1 << 20
@@ -48,6 +39,7 @@ const (
 	DurableKindTurnCommitted             = "turn.committed"
 	AsyncKindStartBackgroundTask         = StartBackgroundTaskTool
 	AsyncKindStartBackgroundTaskRejected = "start_background_task.rejected"
+	asyncKindPresentationSafety          = "presentation.safety"
 	recentPresentationCorrelationLimit   = 8
 )
 
@@ -115,6 +107,25 @@ type stagedPresentation struct {
 	structured json.RawMessage
 }
 
+type pendingPresentationSafety struct {
+	event    handoff.Event
+	decision presentation.Decision
+	summary  string
+}
+
+type presentationSafetyRequest struct {
+	Visual safety.WorkerResultCandidate  `json:"visual"`
+	Speech *safety.WorkerResultCandidate `json:"speech,omitempty"`
+}
+
+type HandoffSafetyCompletedInput struct {
+	Sequence uint64
+	Visual   safety.Decision
+	Speech   safety.Decision
+}
+
+func (HandoffSafetyCompletedInput) isSessionInput() {}
+
 type presentationCorrelation struct {
 	epoch    identity.ResponseEpoch
 	eventID  string
@@ -165,6 +176,8 @@ type Reactor struct {
 	presentationSequence      int64
 	stagedPresentation        *stagedPresentation
 	recentPresentations       []presentationCorrelation
+	deferPresentationSafety   bool
+	pendingPresentationSafety map[uint64]pendingPresentationSafety
 }
 
 func NewReactor(ids IDs, fence *EpochFence) *Reactor {
@@ -184,18 +197,19 @@ func newReactorWithPresentationAndHandoffTools(ids IDs, fence *EpochFence, polic
 		fence = NewEpochFence(0)
 	}
 	reactor := &Reactor{
-		ids:                     ids,
-		state:                   State{Response: ResponseIdle},
-		fence:                   fence,
-		nextSeq:                 1,
-		pendingSessionUpdates:   make(map[uint64]pendingSessionUpdate),
-		handoffCalls:            make(map[string]*handoffCall),
-		terminalResponses:       make(map[string]struct{}),
-		finalizedAssistantTexts: make(map[string]finalizedTranscript),
-		resolvedHandoffs:        make(map[handoffToken]struct{}),
-		presentationPolicy:      policy,
-		safetyPolicy:            safetyPolicy,
-		handoffToolsEnabled:     enabled,
+		ids:                       ids,
+		state:                     State{Response: ResponseIdle},
+		fence:                     fence,
+		nextSeq:                   1,
+		pendingSessionUpdates:     make(map[uint64]pendingSessionUpdate),
+		handoffCalls:              make(map[string]*handoffCall),
+		terminalResponses:         make(map[string]struct{}),
+		finalizedAssistantTexts:   make(map[string]finalizedTranscript),
+		resolvedHandoffs:          make(map[handoffToken]struct{}),
+		presentationPolicy:        policy,
+		safetyPolicy:              safetyPolicy,
+		handoffToolsEnabled:       enabled,
+		pendingPresentationSafety: make(map[uint64]pendingPresentationSafety),
 	}
 	reactor.initErr = validateSessionIDs(ids)
 	return reactor
@@ -253,8 +267,6 @@ func (r *Reactor) ApplyContext(ctx context.Context, input Input) ([]Effect, erro
 		return effects, err
 	case VoiceCommandCompletedInput:
 		return r.applyVoiceCommandCompleted(typed)
-	case DurableEffectCompletedInput:
-		return nil, nil
 	case DurableInput:
 		return r.applyDurable(typed)
 	case TurnCommittedInput:
@@ -265,6 +277,8 @@ func (r *Reactor) ApplyContext(ctx context.Context, input Input) ([]Effect, erro
 		return r.applyHandoffAccepted(typed)
 	case HandoffEventInput:
 		return r.applyHandoffEvent(ctx, typed)
+	case HandoffSafetyCompletedInput:
+		return r.applyHandoffSafetyCompleted(ctx, typed)
 	case FailedInput:
 		return r.applyFailed(typed)
 	default:
@@ -312,7 +326,7 @@ func (r *Reactor) applyHandoffEvent(ctx context.Context, input HandoffEventInput
 		return []Effect{{ClientEvent: handoffDegradedEvent(event, "unsupported_handoff_event"), RequireClientWrite: true}}, nil
 	}
 	event.Payload = append(json.RawMessage(nil), public.Details...)
-	visual, known := handoffVisualEvent(event, public.Details)
+	_, known := handoffVisualEvent(event, public.Details)
 	if !known {
 		return []Effect{{ClientEvent: handoffDegradedEvent(event, "unsupported_handoff_event"), RequireClientWrite: true}}, nil
 	}
@@ -339,27 +353,56 @@ func (r *Reactor) applyHandoffEvent(ctx context.Context, input HandoffEventInput
 	}
 	visualCandidate := baseCandidate.Clone()
 	visualCandidate.Channel = safety.ChannelVisual
+	var speechCandidate *safety.WorkerResultCandidate
+	speechEligible := presentationDecision.SpeakNow || presentationDecision.DeferSpeech
+	if speechEligible {
+		candidate := baseCandidate.Clone()
+		candidate.Channel = safety.ChannelSpeech
+		speechCandidate = &candidate
+	}
+	if r.deferPresentationSafety {
+		sequence := r.allocateSequence()
+		r.pendingPresentationSafety[sequence] = pendingPresentationSafety{
+			event: handoff.CloneEvent(event), decision: presentationDecision, summary: summary,
+		}
+		payload, err := json.Marshal(presentationSafetyRequest{Visual: visualCandidate, Speech: speechCandidate})
+		if err != nil {
+			delete(r.pendingPresentationSafety, sequence)
+			return nil, err
+		}
+		return []Effect{{Async: &AsyncEffect{Kind: asyncKindPresentationSafety, Sequence: sequence, Payload: payload}}}, nil
+	}
 	visualSafety := safety.EvaluateOrSuppress(ctx, r.safetyPolicy, visualCandidate)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	var speechSafety safety.Decision
+	if speechCandidate != nil {
+		speechSafety = safety.EvaluateOrSuppress(ctx, r.safetyPolicy, *speechCandidate)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return r.finishHandoffEvent(ctx, event, presentationDecision, summary, visualSafety, speechSafety)
+}
+
+func (r *Reactor) applyHandoffSafetyCompleted(ctx context.Context, input HandoffSafetyCompletedInput) ([]Effect, error) {
+	pending, ok := r.pendingPresentationSafety[input.Sequence]
+	if !ok {
+		return nil, nil
+	}
+	delete(r.pendingPresentationSafety, input.Sequence)
+	return r.finishHandoffEvent(ctx, pending.event, pending.decision, pending.summary, input.Visual, input.Speech)
+}
+
+func (r *Reactor) finishHandoffEvent(ctx context.Context, event handoff.Event, presentationDecision presentation.Decision, summary string, visualSafety, speechSafety safety.Decision) ([]Effect, error) {
 	visualSummary, visualDetails, visualAllowed, visualTerminate := applyPresentationSafety(visualSafety, summary, event.Payload)
 	_ = visualSummary
 	visualUrgent := visualSafety.Action == safety.ActionCancelResponse
 	if visualTerminate {
 		return r.terminateForSafety(), nil
 	}
-
-	var speechSafety safety.Decision
 	speechEligible := presentationDecision.SpeakNow || presentationDecision.DeferSpeech
-	if speechEligible {
-		speechCandidate := baseCandidate.Clone()
-		speechCandidate.Channel = safety.ChannelSpeech
-		speechSafety = safety.EvaluateOrSuppress(ctx, r.safetyPolicy, speechCandidate)
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-	}
 	speechSummary, speechDetails, speechAllowed, speechTerminate := applyPresentationSafety(speechSafety, summary, event.Payload)
 	urgent := visualUrgent || speechSafety.Action == safety.ActionCancelResponse
 	if speechTerminate {
@@ -374,7 +417,7 @@ func (r *Reactor) applyHandoffEvent(ctx context.Context, input HandoffEventInput
 		visualEvent.Kind = "handoff.needs-input"
 		visualEvent.State = handoff.StateNeedsInput
 	}
-	visual, known = handoffVisualEvent(visualEvent, visualDetails)
+	visual, known := handoffVisualEvent(visualEvent, visualDetails)
 	if !known {
 		return []Effect{{ClientEvent: handoffDegradedEvent(event, "unsupported_handoff_event"), RequireClientWrite: true}}, nil
 	}

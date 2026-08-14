@@ -297,8 +297,10 @@ type sessionRuntime struct {
 	inboxSlots            chan struct{}
 	replayAfter           *int64
 	reconnectMu           sync.Mutex
-	reconnectRotateMu     sync.Mutex
+	reconnectRotateOnce   sync.Once
+	reconnectRotate       chan struct{}
 	presentationMu        sync.Mutex
+	acceptanceGeneration  uint64
 	reconnect             *IssuedReconnectCredential
 	reconnectLossDeadline time.Time
 }
@@ -382,13 +384,16 @@ func (r *sessionRuntime) atTurnBoundary() bool {
 }
 
 type reactorMessage struct {
-	input               Input
-	ingressAfter        uint64
-	egressAfter         uint64
-	done                chan error
-	requireClientWrites bool
-	offerCtx            context.Context
-	controlSequence     uint64
+	input                Input
+	ingressAfter         uint64
+	egressAfter          uint64
+	done                 chan error
+	requireClientWrites  bool
+	offerCtx             context.Context
+	controlSequence      uint64
+	completion           bool
+	acceptanceChecked    bool
+	acceptanceGeneration uint64
 }
 
 type ingressFrame struct {
@@ -488,6 +493,14 @@ type durableEffectControl struct {
 	trusted    TrustedSessionContext
 	transcript *TranscriptRequestedEffect
 	handoff    *HandoffRequestedEffect
+}
+
+type presentationSafetyWork struct {
+	sequence             uint64
+	request              presentationSafetyRequest
+	done                 chan error
+	acceptanceChecked    bool
+	acceptanceGeneration uint64
 }
 
 type sequenceProgress struct {
@@ -599,6 +612,7 @@ type runState struct {
 	client             ClientConn
 	fence              *EpochFence
 	inbox              chan reactorMessage
+	completions        chan reactorMessage
 	ingress            chan ingressFrame
 	ingressSlots       chan struct{}
 	voiceCtl           chan voiceControl
@@ -615,6 +629,7 @@ type runState struct {
 	subject            Subject
 	dispatcher         DurableEffectDispatcher
 	approvalWork       chan approvalResolutionWork
+	safetyWork         chan presentationSafetyWork
 	durableCtl         chan durableEffectControl
 	durableSlots       chan struct{}
 	voiceReadReady     chan struct{}
@@ -648,6 +663,8 @@ type runState struct {
 	externalApplied  atomic.Uint64
 	externalProgress *sequenceProgress
 	pendingVoice     atomic.Int64
+	pendingVoiceMu   sync.Mutex
+	pendingVoiceByID map[uint64]realtime.CommandKind
 	handoffEpoch     atomic.Uint64
 }
 
@@ -1112,6 +1129,7 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	group.Go(runLoop("client writer", state.clientWriter))
 	group.Go(runLoop("reactor", state.reactorLoop))
 	group.Go(runLoop("approval resolver", state.approvalLoop))
+	group.Go(runLoop("presentation safety", state.presentationSafetyLoop))
 	group.Go(runLoop("durable dispatcher", state.durableWriter))
 	abortBeforePublication := func(cause error) error {
 		cancel()
@@ -1770,8 +1788,16 @@ func (m *Manager) rotateReconnectCredential(ctx context.Context, runtime *sessio
 	if !m.ReconnectEnabled() || runtime == nil {
 		return nil
 	}
-	runtime.reconnectRotateMu.Lock()
-	defer runtime.reconnectRotateMu.Unlock()
+	runtime.reconnectRotateOnce.Do(func() {
+		runtime.reconnectRotate = make(chan struct{}, 1)
+		runtime.reconnectRotate <- struct{}{}
+	})
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-runtime.reconnectRotate:
+	}
+	defer func() { runtime.reconnectRotate <- struct{}{} }()
 	runtime.reconnectMu.Lock()
 	if runtime.reconnect == nil {
 		runtime.reconnectMu.Unlock()
@@ -2005,6 +2031,7 @@ func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.Canc
 	group.Go(runLoop("client writer", state.clientWriter))
 	group.Go(runLoop("reactor", state.reactorLoop))
 	group.Go(runLoop("approval resolver", state.approvalLoop))
+	group.Go(runLoop("presentation safety", state.presentationSafetyLoop))
 	group.Go(runLoop("durable dispatcher", state.durableWriter))
 	abort := func(cause error) error {
 		cancel()
@@ -2111,6 +2138,14 @@ func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.Canc
 }
 
 func (m *Manager) registerReplacement(runtime *sessionRuntime, logical *logicalSession, expected identity.Incarnation) error {
+	scope := runtime.handoffScope()
+	m.activeMu.RLock()
+	previous := m.current[scope]
+	m.activeMu.RUnlock()
+	if previous != nil && previous != runtime {
+		previous.presentationMu.Lock()
+		defer previous.presentationMu.Unlock()
+	}
 	m.activeMu.Lock()
 	defer m.activeMu.Unlock()
 	if m.logical[runtime.key.sessionID] != logical || !logical.reconnecting || logical.highWater != expected ||
@@ -2121,7 +2156,9 @@ func (m *Manager) registerReplacement(runtime *sessionRuntime, logical *logicalS
 	if _, exists := m.active[runtime.key]; exists {
 		return ErrStaleReconnect
 	}
-	scope := runtime.handoffScope()
+	if m.current[scope] != previous {
+		return ErrStaleReconnect
+	}
 	if !isNilInterface(m.cfg.HandoffSubscriptions) {
 		replay, ok := m.cfg.HandoffSubscriptions.(HandoffReplayRegistrar)
 		if !ok || isNilInterface(replay) {
@@ -2132,6 +2169,12 @@ func (m *Manager) registerReplacement(runtime *sessionRuntime, logical *logicalS
 		}
 	}
 	m.active[runtime.key] = runtime
+	if previous != nil && previous != runtime {
+		previous.mu.Lock()
+		previous.accepting = false
+		previous.acceptanceGeneration++
+		previous.mu.Unlock()
+	}
 	m.current[scope] = runtime
 	logical.highWater = runtime.key.incarnation
 	logical.responseEpoch = runtime.state.fence.Current()
@@ -2201,12 +2244,14 @@ func newRunState(cfg Config, ids IDs, voice realtime.Session, client ClientConn,
 		client:             client,
 		fence:              NewEpochFence(0),
 		inbox:              make(chan reactorMessage, cfg.ControlEvents),
+		completions:        make(chan reactorMessage, cfg.ControlEvents+2*cfg.WriterControlEvents),
 		ingress:            make(chan ingressFrame, cfg.IngressFrames),
 		ingressSlots:       make(chan struct{}, cfg.IngressFrames),
 		voiceCtl:           make(chan voiceControl, cfg.WriterControlEvents),
 		egress:             make(chan egressFrame, cfg.EgressFrames),
 		clientCtl:          make(chan clientControl, cfg.WriterControlEvents),
 		approvalWork:       make(chan approvalResolutionWork, cfg.ControlEvents),
+		safetyWork:         make(chan presentationSafetyWork, cfg.ControlEvents),
 		durableCtl:         make(chan durableEffectControl, cfg.WriterControlEvents),
 		durableSlots:       make(chan struct{}, cfg.WriterControlEvents),
 		voiceReadReady:     make(chan struct{}),
@@ -2224,6 +2269,7 @@ func newRunState(cfg Config, ids IDs, voice realtime.Session, client ClientConn,
 		cancel:             cancel,
 		boundary:           Snapshot{IDs: ids, Response: ResponseIdle},
 		toolPolicy:         policy,
+		pendingVoiceByID:   make(map[uint64]realtime.CommandKind),
 	}
 	for range cfg.ControlEvents {
 		state.inboxSlots <- struct{}{}
@@ -2353,6 +2399,9 @@ func (m *Manager) register(runtime *sessionRuntime) error {
 	}
 	m.activeMu.Lock()
 	defer m.activeMu.Unlock()
+	if m.current[scope] != previous {
+		return ErrStaleReconnect
+	}
 	if _, exists := m.active[runtime.key]; exists {
 		return ErrSessionAlreadyActive
 	}
@@ -2383,6 +2432,12 @@ func (m *Manager) register(runtime *sessionRuntime) error {
 		m.current = make(map[handoff.Scope]*sessionRuntime)
 	}
 	m.active[runtime.key] = runtime
+	if previous != nil && previous != runtime {
+		previous.mu.Lock()
+		previous.accepting = false
+		previous.acceptanceGeneration++
+		previous.mu.Unlock()
+	}
 	m.current[scope] = runtime
 	logical.runtime = runtime
 	logical.responseEpoch = runtime.state.fence.Current()
@@ -2476,12 +2531,13 @@ func (m *Manager) OfferHandoffEvent(ctx context.Context, scope handoff.Scope, ev
 		return handoff.ErrNoLiveSession
 	}
 	runtime.presentationMu.Lock()
-	defer runtime.presentationMu.Unlock()
 	select {
 	case <-runtime.inboxSlots:
 	case <-runtime.done:
+		runtime.presentationMu.Unlock()
 		return handoff.ErrNoLiveSession
 	case <-offerCtx.Done():
+		runtime.presentationMu.Unlock()
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -2492,25 +2548,36 @@ func (m *Manager) OfferHandoffEvent(ctx context.Context, scope handoff.Scope, ev
 		ingressAfter: runtime.state.latestIngressSequence(), done: make(chan error, 1),
 	}
 	runtime.mu.Lock()
-	if !runtime.accepting {
+	m.activeMu.RLock()
+	current := m.current[scope]
+	m.activeMu.RUnlock()
+	if current != runtime || !runtime.accepting {
 		runtime.mu.Unlock()
 		runtime.inboxSlots <- struct{}{}
+		runtime.presentationMu.Unlock()
 		return handoff.ErrNoLiveSession
 	}
 	select {
 	case <-runtime.done:
 		runtime.mu.Unlock()
 		runtime.inboxSlots <- struct{}{}
+		runtime.presentationMu.Unlock()
 		return handoff.ErrNoLiveSession
 	default:
 	}
 	runtime.state.acceptControl(&message)
+	message.acceptanceChecked = true
+	message.acceptanceGeneration = runtime.acceptanceGeneration
 	runtime.inbox <- message
 	runtime.mu.Unlock()
+	runtime.presentationMu.Unlock()
 	select {
 	case err := <-message.done:
 		if (err == nil || err == handoff.ErrPresentationSuppressed) && event.Seq > 0 && m.ReconnectEnabled() {
-			if rotateErr := m.rotateReconnectCredential(ctx, runtime, event.Seq, false); rotateErr != nil {
+			if rotateErr := m.rotateReconnectCredential(offerCtx, runtime, event.Seq, false); rotateErr != nil {
+				if offerCtx.Err() != nil && ctx.Err() == nil {
+					return ErrControlOverflow
+				}
 				return rotateErr
 			}
 		}
@@ -2759,6 +2826,40 @@ func (s *runState) enqueueReactor(message reactorMessage) error {
 	return nil
 }
 
+func (s *runState) enqueueCompletion(ctx context.Context, input Input) error {
+	return s.enqueueCompletionMessage(ctx, reactorMessage{input: input, completion: true})
+}
+
+func (s *runState) enqueueCompletionMessage(ctx context.Context, message reactorMessage) error {
+	message.completion = true
+	select {
+	case s.completions <- message:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *runState) trackVoice(command realtime.Command) {
+	s.pendingVoiceMu.Lock()
+	if _, exists := s.pendingVoiceByID[command.Sequence]; !exists {
+		s.pendingVoiceByID[command.Sequence] = command.Kind
+		s.pendingVoice.Add(1)
+	}
+	s.pendingVoiceMu.Unlock()
+}
+
+func (s *runState) completeVoice(input VoiceCommandCompletedInput) bool {
+	s.pendingVoiceMu.Lock()
+	kind, exists := s.pendingVoiceByID[input.Sequence]
+	if exists && kind == input.Kind {
+		delete(s.pendingVoiceByID, input.Sequence)
+		s.pendingVoice.Add(-1)
+	}
+	s.pendingVoiceMu.Unlock()
+	return exists && kind == input.Kind
+}
+
 func (s *runState) acceptControl(message *reactorMessage) {
 	message.controlSequence = s.controlAccepted.Add(1)
 }
@@ -2808,9 +2909,9 @@ func (s *runState) voiceWriter(ctx context.Context) error {
 				if control.sent != nil {
 					control.sent <- nil
 				}
-				if err := s.enqueueReactor(reactorMessage{input: VoiceCommandCompletedInput{
+				if err := s.enqueueCompletion(ctx, VoiceCommandCompletedInput{
 					Sequence: control.command.Sequence, Kind: control.command.Kind, Suppressed: true,
-				}}); err != nil {
+				}); err != nil {
 					return err
 				}
 				continue
@@ -2823,9 +2924,9 @@ func (s *runState) voiceWriter(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			if err := s.enqueueReactor(reactorMessage{input: VoiceCommandCompletedInput{
+			if err := s.enqueueCompletion(ctx, VoiceCommandCompletedInput{
 				Sequence: control.command.Sequence, Kind: control.command.Kind,
-			}}); err != nil {
+			}); err != nil {
 				return err
 			}
 			continue
@@ -2997,16 +3098,30 @@ func (s *runState) enqueueEgress(ctx context.Context, event realtime.Event, audi
 
 func (s *runState) reactorLoop(ctx context.Context) error {
 	reactor := newReactorWithPresentationAndHandoffTools(s.ids, s.fence, s.cfg.PresentationPolicy, s.cfg.SafetyPolicy, s.cfg.HandoffToolsEnabled)
+	reactor.deferPresentationSafety = s.runtime != nil
 	var deferredCreate *reactorMessage
 	for {
 		var message reactorMessage
-		if deferredCreate != nil && s.pendingVoice.Load() == 0 {
+		select {
+		case message = <-s.completions:
+		default:
+		}
+		if message.input != nil {
+			// Reserved completions always take priority over ordinary intake.
+		} else if deferredCreate != nil && s.pendingVoice.Load() == 0 {
 			message = *deferredCreate
 			deferredCreate = nil
+		} else if deferredCreate != nil {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case message = <-s.completions:
+			}
 		} else {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
+			case message = <-s.completions:
 			case message = <-s.inbox:
 			}
 		}
@@ -3020,16 +3135,64 @@ func (s *runState) reactorLoop(ctx context.Context) error {
 			}
 		}
 		{
+			presentationLocked := false
+			if message.acceptanceChecked && s.runtime != nil {
+				s.runtime.presentationMu.Lock()
+				presentationLocked = true
+				s.runtime.mu.Lock()
+				accepted := s.runtime.accepting && s.runtime.acceptanceGeneration == message.acceptanceGeneration
+				s.runtime.mu.Unlock()
+				if !accepted {
+					s.runtime.presentationMu.Unlock()
+					if !message.completion {
+						s.controlApplied.Store(message.controlSequence)
+						s.inboxSlots <- struct{}{}
+					}
+					if message.done != nil {
+						message.done <- handoff.ErrNoLiveSession
+					}
+					continue
+				}
+			}
 			if s.cfg.reactorApplyGate != nil {
 				if gate := s.cfg.reactorApplyGate(message.input); gate != nil {
 					select {
 					case <-ctx.Done():
+						if presentationLocked {
+							s.runtime.presentationMu.Unlock()
+						}
 						return ctx.Err()
 					case <-gate:
 					}
 				}
 			}
 			effects, err := reactor.ApplyContext(ctx, message.input)
+			if err == nil {
+				for index := range effects {
+					async := effects[index].Async
+					if async == nil || async.Kind != asyncKindPresentationSafety {
+						continue
+					}
+					var request presentationSafetyRequest
+					if decodeErr := json.Unmarshal(async.Payload, &request); decodeErr != nil {
+						err = decodeErr
+						break
+					}
+					work := presentationSafetyWork{
+						sequence: async.Sequence, request: request, done: message.done,
+						acceptanceChecked: message.acceptanceChecked, acceptanceGeneration: message.acceptanceGeneration,
+					}
+					select {
+					case s.safetyWork <- work:
+						message.done = nil
+						effects[index].Async = nil
+					default:
+						s.metrics.queueOverflow("presentation_safety")
+						err = ErrControlOverflow
+					}
+					break
+				}
+			}
 			markHandoffPresentationEffects(message.input, effects, s.handoffEpoch.Load())
 			policySuppressed := false
 			for index := range effects {
@@ -3066,18 +3229,23 @@ func (s *runState) reactorLoop(ctx context.Context) error {
 				s.boundaryMu.Lock()
 				s.boundary = reactor.Snapshot()
 				s.boundaryMu.Unlock()
-				if _, ok := message.input.(VoiceCommandCompletedInput); ok {
-					s.pendingVoice.Add(-1)
+				if completed, ok := message.input.(VoiceCommandCompletedInput); ok {
+					s.completeVoice(completed)
 				}
 			}
-			s.controlApplied.Store(message.controlSequence)
-			s.inboxSlots <- struct{}{}
+			if !message.completion {
+				s.controlApplied.Store(message.controlSequence)
+				s.inboxSlots <- struct{}{}
+			}
 			if message.done != nil {
 				resultErr := err
 				if resultErr == nil && policySuppressed {
 					resultErr = handoff.ErrPresentationSuppressed
 				}
 				message.done <- resultErr
+			}
+			if presentationLocked {
+				s.runtime.presentationMu.Unlock()
 			}
 			if err != nil {
 				return err
@@ -3089,7 +3257,7 @@ func (s *runState) reactorLoop(ctx context.Context) error {
 func markHandoffPresentationEffects(input Input, effects []Effect, handoffEpoch uint64) {
 	handoffPresentation := false
 	switch typed := input.(type) {
-	case HandoffEventInput, HandoffAcceptedInput:
+	case HandoffEventInput, HandoffAcceptedInput, HandoffSafetyCompletedInput:
 		handoffPresentation = true
 	case VoiceInput:
 		handoffPresentation = handoffEpoch != 0 && handoffEpoch == uint64(typed.Event.Epoch)
@@ -3121,7 +3289,7 @@ func (s *runState) dispatchEffectsQueued(ctx context.Context, effects []Effect, 
 		// effect re-reads the gate so a transition during dispatch cannot leak.
 		if effect.HandoffPresentation && s.cfg.FeatureGates != nil && s.cfg.FeatureGates.Enabled(feature.ShadowMode) {
 			if effect.VoiceCommand != nil && effect.VoiceCommand.Kind == realtime.CommandCreateResponse {
-				if err := s.enqueueReactor(reactorMessage{input: VoiceCommandCompletedInput{Sequence: effect.VoiceCommand.Sequence, Kind: effect.VoiceCommand.Kind, Suppressed: true}}); err != nil {
+				if err := s.enqueueCompletion(ctx, VoiceCommandCompletedInput{Sequence: effect.VoiceCommand.Sequence, Kind: effect.VoiceCommand.Kind, Suppressed: true}); err != nil {
 					return nil, err
 				}
 			}
@@ -3162,7 +3330,7 @@ func (s *runState) dispatchEffectsQueued(ctx context.Context, effects []Effect, 
 				return nil, ErrControlOverflow
 			}
 			control := voiceControl{command: command, handoffPresentation: effect.HandoffPresentation}
-			s.pendingVoice.Add(1)
+			s.trackVoice(command)
 			s.voiceCtl <- control
 		}
 		if effect.Transcript != nil || effect.Handoff != nil {
@@ -3223,11 +3391,7 @@ func (s *runState) durableWriter(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case control := <-s.durableCtl:
-			var sequence uint64
-			kind := "handoff"
 			if control.transcript != nil && !isNilInterface(s.dispatcher) {
-				sequence = control.transcript.Sequence
-				kind = "transcript"
 				if err := s.dispatcher.DispatchTranscript(ctx, control.trusted, *control.transcript); err != nil {
 					s.durableSlots <- struct{}{}
 					return err
@@ -3240,7 +3404,31 @@ func (s *runState) durableWriter(ctx context.Context) error {
 				}
 			}
 			s.durableSlots <- struct{}{}
-			if err := s.enqueueReactor(reactorMessage{input: DurableEffectCompletedInput{Sequence: sequence, Kind: kind}}); err != nil {
+		}
+	}
+}
+
+func (s *runState) presentationSafetyLoop(ctx context.Context) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case work := <-s.safetyWork:
+			visual := safety.EvaluateOrSuppress(ctx, s.cfg.SafetyPolicy, work.request.Visual)
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			var speech safety.Decision
+			if work.request.Speech != nil {
+				speech = safety.EvaluateOrSuppress(ctx, s.cfg.SafetyPolicy, *work.request.Speech)
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			if err := s.enqueueCompletionMessage(ctx, reactorMessage{
+				input: HandoffSafetyCompletedInput{Sequence: work.sequence, Visual: visual, Speech: speech},
+				done:  work.done, acceptanceChecked: work.acceptanceChecked, acceptanceGeneration: work.acceptanceGeneration,
+			}); err != nil {
 				return err
 			}
 		}

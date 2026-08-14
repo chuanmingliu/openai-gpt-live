@@ -53,8 +53,9 @@ func TestMappingLoopServicesCorrelationWhileEventDeliveryIsBackpressured(t *test
 		ctx: ctx, cancel: cancel,
 		reads: make(chan socketRead, count), correlations: make(chan correlationRequest),
 		events: make(chan realtime.Event, 1), closing: make(chan struct{}), done: make(chan struct{}),
-		responses: make(map[string]*responseCorrelation), pending: make(map[identity.ResponseEpoch]struct{}),
-		maxFrameBytes: 1 << 20, closeNow: func() error { return nil },
+		responses: map[string]*responseCorrelation{"response": {unbound: true}}, pending: make(map[identity.ResponseEpoch]struct{}),
+		implicitUnbound: 1,
+		maxFrameBytes:   1 << 20, closeNow: func() error { return nil },
 	}
 	go session.mappingLoop()
 	t.Cleanup(cancel)
@@ -74,16 +75,21 @@ func TestMappingLoopServicesCorrelationWhileEventDeliveryIsBackpressured(t *test
 	// send. The bounded implementation instead owns the accepted tail locally.
 	time.Sleep(20 * time.Millisecond)
 
-	correlated := make(chan error, 1)
+	correlated := make(chan error, 2)
 	go func() {
-		correlated <- session.correlate(context.Background(), correlationRequest{kind: correlationRegister, epoch: 7})
+		correlated <- session.correlate(context.Background(), correlationRequest{kind: correlationBind, epoch: 7, responseID: "response"})
+		correlated <- session.correlate(context.Background(), correlationRequest{kind: correlationCancel, epoch: 8, responseID: "response"})
 	}()
-	select {
-	case err := <-correlated:
-		require.NoError(t, err)
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("correlation did not progress while public event delivery was backpressured")
+	for _, kind := range []string{"bind", "cancel"} {
+		select {
+		case err := <-correlated:
+			require.NoError(t, err)
+		case <-time.After(100 * time.Millisecond):
+			t.Fatalf("%s correlation did not progress while public event delivery was backpressured", kind)
+		}
 	}
+	require.Equal(t, identity.ResponseEpoch(7), session.responses["response"].epoch)
+	require.Equal(t, identity.ResponseEpoch(8), session.responses["response"].cancelEpoch)
 
 	for index := 1; index <= count; index++ {
 		select {

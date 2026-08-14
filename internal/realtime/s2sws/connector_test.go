@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
+	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime/s2sws"
 	sessionpkg "github.com/chuanmingliu/openai-gpt-live/internal/session"
@@ -48,6 +49,36 @@ type testVoiceServer struct {
 	cancel    context.CancelFunc
 	server    *httptest.Server
 }
+
+type compositionClient struct {
+	createdStarted chan struct{}
+	createdRelease chan struct{}
+	createdOnce    sync.Once
+}
+
+func (c *compositionClient) Read(ctx context.Context) (protocol.ClientEvent, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (c *compositionClient) Write(ctx context.Context, event protocol.ServerEvent) error {
+	if event.EventType() == "session.created" {
+		c.createdOnce.Do(func() { close(c.createdStarted) })
+		select {
+		case <-c.createdRelease:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+func (*compositionClient) Close(context.Context, int, string) error { return nil }
+
+type compositionIDs struct{}
+
+func (compositionIDs) NewSessionID() identity.SessionID           { return "composition-session" }
+func (compositionIDs) NewConversationID() identity.ConversationID { return "composition-conversation" }
 
 type observedContext struct {
 	context.Context
@@ -285,6 +316,66 @@ func receiveEvent(t *testing.T, session realtime.Session) realtime.Event {
 	event, err := session.Receive(t.Context())
 	require.NoError(t, err)
 	return event
+}
+
+func TestManagerBargeCancelProgressesThroughSaturatedAdapterDelivery(t *testing.T) {
+	server := newTestVoiceServer(t)
+	connector, err := s2sws.New(s2sws.Config{
+		URL: server.URL, ConnectTimeout: time.Second, MaxFrameBytes: 1 << 20, Model: "composition-model",
+	})
+	require.NoError(t, err)
+	manager := sessionpkg.NewManager(sessionpkg.Config{
+		ControlEvents: 1000, WriterControlEvents: 1000,
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+	}, connector, compositionIDs{})
+	client := &compositionClient{createdStarted: make(chan struct{}), createdRelease: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.Run(ctx, sessionpkg.OpenRequest{Subject: sessionpkg.Subject{
+			TenantID: "tenant", UserID: "user", ExpiresAt: time.Now().Add(time.Hour),
+		}}, client)
+	}()
+	select {
+	case <-client.createdStarted:
+	case err := <-done:
+		t.Fatalf("manager stopped before session.created gate: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("session.created did not reach gate")
+	}
+
+	server.sendEvent(t, map[string]any{
+		"type": "response.created", "event_id": "composition-created",
+		"response": map[string]any{"id": "composition-response", "status": "in_progress"},
+	})
+	for index := range 300 {
+		server.sendEvent(t, map[string]any{
+			"type": "input_audio_buffer.speech_started", "event_id": fmt.Sprintf("composition-speech-%03d", index),
+			"item_id": fmt.Sprintf("composition-item-%03d", index), "audio_start_ms": index,
+		})
+	}
+	close(client.createdRelease)
+
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case raw := <-server.received:
+			var frame struct {
+				Type string `json:"type"`
+			}
+			require.NoError(t, json.Unmarshal(raw, &frame))
+			if frame.Type == "response.cancel" {
+				cancel()
+				require.ErrorIs(t, <-done, context.Canceled)
+				return
+			}
+		case err := <-done:
+			t.Fatalf("manager stopped before barge cancel correlation: %v", err)
+		case <-deadline.C:
+			t.Fatal("barge cancel did not progress through saturated adapter delivery")
+		}
+	}
 }
 
 // TestNewRejectsInvalidConfig catches constructors that defer invalid endpoint
