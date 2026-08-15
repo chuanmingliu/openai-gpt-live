@@ -1078,7 +1078,7 @@ func TestLocalOperatorRunnerRehydratesMatchingComposeOwnershipAfterRestart(t *te
 	newRunner := func() *localOperatorRunner {
 		runnerInterface, err := newLocalOperatorRunner(operatorConfig{Enabled: true, StateDir: state, RepositoryRoot: root, SpeechCommand: speech, SpeechProfile: profile, Readiness: fixedReadiness()}, func(ctx context.Context, program string, args ...string) *exec.Cmd {
 			if len(args) == 1 && args[0] == "gateway-id" {
-				return exec.CommandContext(ctx, "/bin/sh", "-c", "printf gateway-owned")
+				return exec.CommandContext(ctx, "/bin/sh", "-c", "sleep 0.25; printf gateway-owned")
 			}
 			return exec.CommandContext(ctx, "/usr/bin/true")
 		}, func(context.Context, string) bool { return true })

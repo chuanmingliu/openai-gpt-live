@@ -61,6 +61,7 @@ chmod 700 "$state_dir"
 bff_pid=""
 durable_started=false
 startup_complete=false
+preserve_bff_proof=false
 
 stop_current_bff() {
   local pid="" command=""
@@ -70,20 +71,23 @@ stop_current_bff() {
     command=$(ps -p "$pid" -o command= 2>/dev/null || true)
     if [[ "$command" == "$state_dir/live-client"* ]]; then
       kill "$pid" 2>/dev/null || true
-      # The BFF owns four reverse-order cleanup actions, each with its own
-      # reviewed deadline. Keep proof for that complete bounded contract.
-      for _ in {1..12000}; do
+      # One in-flight action may finish before four reverse-order cleanup
+      # actions, each with its own reviewed deadline. Keep proof for that
+      # complete 750-second bounded server contract.
+      for _ in {1..15000}; do
         kill -0 "$pid" 2>/dev/null || break
         sleep 0.05
       done
     else
       warn "saved browser PID is not owned by this wizard; leaving it untouched"
+      preserve_bff_proof=true
       return 1
     fi
   fi
 
   if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
     warn "browser BFF cleanup is still in progress; preserving ownership proof"
+    preserve_bff_proof=true
     return 1
   fi
   rm -f "$state_dir/bff.pid" "$state_dir/live-client"
@@ -96,7 +100,9 @@ cleanup_failed_start() {
       kill "$bff_pid" 2>/dev/null || true
       wait "$bff_pid" 2>/dev/null || true
     fi
-    rm -f "$state_dir/bff.pid" "$state_dir/live-client"
+    if [[ "$preserve_bff_proof" != true ]]; then
+      rm -f "$state_dir/bff.pid" "$state_dir/live-client"
+    fi
     if [[ "$durable_started" == true && -n "${POSTGRES_PASSWORD:-}" ]]; then
       make durable-demo-down >/dev/null 2>&1 || true
     fi

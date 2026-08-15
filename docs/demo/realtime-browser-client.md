@@ -38,8 +38,9 @@ The launcher executes the reviewed `/Users/chuanmingliu/speech-to-speech`
 checkout at `d0270d79ccb6f5c99f76499bb1dbe8a65608cf51`, rather than a separate
 mutable worktree. Its stdout/stderr are retained only in the operator terminal;
 the API exposes fixed status codes, never child diagnostics. Client Stop closes
-the voice surface while keeping `/setup` available so the operator can Start it
-again. During BFF shutdown, every owned cleanup step has its own bounded
+active browser voice WebSockets and rejects later `/ws` upgrades while keeping
+`/setup` available so the operator can Start it again. During BFF shutdown,
+every owned cleanup step has its own bounded
 deadline and ownership proof remains until the wizard confirms process exit.
 
 The speech service and worker both use `deepseek-v4-flash` with thinking

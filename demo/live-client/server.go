@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/tools/websearch"
@@ -27,6 +28,57 @@ type demoHandler struct {
 	tools           *toolPolicyStore
 	operator        *operatorSupervisor
 	operatorContext context.Context
+	clientSessions  *clientSessionSet
+}
+
+type clientSessionSet struct {
+	mu          sync.Mutex
+	accepting   bool
+	connections map[*websocket.Conn]struct{}
+}
+
+func newClientSessionSet() *clientSessionSet {
+	return &clientSessionSet{accepting: true, connections: make(map[*websocket.Conn]struct{})}
+}
+
+// add registers a browser connection only while the client surface is active.
+// Together with stop this closes the small race between the HTTP admission
+// check and WebSocket upgrade when an operator presses Client Stop.
+func (sessions *clientSessionSet) add(connection *websocket.Conn) bool {
+	sessions.mu.Lock()
+	defer sessions.mu.Unlock()
+	if !sessions.accepting {
+		return false
+	}
+	sessions.connections[connection] = struct{}{}
+	return true
+}
+
+func (sessions *clientSessionSet) remove(connection *websocket.Conn) {
+	sessions.mu.Lock()
+	delete(sessions.connections, connection)
+	sessions.mu.Unlock()
+}
+
+func (sessions *clientSessionSet) stop(context.Context) error {
+	sessions.mu.Lock()
+	sessions.accepting = false
+	connections := make([]*websocket.Conn, 0, len(sessions.connections))
+	for connection := range sessions.connections {
+		connections = append(connections, connection)
+	}
+	sessions.mu.Unlock()
+	for _, connection := range connections {
+		_ = connection.Close(websocket.StatusGoingAway, "client stopped")
+	}
+	return nil
+}
+
+func (sessions *clientSessionSet) start(context.Context) error {
+	sessions.mu.Lock()
+	sessions.accepting = true
+	sessions.mu.Unlock()
+	return nil
 }
 
 func newHandler(cfg demoConfig, bearer []byte, dial dialUpstream) (http.Handler, error) {
@@ -78,6 +130,10 @@ func newHandlerWithToolSearchContext(operatorContext context.Context, cfg demoCo
 	if err != nil {
 		return nil, errors.New("demo operator is unavailable")
 	}
+	sessions := cfg.Operator.clientSessions
+	if sessions == nil {
+		sessions = newClientSessionSet()
+	}
 	return &demoHandler{
 		cfg:             cfg,
 		bearer:          append([]byte(nil), bearer...),
@@ -87,6 +143,7 @@ func newHandlerWithToolSearchContext(operatorContext context.Context, cfg demoCo
 		tools:           tools,
 		operator:        operator,
 		operatorContext: operatorContext,
+		clientSessions:  sessions,
 	}, nil
 }
 
@@ -98,15 +155,23 @@ func (handler *demoHandler) ServeHTTP(writer http.ResponseWriter, request *http.
 	case "/api/operator/action":
 		handler.serveOperatorAction(writer, request)
 	case "/api/tool-policy":
+		if !handler.clientAvailable(request) {
+			writer.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		handler.serveToolPolicy(writer, request)
 	case "/api/tool-policy/test":
+		if !handler.clientAvailable(request) {
+			writer.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		handler.serveToolPolicyTest(writer, request)
 	case "/":
 		if request.Method != http.MethodGet {
 			writer.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		if handler.operator != nil && !handler.operator.runner.Ready(request.Context(), componentClient) {
+		if !handler.clientAvailable(request) {
 			writer.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
@@ -116,7 +181,7 @@ func (handler *demoHandler) ServeHTTP(writer http.ResponseWriter, request *http.
 			writer.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		handler.serveAsset(writer, "web/styles.css", "text/css; charset=utf-8")
+		handler.serveClientAsset(writer, request, "web/styles.css", "text/css; charset=utf-8")
 	case "/setup":
 		if request.Method != http.MethodGet {
 			writer.WriteHeader(http.StatusMethodNotAllowed)
@@ -140,49 +205,49 @@ func (handler *demoHandler) ServeHTTP(writer http.ResponseWriter, request *http.
 			writer.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		handler.serveAsset(writer, "web/audio-core.mjs", "text/javascript; charset=utf-8")
+		handler.serveClientAsset(writer, request, "web/audio-core.mjs", "text/javascript; charset=utf-8")
 	case "/browser-runtime.mjs":
 		if request.Method != http.MethodGet {
 			writer.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		handler.serveAsset(writer, "web/browser-runtime.mjs", "text/javascript; charset=utf-8")
+		handler.serveClientAsset(writer, request, "web/browser-runtime.mjs", "text/javascript; charset=utf-8")
 	case "/client-state.mjs":
 		if request.Method != http.MethodGet {
 			writer.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		handler.serveAsset(writer, "web/client-state.mjs", "text/javascript; charset=utf-8")
+		handler.serveClientAsset(writer, request, "web/client-state.mjs", "text/javascript; charset=utf-8")
 	case "/protocol-state.mjs":
 		if request.Method != http.MethodGet {
 			writer.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		handler.serveAsset(writer, "web/protocol-state.mjs", "text/javascript; charset=utf-8")
+		handler.serveClientAsset(writer, request, "web/protocol-state.mjs", "text/javascript; charset=utf-8")
 	case "/tool-state.mjs":
 		if request.Method != http.MethodGet {
 			writer.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		handler.serveAsset(writer, "web/tool-state.mjs", "text/javascript; charset=utf-8")
+		handler.serveClientAsset(writer, request, "web/tool-state.mjs", "text/javascript; charset=utf-8")
 	case "/app.js":
 		if request.Method != http.MethodGet {
 			writer.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		handler.serveAsset(writer, "web/app.js", "text/javascript; charset=utf-8")
+		handler.serveClientAsset(writer, request, "web/app.js", "text/javascript; charset=utf-8")
 	case "/capture-worklet.js":
 		if request.Method != http.MethodGet {
 			writer.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		handler.serveAsset(writer, "web/capture-worklet.js", "text/javascript; charset=utf-8")
+		handler.serveClientAsset(writer, request, "web/capture-worklet.js", "text/javascript; charset=utf-8")
 	case "/playback-worklet.js":
 		if request.Method != http.MethodGet {
 			writer.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		handler.serveAsset(writer, "web/playback-worklet.js", "text/javascript; charset=utf-8")
+		handler.serveClientAsset(writer, request, "web/playback-worklet.js", "text/javascript; charset=utf-8")
 	case "/health/ready":
 		if request.Method != http.MethodGet {
 			writer.WriteHeader(http.StatusMethodNotAllowed)
@@ -196,10 +261,26 @@ func (handler *demoHandler) ServeHTTP(writer http.ResponseWriter, request *http.
 			writer.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
+		if !handler.clientAvailable(request) {
+			writer.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		handler.serveWebSocket(writer, request)
 	default:
 		writer.WriteHeader(http.StatusNotFound)
 	}
+}
+
+func (handler *demoHandler) clientAvailable(request *http.Request) bool {
+	return handler.operator == nil || handler.operator.runner.Ready(request.Context(), componentClient)
+}
+
+func (handler *demoHandler) serveClientAsset(writer http.ResponseWriter, request *http.Request, name, contentType string) {
+	if !handler.clientAvailable(request) {
+		writer.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	handler.serveAsset(writer, name, contentType)
 }
 
 func (handler *demoHandler) serveAsset(writer http.ResponseWriter, name, contentType string) {
@@ -222,6 +303,11 @@ func (handler *demoHandler) serveWebSocket(writer http.ResponseWriter, request *
 	if err != nil {
 		return
 	}
+	if !handler.clientSessions.add(browser) {
+		_ = browser.Close(websocket.StatusGoingAway, "client stopped")
+		return
+	}
+	defer handler.clientSessions.remove(browser)
 	defer browser.CloseNow()
 
 	header := http.Header{}
@@ -271,9 +357,9 @@ func run(ctx context.Context, cfg demoConfig, bearer []byte) error {
 	serverContext, stopServer := context.WithCancel(ctx)
 	defer stopServer()
 	if cfg.Operator.Enabled {
-		cfg.Operator.ClientStop = func(context.Context) error {
-			return nil
-		}
+		cfg.Operator.clientSessions = newClientSessionSet()
+		cfg.Operator.ClientStart = cfg.Operator.clientSessions.start
+		cfg.Operator.ClientStop = cfg.Operator.clientSessions.stop
 	}
 	handler, err := newHandlerWithContext(serverContext, cfg, bearer, defaultDialUpstream)
 	if err != nil {

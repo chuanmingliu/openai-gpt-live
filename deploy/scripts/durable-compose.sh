@@ -74,6 +74,20 @@ case "$operation" in
 esac
 
 case "$operation" in
+  up)
+    [ -n "${S2S_API_KEY:-}" ] || { echo "S2S_API_KEY is required" >&2; exit 1; }
+    [ -n "${DEEPSEEK_API_KEY:-}" ] || { echo "DEEPSEEK_API_KEY is required" >&2; exit 1; }
+    [ -n "${LIVE_STATIC_BEARER_TOKEN:-}" ] || { echo "LIVE_STATIC_BEARER_TOKEN is required" >&2; exit 1; }
+    [ -n "${LIVE_ADMIN_BEARER_TOKEN:-}" ] || { echo "LIVE_ADMIN_BEARER_TOKEN is required" >&2; exit 1; }
+    [ -n "${LIVE_PRIVACY_HMAC_KEY:-}" ] || { echo "LIVE_PRIVACY_HMAC_KEY is required" >&2; exit 1; }
+    [ -n "${LIVE_RETENTION_HMAC_KEY:-}" ] || { echo "LIVE_RETENTION_HMAC_KEY is required" >&2; exit 1; }
+    [ -n "${LIVE_RECONNECT_HMAC_KEY:-}" ] || { echo "LIVE_RECONNECT_HMAC_KEY is required" >&2; exit 1; }
+    [ -n "${LIVE_TOOL_ENCRYPTION_KEY:-}" ] || { echo "LIVE_TOOL_ENCRYPTION_KEY is required" >&2; exit 1; }
+    [ -n "${LIVE_EXPECTED_CONFIG_HASH:-}" ] || { echo "LIVE_EXPECTED_CONFIG_HASH is required" >&2; exit 1; }
+    ;;
+esac
+
+case "$operation" in
   gateway-start)
     [ -n "${S2S_API_KEY:-}" ] || { echo "S2S_API_KEY is required" >&2; exit 1; }
     [ -n "${LIVE_STATIC_BEARER_TOKEN:-}" ] || { echo "LIVE_STATIC_BEARER_TOKEN is required" >&2; exit 1; }
@@ -96,11 +110,17 @@ case "$operation" in
 esac
 
 case "$operation" in
+  *-id|*-stop)
+    exec docker compose \
+      --project-name gpt-live-durable-demo \
+      -f deploy/docker-compose.yml \
+      -f deploy/compose.development-control-panel-identities.yml \
+      "$@"
+    ;;
   postgres-*|gateway-*|worker-*)
     exec docker compose \
       --project-name gpt-live-durable-demo \
       -f deploy/docker-compose.yml \
-      -f deploy/compose.development-durable.yml \
       -f deploy/compose.development-control-panel.yml \
       "$@"
     ;;

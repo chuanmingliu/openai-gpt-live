@@ -26,6 +26,9 @@ const (
 	// escalates against the launcher itself.
 	operatorTerminateWait = 3 * time.Second
 	operatorIdentityRetry = 5 * time.Millisecond
+	// Compose identity discovery starts a local CLI and Docker Desktop client;
+	// it is independent from a short HTTP readiness probe.
+	operatorIdentityTimeout = 3 * time.Second
 )
 
 type operatorConfig struct {
@@ -36,7 +39,9 @@ type operatorConfig struct {
 	SpeechCommand  string
 	SpeechProfile  string
 	Readiness      map[operatorComponent]string
+	ClientStart    func(context.Context) error
 	ClientStop     func(context.Context) error
+	clientSessions *clientSessionSet
 }
 
 type commandFactory func(context.Context, string, ...string) *exec.Cmd
@@ -128,7 +133,7 @@ func newLocalOperatorRunner(cfg operatorConfig, factory commandFactory, probe re
 	runner := &localOperatorRunner{
 		cfg: cfg, newCommand: factory, probe: probe,
 		stateRoot: stateRoot, stateFile: stateFile, records: defaultOperatorRecordOperations(),
-		identityTimeout: operatorReadinessTimeout, identityRetryWait: operatorIdentityRetry, terminateWait: operatorTerminateWait,
+		identityTimeout: operatorIdentityTimeout, identityRetryWait: operatorIdentityRetry, terminateWait: operatorTerminateWait,
 		children: make(map[operatorComponent]*ownedChild), composeOwned: make(map[operatorComponent]string), composeEphemeral: make(map[operatorComponent]string), composePending: make(map[operatorComponent]bool), composeStale: make(map[operatorComponent]string), clientOwned: cfg.ClientStop != nil, speechFile: speechFile, profileFile: profileFile,
 	}
 	runner.composeIdentity = runner.queryComposeIdentity
@@ -308,6 +313,11 @@ func (runner *localOperatorRunner) Run(ctx context.Context, operation fixedOpera
 			if runner.cfg.ClientStop == nil {
 				return errOperatorMissingConfiguration
 			}
+			if runner.cfg.ClientStart != nil {
+				if err := runner.cfg.ClientStart(ctx); err != nil {
+					return commandFailure(ctx)
+				}
+			}
 			runner.mu.Lock()
 			runner.clientOwned = true
 			runner.mu.Unlock()
@@ -316,12 +326,16 @@ func (runner *localOperatorRunner) Run(ctx context.Context, operation fixedOpera
 		if runner.cfg.ClientStop == nil {
 			return errOperatorProcessExited
 		}
-		if err := runner.cfg.ClientStop(ctx); err != nil {
-			return commandFailure(ctx)
-		}
 		runner.mu.Lock()
+		wasOwned := runner.clientOwned
 		runner.clientOwned = false
 		runner.mu.Unlock()
+		if err := runner.cfg.ClientStop(ctx); err != nil {
+			runner.mu.Lock()
+			runner.clientOwned = wasOwned
+			runner.mu.Unlock()
+			return commandFailure(ctx)
+		}
 		return nil
 	case componentSpeech:
 		if operation.Action == actionStart {

@@ -25,15 +25,31 @@ import (
 )
 
 func TestOperatorMainClientStopLeavesPersistentOperatorSurfaceForRestart(t *testing.T) {
-	cfg := testOperatorMainConfig(t)
-	gateway := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writer.WriteHeader(http.StatusOK) }))
+	gateway := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Upgrade") != "websocket" {
+			writer.WriteHeader(http.StatusOK)
+			return
+		}
+		connection, err := websocket.Accept(writer, request, &websocket.AcceptOptions{InsecureSkipVerify: true})
+		require.NoError(t, err)
+		defer connection.CloseNow()
+		<-request.Context().Done()
+	}))
 	t.Cleanup(gateway.Close)
+	cfg := testOperatorMainConfig(t)
+	cfg.GatewayURL = wsURL(gateway.URL) + "/v1/realtime"
 	cfg.Operator.Readiness[componentGateway] = gateway.URL
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- run(ctx, cfg, []byte("operator-main-bearer")) }()
 	waitForOperatorMainReady(t, cfg.Origin)
+	header := http.Header{}
+	header.Set("Origin", cfg.Origin)
+	browser, upgraded, err := websocket.Dial(t.Context(), "ws"+strings.TrimPrefix(cfg.Origin, "http")+"/ws", &websocket.DialOptions{HTTPHeader: header})
+	require.NoError(t, err)
+	require.NotNil(t, upgraded)
+	assert.Equal(t, http.StatusSwitchingProtocols, upgraded.StatusCode)
 
 	request, err := http.NewRequest(http.MethodPost, cfg.Origin+"/api/operator/action", strings.NewReader(`{"component":"client","action":"stop"}`))
 	require.NoError(t, err)
@@ -49,6 +65,15 @@ func TestOperatorMainClientStopLeavesPersistentOperatorSurfaceForRestart(t *test
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusServiceUnavailable, response.StatusCode)
 	_ = response.Body.Close()
+	readContext, stopRead := context.WithTimeout(t.Context(), time.Second)
+	defer stopRead()
+	_, _, err = browser.Read(readContext)
+	require.Error(t, err, "Client Stop must close an already-admitted browser WebSocket")
+	_, rejected, err := websocket.Dial(t.Context(), "ws"+strings.TrimPrefix(cfg.Origin, "http")+"/ws", &websocket.DialOptions{HTTPHeader: header})
+	require.Error(t, err)
+	require.NotNil(t, rejected)
+	assert.Equal(t, http.StatusServiceUnavailable, rejected.StatusCode)
+	_ = rejected.Body.Close()
 
 	request, err = http.NewRequest(http.MethodPost, cfg.Origin+"/api/operator/action", strings.NewReader(`{"component":"client","action":"start"}`))
 	require.NoError(t, err)
@@ -62,6 +87,11 @@ func TestOperatorMainClientStopLeavesPersistentOperatorSurfaceForRestart(t *test
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusOK, response.StatusCode)
 	_ = response.Body.Close()
+	browser, upgraded, err = websocket.Dial(t.Context(), "ws"+strings.TrimPrefix(cfg.Origin, "http")+"/ws", &websocket.DialOptions{HTTPHeader: header})
+	require.NoError(t, err)
+	require.NotNil(t, upgraded)
+	assert.Equal(t, http.StatusSwitchingProtocols, upgraded.StatusCode)
+	_ = browser.Close(websocket.StatusNormalClosure, "done")
 	cancel()
 	select {
 	case err := <-done:
@@ -69,6 +99,51 @@ func TestOperatorMainClientStopLeavesPersistentOperatorSurfaceForRestart(t *test
 	case <-time.After(3 * time.Second):
 		t.Fatal("operator server did not shut down")
 	}
+}
+
+func TestOperatorClientStopRejectsWebSocketUntilRestart(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		connection, err := websocket.Accept(writer, request, nil)
+		require.NoError(t, err)
+		defer connection.CloseNow()
+		<-request.Context().Done()
+	}))
+	t.Cleanup(upstream.Close)
+	config, err := parseConfig(nil)
+	require.NoError(t, err)
+	handler, err := newHandler(config, []byte("operator-client-bearer"), func(ctx context.Context, _ *url.URL, header http.Header) (*websocket.Conn, error) {
+		assert.Equal(t, "Bearer operator-client-bearer", header.Get("Authorization"))
+		connection, _, err := websocket.Dial(ctx, wsURL(upstream.URL), nil)
+		return connection, err
+	})
+	require.NoError(t, err)
+	demo := handler.(*demoHandler)
+	runner := newFakeOperatorRunner()
+	runner.setReady(componentClient, true)
+	runner.setOwned(componentClient, true)
+	runner.setReady(componentGateway, true)
+	demo.operator = newOperatorSupervisor(runner, time.Second)
+	server := httptest.NewServer(demo)
+	t.Cleanup(server.Close)
+
+	stop := makeOperatorActionRequest(demo, http.MethodPost, `{"component":"client","action":"stop"}`, config.Origin, "application/json")
+	require.Equal(t, http.StatusOK, stop.Code)
+
+	header := http.Header{}
+	header.Set("Origin", config.Origin)
+	_, rejected, err := websocket.Dial(t.Context(), wsURL(server.URL)+"/ws", &websocket.DialOptions{HTTPHeader: header})
+	require.Error(t, err)
+	require.NotNil(t, rejected)
+	assert.Equal(t, http.StatusServiceUnavailable, rejected.StatusCode)
+	_ = rejected.Body.Close()
+
+	start := makeOperatorActionRequest(demo, http.MethodPost, `{"component":"client","action":"start"}`, config.Origin, "application/json")
+	require.Equal(t, http.StatusOK, start.Code)
+	connection, admitted, err := websocket.Dial(t.Context(), wsURL(server.URL)+"/ws", &websocket.DialOptions{HTTPHeader: header})
+	require.NoError(t, err)
+	require.NotNil(t, admitted)
+	assert.Equal(t, http.StatusSwitchingProtocols, admitted.StatusCode)
+	_ = connection.Close(websocket.StatusNormalClosure, "done")
 }
 
 func TestOperatorMainGracefulShutdownStopsOwnedSpeech(t *testing.T) {
@@ -120,6 +195,38 @@ func TestOperatorMainGracefulShutdownStopsOwnedSpeech(t *testing.T) {
 		process, err := os.FindProcess(pid)
 		return err != nil || process.Signal(syscall.Signal(0)) != nil
 	}, 2*time.Second, 10*time.Millisecond, "operator-owned speech process survived BFF shutdown")
+}
+
+func TestOperatorShutdownJoinsInFlightActionBeforeIndependentReverseCleanup(t *testing.T) {
+	runner := newFakeOperatorRunner()
+	for _, component := range []operatorComponent{componentSpeech, componentPostgres, componentGateway, componentWorker} {
+		runner.setReady(component, true)
+		runner.setOwned(component, true)
+	}
+	runner.setMigrated(true)
+	runner.block = make(chan struct{})
+	supervisor := newOperatorSupervisor(runner, time.Second)
+	supervisor.migrated = true
+
+	actionDone := make(chan componentStatus, 1)
+	go func() { actionDone <- supervisor.Apply(context.Background(), componentWorker, actionStart) }()
+	require.Eventually(t, func() bool { return runner.callsFor(componentWorker, actionStart) == 1 }, time.Second, time.Millisecond)
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		waitOperatorActions(supervisor)
+		shutdownOwnedOperator(supervisor)
+		close(shutdownDone)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	assert.Zero(t, runner.callsFor(componentGateway, actionStop), "cleanup must not race an in-flight action")
+
+	close(runner.block)
+	<-actionDone
+	require.Eventually(t, func() bool {
+		return runner.callsFor(componentWorker, actionStop) == 1 && runner.callsFor(componentGateway, actionStop) == 1 && runner.callsFor(componentPostgres, actionStop) == 1 && runner.callsFor(componentSpeech, actionStop) == 1
+	}, time.Second, time.Millisecond)
+	<-shutdownDone
 }
 
 func testOperatorMainConfig(t *testing.T) demoConfig {

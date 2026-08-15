@@ -1,0 +1,7 @@
+# Minimal, non-secret Compose view for read-only identity and ownership-safe
+# removal. Service/project labels are supplied by docker-compose.yml; this file
+# intentionally carries no application environment or runtime configuration.
+services:
+  postgres: {}
+  gateway: {}
+  worker: {}

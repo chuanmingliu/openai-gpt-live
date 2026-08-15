@@ -123,6 +123,21 @@ set -euo pipefail
 [[ "$*" == 'compose version' ]]
 EOF
 
+cat >"$scratch/bin/ps" <<'EOF'
+#!/usr/bin/env bash
+if [[ -n "${DEMO_TEST_PRESERVE_COMMAND:-}" ]]; then
+  printf '%s\n' "$DEMO_TEST_PRESERVE_COMMAND"
+  exit 0
+fi
+exec /bin/ps "$@"
+EOF
+
+cat >"$scratch/bin/sleep" <<'EOF'
+#!/usr/bin/env bash
+if [[ -n "${DEMO_TEST_FAST_WAIT:-}" ]]; then exit 0; fi
+exec /bin/sleep "$@"
+EOF
+
 chmod +x "$scratch/bin/"*
 
 run_wizard() {
@@ -199,5 +214,29 @@ fi
 grep -F 'did not become ready' "$scratch/failure.err" >/dev/null || fail "failed readiness lacks a concise action"
 
 grep -F -- '--connect-timeout 0.05 --max-time 0.1' "$scratch/full.calls" >/dev/null || fail "readiness requests are not bounded"
+
+# A prior BFF can still be performing bounded server cleanup. Exercise the
+# real trap/function body with a delayed owned PID (all wait primitives are
+# local shell fakes, so no process is killed). Its proof must survive the
+# nonzero replacement path and EXIT trap.
+preserve_state="$scratch/state-preserve"
+mkdir -p "$preserve_state"
+printf '%s\n' '#!/bin/sh' >"$preserve_state/live-client"
+chmod 700 "$preserve_state/live-client"
+printf '%s\n' '42' >"$preserve_state/bff.pid"
+sed '/^_clear$/,$d' "$root/deploy/scripts/demo-wizard.sh" >"$scratch/wizard-functions.sh"
+if DEMO_WIZARD_STATE_DIR="$preserve_state" bash -c '
+  set -euo pipefail
+  source "$1"
+  startup_complete=false
+  bff_pid=""
+  ps() { printf "%s --operator\\n" "$state_dir/live-client"; }
+  kill() { return 0; }
+  sleep() { :; }
+  stop_current_bff
+' bash "$scratch/wizard-functions.sh"; then
+  fail "wizard replaced a BFF whose cleanup proof was still live"
+fi
+[[ -f "$preserve_state/bff.pid" && -f "$preserve_state/live-client" ]] || fail "failed replacement deleted the prior BFF proof"
 
 printf '%s\n' 'interactive demo wizard boundary tests passed'

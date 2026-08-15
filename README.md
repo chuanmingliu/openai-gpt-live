@@ -87,6 +87,9 @@ PostgreSQL, then Speech. Shutdown does not delete the PostgreSQL volume.
 release-evidence controller. Use the [complete realtime
 browser operator guide](docs/demo/realtime-browser-client.md) for manual
 audible-playback/barge-in acceptance, pool-idle checks, and troubleshooting.
+Client Stop closes active browser voice WebSockets and rejects new client
+connections until explicit Client Start; the persistent `/setup` operator
+surface remains available for that restart.
 
 The control-panel speech launcher uses the reviewed local
 `/Users/chuanmingliu/speech-to-speech` checkout at
