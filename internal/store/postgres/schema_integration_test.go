@@ -28,12 +28,12 @@ var requiredColumns = map[string]map[string]string{
 		"content_bytes": "integer", "created_at": "timestamp with time zone",
 	},
 	"profile_drafts": {
-		"tenant_id": "text", "profile_id": "text", "generation": "bigint", "manifest": "jsonb",
+		"tenant_id": "text", "profile_id": "text", "generation": "bigint", "manifest": "json",
 		"updated_at": "timestamp with time zone", "updated_by": "text",
 	},
 	"profile_versions": {
 		"tenant_id": "text", "profile_id": "text", "version": "bigint", "draft_generation": "bigint",
-		"engine_version": "text", "snapshot_hash": "text", "manifest": "jsonb", "snapshot": "jsonb",
+		"engine_version": "text", "snapshot_hash": "text", "manifest": "json", "snapshot": "json",
 		"active": "boolean", "revoked_at": "timestamp with time zone", "revoked_by": "text",
 		"published_at": "timestamp with time zone", "published_by": "text",
 		"activated_at": "timestamp with time zone", "activated_by": "text",
@@ -177,7 +177,8 @@ var requiredNamedConstraintNames = strings.Fields(`
 	profile_drafts_updated_by_check profile_drafts_updated_at_check
 	profile_versions_draft_generation_uniq profile_versions_identity_check profile_versions_numbers_check
 	profile_versions_engine_hash_check profile_versions_documents_check profile_versions_publication_check
-	profile_versions_activation_check profile_versions_revocation_check profile_versions_state_check
+	profile_versions_activation_check profile_versions_revocation_check profile_versions_chronology_check
+	profile_versions_snapshot_coherence_check profile_versions_state_check
 	conversations_tenant_id_size_check conversations_id_size_check conversations_user_id_size_check
 	conversations_status_check conversations_retention_check conversations_timestamps_check
 	conversations_deletion_actor_size_check conversations_deletion_reason_size_check conversations_deletion_tuple_check
@@ -351,19 +352,95 @@ func TestSchemaProfileV9UpDownUpCatalogAndConstraints(t *testing.T) {
 	_, err = pool.Exec(t.Context(), `INSERT INTO profile_versions
 		(tenant_id,profile_id,version,draft_generation,engine_version,snapshot_hash,manifest,snapshot,
 		 active,published_at,published_by,activated_at,activated_by)
-		VALUES ('tenant-v9','profile-v9',1,1,'jinja-go-v1',$1,'{}','{}',true,$2,'publisher',$2,'publisher')`,
+		VALUES ('tenant-v9','profile-v9',1,1,'jinja-go-v1',$1,'{}',
+			json_build_object('tenant_id','tenant-v9','ref',json_build_object('id','profile-v9','version',1),
+				'engine_version','jinja-go-v1','snapshot_hash',$1::text),true,$2,'publisher',$2,'publisher')`,
 		strings.Repeat("c", 64), profileTestCatalogTime())
 	require.NoError(t, err)
+	var foreignKeyName, deleteAction string
+	var sourceColumns, targetColumns []string
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT constraint_definition.conname,
+		constraint_definition.confdeltype::text,
+		ARRAY(SELECT source_attribute.attname FROM unnest(constraint_definition.conkey) WITH ORDINALITY key(attnum,ordinal)
+			JOIN pg_attribute source_attribute ON source_attribute.attrelid=constraint_definition.conrelid AND source_attribute.attnum=key.attnum
+			ORDER BY key.ordinal),
+		ARRAY(SELECT target_attribute.attname FROM unnest(constraint_definition.confkey) WITH ORDINALITY key(attnum,ordinal)
+			JOIN pg_attribute target_attribute ON target_attribute.attrelid=constraint_definition.confrelid AND target_attribute.attnum=key.attnum
+			ORDER BY key.ordinal)
+		FROM pg_constraint constraint_definition
+		WHERE constraint_definition.conrelid='profile_versions'::regclass AND constraint_definition.contype='f'`).
+		Scan(&foreignKeyName, &deleteAction, &sourceColumns, &targetColumns))
+	assert.Equal(t, "profile_versions_draft_fkey", foreignKeyName)
+	assert.Equal(t, "r", deleteAction, "draft deletion must be RESTRICT")
+	assert.Equal(t, []string{"tenant_id", "profile_id"}, sourceColumns)
+	assert.Equal(t, []string{"tenant_id", "profile_id"}, targetColumns)
+
+	_, err = pool.Exec(t.Context(), `INSERT INTO profile_versions
+		(tenant_id,profile_id,version,draft_generation,engine_version,snapshot_hash,manifest,snapshot,published_at,published_by)
+		VALUES ('tenant-v9','orphan-v9',1,1,'jinja-go-v1',$1,'{}',
+			json_build_object('tenant_id','tenant-v9','ref',json_build_object('id','orphan-v9','version',1),
+				'engine_version','jinja-go-v1','snapshot_hash',$1::text),$2,'publisher')`, strings.Repeat("f", 64), profileTestCatalogTime())
+	assertConstraint(t, err, "profile_versions_draft_fkey")
+	_, err = pool.Exec(t.Context(), `INSERT INTO profile_versions
+		(tenant_id,profile_id,version,draft_generation,engine_version,snapshot_hash,manifest,snapshot,published_at,published_by)
+		VALUES ('tenant-other','profile-v9',1,1,'jinja-go-v1',$1,'{}',
+			json_build_object('tenant_id','tenant-other','ref',json_build_object('id','profile-v9','version',1),
+				'engine_version','jinja-go-v1','snapshot_hash',$1::text),$2,'publisher')`, strings.Repeat("f", 64), profileTestCatalogTime())
+	assertConstraint(t, err, "profile_versions_draft_fkey")
+	_, err = pool.Exec(t.Context(), `DELETE FROM profile_drafts WHERE tenant_id='tenant-v9' AND profile_id='profile-v9'`)
+	assertConstraint(t, err, "profile_versions_draft_fkey")
+
+	coherenceMutations := []struct {
+		name  string
+		query string
+	}{
+		{name: "tenant", query: `UPDATE profile_versions SET snapshot=json_build_object(
+			'tenant_id','tenant-other','ref',json_build_object('id','profile-v9','version',1),
+			'engine_version','jinja-go-v1','snapshot_hash',snapshot_hash)
+			WHERE tenant_id='tenant-v9' AND profile_id='profile-v9' AND version=1`},
+		{name: "profile id", query: `UPDATE profile_versions SET snapshot=json_build_object(
+			'tenant_id','tenant-v9','ref',json_build_object('id','profile-other','version',1),
+			'engine_version','jinja-go-v1','snapshot_hash',snapshot_hash)
+			WHERE tenant_id='tenant-v9' AND profile_id='profile-v9' AND version=1`},
+		{name: "version", query: `UPDATE profile_versions SET snapshot=json_build_object(
+			'tenant_id','tenant-v9','ref',json_build_object('id','profile-v9','version',2),
+			'engine_version','jinja-go-v1','snapshot_hash',snapshot_hash)
+			WHERE tenant_id='tenant-v9' AND profile_id='profile-v9' AND version=1`},
+		{name: "engine", query: `UPDATE profile_versions SET snapshot=json_build_object(
+			'tenant_id','tenant-v9','ref',json_build_object('id','profile-v9','version',1),
+			'engine_version','jinja-go-v2','snapshot_hash',snapshot_hash)
+			WHERE tenant_id='tenant-v9' AND profile_id='profile-v9' AND version=1`},
+		{name: "snapshot hash", query: `UPDATE profile_versions SET snapshot=json_build_object(
+			'tenant_id','tenant-v9','ref',json_build_object('id','profile-v9','version',1),
+			'engine_version','jinja-go-v1','snapshot_hash',repeat('f',64))
+			WHERE tenant_id='tenant-v9' AND profile_id='profile-v9' AND version=1`},
+	}
+	for _, mutation := range coherenceMutations {
+		t.Run("snapshot coherence "+mutation.name, func(t *testing.T) {
+			_, mutationErr := pool.Exec(t.Context(), mutation.query)
+			assertConstraint(t, mutationErr, "profile_versions_snapshot_coherence_check")
+		})
+	}
+	_, err = pool.Exec(t.Context(), `UPDATE profile_versions SET active=false,
+		activated_at=published_at+interval '10 minutes',activated_by='operator',
+		revoked_at=published_at+interval '5 minutes',revoked_by='operator'
+		WHERE tenant_id='tenant-v9' AND profile_id='profile-v9' AND version=1`)
+	assertConstraint(t, err, "profile_versions_chronology_check")
+
 	_, err = pool.Exec(t.Context(), `INSERT INTO profile_versions
 		(tenant_id,profile_id,version,draft_generation,engine_version,snapshot_hash,manifest,snapshot,
 		 active,published_at,published_by,activated_at,activated_by)
-		VALUES ('tenant-v9','profile-v9',2,2,'jinja-go-v1',$1,'{}','{}',true,$2,'publisher',$2,'publisher')`,
+		VALUES ('tenant-v9','profile-v9',2,2,'jinja-go-v1',$1,'{}',
+			json_build_object('tenant_id','tenant-v9','ref',json_build_object('id','profile-v9','version',2),
+				'engine_version','jinja-go-v1','snapshot_hash',$1::text),true,$2,'publisher',$2,'publisher')`,
 		strings.Repeat("d", 64), profileTestCatalogTime())
 	assertConstraint(t, err, "profile_one_active_version")
 	_, err = pool.Exec(t.Context(), `INSERT INTO profile_versions
 		(tenant_id,profile_id,version,draft_generation,engine_version,snapshot_hash,manifest,snapshot,
 		 active,published_at,published_by)
-		VALUES ('tenant-v9','profile-v9',3,1,'jinja-go-v1',$1,'{}','{}',false,$2,'publisher')`,
+		VALUES ('tenant-v9','profile-v9',3,1,'jinja-go-v1',$1,'{}',
+			json_build_object('tenant_id','tenant-v9','ref',json_build_object('id','profile-v9','version',3),
+				'engine_version','jinja-go-v1','snapshot_hash',$1::text),false,$2,'publisher')`,
 		strings.Repeat("e", 64), profileTestCatalogTime())
 	assertConstraint(t, err, "profile_versions_draft_generation_uniq")
 	_, err = pool.Exec(t.Context(), `UPDATE profile_versions
@@ -936,7 +1013,9 @@ func TestSchemaEveryNamedCheckRejectsInvalidMutation(t *testing.T) {
 	_, err = pool.Exec(t.Context(), `INSERT INTO profile_versions
 		(tenant_id,profile_id,version,draft_generation,engine_version,snapshot_hash,manifest,snapshot,
 		 active,published_at,published_by)
-		VALUES ('tenant-c','profile-c',1,1,'jinja-go-v1',$1,'{}','{}',false,CURRENT_TIMESTAMP,'publisher-c')`, strings.Repeat("b", 64))
+		VALUES ('tenant-c','profile-c',1,1,'jinja-go-v1',$1,'{}',
+			json_build_object('tenant_id','tenant-c','ref',json_build_object('id','profile-c','version',1),
+				'engine_version','jinja-go-v1','snapshot_hash',$1::text),false,CURRENT_TIMESTAMP,'publisher-c')`, strings.Repeat("b", 64))
 	require.NoError(t, err)
 
 	mutations := map[string]string{
@@ -956,6 +1035,8 @@ func TestSchemaEveryNamedCheckRejectsInvalidMutation(t *testing.T) {
 		"profile_versions_publication_check":                       `UPDATE profile_versions SET published_by='' WHERE profile_id='profile-c'`,
 		"profile_versions_activation_check":                        `UPDATE profile_versions SET activated_by='operator' WHERE profile_id='profile-c'`,
 		"profile_versions_revocation_check":                        `UPDATE profile_versions SET revoked_by='operator' WHERE profile_id='profile-c'`,
+		"profile_versions_chronology_check":                        `UPDATE profile_versions SET activated_at=published_at+interval '2 minutes',activated_by='operator',revoked_at=published_at+interval '1 minute',revoked_by='operator' WHERE profile_id='profile-c'`,
+		"profile_versions_snapshot_coherence_check":                `UPDATE profile_versions SET snapshot=json_build_object('tenant_id','tenant-other','ref',json_build_object('id','profile-c','version',1),'engine_version','jinja-go-v1','snapshot_hash',snapshot_hash) WHERE profile_id='profile-c'`,
 		"profile_versions_state_check":                             `UPDATE profile_versions SET active=true WHERE profile_id='profile-c'`,
 		"session_reconnect_owners_identifiers_check":               `UPDATE session_reconnect_owners SET owner_id='' WHERE session_id='reconnect-c'`,
 		"session_reconnect_owners_counters_check":                  `UPDATE session_reconnect_owners SET incarnation=0 WHERE session_id='reconnect-c'`,

@@ -23,6 +23,47 @@ func TestManifestHashPreservesResultSchemaNumberText(t *testing.T) {
 	assert.NotEqual(t, mustHash(t, a), mustHash(t, b))
 }
 
+func TestManifestCanonicalJSONIsOwnedOrderedAndPreservesNumberText(t *testing.T) {
+	forward, reverse := orderedManifest(false), orderedManifest(true)
+	forwardJSON, err := forward.CanonicalJSON()
+	require.NoError(t, err)
+	reverseJSON, err := reverse.CanonicalJSON()
+	require.NoError(t, err)
+	assert.Equal(t, forwardJSON, reverseJSON, "map and component insertion order must not change canonical bytes")
+	assert.Contains(t, string(forwardJSON), `"a":1e2`)
+
+	differentNumber := forward.Clone()
+	differentNumber.Recipes[0].ResultSchema = json.RawMessage(`{"a":100,"b":{"x":true,"y":null}}`)
+	differentJSON, err := differentNumber.CanonicalJSON()
+	require.NoError(t, err)
+	assert.NotEqual(t, forwardJSON, differentJSON, "hash-significant numeric lexemes must remain distinct")
+
+	original := append([]byte(nil), forwardJSON...)
+	forwardJSON[0] = '['
+	again, err := forward.CanonicalJSON()
+	require.NoError(t, err)
+	assert.Equal(t, original, again, "returned bytes must be owned")
+}
+
+func TestSnapshotCanonicalJSONRetainsHashAndOwnsBytes(t *testing.T) {
+	snapshot := snapshotFor(t, orderedManifest(false))
+	canonical, err := snapshot.CanonicalJSON()
+	require.NoError(t, err)
+	assert.Contains(t, string(canonical), `"snapshot_hash":"`+snapshot.SnapshotHash+`"`)
+	assert.Contains(t, string(canonical), `"a":1e2`)
+
+	var decoded Snapshot
+	require.NoError(t, json.Unmarshal(canonical, &decoded))
+	assert.Equal(t, snapshot.SnapshotHash, decoded.SnapshotHash)
+	require.NoError(t, decoded.Validate())
+
+	original := append([]byte(nil), canonical...)
+	canonical[0] = '['
+	again, err := snapshot.CanonicalJSON()
+	require.NoError(t, err)
+	assert.Equal(t, original, again, "returned bytes must be owned")
+}
+
 func TestManifestRejectsInvalidUTF8ResultSchemaBeforeHashing(t *testing.T) {
 	for _, raw := range invalidUTF8Schemas() {
 		manifest := validManifest(map[string]TemplateRef{"system.j2": {Hash: strings.Repeat("a", 64), MediaType: "text/plain", Bytes: 4}})

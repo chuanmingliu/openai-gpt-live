@@ -26,7 +26,7 @@ CREATE TABLE profile_drafts (
     tenant_id TEXT NOT NULL,
     profile_id TEXT NOT NULL,
     generation BIGINT NOT NULL,
-    manifest JSONB NOT NULL,
+    manifest JSON NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
     updated_by TEXT NOT NULL,
     CONSTRAINT profile_drafts_pkey PRIMARY KEY (tenant_id, profile_id),
@@ -38,9 +38,9 @@ CREATE TABLE profile_drafts (
     ),
     CONSTRAINT profile_drafts_generation_check CHECK (generation > 0),
     CONSTRAINT profile_drafts_manifest_check CHECK (
-        jsonb_typeof(manifest) = 'object'
+        json_typeof(manifest) = 'object'
         AND octet_length(manifest::text) BETWEEN 2 AND 4194304
-        AND canonical_json_depth_valid(manifest::json)
+        AND canonical_json_depth_valid(manifest)
     ),
     CONSTRAINT profile_drafts_updated_by_check CHECK (
         octet_length(updated_by) BETWEEN 1 AND 256
@@ -56,8 +56,8 @@ CREATE TABLE profile_versions (
     draft_generation BIGINT NOT NULL,
     engine_version TEXT NOT NULL,
     snapshot_hash TEXT NOT NULL,
-    manifest JSONB NOT NULL,
-    snapshot JSONB NOT NULL,
+    manifest JSON NOT NULL,
+    snapshot JSON NOT NULL,
     active BOOLEAN NOT NULL DEFAULT false,
     revoked_at TIMESTAMPTZ,
     revoked_by TEXT,
@@ -67,6 +67,8 @@ CREATE TABLE profile_versions (
     activated_by TEXT,
     CONSTRAINT profile_versions_pkey PRIMARY KEY (tenant_id, profile_id, version),
     CONSTRAINT profile_versions_draft_generation_uniq UNIQUE (tenant_id, profile_id, draft_generation),
+    CONSTRAINT profile_versions_draft_fkey FOREIGN KEY (tenant_id, profile_id)
+        REFERENCES profile_drafts (tenant_id, profile_id) ON DELETE RESTRICT,
     CONSTRAINT profile_versions_identity_check CHECK (
         octet_length(tenant_id) BETWEEN 1 AND 256
         AND tenant_id !~ '[[:cntrl:]]'
@@ -80,12 +82,25 @@ CREATE TABLE profile_versions (
         AND snapshot_hash ~ '^[0-9a-f]{64}$'
     ),
     CONSTRAINT profile_versions_documents_check CHECK (
-        jsonb_typeof(manifest) = 'object'
+        json_typeof(manifest) = 'object'
         AND octet_length(manifest::text) BETWEEN 2 AND 4194304
-        AND canonical_json_depth_valid(manifest::json)
-        AND jsonb_typeof(snapshot) = 'object'
+        AND canonical_json_depth_valid(manifest)
+        AND json_typeof(snapshot) = 'object'
         AND octet_length(snapshot::text) BETWEEN 2 AND 4194304
-        AND canonical_json_depth_valid(snapshot::json)
+        AND canonical_json_depth_valid(snapshot)
+    ),
+    CONSTRAINT profile_versions_snapshot_coherence_check CHECK (
+        json_typeof(snapshot->'tenant_id') = 'string'
+        AND json_typeof(snapshot->'ref') = 'object'
+        AND json_typeof(snapshot->'ref'->'id') = 'string'
+        AND json_typeof(snapshot->'ref'->'version') = 'number'
+        AND json_typeof(snapshot->'engine_version') = 'string'
+        AND json_typeof(snapshot->'snapshot_hash') = 'string'
+        AND (snapshot->>'tenant_id') IS NOT DISTINCT FROM tenant_id
+        AND (snapshot->'ref'->>'id') IS NOT DISTINCT FROM profile_id
+        AND (snapshot->'ref'->>'version') IS NOT DISTINCT FROM version::text
+        AND (snapshot->>'engine_version') IS NOT DISTINCT FROM engine_version
+        AND (snapshot->>'snapshot_hash') IS NOT DISTINCT FROM snapshot_hash
     ),
     CONSTRAINT profile_versions_publication_check CHECK (
         octet_length(published_by) BETWEEN 1 AND 256
@@ -109,6 +124,9 @@ CREATE TABLE profile_versions (
             AND octet_length(revoked_by) BETWEEN 1 AND 256
             AND revoked_by !~ '[[:cntrl:]]'
         )
+    ),
+    CONSTRAINT profile_versions_chronology_check CHECK (
+        revoked_at IS NULL OR activated_at IS NULL OR revoked_at >= activated_at
     ),
     CONSTRAINT profile_versions_state_check CHECK (
         (NOT active OR (activated_at IS NOT NULL AND revoked_at IS NULL))

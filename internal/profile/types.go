@@ -43,6 +43,7 @@ var (
 	ErrPublicationConflict = errors.New("publication_conflict")
 	ErrProfileIncompatible = errors.New("profile_incompatible")
 	ErrProfileRevoked      = errors.New("profile_revoked")
+	ErrStoreUnavailable    = errors.New("profile_store_unavailable")
 )
 
 // ID is a stable profile identity, scoped by the calling tenant.
@@ -261,6 +262,23 @@ func (manifest Manifest) Hash() (string, error) {
 	return hashCanonical(profileHashVersion, canonical), nil
 }
 
+// CanonicalJSON returns owned, deterministic persistence bytes for the exact
+// validated manifest. Result-schema number lexemes remain hash-significant.
+func (manifest Manifest) CanonicalJSON() ([]byte, error) {
+	if err := manifest.Validate(); err != nil {
+		return nil, err
+	}
+	canonical, ok := canonicalManifest(manifest)
+	if !ok {
+		return nil, ErrInvalidProfile
+	}
+	encoded, err := json.Marshal(canonical)
+	if err != nil {
+		return nil, ErrInvalidProfile
+	}
+	return append([]byte(nil), encoded...), nil
+}
+
 // ValidateSnapshot verifies that a snapshot pins this exact manifest's prompt
 // bundle, optional prompt refs, and component records.
 func (manifest Manifest) ValidateSnapshot(snapshot Snapshot) error {
@@ -337,6 +355,24 @@ func (snapshot Snapshot) Hash() (string, error) {
 		return "", ErrInvalidProfile
 	}
 	return hashCanonical(snapshotHashVersion, canonical), nil
+}
+
+// CanonicalJSON returns owned, deterministic persistence bytes for the exact
+// validated snapshot. Unlike hash computation, persistence retains SnapshotHash.
+func (snapshot Snapshot) CanonicalJSON() ([]byte, error) {
+	if err := snapshot.Validate(); err != nil {
+		return nil, err
+	}
+	canonical, ok := canonicalSnapshot(snapshot)
+	if !ok {
+		return nil, ErrInvalidProfile
+	}
+	canonical.SnapshotHash = snapshot.SnapshotHash
+	encoded, err := json.Marshal(canonical)
+	if err != nil {
+		return nil, ErrInvalidProfile
+	}
+	return append([]byte(nil), encoded...), nil
 }
 
 func (snapshot Snapshot) Validate() error {

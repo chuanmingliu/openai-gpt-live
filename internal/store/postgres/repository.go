@@ -14,6 +14,7 @@ import (
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
+	"github.com/chuanmingliu/openai-gpt-live/internal/profile"
 	"github.com/chuanmingliu/openai-gpt-live/internal/worker"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -26,6 +27,9 @@ import (
 func IsTransientDurabilityError(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
+	}
+	if errors.Is(err, profile.ErrStoreUnavailable) {
+		return true
 	}
 	if pgconn.SafeToRetry(err) {
 		return true

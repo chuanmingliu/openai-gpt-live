@@ -14,6 +14,7 @@ import (
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/profile"
 	"github.com/chuanmingliu/openai-gpt-live/internal/prompttmpl"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -23,6 +24,7 @@ const profileTemplateMediaType = "text/plain; charset=utf-8"
 func TestProfileDraftSaveUsesExactGenerationAndOwnedCopies(t *testing.T) {
 	repo, _, _ := repositoryHarness(t)
 	draft := profileDraft("tenant-a", "insurance-sales", profileManifest(t))
+	require.NoError(t, repo.PutBlob(t.Context(), "tenant-a", mustProfileBlob(t, []byte("system"))))
 
 	first, err := repo.SaveDraft(t.Context(), draft, 0)
 	require.NoError(t, err)
@@ -96,6 +98,152 @@ func TestProfileDraftSaveUsesExactGenerationAndOwnedCopies(t *testing.T) {
 	_, ok, err = repo.LoadDraft(t.Context(), "tenant-b", "insurance-sales")
 	require.NoError(t, err)
 	assert.False(t, ok)
+}
+
+func TestProfileSaveDraftPreservesCanonicalNumberLexemesOnInsertAndUpdate(t *testing.T) {
+	repo, pool, _ := repositoryHarness(t)
+	manifest, workerBlob := richProfileManifest(t)
+	manifest.Recipes[0].ResultSchema = []byte(`{"limit":1e100000,"type":"number"}`)
+	require.NoError(t, repo.PutBlob(t.Context(), "tenant-a", mustProfileBlob(t, []byte("system"))))
+	require.NoError(t, repo.PutBlob(t.Context(), "tenant-a", workerBlob))
+	wantJSON, err := manifest.CanonicalJSON()
+	require.NoError(t, err)
+	wantHash, err := manifest.Hash()
+	require.NoError(t, err)
+
+	inserted, err := repo.SaveDraft(t.Context(), profileDraft("tenant-a", "numeric-profile", manifest), 0)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), inserted.Generation)
+	insertedHash, err := inserted.Manifest.Hash()
+	require.NoError(t, err)
+	assert.Equal(t, wantHash, insertedHash)
+	var storedJSON string
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT manifest::text FROM profile_drafts
+		WHERE tenant_id='tenant-a' AND profile_id='numeric-profile'`).Scan(&storedJSON))
+	assert.Equal(t, string(wantJSON), storedJSON)
+	assert.Contains(t, storedJSON, `"limit":1e100000`)
+
+	updated := inserted.Clone()
+	updated.Manifest.Recipes[0].ResultSchema = []byte(`{"type":"number","limit":1e100000}`)
+	updated.UpdatedAt = profileTestTime().Add(time.Minute)
+	wantUpdatedJSON, err := updated.Manifest.CanonicalJSON()
+	require.NoError(t, err)
+	assert.Equal(t, wantJSON, wantUpdatedJSON, "raw-object key order must not change canonical identity")
+	updated, err = repo.SaveDraft(t.Context(), updated, inserted.Generation)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), updated.Generation)
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT manifest::text FROM profile_drafts
+		WHERE tenant_id='tenant-a' AND profile_id='numeric-profile'`).Scan(&storedJSON))
+	assert.Equal(t, string(wantJSON), storedJSON)
+}
+
+func TestProfileSaveDraftInsertRollsBackInvalidDatabaseReadback(t *testing.T) {
+	repo, pool, _ := repositoryHarness(t)
+	manifest := profileManifest(t)
+	require.NoError(t, repo.PutBlob(t.Context(), "tenant-a", mustProfileBlob(t, []byte("system"))))
+	installProfileDraftRewriteTrigger(t, pool)
+
+	_, err := repo.SaveDraft(t.Context(), profileDraft("tenant-a", "rewrite-insert", manifest), 0)
+	assert.ErrorIs(t, err, profile.ErrInvalidProfile)
+	assert.Equal(t, int64(0), tableCount(t, pool, "profile_drafts"), "a failed readback must not commit the inserted row")
+}
+
+func TestProfileSaveDraftUpdateRollsBackInvalidDatabaseReadback(t *testing.T) {
+	repo, pool, _ := repositoryHarness(t)
+	draft := seedProfileDraft(t, repo, "tenant-a", "rewrite-update")
+	wantJSON, err := draft.Manifest.CanonicalJSON()
+	require.NoError(t, err)
+	installProfileDraftRewriteTrigger(t, pool)
+
+	draft.Manifest.Description = "must roll back"
+	draft.UpdatedAt = profileTestTime().Add(time.Minute)
+	_, err = repo.SaveDraft(t.Context(), draft, draft.Generation)
+	assert.ErrorIs(t, err, profile.ErrInvalidProfile)
+	var generation int64
+	var storedJSON string
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT generation,manifest::text FROM profile_drafts
+		WHERE tenant_id='tenant-a' AND profile_id='rewrite-update'`).Scan(&generation, &storedJSON))
+	assert.Equal(t, int64(1), generation)
+	assert.Equal(t, string(wantJSON), storedJSON)
+}
+
+func TestProfileSaveDraftRequiresExactTenantBlobReferences(t *testing.T) {
+	repo, pool, _ := repositoryHarness(t)
+	systemBlob := mustProfileBlob(t, []byte("system"))
+
+	tests := []struct {
+		name     string
+		profile  profile.ID
+		manifest func() profile.Manifest
+		setup    func()
+	}{
+		{
+			name: "missing template blob", profile: "missing-template",
+			manifest: func() profile.Manifest { return profileManifest(t) },
+		},
+		{
+			name: "cross tenant template blob", profile: "cross-tenant-template",
+			manifest: func() profile.Manifest { return profileManifest(t) },
+			setup:    func() { require.NoError(t, repo.PutBlob(t.Context(), "tenant-b", systemBlob)) },
+		},
+		{
+			name: "media mismatch", profile: "media-mismatch",
+			manifest: func() profile.Manifest {
+				manifest := profileManifest(t)
+				ref := manifest.Bundle.Templates["system.j2"]
+				ref.MediaType = "application/json"
+				manifest.Bundle.Templates["system.j2"] = ref
+				return manifest
+			},
+			setup: func() { require.NoError(t, repo.PutBlob(t.Context(), "tenant-a", systemBlob)) },
+		},
+		{
+			name: "byte count mismatch", profile: "byte-mismatch",
+			manifest: func() profile.Manifest {
+				manifest := profileManifest(t)
+				ref := manifest.Bundle.Templates["system.j2"]
+				ref.Bytes++
+				manifest.Bundle.Templates["system.j2"] = ref
+				return manifest
+			},
+			setup: func() { require.NoError(t, repo.PutBlob(t.Context(), "tenant-a", systemBlob)) },
+		},
+		{
+			name: "missing fixture blob", profile: "missing-fixture",
+			manifest: func() profile.Manifest {
+				manifest := profileManifest(t)
+				manifest.Bundle.Fixtures["input.json"] = profile.TemplateRef{Hash: strings.Repeat("f", 64), MediaType: "application/json", Bytes: 2}
+				return manifest
+			},
+			setup: func() { require.NoError(t, repo.PutBlob(t.Context(), "tenant-a", systemBlob)) },
+		},
+		{
+			name: "corrupt content under declared hash", profile: "corrupt-template",
+			manifest: func() profile.Manifest {
+				manifest := profileManifest(t)
+				manifest.Bundle.Templates["system.j2"] = profile.TemplateRef{Hash: strings.Repeat("c", 64), MediaType: profileTemplateMediaType, Bytes: 6}
+				return manifest
+			},
+			setup: func() {
+				_, err := pool.Exec(t.Context(), `INSERT INTO profile_blobs
+					(tenant_id,content_hash,media_type,content,content_bytes,created_at)
+					VALUES ('tenant-a',$1,$2,'secret'::bytea,6,$3)`, strings.Repeat("c", 64), profileTemplateMediaType, profileTestTime())
+				require.NoError(t, err)
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.setup != nil {
+				tc.setup()
+			}
+			_, err := repo.SaveDraft(t.Context(), profileDraft("tenant-a", tc.profile, tc.manifest()), 0)
+			assert.ErrorIs(t, err, profile.ErrInvalidProfile)
+			_, ok, loadErr := repo.LoadDraft(t.Context(), "tenant-a", tc.profile)
+			require.NoError(t, loadErr)
+			assert.False(t, ok)
+		})
+	}
 }
 
 func TestProfileTemplateSaveDeleteIsAtomicAndAcceptsZeroBytes(t *testing.T) {
@@ -189,6 +337,23 @@ func TestProfileTemplateSaveDeleteIsAtomicAndAcceptsZeroBytes(t *testing.T) {
 
 func TestProfileBlobCanonicalIntegrityTenantIsolationAndOwnedBytes(t *testing.T) {
 	repo, pool, _ := repositoryHarness(t)
+	zeroCountContent := []byte("nonempty content")
+	zeroCountHash := sha256.Sum256(zeroCountContent)
+	err := repo.PutBlob(t.Context(), "tenant-zero-count", profile.Blob{
+		MediaType: profileTemplateMediaType, Content: zeroCountContent, ContentBytes: 0,
+	})
+	assert.ErrorIs(t, err, profile.ErrInvalidProfile, "zero is an exact count, not an omitted declaration")
+	_, ok, err := repo.LoadBlob(t.Context(), "tenant-zero-count", hex.EncodeToString(zeroCountHash[:]))
+	require.NoError(t, err)
+	assert.False(t, ok)
+	emptyHash := sha256.Sum256(nil)
+	require.NoError(t, repo.PutBlob(t.Context(), "tenant-empty", profile.Blob{
+		MediaType: profileTemplateMediaType, Content: []byte{}, ContentBytes: 0,
+	}))
+	_, ok, err = repo.LoadBlob(t.Context(), "tenant-empty", hex.EncodeToString(emptyHash[:]))
+	require.NoError(t, err)
+	assert.True(t, ok, "genuine empty content remains valid")
+
 	content := []byte("bounded prompt source")
 	canonical, err := (profile.Blob{MediaType: profileTemplateMediaType, Content: content}).Canonical()
 	require.NoError(t, err)
@@ -393,9 +558,9 @@ func TestProfilePublishRollsBackInsertedVersionAndActiveSwap(t *testing.T) {
 }
 
 func TestProfileRevokeIsTenantExactIdempotentAndBlocksActivation(t *testing.T) {
-	repo, _, _ := repositoryHarness(t)
+	repo, _, manual := repositoryHarness(t)
 	draft := seedProfileDraft(t, repo, "tenant-a", "insurance-sales")
-	_, err := repo.Publish(t.Context(), profilePublishRecord(t, draft, 1, true))
+	_, err := repo.Publish(t.Context(), profilePublishRecord(t, draft, 1, false))
 	require.NoError(t, err)
 
 	assert.ErrorIs(t, repo.Activate(t.Context(), "tenant-b", draft.ID, 1, "intruder"), profile.ErrInvalidProfile)
@@ -403,9 +568,18 @@ func TestProfileRevokeIsTenantExactIdempotentAndBlocksActivation(t *testing.T) {
 	stillActive, ok, err := repo.Resolve(t.Context(), "tenant-a", draft.ID, 1)
 	require.NoError(t, err)
 	require.True(t, ok)
+	assert.False(t, stillActive.Active)
+
+	manual.Advance(10 * time.Minute)
+	require.NoError(t, repo.Activate(t.Context(), "tenant-a", draft.ID, 1, "operator-a"))
+	err = repo.Revoke(t.Context(), "tenant-a", draft.ID, 1, "operator-a", profileTestTime().Add(5*time.Minute))
+	assert.ErrorIs(t, err, profile.ErrInvalidProfile, "revocation cannot predate the recorded activation")
+	stillActive, ok, err = repo.Resolve(t.Context(), "tenant-a", draft.ID, 1)
+	require.NoError(t, err)
+	require.True(t, ok)
 	assert.True(t, stillActive.Active)
 
-	requestedRevokedAt := profileTestTime().Add(2*time.Minute + 123*time.Nanosecond)
+	requestedRevokedAt := profileTestTime().Add(12*time.Minute + 123*time.Nanosecond)
 	storedRevokedAt := requestedRevokedAt.Truncate(time.Microsecond)
 	require.NoError(t, repo.Revoke(t.Context(), "tenant-a", draft.ID, 1, "operator-a", requestedRevokedAt))
 	revoked, ok, err := repo.Resolve(t.Context(), "tenant-a", draft.ID, 1)
@@ -539,7 +713,7 @@ func TestProfilePublishedNestedMapsSlicesAndRawJSONAreOwned(t *testing.T) {
 	assert.Equal(t, []string{"read"}, again.Snapshot.Bindings[0].ToolIDs)
 }
 
-func TestProfileResolvePreservesStoredCanonicalRawJSONAndHash(t *testing.T) {
+func TestProfileResolvePreservesTask3CanonicalRawJSONAndHash(t *testing.T) {
 	repo, _, _ := repositoryHarness(t)
 	manifest, workerBlob := richProfileManifest(t)
 	manifest.Recipes[0].ResultSchema = []byte(`{"minimum":1.2300e+2,"type":"number"}`)
@@ -549,7 +723,7 @@ func TestProfileResolvePreservesStoredCanonicalRawJSONAndHash(t *testing.T) {
 	draft, err := repo.SaveDraft(t.Context(), profileDraft("tenant-a", "numeric-profile", manifest), 0)
 	require.NoError(t, err)
 	storedSchema := append([]byte(nil), draft.Manifest.Recipes[0].ResultSchema...)
-	assert.JSONEq(t, `{"minimum":123.00,"type":"number"}`, string(storedSchema))
+	assert.Equal(t, `{"minimum":1.2300e+2,"type":"number"}`, string(storedSchema))
 	record := profilePublishRecord(t, draft, 1, false)
 	_, err = repo.Publish(t.Context(), record)
 	require.NoError(t, err)
@@ -558,6 +732,7 @@ func TestProfileResolvePreservesStoredCanonicalRawJSONAndHash(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, storedSchema, []byte(published.Manifest.Recipes[0].ResultSchema))
+	assert.Equal(t, storedSchema, []byte(published.Snapshot.Recipes[0].ResultSchema))
 	assert.Equal(t, record.Snapshot.SnapshotHash, published.Snapshot.SnapshotHash)
 }
 
@@ -579,13 +754,42 @@ func TestProfileErrorsAreStableContentFreeAndValidateBeforeSQL(t *testing.T) {
 	draft := seedProfileDraft(t, repo, "tenant-a", "corrupt-profile")
 	_, err = repo.Publish(t.Context(), profilePublishRecord(t, draft, 1, false))
 	require.NoError(t, err)
-	_, err = pool.Exec(t.Context(), `UPDATE profile_versions SET manifest='{"description":"private persisted prompt"}'::jsonb
+	_, err = pool.Exec(t.Context(), `UPDATE profile_versions SET manifest='{"description":"private persisted prompt"}'::json
 		WHERE tenant_id='tenant-a' AND profile_id='corrupt-profile' AND version=1`)
 	require.NoError(t, err)
 	_, _, err = repo.Resolve(t.Context(), "tenant-a", "corrupt-profile", 1)
 	assert.ErrorIs(t, err, profile.ErrInvalidProfile)
 	assert.NotContains(t, err.Error(), "private persisted prompt")
 	assert.NotContains(t, err.Error(), "UPDATE")
+}
+
+func TestProfileStoreUnavailableIsPublicContentFreeAndTransient(t *testing.T) {
+	t.Run("failpoint", func(t *testing.T) {
+		repo, _, _ := repositoryHarness(t)
+		draft := seedProfileDraft(t, repo, "tenant-a", "unavailable-failpoint")
+		repo.failpoint = func(step string) error {
+			if step == "profile_template_blob" {
+				return errors.New("postgres://credential SELECT private prompt")
+			}
+			return nil
+		}
+		_, err := repo.SaveTemplate(t.Context(), draft.TenantID, draft.ID, "opening_message.j2", []byte("private prompt"), draft.Generation, "editor")
+		require.ErrorIs(t, err, profile.ErrStoreUnavailable)
+		assert.True(t, IsTransientDurabilityError(err))
+		assert.Equal(t, "profile_store_unavailable", err.Error())
+		assert.NotContains(t, err.Error(), "credential")
+		assert.NotContains(t, err.Error(), "private prompt")
+	})
+
+	t.Run("closed pool", func(t *testing.T) {
+		repo, pool, _ := repositoryHarness(t)
+		pool.Close()
+		_, _, err := repo.LoadDraft(t.Context(), "tenant-a", "closed-pool")
+		require.ErrorIs(t, err, profile.ErrStoreUnavailable)
+		assert.True(t, IsTransientDurabilityError(err))
+		assert.Equal(t, "profile_store_unavailable", err.Error())
+		assert.NotContains(t, err.Error(), "closed pool")
+	})
 }
 
 func seedProfileDraft(t *testing.T, repo *Repository, tenant string, id profile.ID) profile.Draft {
@@ -707,4 +911,21 @@ func cloneProfileBindings(source []profile.AdapterBinding) []profile.AdapterBind
 
 func profileTestTime() time.Time {
 	return repositoryTestNow
+}
+
+func installProfileDraftRewriteTrigger(t *testing.T, pool interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}) {
+	t.Helper()
+	_, err := pool.Exec(t.Context(), `CREATE FUNCTION rewrite_profile_draft_manifest()
+		RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			NEW.manifest = '{"description":"database rewrite"}';
+			RETURN NEW;
+		END;
+		$$;
+		CREATE TRIGGER rewrite_profile_draft_manifest
+		BEFORE INSERT OR UPDATE ON profile_drafts
+		FOR EACH ROW EXECUTE FUNCTION rewrite_profile_draft_manifest()`)
+	require.NoError(t, err)
 }
