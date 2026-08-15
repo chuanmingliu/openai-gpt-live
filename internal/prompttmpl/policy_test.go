@@ -56,6 +56,16 @@ func TestValidateSourceReturnsContentFreeLocation(t *testing.T) {
 	require.NotContains(t, err.Error(), secret)
 }
 
+func TestValidateLogicalNameScansWithoutAllocation(t *testing.T) {
+	name := longValidLogicalName(64)
+	var err error
+	allocations := testing.AllocsPerRun(100, func() {
+		err = validateLogicalName(name)
+	})
+	require.NoError(t, err)
+	require.Zero(t, allocations)
+}
+
 func TestValidateSourceRejectsCallInMacroSignature(t *testing.T) {
 	err := ValidateSource("system.j2", `{% macro greeting(name=helper()) %}hi{% endmacro %}`, []string{"system.j2"})
 	require.ErrorIs(t, err, ErrTemplateInvalid)

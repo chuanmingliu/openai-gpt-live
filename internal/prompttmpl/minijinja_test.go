@@ -125,6 +125,21 @@ func TestMiniJinjaChecksBundleCardinalityAndCancellationBeforePreprocessing(t *t
 	require.ErrorIs(t, err, ErrTemplateInvalid)
 }
 
+func TestMiniJinjaRejectsOversizedSyntacticallyValidLogicalName(t *testing.T) {
+	limits := DefaultLimits()
+	bundle := Bundle{Templates: map[string]string{longValidLogicalName(limits.BundleBytes / 2): "safe"}}
+	_, err := NewMiniJinja().Compile(t.Context(), bundle, limits)
+	require.ErrorIs(t, err, ErrTemplateInvalid)
+}
+
+func TestMiniJinjaObservesCancellationDuringBoundedLogicalNameScan(t *testing.T) {
+	ctx := &cancelAfterChecksContext{cancelAfter: 12}
+	bundle := Bundle{Templates: map[string]string{longValidLogicalName(32 * 1024): "safe"}}
+	_, err := NewMiniJinja().Compile(ctx, bundle, DefaultLimits())
+	require.ErrorIs(t, err, ErrTemplateInvalid)
+	require.GreaterOrEqual(t, ctx.checks, ctx.cancelAfter)
+}
+
 func TestMiniJinjaStrictStaticBundle(t *testing.T) {
 	compiled := compile(t, Bundle{Templates: map[string]string{
 		"system.j2":          `{% include "fragments/rules.j2" %} {{ customer.name }}`,

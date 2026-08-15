@@ -1,6 +1,7 @@
 package prompttmpl
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sort"
@@ -87,20 +88,42 @@ func sortedTemplateNames(templates map[string]string) []string {
 }
 
 func validateLogicalName(name string) error {
+	return validateLogicalNameContext(nil, name)
+}
+
+func validateLogicalNameContext(ctx context.Context, name string) error {
 	if len(name) < len("a.j2") || !strings.HasSuffix(name, ".j2") || !isLowerAlphaNum(name[0]) {
 		return invalidAt(1, 1)
 	}
+	segmentStart := 0
 	for i := 0; i < len(name); i++ {
+		if i&255 == 0 && ctx != nil && ctx.Err() != nil {
+			return invalidAt(1, 1)
+		}
 		if !isLogicalNameByte(name[i]) {
 			return invalidAt(1, 1)
 		}
-	}
-	for _, segment := range strings.Split(name, "/") {
-		if segment == "" || segment == "." || segment == ".." {
-			return invalidAt(1, 1)
+		if name[i] == '/' {
+			if !validLogicalNameSegment(name, segmentStart, i) {
+				return invalidAt(1, 1)
+			}
+			segmentStart = i + 1
 		}
 	}
+	if (ctx != nil && ctx.Err() != nil) || !validLogicalNameSegment(name, segmentStart, len(name)) {
+		return invalidAt(1, 1)
+	}
 	return nil
+}
+
+func validLogicalNameSegment(name string, start, end int) bool {
+	if start == end {
+		return false
+	}
+	if end-start > 2 || name[start] != '.' {
+		return true
+	}
+	return end-start == 2 && name[start+1] != '.'
 }
 
 func isLowerAlphaNum(b byte) bool { return b >= 'a' && b <= 'z' || b >= '0' && b <= '9' }

@@ -132,6 +132,29 @@ func TestCacheCountsSchemaMetadataACLsAndCancellationBeforePreprocessing(t *test
 	require.Equal(t, 1, engine.Calls(), "cancelled compile must not reach clone, fingerprint, or engine")
 }
 
+func TestCacheRejectsOversizedSyntacticallyValidLogicalNameBeforeEngine(t *testing.T) {
+	engine := &countingEngine{}
+	cache, err := NewCache(engine, 2, 1<<20)
+	require.NoError(t, err)
+	limits := DefaultLimits()
+	bundle := Bundle{Templates: map[string]string{longValidLogicalName(limits.BundleBytes / 2): "safe"}}
+	_, err = cache.Compile(t.Context(), bundle, limits)
+	require.ErrorIs(t, err, ErrTemplateInvalid)
+	require.Zero(t, engine.Calls())
+}
+
+func TestCacheObservesCancellationDuringBoundedLogicalNameScan(t *testing.T) {
+	engine := &countingEngine{}
+	cache, err := NewCache(engine, 2, 1<<20)
+	require.NoError(t, err)
+	ctx := &cancelAfterChecksContext{cancelAfter: 12}
+	bundle := Bundle{Templates: map[string]string{longValidLogicalName(32 * 1024): "safe"}}
+	_, err = cache.Compile(ctx, bundle, DefaultLimits())
+	require.ErrorIs(t, err, ErrTemplateInvalid)
+	require.GreaterOrEqual(t, ctx.checks, ctx.cancelAfter)
+	require.Zero(t, engine.Calls())
+}
+
 func TestCacheEvictsLeastRecentlyUsedEntry(t *testing.T) {
 	engine := &countingEngine{}
 	cache, err := NewCache(engine, 2, 4096)

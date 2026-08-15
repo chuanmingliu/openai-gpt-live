@@ -2,6 +2,7 @@ package prompttmpl
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -9,6 +10,25 @@ import (
 
 	"github.com/stretchr/testify/require"
 )
+
+type cancelAfterChecksContext struct {
+	checks, cancelAfter int
+}
+
+func (ctx *cancelAfterChecksContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (ctx *cancelAfterChecksContext) Done() <-chan struct{}       { return nil }
+func (ctx *cancelAfterChecksContext) Value(any) any               { return nil }
+func (ctx *cancelAfterChecksContext) Err() error {
+	ctx.checks++
+	if ctx.checks >= ctx.cancelAfter {
+		return context.Canceled
+	}
+	return nil
+}
+
+func longValidLogicalName(segments int) string {
+	return strings.Repeat("a/", segments) + "a.j2"
+}
 
 func TestLimitsValidateAppliesExactDefaults(t *testing.T) {
 	got, err := (Limits{}).Validate()
@@ -97,4 +117,15 @@ func TestValidateEngineIdentityRequiresCompositeJinjaGoVersion(t *testing.T) {
 	} {
 		require.Error(t, ValidateEngineIdentity(identity), identity)
 	}
+}
+
+func TestBundleEnvelopeChargesOversizedLogicalNameWithoutGrammarAllocation(t *testing.T) {
+	limits := DefaultLimits()
+	bundle := Bundle{Templates: map[string]string{longValidLogicalName(limits.BundleBytes / 2): "safe"}}
+	var err error
+	allocations := testing.AllocsPerRun(10, func() {
+		err = validateBundleEnvelope(context.Background(), bundle, limits)
+	})
+	require.ErrorIs(t, err, ErrTemplateInvalid)
+	require.Zero(t, allocations, "oversized logical names must be rejected before segment processing")
 }

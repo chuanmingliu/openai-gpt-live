@@ -179,7 +179,7 @@ func validateBundleEnvelope(ctx context.Context, bundle Bundle, limits Limits) e
 		return ErrTemplateInvalid
 	}
 	for name, source := range bundle.Templates {
-		if budget.item() != nil || validateLogicalName(name) != nil || len(source) > limits.TemplateBytes || budget.string(name) != nil || budget.string(source) != nil {
+		if budget.item() != nil || budget.string(name) != nil || validateLogicalNameContext(ctx, name) != nil || len(source) > limits.TemplateBytes || budget.string(source) != nil {
 			return ErrTemplateInvalid
 		}
 	}
