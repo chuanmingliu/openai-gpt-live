@@ -3,6 +3,7 @@ package prompttmpl
 import (
 	"bytes"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -72,4 +73,26 @@ func TestCompileAndRenderErrorsKeepUnknownCauseContentPrivate(t *testing.T) {
 	require.Equal(t, "render system.j2: render_failed", renderErr.Error())
 	require.False(t, errors.Is(compileErr, secret))
 	require.False(t, errors.Is(renderErr, secret))
+}
+
+func TestValidateEngineIdentityRequiresCompositeJinjaGoVersion(t *testing.T) {
+	for _, identity := range []string{
+		"jinja-go-v1/test",
+		"jinja-go-v1/minijinja-go/v2.24.0",
+	} {
+		require.NoError(t, ValidateEngineIdentity(identity), identity)
+	}
+
+	for _, identity := range []string{
+		"",
+		"minijinja-go/v2.24.0",
+		"jinja-go-v1/",
+		"jinja-go-v1//v2.24.0",
+		"jinja-go-v1/../v2.24.0",
+		"jinja-go-v1/implementation with spaces",
+		"jinja-go-v1/implementation\nsecret",
+		"jinja-go-v1/" + strings.Repeat("a", 256),
+	} {
+		require.Error(t, ValidateEngineIdentity(identity), identity)
+	}
 }

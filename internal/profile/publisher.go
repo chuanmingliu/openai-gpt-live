@@ -135,19 +135,26 @@ func (publisher *Publisher) Publish(ctx context.Context, command PublishCommand)
 	if err := contextBoundaryError(ctx); err != nil {
 		return Published{}, err
 	}
+	publishedAt := publisher.now()
+	if err := contextBoundaryError(ctx); err != nil {
+		return Published{}, err
+	}
 	record := PublishRecord{
 		TenantID: command.TenantID, ProfileID: command.ProfileID,
 		ExpectedGeneration: command.ExpectedGeneration, DraftGeneration: prepared.generation,
 		Manifest: prepared.manifest.Clone(), Snapshot: prepared.snapshot.Clone(),
 		EngineVersion: prepared.snapshot.EngineVersion, Actor: command.Actor,
-		Activate: command.Activate, PublishedAt: publisher.now(),
+		Activate: command.Activate, PublishedAt: publishedAt,
 	}
 	if record.Validate() != nil || !validPublisherAuditTime(record.PublishedAt) {
 		return Published{}, ErrInvalidProfile
 	}
-	published, err := publisher.Store.Publish(ctx, record)
-	if err != nil {
-		return Published{}, normalizeStoreBoundaryError(ctx, err)
+	published, storeErr := publisher.Store.Publish(ctx, record)
+	if err := contextBoundaryError(ctx); err != nil {
+		return Published{}, err
+	}
+	if storeErr != nil {
+		return Published{}, normalizeStoreBoundaryError(ctx, storeErr)
 	}
 	return published, nil
 }
@@ -157,8 +164,12 @@ func (publisher *Publisher) Activate(ctx context.Context, tenantID string, ref V
 	if err := validatePublisherMutation(publisher, ctx, tenantID, ref, actor); err != nil {
 		return err
 	}
-	if err := publisher.Store.Activate(ctx, tenantID, ref.ID, ref.Version, actor); err != nil {
-		return normalizeStoreBoundaryError(ctx, err)
+	storeErr := publisher.Store.Activate(ctx, tenantID, ref.ID, ref.Version, actor)
+	if err := contextBoundaryError(ctx); err != nil {
+		return err
+	}
+	if storeErr != nil {
+		return normalizeStoreBoundaryError(ctx, storeErr)
 	}
 	return nil
 }
@@ -169,11 +180,18 @@ func (publisher *Publisher) Revoke(ctx context.Context, tenantID string, ref Ver
 		return err
 	}
 	revokedAt := publisher.now()
+	if err := contextBoundaryError(ctx); err != nil {
+		return err
+	}
 	if !validPublisherAuditTime(revokedAt) {
 		return ErrInvalidProfile
 	}
-	if err := publisher.Store.Revoke(ctx, tenantID, ref.ID, ref.Version, actor, revokedAt); err != nil {
-		return normalizeStoreBoundaryError(ctx, err)
+	storeErr := publisher.Store.Revoke(ctx, tenantID, ref.ID, ref.Version, actor, revokedAt)
+	if err := contextBoundaryError(ctx); err != nil {
+		return err
+	}
+	if storeErr != nil {
+		return normalizeStoreBoundaryError(ctx, storeErr)
 	}
 	return nil
 }
@@ -185,7 +203,7 @@ func validatePublisherMutation(publisher *Publisher, ctx context.Context, tenant
 	if publisher == nil || isNilProfileDependency(publisher.Store) {
 		return ErrProfileIncompatible
 	}
-	if !validIdentifier(tenantID) || ref.Validate() != nil || ref.ID == builtinProfileID || !validIdentifier(actor) {
+	if !validIdentifier(tenantID) || ref.Validate() != nil || ref.Version > uint64(math.MaxInt64) || ref.ID == builtinProfileID || !validIdentifier(actor) {
 		return ErrInvalidProfile
 	}
 	return nil
@@ -210,12 +228,21 @@ func (publisher *Publisher) prepare(ctx context.Context, command PublishCommand)
 	}
 
 	engineVersion := publisher.Engine.Version()
+	if err := contextBoundaryError(ctx); err != nil {
+		return preparedPublication{}, err
+	}
 	catalogVersion := publisher.Catalog.Version()
-	if !validShortText(engineVersion) || !validShortText(catalogVersion) {
+	if err := contextBoundaryError(ctx); err != nil {
+		return preparedPublication{}, err
+	}
+	if prompttmpl.ValidateEngineIdentity(engineVersion) != nil || !validShortText(catalogVersion) {
 		return preparedPublication{}, ErrProfileIncompatible
 	}
 
 	draft, ok, err := publisher.Store.LoadDraft(ctx, command.TenantID, command.ProfileID)
+	if contextErr := contextBoundaryError(ctx); contextErr != nil {
+		return preparedPublication{}, contextErr
+	}
 	if err != nil {
 		return preparedPublication{}, normalizeStoreBoundaryError(ctx, err)
 	}
@@ -232,14 +259,24 @@ func (publisher *Publisher) prepare(ctx context.Context, command PublishCommand)
 	}
 
 	compiled, err := publisher.Engine.Compile(ctx, cloneRenderBundle(bundle), prompttmpl.DefaultLimits())
+	if contextErr := contextBoundaryError(ctx); contextErr != nil {
+		return preparedPublication{}, contextErr
+	}
 	if err != nil {
-		return preparedPublication{}, normalizeCompileBoundaryError(ctx, err)
+		return preparedPublication{}, normalizeCompileBoundaryError(ctx, err, bundle.Templates)
 	}
 	if isNilProfileDependency(compiled) {
 		return preparedPublication{}, ErrProfileIncompatible
 	}
 	engineVersionAfter := publisher.Engine.Version()
-	if !validShortText(engineVersionAfter) || engineVersionAfter != engineVersion || compiled.EngineVersion() != engineVersion {
+	if err := contextBoundaryError(ctx); err != nil {
+		return preparedPublication{}, err
+	}
+	compiledVersion := compiled.EngineVersion()
+	if err := contextBoundaryError(ctx); err != nil {
+		return preparedPublication{}, err
+	}
+	if prompttmpl.ValidateEngineIdentity(engineVersionAfter) != nil || engineVersionAfter != engineVersion || compiledVersion != engineVersion {
 		return preparedPublication{}, ErrProfileIncompatible
 	}
 
@@ -249,11 +286,12 @@ func (publisher *Publisher) prepare(ctx context.Context, command PublishCommand)
 	}
 
 	bindings := cloneBindings(manifest.Bindings)
-	if err := publisher.Catalog.ValidateBindings(ctx, command.TenantID, bindings); err != nil {
-		return preparedPublication{}, normalizeIncompatibleBoundaryError(ctx, err)
-	}
+	catalogErr := publisher.Catalog.ValidateBindings(ctx, command.TenantID, bindings)
 	if err := contextBoundaryError(ctx); err != nil {
 		return preparedPublication{}, err
+	}
+	if catalogErr != nil {
+		return preparedPublication{}, normalizeIncompatibleBoundaryError(ctx, catalogErr)
 	}
 	if _, hasTurn := manifest.Bundle.Templates["turn_instruction.j2"]; hasTurn {
 		capability, ok := publisher.Catalog.(PerResponseInstructionCatalog)
@@ -261,6 +299,9 @@ func (publisher *Publisher) prepare(ctx context.Context, command PublishCommand)
 			return preparedPublication{}, ErrProfileIncompatible
 		}
 		allowed, capabilityErr := capability.SupportsPerResponseInstructions(ctx, command.TenantID)
+		if err := contextBoundaryError(ctx); err != nil {
+			return preparedPublication{}, err
+		}
 		if capabilityErr != nil {
 			return preparedPublication{}, normalizeIncompatibleBoundaryError(ctx, capabilityErr)
 		}
@@ -269,20 +310,29 @@ func (publisher *Publisher) prepare(ctx context.Context, command PublishCommand)
 		}
 	}
 	catalogVersionAfter := publisher.Catalog.Version()
+	if err := contextBoundaryError(ctx); err != nil {
+		return preparedPublication{}, err
+	}
 	if !validShortText(catalogVersionAfter) || catalogVersionAfter != catalogVersion {
 		return preparedPublication{}, ErrProfileIncompatible
 	}
 
 	knowledge := append([]KnowledgeRef(nil), manifest.Knowledge...)
 	if isNilProfileDependency(publisher.Knowledge) {
+		if err := contextBoundaryError(ctx); err != nil {
+			return preparedPublication{}, err
+		}
 		if len(knowledge) != 0 {
 			return preparedPublication{}, ErrProfileIncompatible
 		}
-	} else if err := publisher.Knowledge.ValidateReferences(ctx, command.TenantID, knowledge); err != nil {
-		return preparedPublication{}, normalizeIncompatibleBoundaryError(ctx, err)
-	}
-	if err := contextBoundaryError(ctx); err != nil {
-		return preparedPublication{}, err
+	} else {
+		knowledgeErr := publisher.Knowledge.ValidateReferences(ctx, command.TenantID, knowledge)
+		if err := contextBoundaryError(ctx); err != nil {
+			return preparedPublication{}, err
+		}
+		if knowledgeErr != nil {
+			return preparedPublication{}, normalizeIncompatibleBoundaryError(ctx, knowledgeErr)
+		}
 	}
 
 	if _, err := manifest.Hash(); err != nil {
@@ -293,11 +343,11 @@ func (publisher *Publisher) prepare(ctx context.Context, command PublishCommand)
 		return preparedPublication{}, ErrInvalidProfile
 	}
 	version, err := publisher.Store.NextVersion(ctx, command.TenantID, command.ProfileID)
+	if contextErr := contextBoundaryError(ctx); contextErr != nil {
+		return preparedPublication{}, contextErr
+	}
 	if err != nil {
 		return preparedPublication{}, normalizeStoreBoundaryError(ctx, err)
-	}
-	if err := contextBoundaryError(ctx); err != nil {
-		return preparedPublication{}, err
 	}
 	if version == 0 || version > uint64(math.MaxInt64) {
 		return preparedPublication{}, ErrPublicationConflict
@@ -367,21 +417,21 @@ func loadManifestBundle(ctx context.Context, store Store, tenantID string, manif
 		fixtures[name] = append([]byte(nil), content...)
 	}
 	if err := prompttmpl.ValidateBundleSources(templates); err != nil {
-		return prompttmpl.Bundle{}, nil, prompttmpl.ErrTemplateInvalid
+		return prompttmpl.Bundle{}, nil, err
 	}
 	return prompttmpl.Bundle{Templates: templates, Schema: clonePromptSchema(manifest.Bundle.Schema)}, fixtures, nil
 }
 
 func loadExactProfileBlob(ctx context.Context, store Store, tenantID string, ref TemplateRef) ([]byte, error) {
 	blob, ok, err := store.LoadBlob(ctx, tenantID, ref.Hash)
+	if contextErr := contextBoundaryError(ctx); contextErr != nil {
+		return nil, contextErr
+	}
 	if err != nil {
 		return nil, normalizeStoreBoundaryError(ctx, err)
 	}
 	if !ok {
 		return nil, ErrInvalidProfile
-	}
-	if err := contextBoundaryError(ctx); err != nil {
-		return nil, err
 	}
 	canonical, err := blob.Canonical()
 	if err != nil || blob.Hash != ref.Hash || blob.MediaType != ref.MediaType || blob.ContentBytes != ref.Bytes || canonical.Hash != ref.Hash || canonical.MediaType != ref.MediaType || canonical.ContentBytes != ref.Bytes {
@@ -414,6 +464,9 @@ type syntheticFixture struct {
 }
 
 func validateAndRenderFixtures(ctx context.Context, manifest Manifest, bundle prompttmpl.Bundle, sources map[string][]byte, compiled prompttmpl.CompiledBundle) (map[string]string, error) {
+	if err := contextBoundaryError(ctx); err != nil {
+		return nil, err
+	}
 	if len(sources) == 0 {
 		return nil, prompttmpl.ErrTemplateInvalid
 	}
@@ -424,6 +477,9 @@ func validateAndRenderFixtures(ctx context.Context, manifest Manifest, bundle pr
 	}
 	sort.Strings(names)
 	for _, name := range names {
+		if err := contextBoundaryError(ctx); err != nil {
+			return nil, err
+		}
 		fixture, err := decodeSyntheticFixture(sources[name])
 		if err != nil {
 			return nil, err
@@ -436,6 +492,9 @@ func validateAndRenderFixtures(ctx context.Context, manifest Manifest, bundle pr
 			return nil, prompttmpl.ErrContextInvalid
 		}
 		output, err := compiled.Render(ctx, fixture.template, ownedContext)
+		if contextErr := contextBoundaryError(ctx); contextErr != nil {
+			return nil, contextErr
+		}
 		if err != nil {
 			return nil, normalizeRenderBoundaryError(ctx, err)
 		}
@@ -449,6 +508,9 @@ func validateAndRenderFixtures(ctx context.Context, manifest Manifest, bundle pr
 			return nil, prompttmpl.ErrTemplateInvalid
 		}
 		outputs[name] = output
+		if err := contextBoundaryError(ctx); err != nil {
+			return nil, err
+		}
 	}
 	return outputs, nil
 }
@@ -487,7 +549,7 @@ func decodeSyntheticFixture(raw []byte) (syntheticFixture, error) {
 }
 
 func decodeStrictFixtureValue(decoder *json.Decoder, depth int, count *int) (any, error) {
-	if depth > maxFixtureJSONDepth || count == nil || *count >= prompttmpl.MaxCollectionItems {
+	if depth > maxFixtureJSONDepth || count == nil || *count > prompttmpl.MaxCollectionItems {
 		return nil, prompttmpl.ErrTemplateInvalid
 	}
 	token, err := decoder.Token()
@@ -614,7 +676,7 @@ func normalizeStoreBoundaryError(ctx context.Context, err error) error {
 	return ErrStoreUnavailable
 }
 
-func normalizeCompileBoundaryError(ctx context.Context, err error) error {
+func normalizeCompileBoundaryError(ctx context.Context, err error, templates map[string]string) error {
 	if contextErr := contextBoundaryError(ctx); contextErr != nil {
 		return contextErr
 	}
@@ -626,6 +688,12 @@ func normalizeCompileBoundaryError(ctx context.Context, err error) error {
 	}
 	if errors.Is(err, prompttmpl.ErrRenderLimit) {
 		return prompttmpl.ErrRenderLimit
+	}
+	var compileErr *prompttmpl.CompileError
+	if errors.As(err, &compileErr) && compileErr != nil {
+		if _, ok := templates[compileErr.Template]; ok && ValidateTemplateName(compileErr.Template) == nil {
+			return &prompttmpl.CompileError{Template: compileErr.Template, Err: prompttmpl.ErrTemplateInvalid}
+		}
 	}
 	return prompttmpl.ErrTemplateInvalid
 }

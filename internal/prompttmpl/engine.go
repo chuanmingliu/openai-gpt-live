@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 )
 
@@ -29,13 +30,39 @@ const (
 	MaxRecursionDepth  = DefaultRecursionDepth
 	MaxFuel            = DefaultFuel
 	MaxRenderTimeout   = DefaultRenderTimeout
+
+	EngineIdentityPrefix   = "jinja-go-v1/"
+	MaxEngineIdentityBytes = 255
 )
 
 var (
 	ErrTemplateInvalid = errors.New("template_invalid")
 	ErrLimitsInvalid   = errors.New("template_limits_invalid")
 	ErrRenderLimit     = errors.New("render_limit")
+	ErrEngineIdentity  = errors.New("engine_identity_invalid")
 )
+
+// ValidateEngineIdentity requires the published Jinja-Go language/policy
+// contract and one bounded implementation/version suffix.
+func ValidateEngineIdentity(identity string) error {
+	if len(identity) <= len(EngineIdentityPrefix) || len(identity) > MaxEngineIdentityBytes || !strings.HasPrefix(identity, EngineIdentityPrefix) {
+		return ErrEngineIdentity
+	}
+	implementation := strings.TrimPrefix(identity, EngineIdentityPrefix)
+	segments := strings.Split(implementation, "/")
+	for _, segment := range segments {
+		if segment == "" || segment == "." || segment == ".." {
+			return ErrEngineIdentity
+		}
+		for index := 0; index < len(segment); index++ {
+			value := segment[index]
+			if !(value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9' || value == '-' || value == '_' || value == '.') {
+				return ErrEngineIdentity
+			}
+		}
+	}
+	return nil
+}
 
 // Limits bounds every resource supplied to or consumed by an Engine.
 type Limits struct {
@@ -221,6 +248,8 @@ func approvedCompileCause(err error) error {
 		return ErrTemplateInvalid
 	case errors.Is(err, ErrLimitsInvalid):
 		return ErrLimitsInvalid
+	case errors.Is(err, ErrEngineIdentity):
+		return ErrEngineIdentity
 	default:
 		return nil
 	}

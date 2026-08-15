@@ -19,7 +19,7 @@ type countingEngine struct {
 	compiled int
 }
 
-func (e *countingEngine) Version() string { return "counting-v1" }
+func (e *countingEngine) Version() string { return "jinja-go-v1/counting/v1" }
 
 func (e *countingEngine) Compile(ctx context.Context, bundle Bundle, _ Limits) (CompiledBundle, error) {
 	e.mu.Lock()
@@ -48,7 +48,7 @@ type fakeCompiled struct{ hash string }
 
 func (f fakeCompiled) Render(context.Context, string, Context) (string, error) { return f.hash, nil }
 func (f fakeCompiled) Hash() string                                            { return f.hash }
-func (f fakeCompiled) EngineVersion() string                                   { return "fake-v1" }
+func (f fakeCompiled) EngineVersion() string                                   { return "jinja-go-v1/counting/v1" }
 func (f fakeCompiled) ResidentBytes() int                                      { return 64 }
 
 func cacheBundle(name, source string) Bundle {
@@ -131,7 +131,7 @@ func TestCacheDoesNotCacheCompileFailures(t *testing.T) {
 
 type failingEngine struct{ calls int }
 
-func (e *failingEngine) Version() string { return "failing-v1" }
+func (e *failingEngine) Version() string { return "jinja-go-v1/failing/v1" }
 
 func (e *failingEngine) Compile(context.Context, Bundle, Limits) (CompiledBundle, error) {
 	e.calls++
@@ -163,7 +163,7 @@ func (e *versionedEngine) Compile(_ context.Context, bundle Bundle, _ Limits) (C
 }
 
 func TestCacheSeparatesSchemaEncodingAndEngineVersion(t *testing.T) {
-	engine := &versionedEngine{version: "engine-v1", resident: 64}
+	engine := &versionedEngine{version: "jinja-go-v1/engine-v1", resident: 64}
 	cache, err := NewCache(engine, 8, 4096)
 	require.NoError(t, err)
 	first := cacheBundle("system.j2", "safe")
@@ -175,14 +175,14 @@ func TestCacheSeparatesSchemaEncodingAndEngineVersion(t *testing.T) {
 	_, err = cache.Compile(t.Context(), second, DefaultLimits())
 	require.NoError(t, err)
 	assert.Equal(t, 2, engine.calls)
-	engine.version = "engine-v2"
+	engine.version = "jinja-go-v1/engine-v2"
 	_, err = cache.Compile(t.Context(), second, DefaultLimits())
 	require.NoError(t, err)
 	assert.Equal(t, 3, engine.calls)
 }
 
 func TestCacheDoesNotAdmitOversizeCompiledBundle(t *testing.T) {
-	engine := &versionedEngine{version: "engine-v1", resident: 1 << 20}
+	engine := &versionedEngine{version: "jinja-go-v1/engine-v1", resident: 1 << 20}
 	cache, err := NewCache(engine, 8, 1024)
 	require.NoError(t, err)
 	bundle := cacheBundle("system.j2", "safe")
@@ -194,7 +194,7 @@ func TestCacheDoesNotAdmitOversizeCompiledBundle(t *testing.T) {
 }
 
 func TestCacheEvictsWhenCompiledResidentBytesExceedBudget(t *testing.T) {
-	engine := &versionedEngine{version: "engine-v1", resident: 1024}
+	engine := &versionedEngine{version: "jinja-go-v1/engine-v1", resident: 1024}
 	cache, err := NewCache(engine, 8, 1800)
 	require.NoError(t, err)
 	_, err = cache.Compile(t.Context(), cacheBundle("a.j2", "safe"), DefaultLimits())
@@ -207,7 +207,7 @@ func TestCacheEvictsWhenCompiledResidentBytesExceedBudget(t *testing.T) {
 }
 
 func TestCacheClonesBundleBeforeAdmission(t *testing.T) {
-	engine := &versionedEngine{version: "engine-v1", resident: 64}
+	engine := &versionedEngine{version: "jinja-go-v1/engine-v1", resident: 64}
 	cache, err := NewCache(engine, 8, 4096)
 	require.NoError(t, err)
 	bundle := cacheBundle("system.j2", "safe")
@@ -237,12 +237,12 @@ func (f bundleDerivedCompiled) Render(_ context.Context, name string, _ Context)
 	return f.bundle.Templates[name] + "|" + strings.Join(field.Templates, ","), nil
 }
 func (f bundleDerivedCompiled) Hash() string          { return bundleFingerprint(f.bundle, f.limits) }
-func (f bundleDerivedCompiled) EngineVersion() string { return "bundle-derived-v1" }
+func (f bundleDerivedCompiled) EngineVersion() string { return "jinja-go-v1/bundle-derived/v1" }
 func (f bundleDerivedCompiled) ResidentBytes() int    { return 64 }
 
 type bundleDerivedEngine struct{ calls int }
 
-func (e *bundleDerivedEngine) Version() string { return "bundle-derived-v1" }
+func (e *bundleDerivedEngine) Version() string { return "jinja-go-v1/bundle-derived/v1" }
 func (e *bundleDerivedEngine) Compile(_ context.Context, bundle Bundle, limits Limits) (CompiledBundle, error) {
 	e.calls++
 	return bundleDerivedCompiled{bundle: bundle, limits: limits}, nil
@@ -287,14 +287,44 @@ func TestNewCacheRejectsInvalidLimits(t *testing.T) {
 }
 
 func TestCacheVersionDelegatesToConfiguredEngine(t *testing.T) {
-	engine := &versionedEngine{version: "engine-v1", resident: 64}
+	engine := &versionedEngine{version: "jinja-go-v1/engine-v1", resident: 64}
 	cache, err := NewCache(engine, 2, 4096)
 	require.NoError(t, err)
-	require.Equal(t, "engine-v1", cache.Version())
+	require.Equal(t, "jinja-go-v1/engine-v1", cache.Version())
 
-	engine.version = "engine-v2"
-	require.Equal(t, "engine-v2", cache.Version(), "the cache must not freeze a stale engine identity")
+	engine.version = "jinja-go-v1/engine-v2"
+	require.Equal(t, "jinja-go-v1/engine-v2", cache.Version(), "the cache must not freeze a stale engine identity")
 
 	var nilCache *Cache
 	require.Empty(t, nilCache.Version())
+}
+
+type nilUnsafeEngine struct{ version string }
+
+func (e *nilUnsafeEngine) Version() string { return e.version }
+func (e *nilUnsafeEngine) Compile(context.Context, Bundle, Limits) (CompiledBundle, error) {
+	return sizedCompiled{hash: "safe", version: e.version, resident: 1}, nil
+}
+
+func TestCacheRejectsNoncompliantAndTypedNilEngines(t *testing.T) {
+	_, err := NewCache(&versionedEngine{version: "implementation-only", resident: 1}, 1, 1024)
+	require.Error(t, err)
+
+	var typedNil *nilUnsafeEngine
+	_, err = NewCache(typedNil, 1, 1024)
+	require.Error(t, err)
+}
+
+func TestCacheVersionAndCompileFailClosedForCorruptState(t *testing.T) {
+	var typedNil *nilUnsafeEngine
+	for _, cache := range []*Cache{
+		{engine: typedNil, maxEntries: 1, maxBytes: 1024},
+		{engine: &versionedEngine{version: "jinja-go-v1/valid/v1", resident: 1}, maxEntries: 1, maxBytes: 1024},
+	} {
+		require.NotPanics(t, func() { require.Empty(t, cache.Version()) })
+		require.NotPanics(t, func() {
+			_, err := cache.Compile(t.Context(), cacheBundle("system.j2", "safe"), DefaultLimits())
+			require.Error(t, err)
+		})
+	}
 }

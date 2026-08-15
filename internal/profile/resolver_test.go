@@ -3,6 +3,7 @@ package profile
 import (
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -102,6 +103,47 @@ func TestResolveCustomRequiresConfiguredStoreAndStableMatchingEngine(t *testing.
 	engine.compiledVersion = "different-engine"
 	_, err = NewResolver(store, engine).Resolve(t.Context(), testTenant, published.Ref, ResolveNewSession)
 	require.ErrorIs(t, err, ErrProfileIncompatible)
+}
+
+func TestResolveRejectsNoncompliantEngineIdentityBeforeStoreAccess(t *testing.T) {
+	store, engine, published := publishedResolverFixture(t)
+	engine.versions = []string{"minijinja-go/v2.24.0"}
+	_, err := NewResolver(store, engine).Resolve(t.Context(), testTenant, published.Ref, ResolveNewSession)
+	require.ErrorIs(t, err, ErrProfileIncompatible)
+	require.Zero(t, store.resolveCalls)
+}
+
+func TestResolveRejectsVersionAboveStoreDomainBeforeStoreAccess(t *testing.T) {
+	store, engine, _ := publishedResolverFixture(t)
+	ref := VersionRef{ID: testProfile, Version: uint64(math.MaxInt64) + 1}
+	_, err := NewResolver(store, engine).Resolve(t.Context(), testTenant, ref, ResolveNewSession)
+	require.ErrorIs(t, err, ErrInvalidProfile)
+	require.Zero(t, store.resolveCalls)
+}
+
+func TestResolveClassifiesRevocationBeforeCurrentEngineCompatibility(t *testing.T) {
+	for _, purpose := range []ResolvePurpose{ResolveNewSession, ResolveReconnect, ResolveAcceptedWork} {
+		t.Run(string(purpose), func(t *testing.T) {
+			store, engine, published := publishedResolverFixture(t)
+			published.Active = false
+			revoked := testPublicationTime.Add(time.Minute)
+			published.RevokedAt = &revoked
+			published.EngineVersion = "jinja-go-v1/retired/v1"
+			published.Snapshot.EngineVersion = published.EngineVersion
+			snapshotHash, err := published.Snapshot.Hash()
+			require.NoError(t, err)
+			published.Snapshot.SnapshotHash = snapshotHash
+			require.NoError(t, published.Validate())
+			store.resolved = published
+
+			_, err = NewResolver(store, engine).Resolve(t.Context(), testTenant, published.Ref, purpose)
+			if purpose == ResolveAcceptedWork {
+				require.ErrorIs(t, err, ErrProfileIncompatible)
+				return
+			}
+			require.ErrorIs(t, err, ErrProfileRevoked)
+		})
+	}
 }
 
 func TestResolveRejectsWrongTenantReferenceVersionEngineAndHashes(t *testing.T) {
@@ -254,6 +296,43 @@ func TestResolveStopsWhenEngineCancelsContextButReturnsCompiledBundle(t *testing
 	engine.afterCompile = cancel
 	_, err := NewResolver(store, engine).Resolve(ctx, testTenant, published.Ref, ResolveNewSession)
 	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestResolvePrefersCancellationAfterMissingStoreResult(t *testing.T) {
+	store, engine, published := publishedResolverFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	store.resolveOK = false
+	store.resolveHook = cancel
+	_, err := NewResolver(store, engine).Resolve(ctx, testTenant, published.Ref, ResolveNewSession)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestResolveFencesEngineIdentityReturns(t *testing.T) {
+	t.Run("initial identity", func(t *testing.T) {
+		store, engine, published := publishedResolverFixture(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		engine.versions = []string{"implementation-only"}
+		engine.versionHook = func(call int) {
+			if call == 1 {
+				cancel()
+			}
+		}
+		_, err := NewResolver(store, engine).Resolve(ctx, testTenant, published.Ref, ResolveNewSession)
+		require.ErrorIs(t, err, context.Canceled)
+		require.Zero(t, store.resolveCalls)
+	})
+
+	t.Run("post-compile identity", func(t *testing.T) {
+		store, engine, published := publishedResolverFixture(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		engine.versionHook = func(call int) {
+			if call == 2 {
+				cancel()
+			}
+		}
+		_, err := NewResolver(store, engine).Resolve(ctx, testTenant, published.Ref, ResolveNewSession)
+		require.ErrorIs(t, err, context.Canceled)
+	})
 }
 
 func TestResolveAcceptedWorkStillRejectsCorruptRevokedSnapshot(t *testing.T) {

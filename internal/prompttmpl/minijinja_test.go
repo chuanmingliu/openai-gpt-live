@@ -43,6 +43,21 @@ func hugeValues() []any {
 	return values
 }
 
+func TestMiniJinjaReportsCompositeEngineIdentity(t *testing.T) {
+	engine := NewMiniJinja()
+	require.Equal(t, "jinja-go-v1/minijinja-go/v2.24.0", engine.Version())
+	require.NoError(t, ValidateEngineIdentity(engine.Version()))
+	compiled, err := engine.Compile(t.Context(), Bundle{Templates: map[string]string{"system.j2": "safe"}}, DefaultLimits())
+	require.NoError(t, err)
+	require.Equal(t, engine.Version(), compiled.EngineVersion())
+}
+
+func TestMiniJinjaRendersCheckedInTrailingNewlineExactly(t *testing.T) {
+	got, err := render(t, "safe\n", Context{})
+	require.NoError(t, err)
+	require.Equal(t, "safe\n", got)
+}
+
 func TestMiniJinjaStrictStaticBundle(t *testing.T) {
 	compiled := compile(t, Bundle{Templates: map[string]string{
 		"system.j2":          `{% include "fragments/rules.j2" %} {{ customer.name }}`,

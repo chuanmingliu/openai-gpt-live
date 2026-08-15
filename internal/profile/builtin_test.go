@@ -10,25 +10,28 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const builtinSystemPrompt = "You are a realtime spoken assistant. Reply in the user's language using at most three short sentences unless the user explicitly asks for more detail. Use natural speech without markdown, headings, lists, or narrated reasoning. Keep background work silent and mention it only after a result is available. Only use the server-owned reserved background-task tools: start_background_task, steer_background_task, and cancel_background_task. Never invent task IDs, task results, or capabilities."
+const builtinSystemPrompt = "You are a realtime spoken assistant. Reply in the user's language using at most three short sentences unless the user explicitly asks for more detail. Use natural speech without markdown, headings, lists, or narrated reasoning. Keep background work silent and mention it only after a result is available. Only use the server-owned reserved background-task tools: start_background_task, steer_background_task, and cancel_background_task. Never invent task IDs, task results, or capabilities.\n"
 
 func TestBuiltInProfileRequiresNoStoreAndHasStableLiteralHash(t *testing.T) {
 	first, second := Builtin(), Builtin()
 	require.NoError(t, first.Snapshot.Validate())
 	require.Equal(t, VersionRef{ID: "builtin", Version: 1}, first.Snapshot.Ref)
 	require.Equal(t, "builtin", first.Snapshot.TenantID)
+	require.Equal(t, "jinja-go-v1/minijinja-go/v2.24.0", first.Snapshot.EngineVersion)
 	require.Equal(t, prompttmpl.NewMiniJinja().Version(), first.Snapshot.EngineVersion)
 	require.Equal(t, first.Snapshot.SnapshotHash, second.Snapshot.SnapshotHash)
 
 	// This literal is intentionally updated only when the reviewed built-in
 	// assets or canonical snapshot contract changes.
-	const stableSnapshotHash = "e31054fe0e94fab962253ac0a86d26ecdd05893d72520a9446befa9be7cfc568"
+	const stableSnapshotHash = "70fb32f9d75a9eb5708d9e6d3783243b4aaf9ee551dd6e11f5c26539b2c3ec7c"
 	require.Equal(t, stableSnapshotHash, first.Snapshot.SnapshotHash)
 }
 
 func TestBuiltInProfileRendersExactStaticAssetWithEmptyTypedContext(t *testing.T) {
 	builtin := Builtin()
+	require.Equal(t, builtinSystemPrompt, builtinSystemSource)
 	require.Equal(t, map[string]string{"system.j2": builtinSystemPrompt}, builtin.Bundle.Templates)
+	require.Equal(t, "86141d8177594727d8043b7842762654496d41e0846470c71577f0ea7bb376f4", builtin.Snapshot.System.Hash)
 	require.Empty(t, builtin.Bundle.Schema.Fields)
 	compiled, err := prompttmpl.NewMiniJinja().Compile(t.Context(), builtin.Bundle, prompttmpl.DefaultLimits())
 	require.NoError(t, err)

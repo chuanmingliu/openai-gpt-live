@@ -24,13 +24,19 @@ const (
 var testPublicationTime = time.Date(2026, time.August, 15, 9, 30, 0, 123456000, time.UTC)
 
 type publisherStoreFake struct {
-	draft       Draft
-	draftOK     bool
-	blobs       map[string]Blob
-	nextVersion uint64
-	nextHook    func()
-	resolved    Published
-	resolveOK   bool
+	draft         Draft
+	draftOK       bool
+	blobs         map[string]Blob
+	nextVersion   uint64
+	loadDraftHook func()
+	loadBlobHook  func()
+	nextHook      func()
+	publishHook   func()
+	resolved      Published
+	resolveOK     bool
+	resolveHook   func()
+	activateHook  func()
+	revokeHook    func()
 
 	loadDraftErr   error
 	loadBlobErr    error
@@ -44,6 +50,7 @@ type publisherStoreFake struct {
 	loadBlobCalls  int
 	nextCalls      int
 	publishCalls   int
+	resolveCalls   int
 	activateCalls  int
 	revokeCalls    int
 	published      PublishRecord
@@ -62,6 +69,9 @@ func (s *publisherStoreFake) PutBlob(context.Context, string, Blob) error { retu
 
 func (s *publisherStoreFake) LoadBlob(_ context.Context, tenantID, hash string) (Blob, bool, error) {
 	s.loadBlobCalls++
+	if s.loadBlobHook != nil {
+		s.loadBlobHook()
+	}
 	if s.loadBlobErr != nil {
 		return Blob{}, false, s.loadBlobErr
 	}
@@ -74,6 +84,9 @@ func (s *publisherStoreFake) LoadBlob(_ context.Context, tenantID, hash string) 
 
 func (s *publisherStoreFake) LoadDraft(_ context.Context, tenantID string, id ID) (Draft, bool, error) {
 	s.loadDraftCalls++
+	if s.loadDraftHook != nil {
+		s.loadDraftHook()
+	}
 	if s.loadDraftErr != nil {
 		return Draft{}, false, s.loadDraftErr
 	}
@@ -109,6 +122,9 @@ func (s *publisherStoreFake) NextVersion(context.Context, string, ID) (uint64, e
 func (s *publisherStoreFake) Publish(_ context.Context, record PublishRecord) (Published, error) {
 	s.publishCalls++
 	s.published = record
+	if s.publishHook != nil {
+		s.publishHook()
+	}
 	if s.publishErr != nil {
 		return Published{}, s.publishErr
 	}
@@ -120,6 +136,10 @@ func (s *publisherStoreFake) Publish(_ context.Context, record PublishRecord) (P
 }
 
 func (s *publisherStoreFake) Resolve(_ context.Context, tenantID string, id ID, version uint64) (Published, bool, error) {
+	s.resolveCalls++
+	if s.resolveHook != nil {
+		s.resolveHook()
+	}
 	if s.resolveErr != nil {
 		return Published{}, false, s.resolveErr
 	}
@@ -136,12 +156,18 @@ func (s *publisherStoreFake) ListPublished(context.Context, string, int, string)
 func (s *publisherStoreFake) Activate(_ context.Context, tenant string, id ID, version uint64, actor string) error {
 	s.activateCalls++
 	s.activated.tenant, s.activated.ref, s.activated.actor = tenant, VersionRef{ID: id, Version: version}, actor
+	if s.activateHook != nil {
+		s.activateHook()
+	}
 	return s.activateErr
 }
 
 func (s *publisherStoreFake) Revoke(_ context.Context, tenant string, id ID, version uint64, actor string, at time.Time) error {
 	s.revokeCalls++
 	s.revoked.tenant, s.revoked.ref, s.revoked.actor, s.revoked.at = tenant, VersionRef{ID: id, Version: version}, actor, at
+	if s.revokeHook != nil {
+		s.revokeHook()
+	}
 	return s.revokeErr
 }
 
@@ -160,6 +186,8 @@ type publisherEngine struct {
 	renderErr         error
 	renderReplacement *string
 	afterCompile      func()
+	afterRender       func()
+	versionHook       func(int)
 	seen              prompttmpl.Bundle
 }
 
@@ -167,6 +195,9 @@ func (e *publisherEngine) Version() string {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.versionCalls++
+	if e.versionHook != nil {
+		e.versionHook(e.versionCalls)
+	}
 	if len(e.versions) > 0 {
 		index := e.versionCalls - 1
 		if index >= len(e.versions) {
@@ -193,7 +224,7 @@ func (e *publisherEngine) Compile(ctx context.Context, bundle prompttmpl.Bundle,
 	if e.afterCompile != nil {
 		e.afterCompile()
 	}
-	return publisherCompiled{CompiledBundle: compiled, version: e.compiledVersion, renderErr: e.renderErr, replacement: e.renderReplacement}, nil
+	return publisherCompiled{CompiledBundle: compiled, version: e.compiledVersion, renderErr: e.renderErr, replacement: e.renderReplacement, afterRender: e.afterRender}, nil
 }
 
 func (e *publisherEngine) calls() int {
@@ -207,11 +238,12 @@ type publisherCompiled struct {
 	version     string
 	renderErr   error
 	replacement *string
+	afterRender func()
 }
 
 type permissivePublisherEngine struct{}
 
-func (permissivePublisherEngine) Version() string { return "permissive-v1" }
+func (permissivePublisherEngine) Version() string { return "jinja-go-v1/permissive/v1" }
 
 func (permissivePublisherEngine) Compile(context.Context, prompttmpl.Bundle, prompttmpl.Limits) (prompttmpl.CompiledBundle, error) {
 	return permissivePublisherCompiled{}, nil
@@ -223,7 +255,7 @@ func (permissivePublisherCompiled) Render(context.Context, string, prompttmpl.Co
 	return "Hello 李明", nil
 }
 func (permissivePublisherCompiled) Hash() string          { return "permissive-hash" }
-func (permissivePublisherCompiled) EngineVersion() string { return "permissive-v1" }
+func (permissivePublisherCompiled) EngineVersion() string { return "jinja-go-v1/permissive/v1" }
 func (permissivePublisherCompiled) ResidentBytes() int    { return 1 }
 
 func (c publisherCompiled) EngineVersion() string {
@@ -234,13 +266,19 @@ func (c publisherCompiled) EngineVersion() string {
 }
 
 func (c publisherCompiled) Render(ctx context.Context, name string, values prompttmpl.Context) (string, error) {
+	var output string
+	var err error
 	if c.renderErr != nil {
-		return "", c.renderErr
+		err = c.renderErr
+	} else if c.replacement != nil {
+		output = *c.replacement
+	} else {
+		output, err = c.CompiledBundle.Render(ctx, name, values)
 	}
-	if c.replacement != nil {
-		return *c.replacement, nil
+	if c.afterRender != nil {
+		c.afterRender()
 	}
-	return c.CompiledBundle.Render(ctx, name, values)
+	return output, err
 }
 
 type publisherCatalog struct {
@@ -248,6 +286,8 @@ type publisherCatalog struct {
 	versions      []string
 	versionCalls  int
 	validateCalls int
+	validateHook  func()
+	versionHook   func(int)
 	err           error
 	mutate        bool
 	seen          []AdapterBinding
@@ -255,6 +295,9 @@ type publisherCatalog struct {
 
 func (c *publisherCatalog) Version() string {
 	c.versionCalls++
+	if c.versionHook != nil {
+		c.versionHook(c.versionCalls)
+	}
 	if len(c.versions) == 0 {
 		return c.version
 	}
@@ -267,6 +310,9 @@ func (c *publisherCatalog) Version() string {
 
 func (c *publisherCatalog) ValidateBindings(_ context.Context, _ string, bindings []AdapterBinding) error {
 	c.validateCalls++
+	if c.validateHook != nil {
+		c.validateHook()
+	}
 	c.seen = cloneBindings(bindings)
 	if c.mutate && len(bindings) > 0 {
 		bindings[0].AdapterID = "mutated"
@@ -282,10 +328,14 @@ type publisherCapableCatalog struct {
 	allowed bool
 	err     error
 	calls   int
+	hook    func()
 }
 
 func (c *publisherCapableCatalog) SupportsPerResponseInstructions(context.Context, string) (bool, error) {
 	c.calls++
+	if c.hook != nil {
+		c.hook()
+	}
 	return c.allowed, c.err
 }
 
@@ -294,10 +344,14 @@ type publisherKnowledge struct {
 	err    error
 	mutate bool
 	seen   []KnowledgeRef
+	hook   func()
 }
 
 func (v *publisherKnowledge) ValidateReferences(_ context.Context, _ string, refs []KnowledgeRef) error {
 	v.calls++
+	if v.hook != nil {
+		v.hook()
+	}
 	v.seen = append([]KnowledgeRef(nil), refs...)
 	if v.mutate && len(refs) > 0 {
 		refs[0].ID = "mutated"
@@ -305,9 +359,17 @@ func (v *publisherKnowledge) ValidateReferences(_ context.Context, _ string, ref
 	return v.err
 }
 
-type publisherClock struct{ now time.Time }
+type publisherClock struct {
+	now  time.Time
+	hook func()
+}
 
-func (c publisherClock) Now() time.Time { return c.now }
+func (c publisherClock) Now() time.Time {
+	if c.hook != nil {
+		c.hook()
+	}
+	return c.now
+}
 
 type publisherHarness struct {
 	store     *publisherStoreFake
@@ -406,10 +468,54 @@ func TestPublishCompilesEveryTemplateAndValidatesEveryFixtureBeforeStoreMutation
 func TestPublishValidatesSourcePolicyIndependentlyOfSuppliedEngine(t *testing.T) {
 	h := newPublisherHarness(t)
 	h.setTemplate(t, "system.j2", "{{ forbidden_call() }}", "text/plain; charset=utf-8")
-	publisher := NewPublisher(h.store, permissivePublisherEngine{}, h.catalog, h.knowledge, WithPublisherClock(publisherClock{testPublicationTime}))
+	publisher := NewPublisher(h.store, permissivePublisherEngine{}, h.catalog, h.knowledge, WithPublisherClock(publisherClock{now: testPublicationTime}))
 	_, err := publisher.Publish(t.Context(), publishCommand())
 	require.ErrorIs(t, err, prompttmpl.ErrTemplateInvalid)
 	require.Zero(t, h.store.mutationCalls())
+}
+
+func TestValidateAndPreviewPreserveTrustedSourcePolicyLocationWithoutSource(t *testing.T) {
+	for _, operation := range []struct {
+		name string
+		run  func(*Publisher) error
+	}{
+		{"validate", func(publisher *Publisher) error { return publisher.Validate(t.Context(), publishCommand()) }},
+		{"preview", func(publisher *Publisher) error {
+			_, err := publisher.Preview(t.Context(), publishCommand())
+			return err
+		}},
+	} {
+		t.Run(operation.name, func(t *testing.T) {
+			h := newPublisherHarness(t)
+			h.setTemplate(t, "system.j2", "safe first line\n{{ private_source_token() }}", "text/plain; charset=utf-8")
+			err := operation.run(h.publisher)
+			require.ErrorIs(t, err, prompttmpl.ErrTemplateInvalid)
+			require.Equal(t, "template_invalid: system.j2:2:1", err.Error())
+			require.NotContains(t, err.Error(), "private_source_token")
+			require.Zero(t, h.store.mutationCalls())
+		})
+	}
+}
+
+func TestPublishPreservesOnlyReviewedCompileErrorTemplateMetadata(t *testing.T) {
+	t.Run("known template", func(t *testing.T) {
+		h := newPublisherHarness(t)
+		h.engine.compileErr = &prompttmpl.CompileError{Template: "system.j2", Err: errors.New("private compiler source")}
+		_, err := h.publisher.Publish(t.Context(), publishCommand())
+		require.ErrorIs(t, err, prompttmpl.ErrTemplateInvalid)
+		require.Equal(t, "compile system.j2: template_invalid", err.Error())
+		require.NotContains(t, err.Error(), "private compiler source")
+	})
+
+	t.Run("untrusted template metadata", func(t *testing.T) {
+		h := newPublisherHarness(t)
+		h.engine.compileErr = &prompttmpl.CompileError{Template: "credential-private.j2", Err: errors.New("private compiler source")}
+		_, err := h.publisher.Publish(t.Context(), publishCommand())
+		require.ErrorIs(t, err, prompttmpl.ErrTemplateInvalid)
+		require.Equal(t, prompttmpl.ErrTemplateInvalid.Error(), err.Error())
+		require.NotContains(t, err.Error(), "credential-private")
+		require.NotContains(t, err.Error(), "private compiler source")
+	})
 }
 
 func TestPreviewAndValidateSharePipelineWithoutMutationAndOwnOutputs(t *testing.T) {
@@ -465,7 +571,7 @@ func TestPublishRejectsAdvisoryVersionOutsideStoreDomainBeforeMutation(t *testin
 
 func TestPublishRejectsOutOfRangeAuditClockBeforeMutation(t *testing.T) {
 	h := newPublisherHarness(t)
-	publisher := NewPublisher(h.store, h.engine, h.catalog, h.knowledge, WithPublisherClock(publisherClock{time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC)}))
+	publisher := NewPublisher(h.store, h.engine, h.catalog, h.knowledge, WithPublisherClock(publisherClock{now: time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC)}))
 	_, err := publisher.Publish(t.Context(), publishCommand())
 	require.ErrorIs(t, err, ErrInvalidProfile)
 	require.Zero(t, h.store.publishCalls)
@@ -542,6 +648,30 @@ func TestPublishRejectsStrictFixtureGrammarContextAndExpectedOutput(t *testing.T
 	}
 }
 
+func TestDecodeSyntheticFixtureAdmitsExactAggregateItemLimit(t *testing.T) {
+	fixture := func(arrayItems int) []byte {
+		t.Helper()
+		items := make([]any, arrayItems)
+		for index := range items {
+			items[index] = nil
+		}
+		raw, err := json.Marshal(map[string]any{
+			"template": "system.j2",
+			"context":  map[string]any{"items": items},
+			"expected": "",
+		})
+		require.NoError(t, err)
+		return raw
+	}
+
+	// Root fields (3), the context member (1), and 1,020 array values are
+	// exactly the shared 1,024-item aggregate limit.
+	_, err := decodeSyntheticFixture(fixture(prompttmpl.MaxCollectionItems - 4))
+	require.NoError(t, err)
+	_, err = decodeSyntheticFixture(fixture(prompttmpl.MaxCollectionItems - 3))
+	require.ErrorIs(t, err, prompttmpl.ErrTemplateInvalid)
+}
+
 func TestPublishValidatesFixtureTemplateACLAndBounds(t *testing.T) {
 	t.Run("template ACL", func(t *testing.T) {
 		h := newPublisherHarness(t)
@@ -575,7 +705,7 @@ func TestPublishMapsRenderLimitWithoutContentLeakage(t *testing.T) {
 func TestPublishFailsClosedForCatalogVersionBindingsAndPerTurnCapability(t *testing.T) {
 	t.Run("missing catalog", func(t *testing.T) {
 		h := newPublisherHarness(t)
-		publisher := NewPublisher(h.store, h.engine, nil, h.knowledge, WithPublisherClock(publisherClock{testPublicationTime}))
+		publisher := NewPublisher(h.store, h.engine, nil, h.knowledge, WithPublisherClock(publisherClock{now: testPublicationTime}))
 		_, err := publisher.Publish(t.Context(), publishCommand())
 		require.ErrorIs(t, err, ErrProfileIncompatible)
 		require.Zero(t, h.store.loadDraftCalls)
@@ -630,7 +760,7 @@ func TestPublishFailsClosedForCatalogVersionBindingsAndPerTurnCapability(t *test
 			t.Run(tc.name, func(t *testing.T) {
 				h := newPublisherHarness(t)
 				h.setTemplate(t, "turn_instruction.j2", "Answer {{ customer }}", "text/plain; charset=utf-8")
-				publisher := NewPublisher(h.store, h.engine, tc.catalog, h.knowledge, WithPublisherClock(publisherClock{testPublicationTime}))
+				publisher := NewPublisher(h.store, h.engine, tc.catalog, h.knowledge, WithPublisherClock(publisherClock{now: testPublicationTime}))
 				_, err := publisher.Publish(t.Context(), publishCommand())
 				if tc.wantErr {
 					require.ErrorIs(t, err, ErrProfileIncompatible)
@@ -658,12 +788,20 @@ func TestPublishRequiresStableEngineVersionAcrossCompilation(t *testing.T) {
 	require.Zero(t, h.store.mutationCalls())
 }
 
+func TestPublishRejectsNoncompliantEngineIdentityBeforeStoreAccess(t *testing.T) {
+	h := newPublisherHarness(t)
+	h.engine.versions = []string{"minijinja-go/v2.24.0"}
+	_, err := h.publisher.Publish(t.Context(), publishCommand())
+	require.ErrorIs(t, err, ErrProfileIncompatible)
+	require.Zero(t, h.store.loadDraftCalls)
+}
+
 func TestPublishKnowledgeValidationDefaultsFailClosedAndOwnsReferences(t *testing.T) {
 	knowledge := KnowledgeRef{ID: "policy", Version: 1, Hash: strings.Repeat("a", 64)}
 
 	t.Run("nil accepts empty", func(t *testing.T) {
 		h := newPublisherHarness(t)
-		publisher := NewPublisher(h.store, h.engine, h.catalog, nil, WithPublisherClock(publisherClock{testPublicationTime}))
+		publisher := NewPublisher(h.store, h.engine, h.catalog, nil, WithPublisherClock(publisherClock{now: testPublicationTime}))
 		_, err := publisher.Publish(t.Context(), publishCommand())
 		require.NoError(t, err)
 	})
@@ -671,7 +809,7 @@ func TestPublishKnowledgeValidationDefaultsFailClosedAndOwnsReferences(t *testin
 	t.Run("nil rejects nonempty", func(t *testing.T) {
 		h := newPublisherHarness(t)
 		h.store.draft.Manifest.Knowledge = []KnowledgeRef{knowledge}
-		publisher := NewPublisher(h.store, h.engine, h.catalog, nil, WithPublisherClock(publisherClock{testPublicationTime}))
+		publisher := NewPublisher(h.store, h.engine, h.catalog, nil, WithPublisherClock(publisherClock{now: testPublicationTime}))
 		_, err := publisher.Publish(t.Context(), publishCommand())
 		require.ErrorIs(t, err, ErrProfileIncompatible)
 		require.Zero(t, h.store.mutationCalls())
@@ -727,6 +865,15 @@ func TestPublisherActivateAndRevokeDelegateExactIdentityActorAndClock(t *testing
 	err := h.publisher.Revoke(t.Context(), testTenant, ref, testActor)
 	require.ErrorIs(t, err, ErrStoreUnavailable)
 	require.NotContains(t, err.Error(), "raw database")
+}
+
+func TestPublisherActivateAndRevokeRejectVersionAboveStoreDomainBeforeStoreAccess(t *testing.T) {
+	h := newPublisherHarness(t)
+	ref := VersionRef{ID: testProfile, Version: uint64(math.MaxInt64) + 1}
+	require.ErrorIs(t, h.publisher.Activate(t.Context(), testTenant, ref, testActor), ErrInvalidProfile)
+	require.ErrorIs(t, h.publisher.Revoke(t.Context(), testTenant, ref, testActor), ErrInvalidProfile)
+	require.Zero(t, h.store.activateCalls)
+	require.Zero(t, h.store.revokeCalls)
 }
 
 func TestPublisherRejectsInvalidNilTypedNilCancelledAndReservedInputsBeforeStoreWork(t *testing.T) {
@@ -808,6 +955,183 @@ func TestPublishStopsWhenDependencyCancelsContextButReturnsSuccess(t *testing.T)
 	_, err := h.publisher.Publish(ctx, publishCommand())
 	require.ErrorIs(t, err, context.Canceled)
 	require.Zero(t, h.store.publishCalls)
+}
+
+func TestPublisherPrefersCancellationAfterMissingOrDeniedDependencyResults(t *testing.T) {
+	t.Run("missing draft", func(t *testing.T) {
+		h := newPublisherHarness(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		h.store.draftOK = false
+		h.store.loadDraftHook = cancel
+		_, err := h.publisher.Publish(ctx, publishCommand())
+		require.ErrorIs(t, err, context.Canceled)
+		require.Zero(t, h.engine.calls())
+	})
+
+	t.Run("missing blob", func(t *testing.T) {
+		h := newPublisherHarness(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		delete(h.store.blobs, h.store.draft.Manifest.Bundle.Templates["system.j2"].Hash)
+		h.store.loadBlobHook = cancel
+		_, err := h.publisher.Publish(ctx, publishCommand())
+		require.ErrorIs(t, err, context.Canceled)
+		require.Zero(t, h.engine.calls())
+	})
+
+	t.Run("denied per-response capability", func(t *testing.T) {
+		h := newPublisherHarness(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		h.setTemplate(t, "turn_instruction.j2", "Answer {{ customer }}", "text/plain; charset=utf-8")
+		h.catalog.allowed = false
+		h.catalog.hook = cancel
+		_, err := h.publisher.Publish(ctx, publishCommand())
+		require.ErrorIs(t, err, context.Canceled)
+		require.Zero(t, h.knowledge.calls)
+	})
+}
+
+func TestPublisherFencesSuccessfulDependencyReturnsBeforeClassification(t *testing.T) {
+	t.Run("engine identity", func(t *testing.T) {
+		h := newPublisherHarness(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		h.engine.versions = []string{"implementation-only"}
+		h.engine.versionHook = func(call int) {
+			if call == 1 {
+				cancel()
+			}
+		}
+		_, err := h.publisher.Publish(ctx, publishCommand())
+		require.ErrorIs(t, err, context.Canceled)
+		require.Zero(t, h.store.loadDraftCalls)
+	})
+
+	t.Run("catalog identity", func(t *testing.T) {
+		h := newPublisherHarness(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		h.catalog.publisherCatalog.version = ""
+		h.catalog.publisherCatalog.versionHook = func(call int) {
+			if call == 1 {
+				cancel()
+			}
+		}
+		_, err := h.publisher.Publish(ctx, publishCommand())
+		require.ErrorIs(t, err, context.Canceled)
+		require.Zero(t, h.store.loadDraftCalls)
+	})
+
+	t.Run("compile", func(t *testing.T) {
+		h := newPublisherHarness(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		h.engine.afterCompile = cancel
+		_, err := h.publisher.Publish(ctx, publishCommand())
+		require.ErrorIs(t, err, context.Canceled)
+		require.Zero(t, h.catalog.validateCalls)
+	})
+
+	t.Run("rendered payload", func(t *testing.T) {
+		h := newPublisherHarness(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		replacement := "wrong private output"
+		h.engine.renderReplacement = &replacement
+		h.engine.afterRender = cancel
+		_, err := h.publisher.Publish(ctx, publishCommand())
+		require.ErrorIs(t, err, context.Canceled)
+		require.Zero(t, h.catalog.validateCalls)
+	})
+
+	t.Run("catalog validation", func(t *testing.T) {
+		h := newPublisherHarness(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		h.catalog.publisherCatalog.validateHook = cancel
+		_, err := h.publisher.Publish(ctx, publishCommand())
+		require.ErrorIs(t, err, context.Canceled)
+		require.Zero(t, h.knowledge.calls)
+	})
+
+	t.Run("post-validation catalog identity", func(t *testing.T) {
+		h := newPublisherHarness(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		h.catalog.publisherCatalog.versionHook = func(call int) {
+			if call == 2 {
+				cancel()
+			}
+		}
+		_, err := h.publisher.Publish(ctx, publishCommand())
+		require.ErrorIs(t, err, context.Canceled)
+		require.Zero(t, h.knowledge.calls)
+	})
+
+	t.Run("knowledge validation", func(t *testing.T) {
+		h := newPublisherHarness(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		h.knowledge.hook = cancel
+		_, err := h.publisher.Publish(ctx, publishCommand())
+		require.ErrorIs(t, err, context.Canceled)
+		require.Zero(t, h.store.nextCalls)
+	})
+}
+
+func TestPublisherFencesCancellationAtFixtureLoopBoundary(t *testing.T) {
+	h := newPublisherHarness(t)
+	h.setFixture(t, "second.json", `{"template":"system.j2","context":{"customer":"李明"},"expected":"Hello 李明"}`, "application/json")
+	ctx, cancel := context.WithCancel(context.Background())
+	renderCalls := 0
+	h.engine.afterRender = func() {
+		renderCalls++
+		if renderCalls == 1 {
+			cancel()
+		}
+	}
+	_, err := h.publisher.Publish(ctx, publishCommand())
+	require.ErrorIs(t, err, context.Canceled)
+	require.Equal(t, 1, renderCalls)
+	require.Zero(t, h.catalog.validateCalls)
+}
+
+func TestPublisherFencesClockAndStoreMutationReturns(t *testing.T) {
+	t.Run("publish clock", func(t *testing.T) {
+		h := newPublisherHarness(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		publisher := NewPublisher(h.store, h.engine, h.catalog, h.knowledge, WithPublisherClock(publisherClock{now: time.Time{}, hook: cancel}))
+		_, err := publisher.Publish(ctx, publishCommand())
+		require.ErrorIs(t, err, context.Canceled)
+		require.Zero(t, h.store.publishCalls)
+	})
+
+	t.Run("publish store", func(t *testing.T) {
+		h := newPublisherHarness(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		h.store.publishHook = cancel
+		_, err := h.publisher.Publish(ctx, publishCommand())
+		require.ErrorIs(t, err, context.Canceled)
+		require.Equal(t, 1, h.store.publishCalls)
+	})
+
+	t.Run("activate store", func(t *testing.T) {
+		h := newPublisherHarness(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		h.store.activateHook = cancel
+		err := h.publisher.Activate(ctx, testTenant, VersionRef{ID: testProfile, Version: 1}, testActor)
+		require.ErrorIs(t, err, context.Canceled)
+	})
+
+	t.Run("revoke clock", func(t *testing.T) {
+		h := newPublisherHarness(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		publisher := NewPublisher(h.store, h.engine, h.catalog, h.knowledge, WithPublisherClock(publisherClock{now: time.Time{}, hook: cancel}))
+		err := publisher.Revoke(ctx, testTenant, VersionRef{ID: testProfile, Version: 1}, testActor)
+		require.ErrorIs(t, err, context.Canceled)
+		require.Zero(t, h.store.revokeCalls)
+	})
+
+	t.Run("revoke store", func(t *testing.T) {
+		h := newPublisherHarness(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		h.store.revokeHook = cancel
+		err := h.publisher.Revoke(ctx, testTenant, VersionRef{ID: testProfile, Version: 1}, testActor)
+		require.ErrorIs(t, err, context.Canceled)
+		require.Equal(t, 1, h.store.revokeCalls)
+	})
 }
 
 func cloneTestRenderBundle(bundle prompttmpl.Bundle) prompttmpl.Bundle {

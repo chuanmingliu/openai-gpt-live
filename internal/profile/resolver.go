@@ -2,6 +2,7 @@ package profile
 
 import (
 	"context"
+	"math"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/prompttmpl"
 )
@@ -47,6 +48,9 @@ func (resolver *exactResolver) Resolve(ctx context.Context, tenantID string, ref
 		}
 		return resolver.resolveBuiltin(ctx)
 	}
+	if ref.Version > uint64(math.MaxInt64) {
+		return Resolved{}, ErrInvalidProfile
+	}
 	if isNilProfileDependency(resolver.store) {
 		return Resolved{}, ErrProfileIncompatible
 	}
@@ -56,17 +60,31 @@ func (resolver *exactResolver) Resolve(ctx context.Context, tenantID string, ref
 func (resolver *exactResolver) resolveBuiltin(ctx context.Context) (Resolved, error) {
 	resolved := Builtin()
 	engineVersion := resolver.engine.Version()
-	if !validShortText(engineVersion) || engineVersion != resolved.Snapshot.EngineVersion {
-		return Resolved{}, ErrProfileIncompatible
-	}
-	compiled, err := resolver.engine.Compile(ctx, cloneRenderBundle(resolved.Bundle), prompttmpl.DefaultLimits())
-	if err != nil {
-		return Resolved{}, normalizeCompileBoundaryError(ctx, err)
-	}
 	if err := contextBoundaryError(ctx); err != nil {
 		return Resolved{}, err
 	}
-	if isNilProfileDependency(compiled) || compiled.EngineVersion() != engineVersion || resolver.engine.Version() != engineVersion {
+	if prompttmpl.ValidateEngineIdentity(engineVersion) != nil || engineVersion != resolved.Snapshot.EngineVersion {
+		return Resolved{}, ErrProfileIncompatible
+	}
+	compiled, err := resolver.engine.Compile(ctx, cloneRenderBundle(resolved.Bundle), prompttmpl.DefaultLimits())
+	if contextErr := contextBoundaryError(ctx); contextErr != nil {
+		return Resolved{}, contextErr
+	}
+	if err != nil {
+		return Resolved{}, normalizeCompileBoundaryError(ctx, err, resolved.Bundle.Templates)
+	}
+	if isNilProfileDependency(compiled) {
+		return Resolved{}, ErrProfileIncompatible
+	}
+	compiledVersion := compiled.EngineVersion()
+	if err := contextBoundaryError(ctx); err != nil {
+		return Resolved{}, err
+	}
+	engineVersionAfter := resolver.engine.Version()
+	if err := contextBoundaryError(ctx); err != nil {
+		return Resolved{}, err
+	}
+	if compiledVersion != engineVersion || engineVersionAfter != engineVersion {
 		return Resolved{}, ErrProfileIncompatible
 	}
 	if resolved.Snapshot.Validate() != nil {
@@ -77,25 +95,25 @@ func (resolver *exactResolver) resolveBuiltin(ctx context.Context) (Resolved, er
 
 func (resolver *exactResolver) resolveCustom(ctx context.Context, tenantID string, ref VersionRef, purpose ResolvePurpose) (Resolved, error) {
 	engineVersion := resolver.engine.Version()
-	if !validShortText(engineVersion) {
+	if err := contextBoundaryError(ctx); err != nil {
+		return Resolved{}, err
+	}
+	if prompttmpl.ValidateEngineIdentity(engineVersion) != nil {
 		return Resolved{}, ErrProfileIncompatible
 	}
 	published, ok, err := resolver.store.Resolve(ctx, tenantID, ref.ID, ref.Version)
+	if contextErr := contextBoundaryError(ctx); contextErr != nil {
+		return Resolved{}, contextErr
+	}
 	if err != nil {
 		return Resolved{}, normalizeStoreBoundaryError(ctx, err)
 	}
 	if !ok {
 		return Resolved{}, ErrProfileIncompatible
 	}
-	if err := contextBoundaryError(ctx); err != nil {
-		return Resolved{}, err
-	}
 	published = published.Clone()
 	if published.TenantID != tenantID || published.Ref != ref || published.Snapshot.TenantID != tenantID || published.Snapshot.Ref != ref || published.Validate() != nil || !validPublishedLifecycle(published) {
 		return Resolved{}, ErrInvalidProfile
-	}
-	if published.EngineVersion != engineVersion || published.Snapshot.EngineVersion != engineVersion {
-		return Resolved{}, ErrProfileIncompatible
 	}
 	if purpose != ResolveAcceptedWork {
 		if published.RevokedAt != nil {
@@ -105,6 +123,9 @@ func (resolver *exactResolver) resolveCustom(ctx context.Context, tenantID strin
 			return Resolved{}, ErrProfileIncompatible
 		}
 	}
+	if published.EngineVersion != engineVersion || published.Snapshot.EngineVersion != engineVersion {
+		return Resolved{}, ErrProfileIncompatible
+	}
 	if _, err := published.Manifest.Hash(); err != nil {
 		return Resolved{}, ErrInvalidProfile
 	}
@@ -113,13 +134,24 @@ func (resolver *exactResolver) resolveCustom(ctx context.Context, tenantID strin
 		return Resolved{}, err
 	}
 	compiled, err := resolver.engine.Compile(ctx, cloneRenderBundle(bundle), prompttmpl.DefaultLimits())
-	if err != nil {
-		return Resolved{}, normalizeCompileBoundaryError(ctx, err)
+	if contextErr := contextBoundaryError(ctx); contextErr != nil {
+		return Resolved{}, contextErr
 	}
+	if err != nil {
+		return Resolved{}, normalizeCompileBoundaryError(ctx, err, bundle.Templates)
+	}
+	if isNilProfileDependency(compiled) {
+		return Resolved{}, ErrProfileIncompatible
+	}
+	compiledVersion := compiled.EngineVersion()
 	if err := contextBoundaryError(ctx); err != nil {
 		return Resolved{}, err
 	}
-	if isNilProfileDependency(compiled) || compiled.EngineVersion() != engineVersion || resolver.engine.Version() != engineVersion {
+	engineVersionAfter := resolver.engine.Version()
+	if err := contextBoundaryError(ctx); err != nil {
+		return Resolved{}, err
+	}
+	if compiledVersion != engineVersion || engineVersionAfter != engineVersion {
 		return Resolved{}, ErrProfileIncompatible
 	}
 	if published.Snapshot.Validate() != nil || published.Manifest.ValidateSnapshot(published.Snapshot) != nil {

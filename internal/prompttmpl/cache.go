@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 )
 
@@ -34,7 +35,7 @@ type compileCall struct {
 
 // NewCache creates a cache with independent entry and byte ceilings.
 func NewCache(engine Engine, entries, bytes int) (*Cache, error) {
-	if engine == nil || entries <= 0 || bytes <= 0 {
+	if _, ok := validCacheEngineIdentity(engine); !ok || entries <= 0 || bytes <= 0 {
 		return nil, ErrLimitsInvalid
 	}
 	return &Cache{
@@ -50,24 +51,31 @@ func NewCache(engine Engine, entries, bytes int) (*Cache, error) {
 // Version delegates to the configured engine so callers can detect an engine
 // identity change before and after a cached compilation.
 func (c *Cache) Version() string {
-	if c == nil || c.engine == nil {
+	if !c.validState() {
 		return ""
 	}
-	return c.engine.Version()
+	version, ok := validCacheEngineIdentity(c.engine)
+	if !ok {
+		return ""
+	}
+	return version
 }
 
 // Compile returns a cached immutable compiled bundle or compiles one once for
 // all simultaneous cache misses of the same bundle and limits.
 func (c *Cache) Compile(ctx context.Context, bundle Bundle, requested Limits) (CompiledBundle, error) {
-	if c == nil || c.engine == nil {
+	if !c.validState() {
 		return nil, &CompileError{Err: ErrLimitsInvalid}
+	}
+	engineVersion, ok := validCacheEngineIdentity(c.engine)
+	if !ok {
+		return nil, &CompileError{Err: ErrEngineIdentity}
 	}
 	limits, err := requested.Validate()
 	if err != nil {
 		return nil, &CompileError{Err: ErrLimitsInvalid}
 	}
 	owned := cloneBundle(bundle)
-	engineVersion := c.engine.Version()
 	key := cacheFingerprint(engineVersion, owned, limits)
 
 	c.mu.Lock()
@@ -91,8 +99,16 @@ func (c *Cache) Compile(ctx context.Context, bundle Bundle, requested Limits) (C
 	c.mu.Unlock()
 
 	value, err := c.engine.Compile(nonNilContext(ctx), owned, limits)
-	if err == nil && value == nil {
+	if err == nil && isNilCacheDependency(value) {
 		err = errors.New("engine returned nil compiled bundle")
+	}
+	if err == nil {
+		compiledVersion := value.EngineVersion()
+		currentVersion, currentOK := validCacheEngineIdentity(c.engine)
+		if ValidateEngineIdentity(compiledVersion) != nil || compiledVersion != engineVersion || !currentOK || currentVersion != engineVersion {
+			err = &CompileError{Err: ErrEngineIdentity}
+			value = nil
+		}
 	}
 
 	c.mu.Lock()
@@ -104,6 +120,31 @@ func (c *Cache) Compile(ctx context.Context, bundle Bundle, requested Limits) (C
 	close(call.done)
 	c.mu.Unlock()
 	return value, err
+}
+
+func (c *Cache) validState() bool {
+	return c != nil && c.maxEntries > 0 && c.maxBytes > 0 && c.lru != nil && c.byKey != nil && c.inflight != nil && !isNilCacheDependency(c.engine)
+}
+
+func validCacheEngineIdentity(engine Engine) (string, bool) {
+	if isNilCacheDependency(engine) {
+		return "", false
+	}
+	identity := engine.Version()
+	return identity, ValidateEngineIdentity(identity) == nil
+}
+
+func isNilCacheDependency(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return reflected.IsNil()
+	default:
+		return false
+	}
 }
 
 func (c *Cache) admit(key string, value CompiledBundle, bytes int) {

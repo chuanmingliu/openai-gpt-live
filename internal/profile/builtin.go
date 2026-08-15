@@ -37,7 +37,7 @@ func Builtin() Resolved {
 
 func mustBuildBuiltin() Resolved {
 	schema := decodeBuiltinSchema(builtinSchemaSource)
-	logicalSystem := strings.TrimSuffix(builtinSystemSource, "\n")
+	logicalSystem := builtinSystemSource
 	if logicalSystem == "" || strings.Contains(logicalSystem, "\r") {
 		panic("profile: invalid built-in system asset")
 	}
