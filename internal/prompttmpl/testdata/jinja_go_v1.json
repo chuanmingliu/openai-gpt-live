@@ -36,6 +36,20 @@
     }
   },
   {
+    "name": "dotted_assignment_mutation",
+    "accepted": false,
+    "templates": {
+      "system.j2": "{% set customer.name = \"Li\" %}"
+    }
+  },
+  {
+    "name": "indexed_assignment_mutation",
+    "accepted": false,
+    "templates": {
+      "system.j2": "{% set products[0] = customer %}"
+    }
+  },
+  {
     "name": "dotted_call",
     "accepted": false,
     "templates": {
@@ -47,6 +61,27 @@
     "accepted": false,
     "templates": {
       "system.j2": "{{ helper(customer.name) }}"
+    }
+  },
+  {
+    "name": "parenthesized_call_target",
+    "accepted": false,
+    "templates": {
+      "system.j2": "{{ (helper)(customer.name) }}"
+    }
+  },
+  {
+    "name": "indexed_call_target",
+    "accepted": false,
+    "templates": {
+      "system.j2": "{{ handlers[0](customer.name) }}"
+    }
+  },
+  {
+    "name": "chained_call_target",
+    "accepted": false,
+    "templates": {
+      "system.j2": "{% macro greeting(name) %}{{ name }}{% endmacro %}{{ greeting(customer.name)(customer.name) }}"
     }
   },
   {

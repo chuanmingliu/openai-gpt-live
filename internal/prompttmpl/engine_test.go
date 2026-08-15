@@ -60,3 +60,16 @@ func TestCompileAndRenderErrorsPreserveTheirCause(t *testing.T) {
 	require.NotContains(t, renderErr.Error(), "output")
 	require.True(t, errors.Is(compileErr, ErrTemplateInvalid))
 }
+
+func TestCompileAndRenderErrorsKeepUnknownCauseContentPrivate(t *testing.T) {
+	secret := errors.New("prompt-or-output-secret-93c682")
+	compileErr := &CompileError{Template: "system.j2", Err: secret}
+	renderErr := &RenderError{Template: "system.j2", Err: secret}
+
+	require.NotContains(t, compileErr.Error(), secret.Error())
+	require.NotContains(t, renderErr.Error(), secret.Error())
+	require.Equal(t, "compile system.j2: compile_failed", compileErr.Error())
+	require.Equal(t, "render system.j2: render_failed", renderErr.Error())
+	require.False(t, errors.Is(compileErr, secret))
+	require.False(t, errors.Is(renderErr, secret))
+}

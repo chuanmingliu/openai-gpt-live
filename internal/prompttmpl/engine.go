@@ -164,16 +164,16 @@ func (e *CompileError) Error() string {
 		return "<nil>"
 	}
 	if e.Template == "" {
-		return fmt.Sprintf("compile: %v", e.Err)
+		return "compile: " + compileErrorClass(e.Err)
 	}
-	return fmt.Sprintf("compile %s: %v", e.Template, e.Err)
+	return fmt.Sprintf("compile %s: %s", e.Template, compileErrorClass(e.Err))
 }
 
 func (e *CompileError) Unwrap() error {
 	if e == nil {
 		return nil
 	}
-	return e.Err
+	return approvedCompileCause(e.Err)
 }
 
 // RenderError identifies a render failure without exposing context or output.
@@ -187,16 +187,52 @@ func (e *RenderError) Error() string {
 		return "<nil>"
 	}
 	if e.Template == "" {
-		return fmt.Sprintf("render: %v", e.Err)
+		return "render: " + renderErrorClass(e.Err)
 	}
-	return fmt.Sprintf("render %s: %v", e.Template, e.Err)
+	return fmt.Sprintf("render %s: %s", e.Template, renderErrorClass(e.Err))
 }
 
 func (e *RenderError) Unwrap() error {
 	if e == nil {
 		return nil
 	}
-	return e.Err
+	return approvedRenderCause(e.Err)
+}
+
+func compileErrorClass(err error) string {
+	if cause := approvedCompileCause(err); cause != nil {
+		return cause.Error()
+	}
+	return "compile_failed"
+}
+
+func renderErrorClass(err error) string {
+	if cause := approvedRenderCause(err); cause != nil {
+		return cause.Error()
+	}
+	return "render_failed"
+}
+
+func approvedCompileCause(err error) error {
+	switch {
+	case errors.Is(err, ErrTemplateInvalid):
+		return ErrTemplateInvalid
+	case errors.Is(err, ErrLimitsInvalid):
+		return ErrLimitsInvalid
+	default:
+		return nil
+	}
+}
+
+func approvedRenderCause(err error) error {
+	switch {
+	case errors.Is(err, ErrRenderLimit):
+		return ErrRenderLimit
+	case errors.Is(err, ErrLimitsInvalid):
+		return ErrLimitsInvalid
+	default:
+		return nil
+	}
 }
 
 // CappedWriter writes whole chunks until its byte limit is reached. A chunk

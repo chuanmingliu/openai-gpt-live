@@ -233,11 +233,17 @@ func (p *sourcePolicy) Accept(token sourceToken) error {
 func (p *sourcePolicy) validateStatement(token sourceToken) error {
 	keyword, rest := firstWord(token.body)
 	switch keyword {
-	case "if", "elif", "for", "set":
+	case "if", "elif", "for":
 		if rest == "" {
 			return invalidAt(token.line, token.col)
 		}
 		return p.validateExpressionAt(rest, token.line, token.col)
+	case "set":
+		target, expression, ok := localSetAssignment(rest)
+		if !ok || !isIdentifier(target) || expression == "" {
+			return invalidAt(token.line, token.col)
+		}
+		return p.validateExpressionAt(expression, token.line, token.col)
 	case "else", "endif", "endfor", "endmacro":
 		if strings.TrimSpace(rest) != "" {
 			return invalidAt(token.line, token.col)
@@ -273,6 +279,9 @@ func (p *sourcePolicy) validateExpression(token sourceToken) error {
 }
 
 func (p *sourcePolicy) validateExpressionAt(expression string, line, col int) error {
+	if hasIndirectPostfixCall(expression) {
+		return invalidAt(line, col)
+	}
 	for i := 0; i < len(expression); {
 		if expression[i] == '\'' || expression[i] == '"' {
 			next, ok := skipQuoted(expression, i)
@@ -316,6 +325,41 @@ func (p *sourcePolicy) validateExpressionAt(expression string, line, col int) er
 		}
 	}
 	return nil
+}
+
+func localSetAssignment(rest string) (string, string, bool) {
+	assignment := strings.IndexByte(rest, '=')
+	if assignment < 0 {
+		return "", "", false
+	}
+	target := strings.TrimSpace(rest[:assignment])
+	expression := strings.TrimSpace(rest[assignment+1:])
+	if strings.HasPrefix(expression, "=") {
+		return "", "", false
+	}
+	return target, expression, true
+}
+
+// hasIndirectPostfixCall detects calls whose target is the result of another
+// expression. Only directly named, locally declared macros may be called.
+func hasIndirectPostfixCall(expression string) bool {
+	for i := 0; i < len(expression); i++ {
+		if expression[i] == '\'' || expression[i] == '"' {
+			next, ok := skipQuoted(expression, i)
+			if !ok {
+				return true
+			}
+			i = next - 1
+			continue
+		}
+		if expression[i] != ')' && expression[i] != ']' {
+			continue
+		}
+		if next := skipSpaces(expression, i+1); next < len(expression) && expression[next] == '(' {
+			return true
+		}
+	}
+	return false
 }
 
 func allowedFilter(name string) bool {
@@ -432,26 +476,37 @@ func (e *graphFailure) Error() string { return "invalid include graph" }
 
 func (g *includeGraph) ValidateAcyclic(maxDepth int) error {
 	state := make(map[string]uint8, len(g.edges))
-	var walk func(string, int) error
-	walk = func(name string, depth int) error {
-		if depth > maxDepth || state[name] == 1 {
-			return &graphFailure{name: name}
+	longest := make(map[string]int, len(g.edges))
+	var walk func(string) (int, error)
+	walk = func(name string) (int, error) {
+		if state[name] == 1 {
+			return 0, &graphFailure{name: name}
 		}
 		if state[name] == 2 {
-			return nil
+			return longest[name], nil
 		}
 		state[name] = 1
+		remaining := 0
 		for _, dependency := range g.edges[name] {
-			if err := walk(dependency, depth+1); err != nil {
-				return err
+			dependencyRemaining, err := walk(dependency)
+			if err != nil {
+				return 0, err
+			}
+			if dependencyRemaining+1 > remaining {
+				remaining = dependencyRemaining + 1
 			}
 		}
 		state[name] = 2
-		return nil
+		longest[name] = remaining
+		return remaining, nil
 	}
 	for _, name := range sortedGraphNames(g.edges) {
-		if err := walk(name, 0); err != nil {
+		depth, err := walk(name)
+		if err != nil {
 			return err
+		}
+		if depth > maxDepth {
+			return &graphFailure{name: name}
 		}
 	}
 	return nil

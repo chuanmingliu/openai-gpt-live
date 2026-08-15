@@ -70,6 +70,22 @@ func TestValidateBundleSourcesRejectsNinthInclude(t *testing.T) {
 	require.ErrorIs(t, ValidateBundleSources(templates), ErrTemplateInvalid)
 }
 
+func TestValidateBundleSourcesChecksSharedSubgraphAtEveryRootDepth(t *testing.T) {
+	templates := map[string]string{
+		"a.j2": `{% include "b.j2" %}`,
+		"b.j2": `{% include "c.j2" %}`,
+		"c.j2": "done",
+		"d.j2": `{% include "a.j2" %}`,
+		"e.j2": `{% include "d.j2" %}`,
+		"f.j2": `{% include "e.j2" %}`,
+		"g.j2": `{% include "f.j2" %}`,
+		"h.j2": `{% include "g.j2" %}`,
+		"i.j2": `{% include "h.j2" %}`,
+		"j.j2": `{% include "i.j2" %}`,
+	}
+	require.ErrorIs(t, ValidateBundleSources(templates), ErrTemplateInvalid)
+}
+
 func FuzzValidateSourceNeverPanics(f *testing.F) {
 	for _, seed := range []string{"", "{{ customer.name }}", "{% include \"part.j2\" %}", "{{ \"}}\" }}", strings.Repeat("{", 64)} {
 		f.Add(seed)
