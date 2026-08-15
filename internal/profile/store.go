@@ -3,6 +3,8 @@ package profile
 import (
 	"context"
 	"time"
+
+	"github.com/chuanmingliu/openai-gpt-live/internal/prompttmpl"
 )
 
 // PublishRecord is the complete, already-validated publication input. Stores
@@ -23,7 +25,7 @@ type PublishRecord struct {
 // Validate ensures the record cannot persist a different manifest, snapshot,
 // tenant, or actor than the exact publication it names.
 func (record PublishRecord) Validate() error {
-	if !validIdentifier(record.TenantID) || record.ProfileID.Validate() != nil || record.ExpectedGeneration < 0 || record.DraftGeneration < 0 || !validIdentifier(record.Actor) || !validShortText(record.EngineVersion) || record.Snapshot.TenantID != record.TenantID || record.Snapshot.Ref.ID != record.ProfileID || record.Snapshot.EngineVersion != record.EngineVersion || record.Manifest.ValidateSnapshot(record.Snapshot) != nil {
+	if !validIdentifier(record.TenantID) || record.ProfileID.Validate() != nil || record.ExpectedGeneration < 0 || record.DraftGeneration < 0 || !validIdentifier(record.Actor) || prompttmpl.ValidateEngineIdentity(record.EngineVersion) != nil || record.Snapshot.TenantID != record.TenantID || record.Snapshot.Ref.ID != record.ProfileID || record.Snapshot.EngineVersion != record.EngineVersion || record.Manifest.ValidateSnapshot(record.Snapshot) != nil {
 		return ErrInvalidProfile
 	}
 	return nil

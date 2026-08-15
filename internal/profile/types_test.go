@@ -66,8 +66,7 @@ func TestSnapshotCanonicalJSONRetainsHashAndOwnsBytes(t *testing.T) {
 
 func TestManifestRejectsInvalidUTF8ResultSchemaBeforeHashing(t *testing.T) {
 	for _, raw := range invalidUTF8Schemas() {
-		manifest := validManifest(map[string]TemplateRef{"system.j2": {Hash: strings.Repeat("a", 64), MediaType: "text/plain", Bytes: 4}})
-		manifest.Recipes = []WorkerRecipe{{ID: "research", Version: 1, Objective: manifest.Bundle.Templates["system.j2"], ResultSchema: raw}}
+		manifest := manifestWithResearchRecipe(raw)
 		hash, err := manifest.Hash()
 		require.ErrorIs(t, err, ErrInvalidProfile)
 		require.Empty(t, hash)
@@ -75,8 +74,7 @@ func TestManifestRejectsInvalidUTF8ResultSchemaBeforeHashing(t *testing.T) {
 }
 
 func TestSnapshotRejectsInvalidUTF8ResultSchemaBeforeHashing(t *testing.T) {
-	manifest := validManifest(map[string]TemplateRef{"system.j2": {Hash: strings.Repeat("a", 64), MediaType: "text/plain", Bytes: 4}})
-	manifest.Recipes = []WorkerRecipe{{ID: "research", Version: 1, Objective: manifest.Bundle.Templates["system.j2"], ResultSchema: json.RawMessage(`{"x":"valid"}`)}}
+	manifest := manifestWithResearchRecipe(json.RawMessage(`{"x":"valid"}`))
 	for _, raw := range invalidUTF8Schemas() {
 		snapshot := snapshotFor(t, manifest)
 		snapshot.Recipes[0].ResultSchema = raw
@@ -88,8 +86,7 @@ func TestSnapshotRejectsInvalidUTF8ResultSchemaBeforeHashing(t *testing.T) {
 
 func TestManifestRejectsUnpairedSurrogateResultSchemaBeforeHashing(t *testing.T) {
 	for _, raw := range unpairedSurrogateSchemas() {
-		manifest := validManifest(map[string]TemplateRef{"system.j2": {Hash: strings.Repeat("a", 64), MediaType: "text/plain", Bytes: 4}})
-		manifest.Recipes = []WorkerRecipe{{ID: "research", Version: 1, Objective: manifest.Bundle.Templates["system.j2"], ResultSchema: raw}}
+		manifest := manifestWithResearchRecipe(raw)
 		hash, err := manifest.Hash()
 		require.ErrorIs(t, err, ErrInvalidProfile)
 		require.Empty(t, hash)
@@ -97,8 +94,7 @@ func TestManifestRejectsUnpairedSurrogateResultSchemaBeforeHashing(t *testing.T)
 }
 
 func TestSnapshotRejectsUnpairedSurrogateResultSchemaBeforeHashing(t *testing.T) {
-	manifest := validManifest(map[string]TemplateRef{"system.j2": {Hash: strings.Repeat("a", 64), MediaType: "text/plain", Bytes: 4}})
-	manifest.Recipes = []WorkerRecipe{{ID: "research", Version: 1, Objective: manifest.Bundle.Templates["system.j2"], ResultSchema: json.RawMessage(`{"x":"valid"}`)}}
+	manifest := manifestWithResearchRecipe(json.RawMessage(`{"x":"valid"}`))
 	for _, raw := range unpairedSurrogateSchemas() {
 		snapshot := snapshotFor(t, manifest)
 		snapshot.Recipes[0].ResultSchema = raw
@@ -114,8 +110,7 @@ func TestResultSchemaAcceptsPairedSurrogatesAndOrdinaryEscapes(t *testing.T) {
 		json.RawMessage(`{"x":"quote:\" slash:\\/ line:\n tab:\t latin:\u0061"}`),
 		json.RawMessage(`{"object":{"b":2,"a":1}}`),
 	} {
-		manifest := validManifest(map[string]TemplateRef{"system.j2": {Hash: strings.Repeat("a", 64), MediaType: "text/plain", Bytes: 4}})
-		manifest.Recipes = []WorkerRecipe{{ID: "research", Version: 1, Objective: manifest.Bundle.Templates["system.j2"], ResultSchema: raw}}
+		manifest := manifestWithResearchRecipe(raw)
 		_, err := manifest.Hash()
 		require.NoError(t, err, raw)
 	}
@@ -143,7 +138,7 @@ func TestValidateTemplateNameRejectsFilesystemPaths(t *testing.T) {
 	require.ErrorIs(t, ValidateTemplateName("../secret.j2"), ErrInvalidProfile)
 }
 
-func TestSnapshotAcceptsPinnedWorkerObjectiveOutsideSystemTemplate(t *testing.T) {
+func TestSnapshotAcceptsPinnedWorkerObjectiveWithoutBundleLookup(t *testing.T) {
 	manifest := validManifest(map[string]TemplateRef{"system.j2": {Hash: strings.Repeat("a", 64), MediaType: "text/plain", Bytes: 4}})
 	bundleHash := mustBundleHash(t, manifest.Bundle)
 	snapshot := Snapshot{
@@ -156,6 +151,80 @@ func TestSnapshotAcceptsPinnedWorkerObjectiveOutsideSystemTemplate(t *testing.T)
 		Bindings:               manifest.Bindings,
 		AdapterRegistryVersion: "registry-v1",
 	}
+	hash, err := snapshot.Hash()
+	require.NoError(t, err)
+	snapshot.SnapshotHash = hash
+	require.NoError(t, snapshot.Validate())
+}
+
+func TestManifestBindsWorkerObjectiveToDerivedLogicalName(t *testing.T) {
+	workerRef := TemplateRef{Hash: strings.Repeat("b", 64), MediaType: "text/plain", Bytes: 4}
+	base := validManifest(map[string]TemplateRef{
+		"system.j2":           {Hash: strings.Repeat("a", 64), MediaType: "text/plain", Bytes: 4},
+		"workers/research.j2": workerRef,
+		"fragments/rules.j2":  workerRef,
+	})
+	base.Recipes = []WorkerRecipe{{ID: "research", Version: 1, Objective: workerRef}}
+	require.NoError(t, base.Validate())
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Manifest)
+	}{
+		{"system template", func(manifest *Manifest) { manifest.Recipes[0].Objective = manifest.Bundle.Templates["system.j2"] }},
+		{"fragment template", func(manifest *Manifest) { delete(manifest.Bundle.Templates, "workers/research.j2") }},
+		{"missing worker template", func(manifest *Manifest) {
+			delete(manifest.Bundle.Templates, "workers/research.j2")
+			delete(manifest.Bundle.Templates, "fragments/rules.j2")
+		}},
+		{"mismatched worker tuple", func(manifest *Manifest) { manifest.Recipes[0].Objective.Bytes++ }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manifest := base.Clone()
+			tc.mutate(&manifest)
+			require.ErrorIs(t, manifest.Validate(), ErrInvalidProfile)
+		})
+	}
+}
+
+func TestProfileDomainRequiresCompositeEngineIdentity(t *testing.T) {
+	manifest := validManifest(map[string]TemplateRef{"system.j2": {Hash: strings.Repeat("a", 64), MediaType: "text/plain", Bytes: 4}})
+	valid := snapshotFor(t, manifest)
+
+	for _, identity := range []string{
+		"jinja-go-v1",
+		"jinja-go-v1/",
+		"jinja-go-v1//implementation",
+		"jinja-go-v1/../implementation",
+		"jinja-go-v1/invalid segment",
+		"jinja-go-v1/" + strings.Repeat("a", 244),
+	} {
+		t.Run(identity, func(t *testing.T) {
+			snapshot := valid.Clone()
+			snapshot.EngineVersion = identity
+			_, err := snapshot.Hash()
+			require.ErrorIs(t, err, ErrInvalidProfile)
+
+			published := Published{
+				TenantID: snapshot.TenantID, Ref: snapshot.Ref, DraftGeneration: 1,
+				EngineVersion: identity, Snapshot: snapshot, Manifest: manifest,
+				PublishedAt: testPublicationTime, PublishedBy: "publisher",
+			}
+			require.ErrorIs(t, published.Validate(), ErrInvalidProfile)
+
+			record := PublishRecord{
+				TenantID: snapshot.TenantID, ProfileID: snapshot.Ref.ID,
+				ExpectedGeneration: 1, DraftGeneration: 1, Manifest: manifest,
+				Snapshot: snapshot, EngineVersion: identity, Actor: "publisher",
+				PublishedAt: testPublicationTime,
+			}
+			require.ErrorIs(t, record.Validate(), ErrInvalidProfile)
+		})
+	}
+
+	exact255 := "jinja-go-v1/" + strings.Repeat("a", prompttmpl.MaxEngineIdentityBytes-len(prompttmpl.EngineIdentityPrefix))
+	snapshot := valid.Clone()
+	snapshot.EngineVersion = exact255
 	hash, err := snapshot.Hash()
 	require.NoError(t, err)
 	snapshot.SnapshotHash = hash
@@ -259,6 +328,16 @@ func validManifest(templates map[string]TemplateRef) Manifest {
 	}
 }
 
+func manifestWithResearchRecipe(resultSchema json.RawMessage) Manifest {
+	worker := TemplateRef{Hash: strings.Repeat("b", 64), MediaType: "text/plain", Bytes: 4}
+	manifest := validManifest(map[string]TemplateRef{
+		"system.j2":           {Hash: strings.Repeat("a", 64), MediaType: "text/plain", Bytes: 4},
+		"workers/research.j2": worker,
+	})
+	manifest.Recipes = []WorkerRecipe{{ID: "research", Version: 1, Objective: worker, ResultSchema: resultSchema}}
+	return manifest
+}
+
 func mustHash(t *testing.T, manifest Manifest) string {
 	t.Helper()
 	hash, err := manifest.Hash()
@@ -292,6 +371,7 @@ func orderedManifest(reverse bool) Manifest {
 			fields["region"] = prompttmpl.Field{Type: prompttmpl.TypeString, Templates: []string{"fragments/rules.j2"}}
 		}
 	}
+	templates["workers/research.j2"] = templates["fragments/rules.j2"]
 	resultSchema := json.RawMessage(`{"a":1e2,"b":{"x":true,"y":null}}`)
 	if reverse {
 		resultSchema = json.RawMessage(`{"b":{"y":null,"x":true},"a":1e2}`)
@@ -299,7 +379,7 @@ func orderedManifest(reverse bool) Manifest {
 	return Manifest{
 		Bundle:   PromptBundle{Templates: templates, Fixtures: fixtures, Schema: prompttmpl.ContextSchema{Fields: fields}},
 		Bindings: []AdapterBinding{{AdapterID: "lookup", Version: "v1", ToolIDs: []string{"search"}}},
-		Recipes:  []WorkerRecipe{{ID: "research", Version: 1, Objective: templates["fragments/rules.j2"], BindingIDs: []string{"lookup"}, ResultSchema: resultSchema}},
+		Recipes:  []WorkerRecipe{{ID: "research", Version: 1, Objective: templates["workers/research.j2"], BindingIDs: []string{"lookup"}, ResultSchema: resultSchema}},
 	}
 }
 
@@ -331,7 +411,9 @@ func TestManifestRejectsUnboundedUnsafeAndDuplicateComponents(t *testing.T) {
 		}(),
 		func() Manifest {
 			m := base.Clone()
-			m.Recipes = []WorkerRecipe{{ID: "recipe", Version: 1, Objective: m.Bundle.Templates["system.j2"], ResultSchema: json.RawMessage("\"" + strings.Repeat("x", 65537) + "\"")}}
+			worker := TemplateRef{Hash: strings.Repeat("b", 64), MediaType: "text/plain", Bytes: 4}
+			m.Bundle.Templates["workers/recipe.j2"] = worker
+			m.Recipes = []WorkerRecipe{{ID: "recipe", Version: 1, Objective: worker, ResultSchema: json.RawMessage("\"" + strings.Repeat("x", 65537) + "\"")}}
 			return m
 		}(),
 		func() Manifest {

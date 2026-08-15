@@ -387,7 +387,7 @@ func (snapshot Snapshot) Validate() error {
 }
 
 func (snapshot Snapshot) validate(requireHash bool) error {
-	if !validIdentifier(snapshot.TenantID) || snapshot.Ref.Validate() != nil || !validShortText(snapshot.EngineVersion) || !validShortText(snapshot.AdapterRegistryVersion) || !validHash(snapshot.BundleHash) || snapshot.System.Validate() != nil || !validOptionalTemplateRef(snapshot.Opening) || !validOptionalTemplateRef(snapshot.Turn) || (requireHash && !validHash(snapshot.SnapshotHash)) {
+	if !validIdentifier(snapshot.TenantID) || snapshot.Ref.Validate() != nil || prompttmpl.ValidateEngineIdentity(snapshot.EngineVersion) != nil || !validShortText(snapshot.AdapterRegistryVersion) || !validHash(snapshot.BundleHash) || snapshot.System.Validate() != nil || !validOptionalTemplateRef(snapshot.Opening) || !validOptionalTemplateRef(snapshot.Turn) || (requireHash && !validHash(snapshot.SnapshotHash)) {
 		return ErrInvalidProfile
 	}
 	return validateComponents(snapshot.Recipes, snapshot.Bindings, snapshot.Knowledge, nil)
@@ -409,7 +409,7 @@ func validateComponents(recipes []WorkerRecipe, bindings []AdapterBinding, knowl
 	}
 	recipeIDs := make(map[string]struct{}, len(recipes))
 	for _, recipe := range recipes {
-		if !validRecipe(recipe) || templates != nil && !hasTemplateRef(templates, recipe.Objective) {
+		if !validRecipe(recipe) || templates != nil && !hasWorkerObjectiveRef(templates, recipe) {
 			return ErrInvalidProfile
 		}
 		if _, exists := recipeIDs[recipe.ID]; exists {
@@ -462,7 +462,7 @@ func (published Published) Clone() Published {
 // Validate verifies that persisted published metadata and its snapshot remain
 // mutually consistent and bounded.
 func (published Published) Validate() error {
-	if !validIdentifier(published.TenantID) || published.Ref.Validate() != nil || published.DraftGeneration < 0 || !validShortText(published.EngineVersion) || !validIdentifier(published.PublishedBy) || published.Snapshot.TenantID != published.TenantID || published.Snapshot.Ref != published.Ref || published.Snapshot.EngineVersion != published.EngineVersion || published.Manifest.ValidateSnapshot(published.Snapshot) != nil {
+	if !validIdentifier(published.TenantID) || published.Ref.Validate() != nil || published.DraftGeneration < 0 || prompttmpl.ValidateEngineIdentity(published.EngineVersion) != nil || !validIdentifier(published.PublishedBy) || published.Snapshot.TenantID != published.TenantID || published.Snapshot.Ref != published.Ref || published.Snapshot.EngineVersion != published.EngineVersion || published.Manifest.ValidateSnapshot(published.Snapshot) != nil {
 		return ErrInvalidProfile
 	}
 	return nil
@@ -607,13 +607,13 @@ func validRefMap(refs map[string]TemplateRef) bool {
 	return true
 }
 
-func hasTemplateRef(templates map[string]TemplateRef, want TemplateRef) bool {
-	for _, ref := range templates {
-		if ref == want {
-			return true
-		}
+func hasWorkerObjectiveRef(templates map[string]TemplateRef, recipe WorkerRecipe) bool {
+	name := "workers/" + recipe.ID + ".j2"
+	if ValidateTemplateName(name) != nil {
+		return false
 	}
-	return false
+	ref, ok := templates[name]
+	return ok && ref == recipe.Objective
 }
 
 func validBinding(binding AdapterBinding) bool {

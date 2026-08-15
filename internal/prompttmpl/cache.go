@@ -78,6 +78,9 @@ func (c *Cache) Compile(ctx context.Context, bundle Bundle, requested Limits) (C
 	if err != nil {
 		return nil, &CompileError{Err: ErrLimitsInvalid}
 	}
+	if err := validateBundleEnvelope(ctx, bundle, limits); err != nil {
+		return nil, &CompileError{Err: err}
+	}
 	owned := cloneBundle(bundle)
 	key := cacheFingerprint(engineVersion, owned, limits)
 

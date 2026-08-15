@@ -76,9 +76,11 @@ func TestCompileAndRenderErrorsKeepUnknownCauseContentPrivate(t *testing.T) {
 }
 
 func TestValidateEngineIdentityRequiresCompositeJinjaGoVersion(t *testing.T) {
+	exactLimit := EngineIdentityPrefix + strings.Repeat("a", MaxEngineIdentityBytes-len(EngineIdentityPrefix))
 	for _, identity := range []string{
 		"jinja-go-v1/test",
 		"jinja-go-v1/minijinja-go/v2.24.0",
+		exactLimit,
 	} {
 		require.NoError(t, ValidateEngineIdentity(identity), identity)
 	}
@@ -91,7 +93,7 @@ func TestValidateEngineIdentityRequiresCompositeJinjaGoVersion(t *testing.T) {
 		"jinja-go-v1/../v2.24.0",
 		"jinja-go-v1/implementation with spaces",
 		"jinja-go-v1/implementation\nsecret",
-		"jinja-go-v1/" + strings.Repeat("a", 256),
+		exactLimit + "a",
 	} {
 		require.Error(t, ValidateEngineIdentity(identity), identity)
 	}

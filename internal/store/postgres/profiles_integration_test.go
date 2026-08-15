@@ -5,6 +5,7 @@ package postgres
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"strings"
@@ -231,6 +232,58 @@ func TestProfileDraftReadbackRequiresEveryExactReturnedField(t *testing.T) {
 			stored.manifestJSON = append([]byte(nil), want.manifestJSON...)
 			mutate(&stored)
 			_, err := validateProfileDraftReadback(stored, "tenant-a", "profile-a", 2, manifestJSON, updatedAt, "editor-a")
+			assert.ErrorIs(t, err, profile.ErrInvalidProfile)
+		})
+	}
+}
+
+func TestProfilePublishedReadbackRequiresEveryExactReturnedField(t *testing.T) {
+	draft := profileDraft("tenant-a", "profile-a", profileManifest(t))
+	draft.Generation = 1
+	record := profilePublishRecord(t, draft, 1, true)
+	manifestJSON, err := record.Manifest.CanonicalJSON()
+	require.NoError(t, err)
+	snapshotJSON, err := record.Snapshot.CanonicalJSON()
+	require.NoError(t, err)
+	want := profilePublishedReadback{
+		tenantID: "tenant-a", profileID: "profile-a", version: 1, draftGeneration: 1,
+		engineVersion: record.EngineVersion, snapshotHash: record.Snapshot.SnapshotHash,
+		manifestJSON: manifestJSON, snapshotJSON: snapshotJSON, active: true,
+		publishedAt: record.PublishedAt, publishedBy: record.Actor,
+		activatedAt: sql.NullTime{Time: record.PublishedAt, Valid: true},
+		activatedBy: sql.NullString{String: record.Actor, Valid: true},
+	}
+	_, err = validateExactProfilePublishedReadback(want, want)
+	require.NoError(t, err)
+
+	tests := map[string]func(*profilePublishedReadback){
+		"tenant":        func(stored *profilePublishedReadback) { stored.tenantID = "tenant-b" },
+		"profile":       func(stored *profilePublishedReadback) { stored.profileID = "profile-b" },
+		"version":       func(stored *profilePublishedReadback) { stored.version++ },
+		"generation":    func(stored *profilePublishedReadback) { stored.draftGeneration++ },
+		"engine":        func(stored *profilePublishedReadback) { stored.engineVersion += "/changed" },
+		"snapshot hash": func(stored *profilePublishedReadback) { stored.snapshotHash = strings.Repeat("b", 64) },
+		"manifest":      func(stored *profilePublishedReadback) { stored.manifestJSON = append(stored.manifestJSON, ' ') },
+		"snapshot":      func(stored *profilePublishedReadback) { stored.snapshotJSON = append(stored.snapshotJSON, ' ') },
+		"active":        func(stored *profilePublishedReadback) { stored.active = false },
+		"revoked time": func(stored *profilePublishedReadback) {
+			stored.revokedAt = sql.NullTime{Time: record.PublishedAt, Valid: true}
+		},
+		"revoked actor": func(stored *profilePublishedReadback) {
+			stored.revokedBy = sql.NullString{String: "operator", Valid: true}
+		},
+		"published time":  func(stored *profilePublishedReadback) { stored.publishedAt = stored.publishedAt.Add(time.Microsecond) },
+		"published actor": func(stored *profilePublishedReadback) { stored.publishedBy = "other" },
+		"activated time": func(stored *profilePublishedReadback) {
+			stored.activatedAt.Time = stored.activatedAt.Time.Add(time.Microsecond)
+		},
+		"activated actor": func(stored *profilePublishedReadback) { stored.activatedBy.String = "other" },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			stored := want.clone()
+			mutate(&stored)
+			_, err := validateExactProfilePublishedReadback(stored, want)
 			assert.ErrorIs(t, err, profile.ErrInvalidProfile)
 		})
 	}
@@ -681,6 +734,53 @@ func TestProfilePublishRollsBackInsertedVersionAndActiveSwap(t *testing.T) {
 	assert.True(t, v1.Active)
 }
 
+func TestProfilePublishRollsBackExactCanonicalDatabaseRewrite(t *testing.T) {
+	repo, pool, _ := repositoryHarness(t)
+	draft := seedProfileDraft(t, repo, "tenant-a", "rewrite-publish")
+	installProfilePublishManifestRewriteTrigger(t, pool)
+
+	_, err := repo.Publish(t.Context(), profilePublishRecord(t, draft, 1, false))
+	assert.ErrorIs(t, err, profile.ErrInvalidProfile)
+	assert.Equal(t, int64(0), tableCount(t, pool, "profile_versions"), "rewritten immutable content must roll back")
+}
+
+func TestProfileActivateRollsBackDatabaseAuditRewrite(t *testing.T) {
+	repo, pool, manual := repositoryHarness(t)
+	draft := seedProfileDraft(t, repo, "tenant-a", "rewrite-activate")
+	_, err := repo.Publish(t.Context(), profilePublishRecord(t, draft, 1, false))
+	require.NoError(t, err)
+	manual.Advance(2 * time.Minute)
+	installProfileActivateActorRewriteTrigger(t, pool)
+
+	err = repo.Activate(t.Context(), draft.TenantID, draft.ID, 1, "operator-a")
+	assert.ErrorIs(t, err, profile.ErrInvalidProfile)
+	published, ok, resolveErr := repo.Resolve(t.Context(), draft.TenantID, draft.ID, 1)
+	require.NoError(t, resolveErr)
+	require.True(t, ok)
+	assert.False(t, published.Active, "rewritten activation must roll back")
+	var activatedAt, activatedBy any
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT activated_at,activated_by FROM profile_versions
+		WHERE tenant_id=$1 AND profile_id=$2 AND version=1`, draft.TenantID, draft.ID).Scan(&activatedAt, &activatedBy))
+	assert.Nil(t, activatedAt)
+	assert.Nil(t, activatedBy)
+}
+
+func TestProfileRevokeRollsBackDatabaseAuditRewrite(t *testing.T) {
+	repo, pool, _ := repositoryHarness(t)
+	draft := seedProfileDraft(t, repo, "tenant-a", "rewrite-revoke")
+	_, err := repo.Publish(t.Context(), profilePublishRecord(t, draft, 1, true))
+	require.NoError(t, err)
+	installProfileRevokeActorRewriteTrigger(t, pool)
+
+	err = repo.Revoke(t.Context(), draft.TenantID, draft.ID, 1, "operator-a", profileTestTime().Add(2*time.Minute))
+	assert.ErrorIs(t, err, profile.ErrInvalidProfile)
+	published, ok, resolveErr := repo.Resolve(t.Context(), draft.TenantID, draft.ID, 1)
+	require.NoError(t, resolveErr)
+	require.True(t, ok)
+	assert.True(t, published.Active, "rewritten revocation must roll back")
+	assert.Nil(t, published.RevokedAt)
+}
+
 func TestProfileRevokeIsTenantExactIdempotentAndBlocksActivation(t *testing.T) {
 	repo, _, manual := repositoryHarness(t)
 	draft := seedProfileDraft(t, repo, "tenant-a", "insurance-sales")
@@ -878,6 +978,40 @@ func TestProfileResolveRejectsNoncanonicalStoredDocuments(t *testing.T) {
 	}
 }
 
+func TestProfileStoreRejectsNoncompositeEngineIdentityOnWriteAndRead(t *testing.T) {
+	t.Run("write", func(t *testing.T) {
+		repo, pool, _ := repositoryHarness(t)
+		draft := seedProfileDraft(t, repo, "tenant-a", "invalid-engine-write")
+		record := profilePublishRecord(t, draft, 1, false)
+		record.EngineVersion = "jinja-go-v1"
+		record.Snapshot.EngineVersion = record.EngineVersion
+
+		_, err := repo.Publish(t.Context(), record)
+		assert.ErrorIs(t, err, profile.ErrInvalidProfile)
+		assert.Equal(t, int64(0), tableCount(t, pool, "profile_versions"))
+	})
+
+	t.Run("read", func(t *testing.T) {
+		repo, pool, _ := repositoryHarness(t)
+		draft := seedProfileDraft(t, repo, "tenant-a", "invalid-engine-read")
+		_, err := repo.Publish(t.Context(), profilePublishRecord(t, draft, 1, false))
+		require.NoError(t, err)
+		_, err = pool.Exec(t.Context(), `ALTER TABLE profile_versions DROP CONSTRAINT profile_versions_engine_hash_check`)
+		require.NoError(t, err)
+		_, err = pool.Exec(t.Context(), `UPDATE profile_versions SET engine_version='jinja-go-v1',
+			snapshot=json_build_object(
+				'tenant_id',tenant_id,'ref',json_build_object('id',profile_id,'version',version),
+				'engine_version','jinja-go-v1','snapshot_hash',snapshot_hash)
+			WHERE tenant_id=$1 AND profile_id=$2 AND version=1`, draft.TenantID, draft.ID)
+		require.NoError(t, err)
+
+		_, _, err = repo.Resolve(t.Context(), draft.TenantID, draft.ID, 1)
+		assert.ErrorIs(t, err, profile.ErrInvalidProfile)
+		_, _, err = repo.ListPublished(t.Context(), draft.TenantID, 10, "")
+		assert.ErrorIs(t, err, profile.ErrInvalidProfile)
+	})
+}
+
 func TestProfileErrorsAreStableContentFreeAndValidateBeforeSQL(t *testing.T) {
 	repo, pool, _ := repositoryHarness(t)
 	secret := "private-prompt SELECT postgres://credential"
@@ -1003,7 +1137,7 @@ func profilePublishRecord(t *testing.T, draft profile.Draft, version uint64, act
 	require.NoError(t, err)
 	snapshot := profile.Snapshot{
 		TenantID: draft.TenantID, Ref: profile.VersionRef{ID: draft.ID, Version: version},
-		EngineVersion: "jinja-go-v1", BundleHash: bundleHash,
+		EngineVersion: "jinja-go-v1/test-engine-v1", BundleHash: bundleHash,
 		System:  draft.Manifest.Bundle.Templates["system.j2"],
 		Opening: draft.Manifest.Bundle.Templates["opening_message.j2"],
 		Turn:    draft.Manifest.Bundle.Templates["turn_instruction.j2"],
@@ -1103,5 +1237,62 @@ func installProfileDraftActorRewriteTrigger(t *testing.T, pool interface {
 		CREATE TRIGGER rewrite_profile_draft_actor
 		BEFORE INSERT OR UPDATE ON profile_drafts
 		FOR EACH ROW EXECUTE FUNCTION rewrite_profile_draft_actor()`)
+	require.NoError(t, err)
+}
+
+func installProfilePublishManifestRewriteTrigger(t *testing.T, pool interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}) {
+	t.Helper()
+	_, err := pool.Exec(t.Context(), `CREATE FUNCTION rewrite_profile_publish_manifest()
+		RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			NEW.manifest = replace(NEW.manifest::text, '"description":"original"', '"description":"database rewrite"')::json;
+			RETURN NEW;
+		END;
+		$$;
+		CREATE TRIGGER rewrite_profile_publish_manifest
+		BEFORE INSERT ON profile_versions
+		FOR EACH ROW EXECUTE FUNCTION rewrite_profile_publish_manifest()`)
+	require.NoError(t, err)
+}
+
+func installProfileActivateActorRewriteTrigger(t *testing.T, pool interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}) {
+	t.Helper()
+	_, err := pool.Exec(t.Context(), `CREATE FUNCTION rewrite_profile_activate_actor()
+		RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.active AND NOT OLD.active THEN
+				NEW.activated_by = 'database-actor';
+				NEW.activated_at = NEW.activated_at + interval '1 microsecond';
+			END IF;
+			RETURN NEW;
+		END;
+		$$;
+		CREATE TRIGGER rewrite_profile_activate_actor
+		BEFORE UPDATE ON profile_versions
+		FOR EACH ROW EXECUTE FUNCTION rewrite_profile_activate_actor()`)
+	require.NoError(t, err)
+}
+
+func installProfileRevokeActorRewriteTrigger(t *testing.T, pool interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}) {
+	t.Helper()
+	_, err := pool.Exec(t.Context(), `CREATE FUNCTION rewrite_profile_revoke_actor()
+		RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.revoked_at IS NOT NULL AND OLD.revoked_at IS NULL THEN
+				NEW.revoked_by = 'database-actor';
+				NEW.revoked_at = NEW.revoked_at + interval '1 microsecond';
+			END IF;
+			RETURN NEW;
+		END;
+		$$;
+		CREATE TRIGGER rewrite_profile_revoke_actor
+		BEFORE UPDATE ON profile_versions
+		FOR EACH ROW EXECUTE FUNCTION rewrite_profile_revoke_actor()`)
 	require.NoError(t, err)
 }

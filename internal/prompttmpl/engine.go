@@ -165,6 +165,74 @@ type Bundle struct {
 	Schema    ContextSchema
 }
 
+// validateBundleEnvelope bounds the complete engine-neutral bundle before any
+// clone, sort, or fingerprint allocation. Its byte accounting uses the cache's
+// length-prefixed canonical primitives while excluding cache format, engine
+// identity, and render limits, which are not part of Bundle.
+func validateBundleEnvelope(ctx context.Context, bundle Bundle, limits Limits) error {
+	ctx = nonNilContext(ctx)
+	if ctx.Err() != nil || len(bundle.Templates) > limits.CollectionItems || len(bundle.Schema.Fields) > limits.CollectionItems {
+		return ErrTemplateInvalid
+	}
+	budget := bundleEnvelopeBudget{ctx: ctx, maxBytes: limits.BundleBytes, maxItems: limits.CollectionItems}
+	if budget.add(8) != nil { // template count
+		return ErrTemplateInvalid
+	}
+	for name, source := range bundle.Templates {
+		if budget.item() != nil || validateLogicalName(name) != nil || len(source) > limits.TemplateBytes || budget.string(name) != nil || budget.string(source) != nil {
+			return ErrTemplateInvalid
+		}
+	}
+	if budget.add(8) != nil { // schema field count
+		return ErrTemplateInvalid
+	}
+	for name, field := range bundle.Schema.Fields {
+		if budget.item() != nil || budget.string(name) != nil || budget.string(string(field.Type)) != nil ||
+			budget.add(8) != nil || budget.add(8) != nil || budget.add(8) != nil ||
+			budget.string(field.Sensitivity) != nil || budget.string(field.Source) != nil || budget.add(8) != nil {
+			return ErrTemplateInvalid
+		}
+		if len(field.Templates) > limits.CollectionItems-budget.items {
+			return ErrTemplateInvalid
+		}
+		for _, template := range field.Templates {
+			if budget.item() != nil || budget.string(template) != nil {
+				return ErrTemplateInvalid
+			}
+		}
+	}
+	return nil
+}
+
+type bundleEnvelopeBudget struct {
+	ctx                context.Context
+	bytes, items       int
+	maxBytes, maxItems int
+}
+
+func (budget *bundleEnvelopeBudget) add(amount int) error {
+	if budget.ctx.Err() != nil || amount < 0 || amount > budget.maxBytes-budget.bytes {
+		return ErrTemplateInvalid
+	}
+	budget.bytes += amount
+	return nil
+}
+
+func (budget *bundleEnvelopeBudget) item() error {
+	if budget.ctx.Err() != nil || budget.items >= budget.maxItems {
+		return ErrTemplateInvalid
+	}
+	budget.items++
+	return nil
+}
+
+func (budget *bundleEnvelopeBudget) string(value string) error {
+	if budget.add(8) != nil || len(value) > budget.maxBytes-budget.bytes {
+		return ErrTemplateInvalid
+	}
+	return budget.add(len(value))
+}
+
 // Context is the JSON-like data available to a rendered template.
 type Context map[string]any
 

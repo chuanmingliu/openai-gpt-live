@@ -67,6 +67,71 @@ func TestCacheReturnsPreviouslyCompiledBundle(t *testing.T) {
 	assert.Equal(t, 1, engine.Calls())
 }
 
+func TestCacheEnforcesWholeBundleEnvelopeBeforeCloneOrFingerprint(t *testing.T) {
+	engine := &countingEngine{}
+	cache, err := NewCache(engine, 2, 1<<20)
+	require.NoError(t, err)
+	limits := DefaultLimits()
+	limits.BundleBytes = 512
+	exact := Bundle{Templates: map[string]string{"system.j2": strings.Repeat("x", 471)}}
+	_, err = cache.Compile(t.Context(), exact, limits)
+	require.NoError(t, err)
+	require.Equal(t, 1, engine.Calls())
+
+	over := cloneBundle(exact)
+	over.Templates["system.j2"] += "x"
+	_, err = cache.Compile(t.Context(), over, limits)
+	require.ErrorIs(t, err, ErrTemplateInvalid)
+	require.Equal(t, 1, engine.Calls(), "oversized bundle must not reach the engine")
+}
+
+func TestCacheCountsSchemaMetadataACLsAndCancellationBeforePreprocessing(t *testing.T) {
+	engine := &countingEngine{}
+	cache, err := NewCache(engine, 2, 1<<20)
+	require.NoError(t, err)
+	limits := DefaultLimits()
+	limits.CollectionItems = 4
+	exact := Bundle{
+		Templates: map[string]string{"system.j2": "safe"},
+		Schema: ContextSchema{Fields: map[string]Field{
+			"customer": {Type: TypeString, Templates: []string{"system.j2", "system.j2"}},
+		}},
+	}
+	_, err = cache.Compile(t.Context(), exact, limits)
+	require.NoError(t, err)
+	require.Equal(t, 1, engine.Calls())
+
+	over := cloneBundle(exact)
+	field := over.Schema.Fields["customer"]
+	field.Templates = append(field.Templates, "system.j2")
+	over.Schema.Fields["customer"] = field
+	_, err = cache.Compile(t.Context(), over, limits)
+	require.ErrorIs(t, err, ErrTemplateInvalid)
+	require.Equal(t, 1, engine.Calls())
+
+	manyTemplates := Bundle{Templates: map[string]string{}}
+	for index := range limits.CollectionItems + 1 {
+		manyTemplates.Templates[fmt.Sprintf("t%d.j2", index)] = ""
+	}
+	_, err = cache.Compile(t.Context(), manyTemplates, limits)
+	require.ErrorIs(t, err, ErrTemplateInvalid)
+	require.Equal(t, 1, engine.Calls())
+
+	manyFields := Bundle{Templates: map[string]string{"system.j2": "safe"}, Schema: ContextSchema{Fields: map[string]Field{}}}
+	for index := range limits.CollectionItems + 1 {
+		manyFields.Schema.Fields[fmt.Sprintf("field-%d", index)] = Field{Type: TypeString}
+	}
+	_, err = cache.Compile(t.Context(), manyFields, limits)
+	require.ErrorIs(t, err, ErrTemplateInvalid)
+	require.Equal(t, 1, engine.Calls())
+
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err = cache.Compile(cancelled, manyTemplates, limits)
+	require.ErrorIs(t, err, ErrTemplateInvalid)
+	require.Equal(t, 1, engine.Calls(), "cancelled compile must not reach clone, fingerprint, or engine")
+}
+
 func TestCacheEvictsLeastRecentlyUsedEntry(t *testing.T) {
 	engine := &countingEngine{}
 	cache, err := NewCache(engine, 2, 4096)

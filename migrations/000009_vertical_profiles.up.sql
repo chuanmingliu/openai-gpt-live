@@ -77,8 +77,9 @@ CREATE TABLE profile_versions (
     ),
     CONSTRAINT profile_versions_numbers_check CHECK (version > 0 AND draft_generation > 0),
     CONSTRAINT profile_versions_engine_hash_check CHECK (
-        octet_length(engine_version) BETWEEN 1 AND 256
-        AND engine_version !~ '[[:cntrl:]]'
+        octet_length(engine_version) BETWEEN 13 AND 255
+        AND engine_version ~ '^jinja-go-v1/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$'
+        AND NOT (string_to_array(substr(engine_version, 13), '/') && ARRAY['.', '..']::TEXT[])
         AND snapshot_hash ~ '^[0-9a-f]{64}$'
     ),
     CONSTRAINT profile_versions_documents_check CHECK (

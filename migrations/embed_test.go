@@ -148,7 +148,7 @@ func TestEmbeddedVerticalProfileMigrationCatalogIsExact(t *testing.T) {
 	assert.Equal(t, wantNames, gotNames)
 	wantChecksums := map[string]string{
 		"000009_vertical_profiles.down.sql": "14ddeb515492515b2f23a0afe754c1ab31cfa534ec93bed974f46b87798dd39e",
-		"000009_vertical_profiles.up.sql":   "4361880ea8bcadad18d1bff08647146bd38fcddf3206bcde9a5f303e9a2780c4",
+		"000009_vertical_profiles.up.sql":   "363d71258d0fecd30538eaf3bbeb323a1e9c87ac7004226a39ea32f9ca8d7729",
 	}
 	for name, checksum := range wantChecksums {
 		contents, readErr := files.ReadFile(name)

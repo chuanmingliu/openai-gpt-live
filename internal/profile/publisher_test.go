@@ -633,6 +633,47 @@ func TestPublishRejectsMissingOrCorruptBlobTuples(t *testing.T) {
 	}
 }
 
+func TestPublishRequiresWorkerObjectiveAtDerivedLogicalName(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*publisherHarness, TemplateRef)
+	}{
+		{"system template", func(h *publisherHarness, _ TemplateRef) {
+			h.store.draft.Manifest.Recipes[0].Objective = h.store.draft.Manifest.Bundle.Templates["system.j2"]
+		}},
+		{"fragment template", func(h *publisherHarness, worker TemplateRef) {
+			delete(h.store.draft.Manifest.Bundle.Templates, "workers/research.j2")
+			h.store.draft.Manifest.Bundle.Templates["fragments/rules.j2"] = worker
+		}},
+		{"missing worker path", func(h *publisherHarness, _ TemplateRef) {
+			delete(h.store.draft.Manifest.Bundle.Templates, "workers/research.j2")
+		}},
+		{"mismatched tuple", func(h *publisherHarness, _ TemplateRef) {
+			h.store.draft.Manifest.Recipes[0].Objective.Bytes++
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newPublisherHarness(t)
+			h.setTemplate(t, "workers/research.j2", "Research {{ customer }}", "text/plain; charset=utf-8")
+			worker := h.store.draft.Manifest.Bundle.Templates["workers/research.j2"]
+			h.store.draft.Manifest.Recipes = []WorkerRecipe{{ID: "research", Version: 1, Objective: worker}}
+			tc.mutate(h, worker)
+
+			_, err := h.publisher.Publish(t.Context(), publishCommand())
+			require.ErrorIs(t, err, ErrInvalidProfile)
+			require.Zero(t, h.store.mutationCalls())
+		})
+	}
+
+	h := newPublisherHarness(t)
+	h.setTemplate(t, "workers/research.j2", "Research {{ customer }}", "text/plain; charset=utf-8")
+	worker := h.store.draft.Manifest.Bundle.Templates["workers/research.j2"]
+	h.store.draft.Manifest.Recipes = []WorkerRecipe{{ID: "research", Version: 1, Objective: worker}}
+	_, err := h.publisher.Publish(t.Context(), publishCommand())
+	require.NoError(t, err)
+	require.Equal(t, 1, h.store.publishCalls)
+}
+
 func TestPublishRejectsStrictFixtureGrammarContextAndExpectedOutput(t *testing.T) {
 	tests := []struct {
 		name string

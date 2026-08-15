@@ -404,9 +404,8 @@ func (r *Repository) Publish(ctx context.Context, record profile.PublishRecord) 
 		return profile.Published{}, profile.ErrPublicationConflict
 	}
 	if owned.Activate {
-		if _, err := tx.Exec(ctx, `UPDATE profile_versions SET active=false
-			WHERE tenant_id=$1 AND profile_id=$2 AND active`, owned.TenantID, owned.ProfileID); err != nil {
-			return profile.Published{}, mapProfileStoreError(ctx, err, nil)
+		if err := deactivateProfileVersion(ctx, tx, owned.TenantID, owned.ProfileID); err != nil {
+			return profile.Published{}, err
 		}
 		if err := r.profileAfter(ctx, "profile_publish_deactivated"); err != nil {
 			return profile.Published{}, err
@@ -418,27 +417,37 @@ func (r *Repository) Publish(ctx context.Context, record profile.PublishRecord) 
 		activatedAt = owned.PublishedAt
 		activatedBy = owned.Actor
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO profile_versions (
+	stored, err := scanProfilePublishedReadback(tx.QueryRow(ctx, `INSERT INTO profile_versions (
 		tenant_id,profile_id,version,draft_generation,engine_version,snapshot_hash,manifest,snapshot,
 		active,published_at,published_by,activated_at,activated_by)
-		VALUES ($1,$2,$3,$4,$5,$6,$7::json,$8::json,$9,$10,$11,$12,$13)`,
+		VALUES ($1,$2,$3,$4,$5,$6,$7::json,$8::json,$9,$10,$11,$12,$13)
+		RETURNING tenant_id,profile_id,version,draft_generation,engine_version,snapshot_hash,
+			manifest::text,snapshot::text,active,revoked_at,revoked_by,published_at,published_by,activated_at,activated_by`,
 		owned.TenantID, owned.ProfileID, int64(owned.Snapshot.Ref.Version), owned.DraftGeneration,
 		owned.EngineVersion, owned.Snapshot.SnapshotHash, manifestJSON, snapshotJSON, owned.Activate,
-		owned.PublishedAt, owned.Actor, activatedAt, activatedBy)
+		owned.PublishedAt, owned.Actor, activatedAt, activatedBy))
 	if err != nil {
 		return profile.Published{}, mapProfileStoreError(ctx, err, profile.ErrPublicationConflict)
+	}
+	expected := profilePublishedReadback{
+		tenantID: owned.TenantID, profileID: string(owned.ProfileID), version: int64(owned.Snapshot.Ref.Version),
+		draftGeneration: owned.DraftGeneration, engineVersion: owned.EngineVersion, snapshotHash: owned.Snapshot.SnapshotHash,
+		manifestJSON: append([]byte(nil), manifestJSON...), snapshotJSON: append([]byte(nil), snapshotJSON...), active: owned.Activate,
+		publishedAt: owned.PublishedAt, publishedBy: owned.Actor,
+	}
+	if owned.Activate {
+		expected.activatedAt = sql.NullTime{Time: owned.PublishedAt, Valid: true}
+		expected.activatedBy = sql.NullString{String: owned.Actor, Valid: true}
+	}
+	published, err := validateExactProfilePublishedReadback(stored, expected)
+	if err != nil {
+		return profile.Published{}, err
 	}
 	if err := r.profileAfter(ctx, "profile_publish_inserted"); err != nil {
 		return profile.Published{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return profile.Published{}, mapProfileStoreError(ctx, err, nil)
-	}
-	published := profile.Published{
-		TenantID: owned.TenantID, Ref: owned.Snapshot.Ref,
-		DraftGeneration: owned.DraftGeneration, EngineVersion: owned.EngineVersion,
-		Snapshot: owned.Snapshot.Clone(), Manifest: owned.Manifest.Clone(), Active: owned.Activate,
-		PublishedAt: owned.PublishedAt, PublishedBy: owned.Actor,
 	}
 	return published.Clone(), nil
 }
@@ -505,7 +514,7 @@ func (r *Repository) ListPublished(ctx context.Context, tenantID string, pageSiz
 			return nil, "", mapProfileStoreError(ctx, err, nil)
 		}
 		ref := profile.VersionRef{ID: profile.ID(id), Version: uint64(version)}
-		if version <= 0 || ref.Validate() != nil || !validProfileIdentifier(engineVersion) || !validProfileHash(snapshotHash) ||
+		if version <= 0 || ref.Validate() != nil || prompttmpl.ValidateEngineIdentity(engineVersion) != nil || !validProfileHash(snapshotHash) ||
 			!validProfileTime(publishedAt) || active && revoked.Valid || revoked.Valid && !validProfileTime(revoked.Time) {
 			return nil, "", profile.ErrInvalidProfile
 		}
@@ -545,43 +554,53 @@ func (r *Repository) Activate(ctx context.Context, tenantID string, profileID pr
 	if err := lockProfileDraft(ctx, tx, tenantID, profileID); err != nil {
 		return err
 	}
-	var active bool
-	var revokedAt sql.NullTime
-	var publishedAt time.Time
-	err = tx.QueryRow(ctx, `SELECT active,revoked_at,published_at FROM profile_versions
-		WHERE tenant_id=$1 AND profile_id=$2 AND version=$3 FOR UPDATE`, tenantID, profileID, int64(version)).
-		Scan(&active, &revokedAt, &publishedAt)
+	before, err := scanProfilePublishedReadback(tx.QueryRow(ctx, `SELECT
+		tenant_id,profile_id,version,draft_generation,engine_version,snapshot_hash,
+		manifest::text,snapshot::text,active,revoked_at,revoked_by,published_at,published_by,activated_at,activated_by
+		FROM profile_versions WHERE tenant_id=$1 AND profile_id=$2 AND version=$3 FOR UPDATE`, tenantID, profileID, int64(version)))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return profile.ErrInvalidProfile
 	}
 	if err != nil {
 		return mapProfileStoreError(ctx, err, nil)
 	}
-	if revokedAt.Valid {
+	published, err := before.canonicalPublished()
+	if err != nil || published.TenantID != tenantID || published.Ref != (profile.VersionRef{ID: profileID, Version: version}) {
+		return profile.ErrInvalidProfile
+	}
+	if before.revokedAt.Valid {
 		return profile.ErrProfileRevoked
 	}
-	if active {
+	if before.active {
 		return nil
 	}
 	activatedAt := canonicalProfileTime(r.clock.Now())
-	if !validProfileTime(activatedAt) || activatedAt.Before(publishedAt) {
+	if !validProfileTime(activatedAt) || activatedAt.Before(before.publishedAt) {
 		return profile.ErrInvalidProfile
 	}
-	if _, err := tx.Exec(ctx, `UPDATE profile_versions SET active=false
-		WHERE tenant_id=$1 AND profile_id=$2 AND active`, tenantID, profileID); err != nil {
-		return mapProfileStoreError(ctx, err, nil)
+	if err := deactivateProfileVersion(ctx, tx, tenantID, profileID); err != nil {
+		return err
 	}
 	if err := r.profileAfter(ctx, "profile_activate_deactivated"); err != nil {
 		return err
 	}
-	tag, err := tx.Exec(ctx, `UPDATE profile_versions SET active=true,activated_at=$4,activated_by=$5
-		WHERE tenant_id=$1 AND profile_id=$2 AND version=$3 AND revoked_at IS NULL`,
-		tenantID, profileID, int64(version), activatedAt, actor)
+	stored, err := scanProfilePublishedReadback(tx.QueryRow(ctx, `UPDATE profile_versions SET active=true,activated_at=$4,activated_by=$5
+		WHERE tenant_id=$1 AND profile_id=$2 AND version=$3 AND revoked_at IS NULL
+		RETURNING tenant_id,profile_id,version,draft_generation,engine_version,snapshot_hash,
+			manifest::text,snapshot::text,active,revoked_at,revoked_by,published_at,published_by,activated_at,activated_by`,
+		tenantID, profileID, int64(version), activatedAt, actor))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return profile.ErrProfileRevoked
+	}
 	if err != nil {
 		return mapProfileStoreError(ctx, err, profile.ErrPublicationConflict)
 	}
-	if tag.RowsAffected() != 1 {
-		return profile.ErrProfileRevoked
+	expected := before.clone()
+	expected.active = true
+	expected.activatedAt = sql.NullTime{Time: activatedAt, Valid: true}
+	expected.activatedBy = sql.NullString{String: actor, Valid: true}
+	if _, err := validateExactProfilePublishedReadback(stored, expected); err != nil {
+		return err
 	}
 	if err := r.profileAfter(ctx, "profile_activated"); err != nil {
 		return err
@@ -606,35 +625,46 @@ func (r *Repository) Revoke(ctx context.Context, tenantID string, profileID prof
 	if err := lockProfileDraft(ctx, tx, tenantID, profileID); err != nil {
 		return err
 	}
-	var storedAt, activatedAt sql.NullTime
-	var storedBy sql.NullString
-	var publishedAt time.Time
-	err = tx.QueryRow(ctx, `SELECT revoked_at,revoked_by,published_at,activated_at FROM profile_versions
-		WHERE tenant_id=$1 AND profile_id=$2 AND version=$3 FOR UPDATE`, tenantID, profileID, int64(version)).
-		Scan(&storedAt, &storedBy, &publishedAt, &activatedAt)
+	before, err := scanProfilePublishedReadback(tx.QueryRow(ctx, `SELECT
+		tenant_id,profile_id,version,draft_generation,engine_version,snapshot_hash,
+		manifest::text,snapshot::text,active,revoked_at,revoked_by,published_at,published_by,activated_at,activated_by
+		FROM profile_versions WHERE tenant_id=$1 AND profile_id=$2 AND version=$3 FOR UPDATE`, tenantID, profileID, int64(version)))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return profile.ErrInvalidProfile
 	}
 	if err != nil {
 		return mapProfileStoreError(ctx, err, nil)
 	}
-	if storedAt.Valid || storedBy.Valid {
-		if storedAt.Valid && storedBy.Valid && storedAt.Time.Equal(revokedAt) && storedBy.String == actor {
+	published, err := before.canonicalPublished()
+	if err != nil || published.TenantID != tenantID || published.Ref != (profile.VersionRef{ID: profileID, Version: version}) {
+		return profile.ErrInvalidProfile
+	}
+	if before.revokedAt.Valid || before.revokedBy.Valid {
+		if before.revokedAt.Valid && before.revokedBy.Valid && before.revokedAt.Time.Equal(revokedAt) && before.revokedBy.String == actor {
 			return nil
 		}
 		return profile.ErrPublicationConflict
 	}
-	if revokedAt.Before(publishedAt) || activatedAt.Valid && revokedAt.Before(activatedAt.Time) {
+	if revokedAt.Before(before.publishedAt) || before.activatedAt.Valid && revokedAt.Before(before.activatedAt.Time) {
 		return profile.ErrInvalidProfile
 	}
-	tag, err := tx.Exec(ctx, `UPDATE profile_versions SET revoked_at=$4,revoked_by=$5,active=false
-		WHERE tenant_id=$1 AND profile_id=$2 AND version=$3 AND revoked_at IS NULL`,
-		tenantID, profileID, int64(version), revokedAt, actor)
+	stored, err := scanProfilePublishedReadback(tx.QueryRow(ctx, `UPDATE profile_versions SET revoked_at=$4,revoked_by=$5,active=false
+		WHERE tenant_id=$1 AND profile_id=$2 AND version=$3 AND revoked_at IS NULL
+		RETURNING tenant_id,profile_id,version,draft_generation,engine_version,snapshot_hash,
+			manifest::text,snapshot::text,active,revoked_at,revoked_by,published_at,published_by,activated_at,activated_by`,
+		tenantID, profileID, int64(version), revokedAt, actor))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return profile.ErrPublicationConflict
+	}
 	if err != nil {
 		return mapProfileStoreError(ctx, err, profile.ErrPublicationConflict)
 	}
-	if tag.RowsAffected() != 1 {
-		return profile.ErrPublicationConflict
+	expected := before.clone()
+	expected.active = false
+	expected.revokedAt = sql.NullTime{Time: revokedAt, Valid: true}
+	expected.revokedBy = sql.NullString{String: actor, Valid: true}
+	if _, err := validateExactProfilePublishedReadback(stored, expected); err != nil {
+		return err
 	}
 	if err := r.profileAfter(ctx, "profile_revoked"); err != nil {
 		return err
@@ -792,53 +822,132 @@ func validatePublishedBlobRefs(ctx context.Context, tx pgx.Tx, tenantID string, 
 	return nil
 }
 
-func scanProfilePublished(row pgx.Row) (profile.Published, error) {
-	var tenantID, profileID, engineVersion, snapshotHash, publishedBy string
-	var version, draftGeneration int64
-	var manifestJSON, snapshotJSON []byte
-	var active bool
-	var revokedAt, activatedAt sql.NullTime
-	var revokedBy, activatedBy sql.NullString
-	var publishedAt time.Time
+type profilePublishedReadback struct {
+	tenantID, profileID         string
+	version, draftGeneration    int64
+	engineVersion, snapshotHash string
+	manifestJSON, snapshotJSON  []byte
+	active                      bool
+	revokedAt, activatedAt      sql.NullTime
+	revokedBy, activatedBy      sql.NullString
+	publishedAt                 time.Time
+	publishedBy                 string
+}
+
+func (stored profilePublishedReadback) clone() profilePublishedReadback {
+	stored.manifestJSON = append([]byte(nil), stored.manifestJSON...)
+	stored.snapshotJSON = append([]byte(nil), stored.snapshotJSON...)
+	return stored
+}
+
+func scanProfilePublishedReadback(row pgx.Row) (profilePublishedReadback, error) {
+	var stored profilePublishedReadback
 	if err := row.Scan(
-		&tenantID, &profileID, &version, &draftGeneration, &engineVersion, &snapshotHash,
-		&manifestJSON, &snapshotJSON, &active, &revokedAt, &revokedBy, &publishedAt, &publishedBy, &activatedAt, &activatedBy,
+		&stored.tenantID, &stored.profileID, &stored.version, &stored.draftGeneration, &stored.engineVersion, &stored.snapshotHash,
+		&stored.manifestJSON, &stored.snapshotJSON, &stored.active, &stored.revokedAt, &stored.revokedBy,
+		&stored.publishedAt, &stored.publishedBy, &stored.activatedAt, &stored.activatedBy,
 	); err != nil {
+		return profilePublishedReadback{}, err
+	}
+	return stored.clone(), nil
+}
+
+func scanProfilePublished(row pgx.Row) (profile.Published, error) {
+	stored, err := scanProfilePublishedReadback(row)
+	if err != nil {
 		return profile.Published{}, err
 	}
+	return stored.canonicalPublished()
+}
+
+func (stored profilePublishedReadback) canonicalPublished() (profile.Published, error) {
 	var manifest profile.Manifest
 	var snapshot profile.Snapshot
-	if decodeProfileDocument(manifestJSON, &manifest) != nil || decodeProfileDocument(snapshotJSON, &snapshot) != nil {
+	if decodeProfileDocument(stored.manifestJSON, &manifest) != nil || decodeProfileDocument(stored.snapshotJSON, &snapshot) != nil {
 		return profile.Published{}, profile.ErrInvalidProfile
 	}
 	canonicalManifest, manifestErr := encodeProfileManifest(manifest)
 	canonicalSnapshot, snapshotErr := encodeProfileSnapshot(snapshot)
 	if manifestErr != nil || snapshotErr != nil ||
-		!bytes.Equal(manifestJSON, canonicalManifest) || !bytes.Equal(snapshotJSON, canonicalSnapshot) {
+		!bytes.Equal(stored.manifestJSON, canonicalManifest) || !bytes.Equal(stored.snapshotJSON, canonicalSnapshot) {
 		return profile.Published{}, profile.ErrInvalidProfile
 	}
-	if version <= 0 || draftGeneration <= 0 || !validProfileTime(publishedAt) ||
-		revokedAt.Valid != revokedBy.Valid || activatedAt.Valid != activatedBy.Valid ||
-		revokedAt.Valid && (!validProfileTime(revokedAt.Time) || !validProfileIdentifier(revokedBy.String) || revokedAt.Time.Before(publishedAt)) ||
-		activatedAt.Valid && (!validProfileTime(activatedAt.Time) || !validProfileIdentifier(activatedBy.String) || activatedAt.Time.Before(publishedAt)) ||
-		revokedAt.Valid && activatedAt.Valid && revokedAt.Time.Before(activatedAt.Time) ||
-		active && (revokedAt.Valid || !activatedAt.Valid) {
+	if stored.version <= 0 || stored.draftGeneration <= 0 || !validProfileTime(stored.publishedAt) ||
+		stored.revokedAt.Valid != stored.revokedBy.Valid || stored.activatedAt.Valid != stored.activatedBy.Valid ||
+		stored.revokedAt.Valid && (!validProfileTime(stored.revokedAt.Time) || !validProfileIdentifier(stored.revokedBy.String) || stored.revokedAt.Time.Before(stored.publishedAt)) ||
+		stored.activatedAt.Valid && (!validProfileTime(stored.activatedAt.Time) || !validProfileIdentifier(stored.activatedBy.String) || stored.activatedAt.Time.Before(stored.publishedAt)) ||
+		stored.revokedAt.Valid && stored.activatedAt.Valid && stored.revokedAt.Time.Before(stored.activatedAt.Time) ||
+		stored.active && (stored.revokedAt.Valid || !stored.activatedAt.Valid) {
 		return profile.Published{}, profile.ErrInvalidProfile
 	}
 	published := profile.Published{
-		TenantID: tenantID, Ref: profile.VersionRef{ID: profile.ID(profileID), Version: uint64(version)},
-		DraftGeneration: draftGeneration, EngineVersion: engineVersion,
-		Snapshot: snapshot, Manifest: manifest, Active: active,
-		PublishedAt: publishedAt.UTC(), PublishedBy: publishedBy,
+		TenantID: stored.tenantID, Ref: profile.VersionRef{ID: profile.ID(stored.profileID), Version: uint64(stored.version)},
+		DraftGeneration: stored.draftGeneration, EngineVersion: stored.engineVersion,
+		Snapshot: snapshot, Manifest: manifest, Active: stored.active,
+		PublishedAt: stored.publishedAt.UTC(), PublishedBy: stored.publishedBy,
 	}
-	if revokedAt.Valid {
-		value := revokedAt.Time.UTC()
+	if stored.revokedAt.Valid {
+		value := stored.revokedAt.Time.UTC()
 		published.RevokedAt = &value
 	}
-	if snapshotHash != snapshot.SnapshotHash || published.Validate() != nil {
+	if stored.snapshotHash != snapshot.SnapshotHash || published.Validate() != nil {
 		return profile.Published{}, profile.ErrInvalidProfile
 	}
 	return published.Clone(), nil
+}
+
+func validateExactProfilePublishedReadback(stored, expected profilePublishedReadback) (profile.Published, error) {
+	if !equalProfilePublishedReadback(stored, expected) {
+		return profile.Published{}, profile.ErrInvalidProfile
+	}
+	return stored.canonicalPublished()
+}
+
+func equalProfilePublishedReadback(left, right profilePublishedReadback) bool {
+	return left.tenantID == right.tenantID && left.profileID == right.profileID &&
+		left.version == right.version && left.draftGeneration == right.draftGeneration &&
+		left.engineVersion == right.engineVersion && left.snapshotHash == right.snapshotHash &&
+		bytes.Equal(left.manifestJSON, right.manifestJSON) && bytes.Equal(left.snapshotJSON, right.snapshotJSON) &&
+		left.active == right.active && equalNullTime(left.revokedAt, right.revokedAt) &&
+		left.revokedBy == right.revokedBy && left.publishedAt.Equal(right.publishedAt) &&
+		left.publishedBy == right.publishedBy && equalNullTime(left.activatedAt, right.activatedAt) &&
+		left.activatedBy == right.activatedBy
+}
+
+func equalNullTime(left, right sql.NullTime) bool {
+	return left.Valid == right.Valid && (!left.Valid || left.Time.Equal(right.Time))
+}
+
+func deactivateProfileVersion(ctx context.Context, tx pgx.Tx, tenantID string, profileID profile.ID) error {
+	before, err := scanProfilePublishedReadback(tx.QueryRow(ctx, `SELECT
+		tenant_id,profile_id,version,draft_generation,engine_version,snapshot_hash,
+		manifest::text,snapshot::text,active,revoked_at,revoked_by,published_at,published_by,activated_at,activated_by
+		FROM profile_versions WHERE tenant_id=$1 AND profile_id=$2 AND active FOR UPDATE`, tenantID, profileID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return mapProfileStoreError(ctx, err, nil)
+	}
+	published, err := before.canonicalPublished()
+	if err != nil || published.TenantID != tenantID || published.Ref.ID != profileID || !before.active {
+		return profile.ErrInvalidProfile
+	}
+	stored, err := scanProfilePublishedReadback(tx.QueryRow(ctx, `UPDATE profile_versions SET active=false
+		WHERE tenant_id=$1 AND profile_id=$2 AND version=$3 AND active
+		RETURNING tenant_id,profile_id,version,draft_generation,engine_version,snapshot_hash,
+			manifest::text,snapshot::text,active,revoked_at,revoked_by,published_at,published_by,activated_at,activated_by`,
+		tenantID, profileID, before.version))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return profile.ErrPublicationConflict
+	}
+	if err != nil {
+		return mapProfileStoreError(ctx, err, profile.ErrPublicationConflict)
+	}
+	expected := before.clone()
+	expected.active = false
+	_, err = validateExactProfilePublishedReadback(stored, expected)
+	return err
 }
 
 func encodeProfileManifest(manifest profile.Manifest) ([]byte, error) {

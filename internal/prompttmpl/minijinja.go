@@ -36,7 +36,7 @@ func (miniJinjaEngine) Compile(ctx context.Context, bundle Bundle, requested Lim
 	if err := ctxErr(ctx); err != nil {
 		return nil, &CompileError{Err: ErrTemplateInvalid}
 	}
-	if err := validateBundleSize(bundle, limits); err != nil {
+	if err := validateBundleEnvelope(ctx, bundle, limits); err != nil {
 		return nil, &CompileError{Err: err}
 	}
 	if err := ValidateBundleSources(bundle.Templates); err != nil {
@@ -323,23 +323,6 @@ func (b *contextBudget) jsonString(value string) error {
 func (b *contextBudget) check() error {
 	if err := ctxErr(b.ctx); err != nil {
 		return ErrRenderLimit
-	}
-	return nil
-}
-
-func validateBundleSize(bundle Bundle, limits Limits) error {
-	total := 0
-	for name, source := range bundle.Templates {
-		if err := validateLogicalName(name); err != nil {
-			return ErrTemplateInvalid
-		}
-		if len(source) > limits.TemplateBytes {
-			return ErrTemplateInvalid
-		}
-		total += len(source)
-		if total > limits.BundleBytes {
-			return ErrTemplateInvalid
-		}
 	}
 	return nil
 }
