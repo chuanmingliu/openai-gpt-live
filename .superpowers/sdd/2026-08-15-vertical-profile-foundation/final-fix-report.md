@@ -94,3 +94,66 @@ Before the implementation commit, `git diff --cached --name-only` contained exac
 Protected browser/audio files, `.zshrc`, research notes, and the realtime interruption plan remained untouched and unstaged. No path outside the brief was required.
 
 Concerns: none.
+
+## Final fix round 2/5 — bounded logical-name preprocessing
+
+Date: 2026-08-16
+
+Base: `f4fd7270175e627fb5bf01eaa0a49e53d3a98cde`
+
+Implementation commit: `e9bf48dfaaf272df393a3f2b86d24da58c7c9c05 fix: bound logical name validation`
+
+This round closes the sole P2 in `final-rereview-1.md`. The evidence report is committed separately so it can record the immutable implementation commit.
+
+### Strict RED evidence
+
+The six focused regressions were added before production changes and run together:
+
+- `TestBundleEnvelopeChargesOversizedLogicalNameWithoutGrammarAllocation` — RED because the oversized syntactically valid name incurred one allocation before rejection.
+- `TestValidateLogicalNameScansWithoutAllocation` — RED because `strings.Split` incurred one allocation for a valid segmented name.
+- `TestMiniJinjaObservesCancellationDuringBoundedLogicalNameScan` — RED because compilation returned success rather than `template_invalid` after the deterministic context cancelled during the scan.
+- `TestCacheObservesCancellationDuringBoundedLogicalNameScan` — RED because Cache returned success and could reach preprocessing/engine work rather than observing cancellation.
+- Direct oversized-valid-name cases through MiniJinja and Cache were also pinned; Cache must reject before calling its engine.
+- Combined RED command exited 1 with exactly those four missing-behavior failures; the oversized public-path rejection assertions already described the existing final error class.
+
+### Implementation and GREEN
+
+- `validateBundleEnvelope` now charges the length-prefixed logical-name bytes before any grammar processing. An oversized name returns the stable `template_invalid` class without scanning or allocating by segment count.
+- Logical-name validation now performs one allocation-free byte scan, tracks segment boundaries by indexes, and preserves the prior allowed-byte, suffix, first-byte, empty-segment, `.`-segment, and `..`-segment grammar.
+- The bounded engine scan observes context cancellation every 256 bytes and once after the loop. MiniJinja and Cache therefore reject cancellation before clone, sort, fingerprint, compiler, or engine work.
+- Fresh focused GREEN after final formatting: `go test ./internal/prompttmpl -run 'Test(BundleEnvelopeChargesOversizedLogicalNameWithoutGrammarAllocation|ValidateLogicalNameScansWithoutAllocation|MiniJinjaRejectsOversizedSyntacticallyValidLogicalName|MiniJinjaObservesCancellationDuringBoundedLogicalNameScan|CacheRejectsOversizedSyntacticallyValidLogicalNameBeforeEngine|CacheObservesCancellationDuringBoundedLogicalNameScan)$' -count=1` — PASS in 0.427s.
+- Repeated package verification: `go test ./internal/prompttmpl -count=10` — PASS in 0.518s.
+- Repeated race verification: `go test -race ./internal/prompttmpl -count=10` — PASS in 1.613s.
+
+### Complete acceptance matrix
+
+- `go test ./internal/prompttmpl ./internal/profile ./internal/store/postgres ./migrations -count=1`
+  - PASS: prompttmpl 0.346s; profile 0.613s; PostgreSQL package 0.967s; migrations 1.399s.
+- `go test -race ./internal/prompttmpl ./internal/profile ./internal/store/postgres ./migrations -count=3`
+  - PASS: prompttmpl 1.390s; profile 2.293s; PostgreSQL package 2.400s; migrations 2.823s.
+- `CGO_ENABLED=0 go test ./internal/prompttmpl ./internal/profile -count=1`
+  - PASS: prompttmpl 0.671s; profile 1.100s.
+- Real PostgreSQL 16 ordinary: `go test -json -tags=integration ./internal/store/postgres -run 'TestProfile|TestSchema' -count=1`
+  - PASS in 65.074s against actual `postgres:16-alpine`; JSON filtering reported exactly `skip_actions=0 fail_actions=0`.
+- Real PostgreSQL 16 race: `go test -race -json -tags=integration ./migrations ./internal/store/postgres -run 'TestProfile|TestSchema|TestEmbedded' -count=1`
+  - PASS: migrations 2.207s; PostgreSQL 71.628s; JSON filtering reported exactly `skip_actions=0 fail_actions=0`.
+- `go test ./... -count=1`
+  - PASS for every package; `demo/live-client` passed in 39.418s.
+- `go test -race ./... -count=1`
+  - PASS for every package; `demo/live-client` passed in 43.912s.
+- `go test ./internal/prompttmpl -run=^$ -fuzz=FuzzValidateSourceNeverPanics -fuzztime=10s`
+  - PASS after 2,997,279 executions; no panic or hang.
+- `go vet ./...`, `go build ./...`, `go mod tidy -diff`, changed-owned-Go-file `gofmt -d`, plain and fix-range `git diff --check`
+  - PASS with no diagnostics or diff.
+- `make verify-deploy-static`
+  - PASS: durable Compose wrapper, deploy validation, live load/loadgen, supply-evidence semantic boundary, release-gate boundary, and static deployment verification.
+
+### Privacy, scope, and commit audit
+
+- The new cancellation/oversize paths return only the existing content-free `template_invalid` sentinel. They add no logical name, prompt text, source bytes, context data, or raw cancellation detail to public errors or logs.
+- The scanner slices no segments and allocates nothing for accepted logical names. The oversized envelope regression records zero allocations, and both Cache regressions prove the supplied engine remains untouched.
+- Before commit, `git diff --cached --name-only` contained exactly the six authorized implementation/test paths: `internal/prompttmpl/engine.go`, `engine_test.go`, `policy.go`, `policy_test.go`, `minijinja_test.go`, and `cache_test.go`. `git diff --cached --check` passed.
+- Commit `e9bf48dfaaf272df393a3f2b86d24da58c7c9c05` contains 107 insertions and 5 deletions across only those six paths.
+- Protected browser/audio files, `.zshrc`, research notes, and the realtime interruption plan remained untouched and unstaged. No path outside the brief was required.
+
+Round 2 concerns: none.
