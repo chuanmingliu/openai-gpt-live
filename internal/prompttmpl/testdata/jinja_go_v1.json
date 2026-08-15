@@ -1,0 +1,103 @@
+[
+  {
+    "name": "variables_maps_lists_indexing_and_unicode",
+    "accepted": true,
+    "templates": {
+      "system.j2": "您好 {{ customer.name }} {{ products[0].label }} {{ scores[1] }}"
+    }
+  },
+  {
+    "name": "control_flow_set_defined_none_comparisons_and_whitespace",
+    "accepted": true,
+    "templates": {
+      "system.j2": "{%- set greeting = customer.name -%}{% if customer.name is defined and customer.note is none %}{{ greeting }}{% elif scores[0] >= 2 %}high{% else %}low{% endif %}{% for product in products %}{{ product.label }}{% endfor %}"
+    }
+  },
+  {
+    "name": "macros_and_static_include",
+    "accepted": true,
+    "templates": {
+      "system.j2": "{% macro greeting(name) %}Hello {{ name | upper }}{% endmacro %}{% include \"fragments/rules.j2\" %}{{ greeting(customer.name) }}",
+      "fragments/rules.j2": "Use approved facts only."
+    }
+  },
+  {
+    "name": "append_mutation",
+    "accepted": false,
+    "templates": {
+      "system.j2": "{% set ignored = products.append(customer) %}"
+    }
+  },
+  {
+    "name": "update_mutation",
+    "accepted": false,
+    "templates": {
+      "system.j2": "{% set ignored = customer.update({\"name\": \"Li\"}) %}"
+    }
+  },
+  {
+    "name": "dotted_call",
+    "accepted": false,
+    "templates": {
+      "system.j2": "{{ customer.name.lower() }}"
+    }
+  },
+  {
+    "name": "undeclared_call",
+    "accepted": false,
+    "templates": {
+      "system.j2": "{{ helper(customer.name) }}"
+    }
+  },
+  {
+    "name": "random_nondeterminism",
+    "accepted": false,
+    "templates": {
+      "system.j2": "{{ products | random }}"
+    }
+  },
+  {
+    "name": "dynamic_include",
+    "accepted": false,
+    "templates": {
+      "system.j2": "{% include selected_fragment %}",
+      "fragments/rules.j2": "rules"
+    }
+  },
+  {
+    "name": "import_outside_bundle",
+    "accepted": false,
+    "templates": {
+      "system.j2": "{% import \"outside.j2\" as helpers %}"
+    }
+  },
+  {
+    "name": "recursive_include_cycle",
+    "accepted": false,
+    "templates": {
+      "system.j2": "{% include \"fragments/a.j2\" %}",
+      "fragments/a.j2": "{% include \"system.j2\" %}"
+    }
+  },
+  {
+    "name": "filesystem_like_name",
+    "accepted": false,
+    "templates": {
+      "../system.j2": "hello"
+    }
+  },
+  {
+    "name": "credential_reference_from_demo",
+    "accepted": false,
+    "templates": {
+      "system.j2": "{{ credentials.get(\"api_key\") }}"
+    }
+  },
+  {
+    "name": "logging_call_from_demo",
+    "accepted": false,
+    "templates": {
+      "system.j2": "{% set ignored = logger.info(\"rendered\") %}"
+    }
+  }
+]
