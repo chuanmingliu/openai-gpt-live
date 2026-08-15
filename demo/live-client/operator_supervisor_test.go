@@ -210,6 +210,22 @@ func TestOperatorSupervisorReportsOwnedUnreadyAsFailedAndProtectsDependencies(t 
 	}
 }
 
+func TestOperatorSupervisorClearsAnUnownedStartFailureForRetry(t *testing.T) {
+	runner := newFakeOperatorRunner()
+	runner.err = errors.New("start failed before ownership")
+	supervisor := newOperatorSupervisor(runner, time.Second)
+
+	failed := supervisor.Apply(t.Context(), componentSpeech, actionStart)
+	assert.Equal(t, "operation_failed", failed.Code)
+	assert.False(t, runner.Owned(componentSpeech))
+	assert.Equal(t, "process_exited", supervisor.Apply(t.Context(), componentSpeech, actionStop).Code)
+
+	runner.err = nil
+	retried := supervisor.Apply(t.Context(), componentSpeech, actionStart)
+	assert.Equal(t, "ready", retried.Code)
+	assert.True(t, runner.Owned(componentSpeech))
+}
+
 func TestOperatorSupervisorRejectsStopOfUnownedComponent(t *testing.T) {
 	supervisor := newOperatorSupervisor(newFakeOperatorRunner(), 100*time.Millisecond)
 

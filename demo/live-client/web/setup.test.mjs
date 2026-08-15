@@ -14,6 +14,7 @@ function snapshot(overrides = {}) {
       code: codes[component] || (ready.has(component) ? 'ready' : busy.has(component) ? 'operation_in_progress' : 'stopped'),
       ready: ready.has(component),
       busy: busy.has(component),
+      owned: ready.has(component),
     })),
   };
 }
@@ -120,7 +121,7 @@ test('status snapshots alone never enable migration-gated starts', async () => {
 
 test('successful current-generation migrate unlocks durable starts, while a busy dependant keeps stops disabled', async () => {
   const dom = fakeDOM();
-  const actions = [response({component: 'postgres', state: 'ready', code: 'ready', ready: true, busy: false})];
+  const actions = [response({component: 'postgres', state: 'ready', code: 'ready', ready: true, busy: false, owned: true})];
   const controller = createSetupController({
     fetch: async (url) => url.endsWith('/status')
       ? response(snapshot({ready: ['speech', 'postgres'], busy: ['gateway']}))
@@ -166,6 +167,7 @@ test('owned-unready failed services remain stoppable and block dependency remova
   const gateway = value.components.find((component) => component.component === 'gateway');
   gateway.state = 'failed';
   gateway.code = 'process_exited';
+  gateway.owned = true;
   const controller = createSetupController({fetch: async () => response(value), timers: fakeTimers(), dom});
 
   await controller.refresh();
@@ -177,6 +179,65 @@ test('owned-unready failed services remain stoppable and block dependency remova
   assert.equal(cards.find((item) => item.component === 'postgres').actions.stop, false);
 });
 
+test('unowned failed Start remains retryable while an owned failed service is Stop-only', async () => {
+  const statuses = (speech) => ({components: COMPONENTS.map((component) => ({
+    component,
+    state: component === 'speech' ? speech.state : 'stopped',
+    code: component === 'speech' ? speech.code : 'stopped',
+    ready: component === 'speech' ? speech.ready : false,
+    busy: false,
+    owned: component === 'speech' ? speech.owned : false,
+  }))});
+  const actions = [];
+  const unownedDOM = fakeDOM();
+  const unowned = createSetupController({
+    fetch: async (_url, request) => {
+      actions.push(JSON.parse(request.body));
+      return response(actions.length === 1
+        ? {component: 'speech', state: 'failed', code: 'operation_failed', ready: false, busy: false, owned: false}
+        : {component: 'speech', state: 'ready', code: 'ready', ready: true, busy: false, owned: true}, actions.length !== 1);
+    }, timers: fakeTimers(), dom: unownedDOM,
+  });
+  await unowned.act('speech', 'start');
+  let speech = unownedDOM.renders.at(-1).components.find((item) => item.component === 'speech');
+  assert.equal(speech.actions.start, true);
+  assert.equal(speech.actions.stop, false);
+  await unowned.act('speech', 'start');
+  speech = unownedDOM.renders.at(-1).components.find((item) => item.component === 'speech');
+  assert.equal(speech.actions.start, false);
+  assert.equal(speech.actions.stop, true);
+  assert.deepEqual(actions, [{component: 'speech', action: 'start'}, {component: 'speech', action: 'start'}]);
+
+  const ownedDOM = fakeDOM();
+  const ownedActions = [];
+  const owned = createSetupController({
+    fetch: async (_url, request) => {
+      if (request?.method !== 'POST') return response(statuses({state: 'failed', code: 'process_exited', ready: false, owned: true}));
+      ownedActions.push(JSON.parse(request.body));
+      return response({component: 'speech', state: 'stopped', code: 'stopped', ready: false, busy: false, owned: false});
+    }, timers: fakeTimers(), dom: ownedDOM,
+  });
+  await owned.refresh();
+  speech = ownedDOM.renders.at(-1).components.find((item) => item.component === 'speech');
+  assert.equal(speech.actions.start, false);
+  assert.equal(speech.actions.stop, true);
+  await owned.act('speech', 'stop');
+  speech = ownedDOM.renders.at(-1).components.find((item) => item.component === 'speech');
+  assert.equal(speech.state, 'stopped');
+  assert.deepEqual(ownedActions, [{component: 'speech', action: 'stop'}]);
+});
+
+test('malformed owned authority fails closed', async () => {
+  const value = snapshot();
+  value.components[0].owned = 'injected';
+  const dom = fakeDOM();
+  const controller = createSetupController({fetch: async () => response(value), timers: fakeTimers(), dom});
+
+  await controller.refresh();
+
+  assert.equal(dom.renders.at(-1).components.find((item) => item.component === 'speech').state, 'unknown');
+});
+
 test('suppresses double clicks and fences a late poll behind a newer action response', async () => {
   const dom = fakeDOM();
   const timers = fakeTimers();
@@ -186,7 +247,7 @@ test('suppresses double clicks and fences a late poll behind a newer action resp
     fetch: (url) => {
       if (url.endsWith('/status')) return poll.promise;
       actionCalls += 1;
-      return Promise.resolve(response({component: 'speech', state: 'ready', code: 'ready', ready: true, busy: false}));
+      return Promise.resolve(response({component: 'speech', state: 'ready', code: 'ready', ready: true, busy: false, owned: true}));
     }, timers, dom,
   });
 
@@ -217,7 +278,7 @@ test('failed or late migrate responses never unlock durable starts', async () =>
   await controller.applySnapshot(snapshot({ready: ['speech', 'postgres']}));
   const migrate = controller.act('postgres', 'migrate');
   controller.destroy();
-  delayedMigrate.resolve(response({component: 'postgres', state: 'ready', code: 'ready', ready: true, busy: false}));
+  delayedMigrate.resolve(response({component: 'postgres', state: 'ready', code: 'ready', ready: true, busy: false, owned: true}));
   await migrate;
 
   let cards = dom.renders.at(-1).components;
@@ -225,7 +286,7 @@ test('failed or late migrate responses never unlock durable starts', async () =>
   assert.equal(cards.find((item) => item.component === 'worker').actions.start, false);
 
   const failed = createSetupController({
-    fetch: async () => response({component: 'postgres', state: 'failed', code: 'operation_failed', ready: false, busy: false}, false),
+    fetch: async () => response({component: 'postgres', state: 'failed', code: 'operation_failed', ready: false, busy: false, owned: false}, false),
     timers: fakeTimers(), dom: fakeDOM(),
   });
   await failed.applySnapshot(snapshot({ready: ['speech', 'postgres']}));
@@ -246,7 +307,7 @@ test('a periodic poll after two seconds preserves migration confirmation while a
   const controller = createSetupController({
     fetch: async (url) => url.endsWith('/status')
       ? response(snapshots.shift())
-      : response({component: 'postgres', state: 'ready', code: 'ready', ready: true, busy: false}),
+      : response({component: 'postgres', state: 'ready', code: 'ready', ready: true, busy: false, owned: true}),
     timers, dom,
   });
 
@@ -271,7 +332,7 @@ test('postgres loss in a later status poll relocks a prior migration confirmatio
   const controller = createSetupController({
     fetch: async (url) => url.endsWith('/status')
       ? response(snapshots.shift())
-      : response({component: 'postgres', state: 'ready', code: 'ready', ready: true, busy: false}),
+      : response({component: 'postgres', state: 'ready', code: 'ready', ready: true, busy: false, owned: true}),
     timers: fakeTimers(), dom,
   });
 
@@ -285,8 +346,8 @@ test('postgres loss in a later status poll relocks a prior migration confirmatio
 test('uses a valid non-success action status for the requested component but fails closed for another component', async () => {
   const dom = fakeDOM();
   const responses = [
-    response({component: 'gateway', state: 'failed', code: 'dependency_not_ready', ready: false, busy: false}, false),
-    response({component: 'postgres', state: 'ready', code: 'ready', ready: true, busy: false}),
+    response({component: 'gateway', state: 'failed', code: 'dependency_not_ready', ready: false, busy: false, owned: false}, false),
+    response({component: 'postgres', state: 'ready', code: 'ready', ready: true, busy: false, owned: true}),
   ];
   const controller = createSetupController({fetch: async () => responses.shift(), timers: fakeTimers(), dom});
 
@@ -314,7 +375,7 @@ test('aborts on teardown and recovers from network and malformed response failur
   });
   await recovery.refresh();
   assert.match(recovery.dom.announcements.at(-1), /Unable to contact local setup service/);
-  await recovery.applySnapshot({components: [{component: 'speech', state: 'ready', code: 'ready', ready: true, busy: false}]});
+  await recovery.applySnapshot({components: [{component: 'speech', state: 'ready', code: 'ready', ready: true, busy: false, owned: true}]});
   assert.equal(recovery.dom.renders.at(-1).components[0].status, 'Status unavailable.');
 });
 

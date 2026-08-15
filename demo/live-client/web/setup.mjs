@@ -30,7 +30,7 @@ const STATE_COPY = Object.freeze({
   ready: 'State: Ready', stopped: 'State: Stopped', starting: 'State: Starting',
   stopping: 'State: Stopping', failed: 'State: Failed', unknown: 'State: Unavailable',
 });
-const UNKNOWN = Object.freeze({state: 'unknown', code: 'unknown', ready: false, busy: false});
+const UNKNOWN = Object.freeze({state: 'unknown', code: 'unknown', ready: false, busy: false, owned: false});
 
 function initialSnapshot() {
   return new Map(COMPONENTS.map((component) => [component, {...UNKNOWN}]));
@@ -38,13 +38,14 @@ function initialSnapshot() {
 
 function statusIsValid(value, expectedComponent) {
   return value !== null && typeof value === 'object'
-    && Object.keys(value).length === 5
-    && Object.keys(value).every((key) => ['component', 'state', 'code', 'ready', 'busy'].includes(key))
+    && Object.keys(value).length === 6
+    && Object.keys(value).every((key) => ['component', 'state', 'code', 'ready', 'busy', 'owned'].includes(key))
     && value.component === expectedComponent
     && STATES.has(value.state)
     && CODES.has(value.code)
     && typeof value.ready === 'boolean'
-    && typeof value.busy === 'boolean';
+    && typeof value.busy === 'boolean'
+    && typeof value.owned === 'boolean';
 }
 
 function decodeSnapshot(value) {
@@ -56,7 +57,7 @@ function decodeSnapshot(value) {
     if (status === null || typeof status !== 'object' || !COMPONENTS.includes(status.component)
         || result.has(status.component) || !statusIsValid(status, status.component)) return null;
     result.set(status.component, {
-      state: status.state, code: status.code, ready: status.ready, busy: status.busy,
+      state: status.state, code: status.code, ready: status.ready, busy: status.busy, owned: status.owned,
     });
   }
   return result.size === COMPONENTS.length ? result : null;
@@ -65,7 +66,7 @@ function decodeSnapshot(value) {
 function decodeActionStatus(value) {
   if (value === null || typeof value !== 'object' || !COMPONENTS.includes(value.component)
       || !statusIsValid(value, value.component)) return null;
-  return {component: value.component, status: {state: value.state, code: value.code, ready: value.ready, busy: value.busy}};
+  return {component: value.component, status: {state: value.state, code: value.code, ready: value.ready, busy: value.busy, owned: value.owned}};
 }
 
 function createModel(snapshot, localBusy, migrationConfirmed) {
@@ -78,9 +79,9 @@ function createModel(snapshot, localBusy, migrationConfirmed) {
       const dependenciesReady = DEPENDENCIES[component].every(ready)
         && (!['gateway', 'worker'].includes(component) || migrationConfirmed);
       const dependantsStopped = DEPENDANTS[component].every((dependant) => !ready(dependant)
-        && snapshot.get(dependant)?.state !== 'failed'
+        && !(snapshot.get(dependant)?.state === 'failed' && snapshot.get(dependant)?.owned)
         && !localBusy.has(dependant) && !snapshot.get(dependant)?.busy);
-      const ownedUnready = status.state === 'failed';
+      const ownedUnready = status.state === 'failed' && status.owned;
       const actions = {
         start: !actionInFlight && !busy && !status.ready && !ownedUnready && dependenciesReady,
         stop: !actionInFlight && !busy && (status.ready || ownedUnready) && dependantsStopped,

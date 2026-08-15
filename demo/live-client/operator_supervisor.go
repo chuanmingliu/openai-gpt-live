@@ -38,6 +38,7 @@ type componentStatus struct {
 	Code      string
 	Ready     bool
 	Busy      bool
+	Owned     bool
 }
 
 type operatorRunner interface {
@@ -97,7 +98,7 @@ func (supervisor *operatorSupervisor) Apply(ctx context.Context, component opera
 	}
 	if code := supervisor.dependencyCodeLocked(ctx, component, action); code != "" {
 		supervisor.mu.Unlock()
-		return componentStatus{Component: component, State: "failed", Code: code, Ready: supervisor.runner.Ready(ctx, component)}
+		return componentStatus{Component: component, State: "failed", Code: code, Ready: supervisor.runner.Ready(ctx, component), Owned: supervisor.runner.Owned(component)}
 	}
 	wasOwned := supervisor.runner.Owned(component)
 	supervisor.inFlight[component] = action
@@ -165,21 +166,22 @@ func (supervisor *operatorSupervisor) status(ctx context.Context, component oper
 	failedCode := supervisor.failed[component]
 	supervisor.mu.Unlock()
 	ready := supervisor.runner != nil && supervisor.runner.Ready(ctx, component)
+	owned := supervisor.runner != nil && supervisor.runner.Owned(component)
 	if busy {
 		state := "starting"
 		if action == actionStop {
 			state = "stopping"
 		}
-		return componentStatus{Component: component, State: state, Code: "operation_in_progress", Ready: ready, Busy: true}
+		return componentStatus{Component: component, State: state, Code: "operation_in_progress", Ready: ready, Busy: true, Owned: owned}
 	}
 	if failedCode != "" {
-		return componentStatus{Component: component, State: "failed", Code: failedCode, Ready: ready}
+		return componentStatus{Component: component, State: "failed", Code: failedCode, Ready: ready, Owned: owned}
 	}
 	if ready {
-		return componentStatus{Component: component, State: "ready", Code: "ready", Ready: true}
+		return componentStatus{Component: component, State: "ready", Code: "ready", Ready: true, Owned: owned}
 	}
-	if supervisor.runner != nil && supervisor.runner.Owned(component) {
-		return componentStatus{Component: component, State: "failed", Code: "process_exited"}
+	if owned {
+		return componentStatus{Component: component, State: "failed", Code: "process_exited", Owned: true}
 	}
 	return componentStatus{Component: component, State: "stopped", Code: "stopped"}
 }

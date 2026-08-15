@@ -28,6 +28,7 @@ type operatorAPIStatus struct {
 	Code      string            `json:"code"`
 	Ready     bool              `json:"ready"`
 	Busy      bool              `json:"busy"`
+	Owned     bool              `json:"owned"`
 }
 
 type operatorAPISnapshot struct {

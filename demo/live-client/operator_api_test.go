@@ -24,7 +24,7 @@ func TestOperatorAPIStatusReturnsOnlyFixedSnapshotSchema(t *testing.T) {
 	require.Equal(t, http.StatusOK, response.Code)
 	assert.Equal(t, "application/json; charset=utf-8", response.Header().Get("Content-Type"))
 	assert.Equal(t, "no-store", response.Header().Get("Cache-Control"))
-	assert.JSONEq(t, `{"components":[{"component":"speech","state":"ready","code":"ready","ready":true,"busy":false},{"component":"postgres","state":"stopped","code":"stopped","ready":false,"busy":false},{"component":"gateway","state":"stopped","code":"stopped","ready":false,"busy":false},{"component":"worker","state":"stopped","code":"stopped","ready":false,"busy":false},{"component":"client","state":"stopped","code":"stopped","ready":false,"busy":false}]}`, response.Body.String())
+	assert.JSONEq(t, `{"components":[{"component":"speech","state":"ready","code":"ready","ready":true,"busy":false,"owned":false},{"component":"postgres","state":"stopped","code":"stopped","ready":false,"busy":false,"owned":false},{"component":"gateway","state":"stopped","code":"stopped","ready":false,"busy":false,"owned":false},{"component":"worker","state":"stopped","code":"stopped","ready":false,"busy":false,"owned":false},{"component":"client","state":"stopped","code":"stopped","ready":false,"busy":false,"owned":false}]}`, response.Body.String())
 	assertContentFreeOperatorResponse(t, response, "sentinel-browser-secret")
 }
 
@@ -34,11 +34,28 @@ func TestOperatorAPIOwnedUnreadyComponentIsFailedAndCanBeStopped(t *testing.T) {
 
 	status := httptest.NewRecorder()
 	handler.ServeHTTP(status, httptest.NewRequest(http.MethodGet, "/api/operator/status", nil))
-	assert.Contains(t, status.Body.String(), `{"component":"speech","state":"failed","code":"process_exited","ready":false,"busy":false}`)
+	assert.Contains(t, status.Body.String(), `{"component":"speech","state":"failed","code":"process_exited","ready":false,"busy":false,"owned":true}`)
 
 	response := makeOperatorActionRequest(handler, http.MethodPost, `{"component":"speech","action":"stop"}`, "http://127.0.0.1:3000", "application/json")
 	assert.Equal(t, http.StatusOK, response.Code)
-	assert.JSONEq(t, `{"component":"speech","state":"stopped","code":"stopped","ready":false,"busy":false}`, response.Body.String())
+	assert.JSONEq(t, `{"component":"speech","state":"stopped","code":"stopped","ready":false,"busy":false,"owned":false}`, response.Body.String())
+}
+
+func TestOperatorAPIUnownedFailedStartCanRetryButCannotStop(t *testing.T) {
+	handler, runner := newOperatorAPIHandler(t)
+	runner.err = errors.New("local start failure")
+
+	failed := makeOperatorActionRequest(handler, http.MethodPost, `{"component":"speech","action":"start"}`, "http://127.0.0.1:3000", "application/json")
+	assert.Equal(t, http.StatusServiceUnavailable, failed.Code)
+	assert.JSONEq(t, `{"component":"speech","state":"failed","code":"operation_failed","ready":false,"busy":false,"owned":false}`, failed.Body.String())
+
+	stopped := makeOperatorActionRequest(handler, http.MethodPost, `{"component":"speech","action":"stop"}`, "http://127.0.0.1:3000", "application/json")
+	assert.Equal(t, http.StatusConflict, stopped.Code)
+
+	runner.err = nil
+	retried := makeOperatorActionRequest(handler, http.MethodPost, `{"component":"speech","action":"start"}`, "http://127.0.0.1:3000", "application/json")
+	assert.Equal(t, http.StatusOK, retried.Code)
+	assert.JSONEq(t, `{"component":"speech","state":"ready","code":"ready","ready":true,"busy":false,"owned":true}`, retried.Body.String())
 }
 
 func TestOperatorAPIActionAcceptsOnlyExactValidJSON(t *testing.T) {
@@ -46,7 +63,7 @@ func TestOperatorAPIActionAcceptsOnlyExactValidJSON(t *testing.T) {
 
 	response := makeOperatorActionRequest(handler, http.MethodPost, `{"component":"speech","action":"start"}`, "http://127.0.0.1:3000", "application/json; charset=utf-8")
 	require.Equal(t, http.StatusOK, response.Code)
-	assert.JSONEq(t, `{"component":"speech","state":"ready","code":"ready","ready":true,"busy":false}`, response.Body.String())
+	assert.JSONEq(t, `{"component":"speech","state":"ready","code":"ready","ready":true,"busy":false,"owned":true}`, response.Body.String())
 	assert.Equal(t, []fixedOperation{{Component: componentSpeech, Action: actionStart}}, runner.operations())
 
 	for _, body := range []string{
@@ -111,7 +128,7 @@ func TestOperatorAPIReportsDependencyAndInFlightConflicts(t *testing.T) {
 
 	response := makeOperatorActionRequest(handler, http.MethodPost, `{"component":"gateway","action":"start"}`, "http://127.0.0.1:3000", "application/json")
 	require.Equal(t, http.StatusConflict, response.Code)
-	assert.JSONEq(t, `{"component":"gateway","state":"failed","code":"dependency_not_ready","ready":false,"busy":false}`, response.Body.String())
+	assert.JSONEq(t, `{"component":"gateway","state":"failed","code":"dependency_not_ready","ready":false,"busy":false,"owned":false}`, response.Body.String())
 
 	runner.block = make(chan struct{})
 	completed := make(chan struct{})
@@ -122,7 +139,7 @@ func TestOperatorAPIReportsDependencyAndInFlightConflicts(t *testing.T) {
 	<-runner.started
 	response = makeOperatorActionRequest(handler, http.MethodPost, `{"component":"speech","action":"start"}`, "http://127.0.0.1:3000", "application/json")
 	assert.Equal(t, http.StatusConflict, response.Code)
-	assert.JSONEq(t, `{"component":"speech","state":"starting","code":"operation_in_progress","ready":false,"busy":true}`, response.Body.String())
+	assert.JSONEq(t, `{"component":"speech","state":"starting","code":"operation_in_progress","ready":false,"busy":true,"owned":false}`, response.Body.String())
 	close(runner.block)
 	<-completed
 }
@@ -143,7 +160,7 @@ func TestOperatorAPIRejectsDependencyInterleavingsDuringStops(t *testing.T) {
 		<-runner.stopStarted
 		response := makeOperatorActionRequest(handler, http.MethodPost, `{"component":"gateway","action":"start"}`, "http://127.0.0.1:3000", "application/json")
 		assert.Equal(t, http.StatusConflict, response.Code)
-		assert.JSONEq(t, `{"component":"gateway","state":"failed","code":"dependency_not_ready","ready":false,"busy":false}`, response.Body.String())
+		assert.JSONEq(t, `{"component":"gateway","state":"failed","code":"dependency_not_ready","ready":false,"busy":false,"owned":false}`, response.Body.String())
 		close(runner.blockStop)
 		<-stopped
 	})
@@ -187,14 +204,14 @@ func TestOperatorAPIFailedActionsUseUnavailableStatus(t *testing.T) {
 			response := makeOperatorActionRequest(handler, http.MethodPost, `{"component":"speech","action":"start"}`, "http://127.0.0.1:3000", "application/json")
 
 			assert.Equal(t, http.StatusServiceUnavailable, response.Code)
-			assert.JSONEq(t, `{"component":"speech","state":"failed","code":"`+test.code+`","ready":false,"busy":false}`, response.Body.String())
+			assert.JSONEq(t, `{"component":"speech","state":"failed","code":"`+test.code+`","ready":false,"busy":false,"owned":false}`, response.Body.String())
 		})
 	}
 
 	handler, _ := newOperatorAPIHandler(t)
 	response := makeOperatorActionRequest(handler, http.MethodPost, `{"component":"speech","action":"stop"}`, "http://127.0.0.1:3000", "application/json")
 	assert.Equal(t, http.StatusConflict, response.Code)
-	assert.JSONEq(t, `{"component":"speech","state":"failed","code":"process_exited","ready":false,"busy":false}`, response.Body.String())
+	assert.JSONEq(t, `{"component":"speech","state":"failed","code":"process_exited","ready":false,"busy":false,"owned":false}`, response.Body.String())
 }
 
 func TestOperatorAPIActionOutlivesDisconnectedRequest(t *testing.T) {
