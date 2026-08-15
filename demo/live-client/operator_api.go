@@ -38,6 +38,9 @@ func newConfiguredOperatorSupervisor(cfg demoConfig) (*operatorSupervisor, error
 	if !cfg.Operator.Enabled {
 		return nil, nil
 	}
+	if cfg.Operator.supervisor != nil {
+		return cfg.Operator.supervisor, nil
+	}
 	runner, err := newLocalOperatorRunner(cfg.Operator, nil, nil)
 	if err != nil {
 		return nil, err

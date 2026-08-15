@@ -1071,6 +1071,20 @@ func TestLocalOperatorRunnerClientStopUsesOnlyServerCallback(t *testing.T) {
 	assert.False(t, runner.Owned(componentClient))
 }
 
+func TestLocalOperatorRunnerClientStopStaysClosedAfterDeadline(t *testing.T) {
+	root, speech, profile := newRunnerRepository(t)
+	runnerInterface, err := newLocalOperatorRunner(operatorConfig{
+		Enabled: true, StateDir: filepath.Join(t.TempDir(), "state"), RepositoryRoot: root, SpeechCommand: speech, SpeechProfile: profile, Readiness: fixedReadiness(),
+		ClientStop: func(ctx context.Context) error { return ctx.Err() },
+	}, nil, func(context.Context, string) bool { return true })
+	require.NoError(t, err)
+	runner := runnerInterface.(*localOperatorRunner)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	require.Error(t, runner.Run(ctx, fixedOperation{Component: componentClient, Action: actionStop}))
+	assert.False(t, runner.Owned(componentClient), "a timed-out Client Stop must remain fail-closed")
+}
+
 func TestLocalOperatorRunnerRehydratesMatchingComposeOwnershipAfterRestart(t *testing.T) {
 	setRequiredOperatorEnvironment(t)
 	root, speech, profile := newRunnerRepository(t)

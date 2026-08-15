@@ -42,6 +42,7 @@ type operatorConfig struct {
 	ClientStart    func(context.Context) error
 	ClientStop     func(context.Context) error
 	clientSessions *clientSessionSet
+	supervisor     *operatorSupervisor
 }
 
 type commandFactory func(context.Context, string, ...string) *exec.Cmd
@@ -331,9 +332,11 @@ func (runner *localOperatorRunner) Run(ctx context.Context, operation fixedOpera
 		runner.clientOwned = false
 		runner.mu.Unlock()
 		if err := runner.cfg.ClientStop(ctx); err != nil {
-			runner.mu.Lock()
-			runner.clientOwned = wasOwned
-			runner.mu.Unlock()
+			if ctx.Err() == nil {
+				runner.mu.Lock()
+				runner.clientOwned = wasOwned
+				runner.mu.Unlock()
+			}
 			return commandFailure(ctx)
 		}
 		return nil

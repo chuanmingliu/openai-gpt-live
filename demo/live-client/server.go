@@ -60,18 +60,25 @@ func (sessions *clientSessionSet) remove(connection *websocket.Conn) {
 	sessions.mu.Unlock()
 }
 
-func (sessions *clientSessionSet) stop(context.Context) error {
+func (sessions *clientSessionSet) stop(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	sessions.mu.Lock()
 	sessions.accepting = false
 	connections := make([]*websocket.Conn, 0, len(sessions.connections))
 	for connection := range sessions.connections {
 		connections = append(connections, connection)
 	}
+	// A quiet peer may never return the graceful close frame. Remove every
+	// connection before aborting it so neither a deadline nor peer behavior can
+	// retain a client session in the operator lifecycle.
+	sessions.connections = make(map[*websocket.Conn]struct{})
 	sessions.mu.Unlock()
 	for _, connection := range connections {
-		_ = connection.Close(websocket.StatusGoingAway, "client stopped")
+		connection.CloseNow()
 	}
-	return nil
+	return ctx.Err()
 }
 
 func (sessions *clientSessionSet) start(context.Context) error {
@@ -357,7 +364,9 @@ func run(ctx context.Context, cfg demoConfig, bearer []byte) error {
 	serverContext, stopServer := context.WithCancel(ctx)
 	defer stopServer()
 	if cfg.Operator.Enabled {
-		cfg.Operator.clientSessions = newClientSessionSet()
+		if cfg.Operator.clientSessions == nil {
+			cfg.Operator.clientSessions = newClientSessionSet()
+		}
 		cfg.Operator.ClientStart = cfg.Operator.clientSessions.start
 		cfg.Operator.ClientStop = cfg.Operator.clientSessions.stop
 	}
@@ -413,6 +422,14 @@ func waitOperatorActions(supervisor *operatorSupervisor) {
 func shutdownOwnedOperator(supervisor *operatorSupervisor) {
 	if supervisor == nil || supervisor.runner == nil {
 		return
+	}
+	// http.Server.Shutdown does not close hijacked WebSockets. Client is the
+	// first reverse dependency: its local runner callback aborts every browser
+	// session before worker and gateway cleanup can touch their upstream.
+	if supervisor.runner.Owned(componentClient) {
+		step, cancel := context.WithTimeout(context.Background(), operatorActionTimeout)
+		_ = supervisor.runner.Run(step, fixedOperation{Component: componentClient, Action: actionStop})
+		cancel()
 	}
 	for _, component := range []operatorComponent{componentWorker, componentGateway, componentPostgres, componentSpeech} {
 		if supervisor.runner.Owned(component) {

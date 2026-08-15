@@ -26,6 +26,7 @@ test-demo-live-client:
 	./deploy/scripts/test-demo-wizard.sh
 	./deploy/scripts/test-durable-compose.sh
 	./deploy/scripts/test-control-panel-compose-render.sh
+	./deploy/scripts/test-control-panel-port-publish-boundary.sh
 	./deploy/scripts/test-control-panel-port-publish.sh
 
 test-control-panel-compose-render:

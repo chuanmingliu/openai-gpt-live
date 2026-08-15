@@ -1,24 +1,38 @@
 #!/bin/sh
 set -eu
 
-image=${CONTROL_PANEL_PORT_TEST_IMAGE:-busybox:1.36}
+root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+source_dir="$root/deploy/tests/control-panel-port-listener"
 name="gpt-live-control-panel-port-$$"
+image="gpt-live-control-panel-port:$$"
 
 command -v docker >/dev/null 2>&1 || { echo "control-panel port publish test skipped: docker unavailable"; exit 0; }
 docker info >/dev/null 2>&1 || { echo "control-panel port publish test skipped: docker daemon unavailable"; exit 0; }
-# A runnable daemon must execute the regression rather than silently pass on a
-# cold image cache. Pulling this fixed public test image never contacts an
-# application provider or an operator's service.
-docker image inspect "$image" >/dev/null 2>&1 || docker pull "$image" >/dev/null
+command -v go >/dev/null 2>&1 || { echo "go is required for the control-panel port publish test" >&2; exit 127; }
+[ -f "$source_dir/main.go" ] && [ -f "$source_dir/Dockerfile" ] || { echo "control-panel listener source is missing" >&2; exit 1; }
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/gpt-live-control-panel-port.XXXXXX")
 
-cleanup() { docker rm -f "$name" >/dev/null 2>&1 || true; }
+cleanup() {
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  docker image rm -f "$image" >/dev/null 2>&1 || true
+  rm -rf "$scratch"
+}
 trap cleanup EXIT HUP INT TERM
+
+docker_arch=$(docker version --format '{{.Server.Arch}}')
+case "$docker_arch" in
+  amd64|arm64) go_arch=$docker_arch ;;
+  x86_64) go_arch=amd64 ;;
+  aarch64) go_arch=arm64 ;;
+  *) echo "unsupported Docker architecture for control-panel port test" >&2; exit 1 ;;
+esac
+CGO_ENABLED=0 GOOS=linux GOARCH="$go_arch" go build -trimpath -ldflags='-s -w' -o "$scratch/listener" ./deploy/tests/control-panel-port-listener
+docker build --pull=false -f "$source_dir/Dockerfile" -t "$image" "$scratch" >/dev/null
 
 # This is deliberately provider-free and disposable. It proves the engine path
 # used by the control-panel diagnostics: a container-wide listener remains
 # reachable through a host-loopback-only publication.
-docker run -d --rm --name "$name" -p 127.0.0.1::9090 "$image" \
-  sh -c 'exec busybox httpd -f -p 0.0.0.0:9090' >/dev/null
+docker run -d --rm --name "$name" -p 127.0.0.1::9090 "$image" >/dev/null
 
 published=$(docker port "$name" 9090/tcp | sed -n '1p')
 case "$published" in

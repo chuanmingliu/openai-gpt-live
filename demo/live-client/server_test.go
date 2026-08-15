@@ -39,6 +39,8 @@ func TestOperatorMainClientStopLeavesPersistentOperatorSurfaceForRestart(t *test
 	cfg := testOperatorMainConfig(t)
 	cfg.GatewayURL = wsURL(gateway.URL) + "/v1/realtime"
 	cfg.Operator.Readiness[componentGateway] = gateway.URL
+	sessions := newClientSessionSet()
+	cfg.Operator.clientSessions = sessions
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	done := make(chan error, 1)
@@ -46,29 +48,38 @@ func TestOperatorMainClientStopLeavesPersistentOperatorSurfaceForRestart(t *test
 	waitForOperatorMainReady(t, cfg.Origin)
 	header := http.Header{}
 	header.Set("Origin", cfg.Origin)
-	browser, upgraded, err := websocket.Dial(t.Context(), "ws"+strings.TrimPrefix(cfg.Origin, "http")+"/ws", &websocket.DialOptions{HTTPHeader: header})
-	require.NoError(t, err)
-	require.NotNil(t, upgraded)
-	assert.Equal(t, http.StatusSwitchingProtocols, upgraded.StatusCode)
+	browsers := make([]*websocket.Conn, 0, 8)
+	for range 8 {
+		browser, upgraded, err := websocket.Dial(t.Context(), "ws"+strings.TrimPrefix(cfg.Origin, "http")+"/ws", &websocket.DialOptions{HTTPHeader: header})
+		require.NoError(t, err)
+		require.NotNil(t, upgraded)
+		assert.Equal(t, http.StatusSwitchingProtocols, upgraded.StatusCode)
+		browsers = append(browsers, browser)
+	}
 
 	request, err := http.NewRequest(http.MethodPost, cfg.Origin+"/api/operator/action", strings.NewReader(`{"component":"client","action":"stop"}`))
 	require.NoError(t, err)
 	request.Header.Set("Origin", cfg.Origin)
 	request.Header.Set("Content-Type", "application/json")
+	stopStarted := time.Now()
 	response, err := http.DefaultClient.Do(request)
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusOK, response.StatusCode)
 	_ = response.Body.Close()
+	assert.Less(t, time.Since(stopStarted), time.Second, "Client Stop must abort quiet WebSockets without serial close handshakes")
+	assert.Empty(t, sessions.snapshot(), "Client Stop must drop every registered WebSocket before returning")
 
 	waitForOperatorMainReady(t, cfg.Origin)
 	response, err = http.Get(cfg.Origin + "/")
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusServiceUnavailable, response.StatusCode)
 	_ = response.Body.Close()
-	readContext, stopRead := context.WithTimeout(t.Context(), time.Second)
-	defer stopRead()
-	_, _, err = browser.Read(readContext)
-	require.Error(t, err, "Client Stop must close an already-admitted browser WebSocket")
+	for _, browser := range browsers {
+		readContext, stopRead := context.WithTimeout(t.Context(), time.Second)
+		_, _, err = browser.Read(readContext)
+		stopRead()
+		require.Error(t, err, "Client Stop must close every already-admitted browser WebSocket")
+	}
 	_, rejected, err := websocket.Dial(t.Context(), "ws"+strings.TrimPrefix(cfg.Origin, "http")+"/ws", &websocket.DialOptions{HTTPHeader: header})
 	require.Error(t, err)
 	require.NotNil(t, rejected)
@@ -87,7 +98,7 @@ func TestOperatorMainClientStopLeavesPersistentOperatorSurfaceForRestart(t *test
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusOK, response.StatusCode)
 	_ = response.Body.Close()
-	browser, upgraded, err = websocket.Dial(t.Context(), "ws"+strings.TrimPrefix(cfg.Origin, "http")+"/ws", &websocket.DialOptions{HTTPHeader: header})
+	browser, upgraded, err := websocket.Dial(t.Context(), "ws"+strings.TrimPrefix(cfg.Origin, "http")+"/ws", &websocket.DialOptions{HTTPHeader: header})
 	require.NoError(t, err)
 	require.NotNil(t, upgraded)
 	assert.Equal(t, http.StatusSwitchingProtocols, upgraded.StatusCode)
@@ -146,6 +157,13 @@ func TestOperatorClientStopRejectsWebSocketUntilRestart(t *testing.T) {
 	_ = connection.Close(websocket.StatusNormalClosure, "done")
 }
 
+func TestClientSessionStopReturnsAnExpiredOperationContext(t *testing.T) {
+	sessions := newClientSessionSet()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	require.ErrorIs(t, sessions.stop(ctx), context.Canceled)
+}
+
 func TestOperatorMainGracefulShutdownStopsOwnedSpeech(t *testing.T) {
 	cfg := testOperatorMainConfig(t)
 	speechReady := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
@@ -197,6 +215,54 @@ func TestOperatorMainGracefulShutdownStopsOwnedSpeech(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond, "operator-owned speech process survived BFF shutdown")
 }
 
+func TestParentShutdownClosesActiveClientBeforeGatewayCleanup(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		connection, err := websocket.Accept(writer, request, &websocket.AcceptOptions{InsecureSkipVerify: true})
+		require.NoError(t, err)
+		defer connection.CloseNow()
+		<-request.Context().Done()
+	}))
+	t.Cleanup(upstream.Close)
+
+	cfg := testOperatorMainConfig(t)
+	cfg.GatewayURL = wsURL(upstream.URL) + "/v1/realtime"
+	sessions := newClientSessionSet()
+	browserClosed := make(chan struct{})
+	runner := newShutdownLifecycleRunner(sessions, browserClosed)
+	cfg.Operator.clientSessions = sessions
+	cfg.Operator.supervisor = newOperatorSupervisor(runner, time.Second)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, cfg, []byte("shutdown-browser-bearer")) }()
+	waitForOperatorMainReady(t, cfg.Origin)
+
+	header := http.Header{}
+	header.Set("Origin", cfg.Origin)
+	browser, response, err := websocket.Dial(t.Context(), "ws"+strings.TrimPrefix(cfg.Origin, "http")+"/ws", &websocket.DialOptions{HTTPHeader: header})
+	require.NoError(t, err)
+	require.NotNil(t, response)
+	assert.Equal(t, http.StatusSwitchingProtocols, response.StatusCode)
+	go func() {
+		readContext, stopRead := context.WithTimeout(context.Background(), time.Second)
+		defer stopRead()
+		_, _, readErr := browser.Read(readContext)
+		if readErr != nil {
+			close(browserClosed)
+		}
+	}()
+
+	cancel()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("parent shutdown did not complete")
+	}
+	assert.True(t, runner.gatewaySawClosedClient(), "Gateway cleanup began before the active browser WebSocket closed")
+	assert.Empty(t, sessions.snapshot(), "parent shutdown retained browser sessions")
+}
+
 func TestOperatorShutdownJoinsInFlightActionBeforeIndependentReverseCleanup(t *testing.T) {
 	runner := newFakeOperatorRunner()
 	for _, component := range []operatorComponent{componentSpeech, componentPostgres, componentGateway, componentWorker} {
@@ -227,6 +293,77 @@ func TestOperatorShutdownJoinsInFlightActionBeforeIndependentReverseCleanup(t *t
 		return runner.callsFor(componentWorker, actionStop) == 1 && runner.callsFor(componentGateway, actionStop) == 1 && runner.callsFor(componentPostgres, actionStop) == 1 && runner.callsFor(componentSpeech, actionStop) == 1
 	}, time.Second, time.Millisecond)
 	<-shutdownDone
+}
+
+type shutdownLifecycleRunner struct {
+	mu               sync.Mutex
+	sessions         *clientSessionSet
+	browserClosed    <-chan struct{}
+	ready            map[operatorComponent]bool
+	owned            map[operatorComponent]bool
+	gatewaySawClient bool
+}
+
+func newShutdownLifecycleRunner(sessions *clientSessionSet, browserClosed <-chan struct{}) *shutdownLifecycleRunner {
+	return &shutdownLifecycleRunner{
+		sessions: sessions, browserClosed: browserClosed,
+		ready: map[operatorComponent]bool{componentClient: true},
+		owned: map[operatorComponent]bool{
+			componentClient: true, componentWorker: true, componentGateway: true,
+			componentPostgres: true, componentSpeech: true,
+		},
+	}
+}
+
+func (runner *shutdownLifecycleRunner) Run(ctx context.Context, operation fixedOperation) error {
+	if operation.Action != actionStop {
+		return nil
+	}
+	if operation.Component == componentClient {
+		return runner.sessions.stop(ctx)
+	}
+	if operation.Component == componentGateway {
+		select {
+		case <-runner.browserClosed:
+			runner.mu.Lock()
+			runner.gatewaySawClient = true
+			runner.mu.Unlock()
+		case <-time.After(time.Second):
+		}
+	}
+	runner.mu.Lock()
+	runner.owned[operation.Component] = false
+	runner.ready[operation.Component] = false
+	runner.mu.Unlock()
+	return nil
+}
+
+func (runner *shutdownLifecycleRunner) Ready(_ context.Context, component operatorComponent) bool {
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	return runner.ready[component]
+}
+
+func (runner *shutdownLifecycleRunner) Owned(component operatorComponent) bool {
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	return runner.owned[component]
+}
+
+func (runner *shutdownLifecycleRunner) gatewaySawClosedClient() bool {
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	return runner.gatewaySawClient
+}
+
+func (sessions *clientSessionSet) snapshot() []*websocket.Conn {
+	sessions.mu.Lock()
+	defer sessions.mu.Unlock()
+	connections := make([]*websocket.Conn, 0, len(sessions.connections))
+	for connection := range sessions.connections {
+		connections = append(connections, connection)
+	}
+	return connections
 }
 
 func testOperatorMainConfig(t *testing.T) demoConfig {
