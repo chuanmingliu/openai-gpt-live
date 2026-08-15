@@ -23,6 +23,28 @@ func TestManifestHashPreservesResultSchemaNumberText(t *testing.T) {
 	assert.NotEqual(t, mustHash(t, a), mustHash(t, b))
 }
 
+func TestManifestRejectsInvalidUTF8ResultSchemaBeforeHashing(t *testing.T) {
+	for _, raw := range invalidUTF8Schemas() {
+		manifest := validManifest(map[string]TemplateRef{"system.j2": {Hash: strings.Repeat("a", 64), MediaType: "text/plain", Bytes: 4}})
+		manifest.Recipes = []WorkerRecipe{{ID: "research", Version: 1, Objective: manifest.Bundle.Templates["system.j2"], ResultSchema: raw}}
+		hash, err := manifest.Hash()
+		require.ErrorIs(t, err, ErrInvalidProfile)
+		require.Empty(t, hash)
+	}
+}
+
+func TestSnapshotRejectsInvalidUTF8ResultSchemaBeforeHashing(t *testing.T) {
+	manifest := validManifest(map[string]TemplateRef{"system.j2": {Hash: strings.Repeat("a", 64), MediaType: "text/plain", Bytes: 4}})
+	manifest.Recipes = []WorkerRecipe{{ID: "research", Version: 1, Objective: manifest.Bundle.Templates["system.j2"], ResultSchema: json.RawMessage(`{"x":"valid"}`)}}
+	for _, raw := range invalidUTF8Schemas() {
+		snapshot := snapshotFor(t, manifest)
+		snapshot.Recipes[0].ResultSchema = raw
+		hash, err := snapshot.Hash()
+		require.ErrorIs(t, err, ErrInvalidProfile)
+		require.Empty(t, hash)
+	}
+}
+
 func TestManifestRejectsInvalidReferencesAndDuplicateBindings(t *testing.T) {
 	manifest := validManifest(map[string]TemplateRef{"system.j2": {Hash: strings.Repeat("a", 64), MediaType: "text/plain", Bytes: 4}})
 	manifest.Bundle.Templates["../secret.j2"] = TemplateRef{Hash: strings.Repeat("b", 64), MediaType: "text/plain", Bytes: 1}
@@ -289,4 +311,11 @@ func snapshotFor(t *testing.T, manifest Manifest) Snapshot {
 	require.NoError(t, err)
 	snapshot.SnapshotHash = hash
 	return snapshot
+}
+
+func invalidUTF8Schemas() []json.RawMessage {
+	return []json.RawMessage{
+		[]byte{'{', '"', 'x', '"', ':', '"', 0xff, '"', '}'},
+		[]byte{'{', '"', 'x', '"', ':', '"', 0xfe, '"', '}'},
+	}
 }

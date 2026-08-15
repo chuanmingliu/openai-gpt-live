@@ -254,7 +254,11 @@ func (manifest Manifest) Hash() (string, error) {
 	if err := manifest.Validate(); err != nil {
 		return "", err
 	}
-	return hashCanonical(profileHashVersion, canonicalManifest(manifest)), nil
+	canonical, ok := canonicalManifest(manifest)
+	if !ok {
+		return "", ErrInvalidProfile
+	}
+	return hashCanonical(profileHashVersion, canonical), nil
 }
 
 // ValidateSnapshot verifies that a snapshot pins this exact manifest's prompt
@@ -267,8 +271,11 @@ func (manifest Manifest) ValidateSnapshot(snapshot Snapshot) error {
 	if err != nil || snapshot.BundleHash != bundleHash || snapshot.System != manifest.Bundle.Templates["system.j2"] || snapshot.Opening != manifest.Bundle.Templates["opening_message.j2"] || snapshot.Turn != manifest.Bundle.Templates["turn_instruction.j2"] {
 		return ErrInvalidProfile
 	}
-	canonicalizedManifest := canonicalManifest(manifest)
-	canonicalizedSnapshot := canonicalSnapshot(snapshot)
+	canonicalizedManifest, manifestOK := canonicalManifest(manifest)
+	canonicalizedSnapshot, snapshotOK := canonicalSnapshot(snapshot)
+	if !manifestOK || !snapshotOK {
+		return ErrInvalidProfile
+	}
 	if !reflect.DeepEqual(canonicalizedManifest.Recipes, canonicalizedSnapshot.Recipes) || !reflect.DeepEqual(canonicalizedManifest.Bindings, canonicalizedSnapshot.Bindings) || !reflect.DeepEqual(canonicalizedManifest.Knowledge, canonicalizedSnapshot.Knowledge) {
 		return ErrInvalidProfile
 	}
@@ -325,7 +332,11 @@ func (snapshot Snapshot) Hash() (string, error) {
 	if err := snapshot.validate(false); err != nil {
 		return "", err
 	}
-	return hashCanonical(snapshotHashVersion, canonicalSnapshot(snapshot)), nil
+	canonical, ok := canonicalSnapshot(snapshot)
+	if !ok {
+		return "", ErrInvalidProfile
+	}
+	return hashCanonical(snapshotHashVersion, canonical), nil
 }
 
 func (snapshot Snapshot) Validate() error {
@@ -587,7 +598,7 @@ func validJSON(raw json.RawMessage) bool {
 	if len(raw) == 0 {
 		return true
 	}
-	if len(raw) > maxRawJSONBytes || !json.Valid(raw) {
+	if len(raw) > maxRawJSONBytes || !utf8.Valid(raw) || !json.Valid(raw) {
 		return false
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
@@ -599,21 +610,27 @@ func validJSON(raw json.RawMessage) bool {
 	return decoder.Decode(&struct{}{}) == io.EOF
 }
 
-func canonicalJSON(raw json.RawMessage) json.RawMessage {
+func canonicalJSON(raw json.RawMessage) (json.RawMessage, bool) {
 	if len(raw) == 0 {
-		return nil
+		return nil, true
+	}
+	if !validJSON(raw) {
+		return nil, false
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	var value any
 	if err := decoder.Decode(&value); err != nil {
-		return nil
+		return nil, false
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return nil, false
 	}
 	encoded, err := json.Marshal(value)
 	if err != nil {
-		return nil
+		return nil, false
 	}
-	return json.RawMessage(encoded)
+	return json.RawMessage(encoded), true
 }
 
 func hashCanonical(version string, value any) string {
@@ -634,7 +651,7 @@ func canonicalBundle(bundle PromptBundle) PromptBundle {
 	return clone
 }
 
-func canonicalManifest(manifest Manifest) Manifest {
+func canonicalManifest(manifest Manifest) (Manifest, bool) {
 	clone := manifest.Clone()
 	clone.Bundle = canonicalBundle(clone.Bundle)
 	sort.Slice(clone.Recipes, func(i, j int) bool { return clone.Recipes[i].ID < clone.Recipes[j].ID })
@@ -646,20 +663,27 @@ func canonicalManifest(manifest Manifest) Manifest {
 		sort.Strings(clone.Recipes[index].BindingIDs)
 		sort.Strings(clone.Recipes[index].RequiredEvidence)
 		sort.Strings(clone.Recipes[index].OptionalEvidence)
-		clone.Recipes[index].ResultSchema = canonicalJSON(clone.Recipes[index].ResultSchema)
+		canonical, ok := canonicalJSON(clone.Recipes[index].ResultSchema)
+		if !ok {
+			return Manifest{}, false
+		}
+		clone.Recipes[index].ResultSchema = canonical
 	}
 	for index := range clone.Bindings {
 		sort.Strings(clone.Bindings[index].ToolIDs)
 	}
-	return clone
+	return clone, true
 }
 
-func canonicalSnapshot(snapshot Snapshot) Snapshot {
+func canonicalSnapshot(snapshot Snapshot) (Snapshot, bool) {
 	clone := snapshot.Clone()
 	clone.SnapshotHash = ""
-	canonical := canonicalManifest(Manifest{Recipes: clone.Recipes, Bindings: clone.Bindings, Knowledge: clone.Knowledge})
+	canonical, ok := canonicalManifest(Manifest{Recipes: clone.Recipes, Bindings: clone.Bindings, Knowledge: clone.Knowledge})
+	if !ok {
+		return Snapshot{}, false
+	}
 	clone.Recipes, clone.Bindings, clone.Knowledge = canonical.Recipes, canonical.Bindings, canonical.Knowledge
-	return clone
+	return clone, true
 }
 
 func cloneSchema(schema prompttmpl.ContextSchema) prompttmpl.ContextSchema {
