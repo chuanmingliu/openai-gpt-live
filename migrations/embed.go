@@ -20,7 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const latestVersion uint = 8
+const latestVersion uint = 9
 
 const (
 	migrationCancelTimeout     = 2 * time.Second

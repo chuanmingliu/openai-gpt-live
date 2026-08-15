@@ -89,7 +89,6 @@ func TestCoordinatorDeliveryShardMigrationEmbeddedChecksums(t *testing.T) {
 }
 
 func TestHandoffToolPolicyMigrationCatalogIsExact(t *testing.T) {
-	assert.Equal(t, uint(8), latestVersion)
 	wantChecksums := map[string]string{
 		"000008_handoff_tool_policy.up.sql":   "1d8c8b02aeb778c6f7dd773e202af3385c7898f1ec597109b35452377adc2af7",
 		"000008_handoff_tool_policy.down.sql": "a58d92d73037821a1358840f786f81ac006c04dc17675bde52ac2765607e1697",
@@ -123,6 +122,40 @@ $$;
 
 ALTER TABLE handoffs DROP COLUMN tool_policy;
 `, string(down))
+}
+
+func TestEmbeddedVerticalProfileMigrationCatalogIsExact(t *testing.T) {
+	assert.Equal(t, uint(9), latestVersion)
+	wantNames := []string{
+		"000001_durable_handoffs.down.sql", "000001_durable_handoffs.up.sql",
+		"000002_task11_coordinator_replay.down.sql", "000002_task11_coordinator_replay.up.sql",
+		"000003_task12_tool_invocation_scope.down.sql", "000003_task12_tool_invocation_scope.up.sql",
+		"000004_runtime_flags.down.sql", "000004_runtime_flags.up.sql",
+		"000005_deletion_provenance.down.sql", "000005_deletion_provenance.up.sql",
+		"000006_reconnect_owners.down.sql", "000006_reconnect_owners.up.sql",
+		"000007_coordinator_delivery_shards.down.sql", "000007_coordinator_delivery_shards.up.sql",
+		"000008_handoff_tool_policy.down.sql", "000008_handoff_tool_policy.up.sql",
+		"000009_vertical_profiles.down.sql", "000009_vertical_profiles.up.sql",
+	}
+	entries, err := files.ReadDir(".")
+	require.NoError(t, err)
+	gotNames := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			gotNames = append(gotNames, entry.Name())
+		}
+	}
+	assert.Equal(t, wantNames, gotNames)
+	wantChecksums := map[string]string{
+		"000009_vertical_profiles.down.sql": "14ddeb515492515b2f23a0afe754c1ab31cfa534ec93bed974f46b87798dd39e",
+		"000009_vertical_profiles.up.sql":   "6659984635cfe12f5cf735277579f1b0e309d88e910f2bdea6c921ed345fb4f5",
+	}
+	for name, checksum := range wantChecksums {
+		contents, readErr := files.ReadFile(name)
+		require.NoError(t, readErr)
+		digest := sha256.Sum256(contents)
+		assert.Equal(t, checksum, hex.EncodeToString(digest[:]), name)
+	}
 }
 
 func TestHandoffToolPolicyDataLossRefusalClassificationIsExact(t *testing.T) {

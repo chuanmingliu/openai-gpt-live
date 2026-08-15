@@ -23,6 +23,21 @@ import (
 )
 
 var requiredColumns = map[string]map[string]string{
+	"profile_blobs": {
+		"tenant_id": "text", "content_hash": "text", "media_type": "text", "content": "bytea",
+		"content_bytes": "integer", "created_at": "timestamp with time zone",
+	},
+	"profile_drafts": {
+		"tenant_id": "text", "profile_id": "text", "generation": "bigint", "manifest": "jsonb",
+		"updated_at": "timestamp with time zone", "updated_by": "text",
+	},
+	"profile_versions": {
+		"tenant_id": "text", "profile_id": "text", "version": "bigint", "draft_generation": "bigint",
+		"engine_version": "text", "snapshot_hash": "text", "manifest": "jsonb", "snapshot": "jsonb",
+		"active": "boolean", "revoked_at": "timestamp with time zone", "revoked_by": "text",
+		"published_at": "timestamp with time zone", "published_by": "text",
+		"activated_at": "timestamp with time zone", "activated_by": "text",
+	},
 	"conversations": {
 		"tenant_id": "text", "id": "text", "user_id": "text", "status": "text",
 		"retention_until": "timestamp with time zone", "deletion_actor": "text", "deletion_reason_code": "text",
@@ -107,6 +122,7 @@ var requiredColumns = map[string]map[string]string{
 }
 
 var requiredDefaults = map[string]string{
+	"profile_versions.active":                   `false`,
 	"conversations.status":                      `'active'::text`,
 	"conversations.created_at":                  `CURRENT_TIMESTAMP`,
 	"conversations.updated_at":                  `CURRENT_TIMESTAMP`,
@@ -156,6 +172,12 @@ var requiredDefaults = map[string]string{
 }
 
 var requiredNamedConstraintNames = strings.Fields(`
+	profile_blobs_identity_check profile_blobs_media_type_check profile_blobs_content_check profile_blobs_created_at_check
+	profile_drafts_identity_check profile_drafts_generation_check profile_drafts_manifest_check
+	profile_drafts_updated_by_check profile_drafts_updated_at_check
+	profile_versions_draft_generation_uniq profile_versions_identity_check profile_versions_numbers_check
+	profile_versions_engine_hash_check profile_versions_documents_check profile_versions_publication_check
+	profile_versions_activation_check profile_versions_revocation_check profile_versions_state_check
 	conversations_tenant_id_size_check conversations_id_size_check conversations_user_id_size_check
 	conversations_status_check conversations_retention_check conversations_timestamps_check
 	conversations_deletion_actor_size_check conversations_deletion_reason_size_check conversations_deletion_tuple_check
@@ -221,7 +243,7 @@ func TestSchemaMigrationLifecycle(t *testing.T) {
 
 	version, dirty, err := migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
-	assert.Equal(t, uint(8), version)
+	assert.Equal(t, uint(9), version)
 	assert.False(t, dirty)
 	var journalPresent bool
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
@@ -243,6 +265,13 @@ func TestSchemaMigrationLifecycle(t *testing.T) {
 	}
 	require.NoError(t, migrations.Down(t.Context(), pool))
 	require.NoError(t, migrations.Up(t.Context(), pool))
+	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
+	version, dirty, err = migrations.Version(t.Context(), pool)
+	require.NoError(t, err)
+	assert.Equal(t, uint(8), version)
+	assert.False(t, dirty)
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
+	assert.True(t, journalPresent)
 	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
 	version, dirty, err = migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
@@ -292,8 +321,70 @@ func TestSchemaMigrationLifecycle(t *testing.T) {
 	assert.False(t, dirty)
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
 	assert.False(t, journalPresent)
-	require.NoError(t, migrations.Steps(t.Context(), pool, 7))
+	require.NoError(t, migrations.Steps(t.Context(), pool, 8))
 	require.NoError(t, migrations.Steps(t.Context(), pool, 0))
+	require.NoError(t, migrations.Check(t.Context(), pool))
+}
+
+func TestSchemaProfileV9UpDownUpCatalogAndConstraints(t *testing.T) {
+	pool := testkit.Postgres(t)
+	require.NoError(t, migrations.Up(t.Context(), pool))
+
+	for _, table := range []string{"profile_blobs", "profile_drafts", "profile_versions"} {
+		var present bool
+		require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass($1) IS NOT NULL`, table).Scan(&present))
+		assert.True(t, present, table)
+	}
+	_, err := pool.Exec(t.Context(), `INSERT INTO profile_blobs
+		(tenant_id,content_hash,media_type,content,content_bytes,created_at)
+		VALUES ('tenant-v9',$1,'text/plain; charset=utf-8',''::bytea,0,$2)`, strings.Repeat("a", 64), profileTestCatalogTime())
+	require.NoError(t, err, "zero-byte deterministic templates are valid")
+	_, err = pool.Exec(t.Context(), `INSERT INTO profile_blobs
+		(tenant_id,content_hash,media_type,content,content_bytes,created_at)
+		VALUES ('tenant-v9',$1,'text/plain; charset=utf-8',''::bytea,524289,$2)`, strings.Repeat("b", 64), profileTestCatalogTime())
+	assertConstraint(t, err, "profile_blobs_content_check")
+
+	_, err = pool.Exec(t.Context(), `INSERT INTO profile_drafts
+		(tenant_id,profile_id,generation,manifest,updated_at,updated_by)
+		VALUES ('tenant-v9','profile-v9',2,'{}',$1,'editor')`, profileTestCatalogTime())
+	require.NoError(t, err)
+	_, err = pool.Exec(t.Context(), `INSERT INTO profile_versions
+		(tenant_id,profile_id,version,draft_generation,engine_version,snapshot_hash,manifest,snapshot,
+		 active,published_at,published_by,activated_at,activated_by)
+		VALUES ('tenant-v9','profile-v9',1,1,'jinja-go-v1',$1,'{}','{}',true,$2,'publisher',$2,'publisher')`,
+		strings.Repeat("c", 64), profileTestCatalogTime())
+	require.NoError(t, err)
+	_, err = pool.Exec(t.Context(), `INSERT INTO profile_versions
+		(tenant_id,profile_id,version,draft_generation,engine_version,snapshot_hash,manifest,snapshot,
+		 active,published_at,published_by,activated_at,activated_by)
+		VALUES ('tenant-v9','profile-v9',2,2,'jinja-go-v1',$1,'{}','{}',true,$2,'publisher',$2,'publisher')`,
+		strings.Repeat("d", 64), profileTestCatalogTime())
+	assertConstraint(t, err, "profile_one_active_version")
+	_, err = pool.Exec(t.Context(), `INSERT INTO profile_versions
+		(tenant_id,profile_id,version,draft_generation,engine_version,snapshot_hash,manifest,snapshot,
+		 active,published_at,published_by)
+		VALUES ('tenant-v9','profile-v9',3,1,'jinja-go-v1',$1,'{}','{}',false,$2,'publisher')`,
+		strings.Repeat("e", 64), profileTestCatalogTime())
+	assertConstraint(t, err, "profile_versions_draft_generation_uniq")
+	_, err = pool.Exec(t.Context(), `UPDATE profile_versions
+		SET revoked_at=$1,revoked_by='operator',active=true WHERE tenant_id='tenant-v9' AND profile_id='profile-v9' AND version=1`,
+		profileTestCatalogTime().Add(time.Minute))
+	assertConstraint(t, err, "profile_versions_state_check")
+
+	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
+	version, dirty, err := migrations.Version(t.Context(), pool)
+	require.NoError(t, err)
+	assert.Equal(t, uint(8), version)
+	assert.False(t, dirty)
+	for _, table := range []string{"profile_blobs", "profile_drafts", "profile_versions"} {
+		var present bool
+		require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass($1) IS NOT NULL`, table).Scan(&present))
+		assert.False(t, present, table)
+	}
+	var priorPresent bool
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('handoffs') IS NOT NULL`).Scan(&priorPresent))
+	assert.True(t, priorPresent)
+	require.NoError(t, migrations.Up(t.Context(), pool))
 	require.NoError(t, migrations.Check(t.Context(), pool))
 }
 
@@ -307,7 +398,7 @@ func TestSchemaHandoffToolPolicyV8UpDownUpIsExactAndRefusesDataLoss(t *testing.T
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT tool_policy=$1::jsonb FROM handoffs WHERE id='handoff-v8'`, defaultPolicy).Scan(&exact))
 	assert.True(t, exact)
 
-	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
+	require.NoError(t, migrations.Steps(t.Context(), pool, -2))
 	var columnPresent bool
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT EXISTS (
 		SELECT 1 FROM information_schema.columns
@@ -358,12 +449,12 @@ func TestSchemaTask20RuntimeFlagsV4UpDownUpPreservesPriorDurableRowsAndTriggers(
 		assert.Equal(t, 2, triggers)
 	}
 	assertV4Objects(true)
-	require.NoError(t, migrations.Steps(t.Context(), pool, -2))
+	require.NoError(t, migrations.Steps(t.Context(), pool, -6))
 	assertV4Objects(false)
 	var preserved int
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM conversations WHERE tenant_id='tenant-v4-preserve' AND id='conversation-v4-preserve'`).Scan(&preserved))
 	assert.Equal(t, 1, preserved)
-	require.NoError(t, migrations.Steps(t.Context(), pool, 2))
+	require.NoError(t, migrations.Steps(t.Context(), pool, 6))
 	assertV4Objects(true)
 	var authorityVersion, flags int
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT version FROM runtime_feature_authority WHERE singleton=true`).Scan(&authorityVersion))
@@ -383,7 +474,7 @@ func TestSchemaTask21DeletionProvenanceV5DownUpPreservesPriorDurableRows(t *test
 		WHERE tenant_id='tenant-v5-preserve' AND id='conversation-v5-preserve'`)
 	require.NoError(t, err)
 
-	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
+	require.NoError(t, migrations.Steps(t.Context(), pool, -5))
 	version, dirty, err := migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
 	assert.Equal(t, uint(4), version)
@@ -399,7 +490,7 @@ func TestSchemaTask21DeletionProvenanceV5DownUpPreservesPriorDurableRows(t *test
 	)`).Scan(&provenanceColumnPresent))
 	assert.False(t, provenanceColumnPresent)
 
-	require.NoError(t, migrations.Steps(t.Context(), pool, 1))
+	require.NoError(t, migrations.Steps(t.Context(), pool, 5))
 	require.NoError(t, migrations.Check(t.Context(), pool))
 	var actor, reason *string
 	var requestedAt *time.Time
@@ -434,7 +525,7 @@ func TestSchemaTask12ToolInvocationScopeSafeDownAndUp(t *testing.T) {
 	require.NoError(t, insertHandoff(t, pool, "tenant-safe", "conversation-safe", "handoff-safe", "handoff-idem-safe"))
 	require.NoError(t, insertToolInvocation(t, pool, "invocation-safe", "tenant-safe", "conversation-safe", "handoff-safe", "tool-idem-safe"))
 
-	require.NoError(t, migrations.Steps(t.Context(), pool, -3))
+	require.NoError(t, migrations.Steps(t.Context(), pool, -7))
 	version, dirty, err := migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
 	assert.Equal(t, uint(2), version)
@@ -463,7 +554,7 @@ func TestSchemaTask12ToolInvocationScopeConflictingDownRefusalPreservesV3(t *tes
 	require.NoError(t, insertToolInvocation(t, pool, "invocation-a", "tenant-conflict", "conversation-a", "same-handoff", "tool-idem-a"))
 	require.NoError(t, insertToolInvocation(t, pool, "invocation-b", "tenant-conflict", "conversation-b", "same-handoff", "tool-idem-b"))
 
-	require.NoError(t, migrations.Steps(t.Context(), pool, -2))
+	require.NoError(t, migrations.Steps(t.Context(), pool, -6))
 	err := migrations.Steps(t.Context(), pool, -1)
 	require.ErrorIs(t, err, migrations.ErrToolInvocationScopeConflict)
 	version, dirty, versionErr := migrations.Version(t.Context(), pool)
@@ -553,7 +644,7 @@ func TestSchemaMigrationLockTimeoutLeavesNoOrphan(t *testing.T) {
 // backend, roll back the statement, and preserve a clean schema version.
 func TestSchemaMigrationCancellationWhileExecutingSQL(t *testing.T) {
 	pool := migratedPostgres(t)
-	require.NoError(t, migrations.Steps(t.Context(), pool, -3))
+	require.NoError(t, migrations.Steps(t.Context(), pool, -7))
 	locker, err := pool.Acquire(t.Context())
 	require.NoError(t, err)
 	defer locker.Release()
@@ -828,8 +919,49 @@ func TestSchemaEveryNamedCheckRejectsInvalidMutation(t *testing.T) {
 		(delivery_affinity,lease_owner,lease_until,lease_generation)
 		VALUES ('app-c','worker-c',CURRENT_TIMESTAMP+interval '1 minute',1)`)
 	require.NoError(t, err)
+	_, err = pool.Exec(t.Context(), `INSERT INTO session_reconnect_owners (
+		session_id,tenant_id,user_id,conversation_id,incarnation,event_cursor,provider_model,response_epoch,
+		credential_id,owner_id,owner_state,expires_at,owner_lease_expires_at)
+		VALUES ('reconnect-c','tenant-c','user-c','conversation-c',1,0,'model-c',0,
+		'credential-c','owner-c','active',CURRENT_TIMESTAMP+interval '5 minutes',CURRENT_TIMESTAMP+interval '1 minute')`)
+	require.NoError(t, err)
+	_, err = pool.Exec(t.Context(), `INSERT INTO profile_blobs
+		(tenant_id,content_hash,media_type,content,content_bytes,created_at)
+		VALUES ('tenant-c',$1,'text/plain; charset=utf-8','x'::bytea,1,CURRENT_TIMESTAMP)`, strings.Repeat("a", 64))
+	require.NoError(t, err)
+	_, err = pool.Exec(t.Context(), `INSERT INTO profile_drafts
+		(tenant_id,profile_id,generation,manifest,updated_at,updated_by)
+		VALUES ('tenant-c','profile-c',1,'{}',CURRENT_TIMESTAMP,'editor-c')`)
+	require.NoError(t, err)
+	_, err = pool.Exec(t.Context(), `INSERT INTO profile_versions
+		(tenant_id,profile_id,version,draft_generation,engine_version,snapshot_hash,manifest,snapshot,
+		 active,published_at,published_by)
+		VALUES ('tenant-c','profile-c',1,1,'jinja-go-v1',$1,'{}','{}',false,CURRENT_TIMESTAMP,'publisher-c')`, strings.Repeat("b", 64))
+	require.NoError(t, err)
 
 	mutations := map[string]string{
+		"profile_blobs_identity_check":                             `UPDATE profile_blobs SET tenant_id='' WHERE tenant_id='tenant-c'`,
+		"profile_blobs_media_type_check":                           `UPDATE profile_blobs SET media_type='' WHERE tenant_id='tenant-c'`,
+		"profile_blobs_content_check":                              `UPDATE profile_blobs SET content_bytes=2 WHERE tenant_id='tenant-c'`,
+		"profile_blobs_created_at_check":                           `UPDATE profile_blobs SET created_at='infinity' WHERE tenant_id='tenant-c'`,
+		"profile_drafts_identity_check":                            `UPDATE profile_drafts SET profile_id='' WHERE profile_id='profile-c'`,
+		"profile_drafts_generation_check":                          `UPDATE profile_drafts SET generation=0 WHERE profile_id='profile-c'`,
+		"profile_drafts_manifest_check":                            `UPDATE profile_drafts SET manifest='[]' WHERE profile_id='profile-c'`,
+		"profile_drafts_updated_by_check":                          `UPDATE profile_drafts SET updated_by='' WHERE profile_id='profile-c'`,
+		"profile_drafts_updated_at_check":                          `UPDATE profile_drafts SET updated_at='infinity' WHERE profile_id='profile-c'`,
+		"profile_versions_identity_check":                          `UPDATE profile_versions SET profile_id='' WHERE profile_id='profile-c'`,
+		"profile_versions_numbers_check":                           `UPDATE profile_versions SET version=0 WHERE profile_id='profile-c'`,
+		"profile_versions_engine_hash_check":                       `UPDATE profile_versions SET engine_version='' WHERE profile_id='profile-c'`,
+		"profile_versions_documents_check":                         `UPDATE profile_versions SET snapshot='[]' WHERE profile_id='profile-c'`,
+		"profile_versions_publication_check":                       `UPDATE profile_versions SET published_by='' WHERE profile_id='profile-c'`,
+		"profile_versions_activation_check":                        `UPDATE profile_versions SET activated_by='operator' WHERE profile_id='profile-c'`,
+		"profile_versions_revocation_check":                        `UPDATE profile_versions SET revoked_by='operator' WHERE profile_id='profile-c'`,
+		"profile_versions_state_check":                             `UPDATE profile_versions SET active=true WHERE profile_id='profile-c'`,
+		"session_reconnect_owners_identifiers_check":               `UPDATE session_reconnect_owners SET owner_id='' WHERE session_id='reconnect-c'`,
+		"session_reconnect_owners_counters_check":                  `UPDATE session_reconnect_owners SET incarnation=0 WHERE session_id='reconnect-c'`,
+		"session_reconnect_owners_state_check":                     `UPDATE session_reconnect_owners SET owner_state='unknown' WHERE session_id='reconnect-c'`,
+		"session_reconnect_owners_times_check":                     `UPDATE session_reconnect_owners SET expires_at=created_at WHERE session_id='reconnect-c'`,
+		"session_reconnect_owners_previous_check":                  `UPDATE session_reconnect_owners SET previous_credential_id='previous' WHERE session_id='reconnect-c'`,
 		"conversations_tenant_id_size_check":                       `UPDATE conversations SET tenant_id='' WHERE tenant_id='tenant-free'`,
 		"conversations_id_size_check":                              `UPDATE conversations SET id='' WHERE tenant_id='tenant-free'`,
 		"conversations_user_id_size_check":                         `UPDATE conversations SET user_id='' WHERE tenant_id='tenant-free'`,
@@ -1404,8 +1536,12 @@ func TestSchemaRequiredIndexesAndPlans(t *testing.T) {
 		keys      []string
 		options   []int16
 		predicate string
+		unique    bool
 	}
 	expected := map[string]expectedIndex{
+		"profile_one_active_version": {
+			keys: []string{"tenant_id", "profile_id"}, options: []int16{0, 0}, predicate: "active", unique: true,
+		},
 		"handoffs_runnable_idx": {
 			keys:      []string{"priority", "ready_at", "created_at"},
 			options:   []int16{3, 0, 0},
@@ -1441,19 +1577,21 @@ func TestSchemaRequiredIndexesAndPlans(t *testing.T) {
 		var keys []string
 		var options []int16
 		var predicate string
+		var unique bool
 		require.NoError(t, pool.QueryRow(t.Context(), `
-			SELECT indnkeyatts, indnatts,
+			SELECT indnkeyatts, indnatts, indisunique,
 				ARRAY(SELECT pg_get_indexdef(indexrelid, position, false)
 					FROM generate_series(1, indnatts) AS positions(position) ORDER BY position),
 				indoption::int2[],
 				COALESCE(pg_get_expr(indpred, indrelid), '')
 			FROM pg_index WHERE indexrelid = to_regclass($1)`, name).
-			Scan(&keyCount, &attributeCount, &keys, &options, &predicate), name)
+			Scan(&keyCount, &attributeCount, &unique, &keys, &options, &predicate), name)
 		assert.Equal(t, len(want.keys), keyCount, "%s key count", name)
 		assert.Equal(t, keyCount, attributeCount, "%s must not gain unreviewed INCLUDE columns", name)
 		assert.Equal(t, want.keys, keys, "%s ordered key expressions", name)
 		assert.Equal(t, want.options, options, "%s ordering/null-position options", name)
 		assert.Equal(t, want.predicate, predicate, "%s normalized predicate", name)
+		assert.Equal(t, want.unique, unique, "%s uniqueness", name)
 	}
 
 	insertConversation(t, pool, "tenant-plan", "conversation-plan")
@@ -1627,6 +1765,8 @@ func assertPromptCancellation(t *testing.T, done <-chan error, unblock func()) {
 func allowedNullableColumn(table, column string) bool {
 	key := table + "." + column
 	allowed := map[string]bool{
+		"profile_versions.revoked_at": true, "profile_versions.revoked_by": true,
+		"profile_versions.activated_at": true, "profile_versions.activated_by": true,
 		"conversations.deletion_actor": true, "conversations.deletion_reason_code": true,
 		"conversations.deletion_requested_at":         true,
 		"session_reconnect_owners.subject_expires_at": true, "session_reconnect_owners.previous_credential_id": true,
@@ -1646,6 +1786,10 @@ func allowedNullableColumn(table, column string) bool {
 		"coordinator_work_journal.delivered_at": true,
 	}
 	return allowed[key]
+}
+
+func profileTestCatalogTime() time.Time {
+	return time.Date(2026, 8, 15, 10, 0, 0, 0, time.UTC)
 }
 
 func highKeyJSON(fields int) string {
