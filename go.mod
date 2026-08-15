@@ -9,6 +9,7 @@ require (
 	github.com/go-jose/go-jose/v4 v4.1.3
 	github.com/golang-migrate/migrate/v4 v4.19.1
 	github.com/jackc/pgx/v5 v5.10.0
+	github.com/mitsuhiko/minijinja/minijinja-go/v2 v2.24.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/shirou/gopsutil/v4 v4.26.5
 	github.com/stretchr/testify v1.11.1
