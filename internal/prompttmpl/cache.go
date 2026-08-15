@@ -47,6 +47,15 @@ func NewCache(engine Engine, entries, bytes int) (*Cache, error) {
 	}, nil
 }
 
+// Version delegates to the configured engine so callers can detect an engine
+// identity change before and after a cached compilation.
+func (c *Cache) Version() string {
+	if c == nil || c.engine == nil {
+		return ""
+	}
+	return c.engine.Version()
+}
+
 // Compile returns a cached immutable compiled bundle or compiles one once for
 // all simultaneous cache misses of the same bundle and limits.
 func (c *Cache) Compile(ctx context.Context, bundle Bundle, requested Limits) (CompiledBundle, error) {

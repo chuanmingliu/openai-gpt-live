@@ -285,3 +285,16 @@ func TestNewCacheRejectsInvalidLimits(t *testing.T) {
 		})
 	}
 }
+
+func TestCacheVersionDelegatesToConfiguredEngine(t *testing.T) {
+	engine := &versionedEngine{version: "engine-v1", resident: 64}
+	cache, err := NewCache(engine, 2, 4096)
+	require.NoError(t, err)
+	require.Equal(t, "engine-v1", cache.Version())
+
+	engine.version = "engine-v2"
+	require.Equal(t, "engine-v2", cache.Version(), "the cache must not freeze a stale engine identity")
+
+	var nilCache *Cache
+	require.Empty(t, nilCache.Version())
+}
