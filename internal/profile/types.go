@@ -2,24 +2,37 @@
 package profile
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/prompttmpl"
 )
 
 const (
-	maxProfileIDBytes   = 256
+	maxIdentifierBytes  = 256
+	maxDescriptionBytes = 64 * 1024
+	maxRawJSONBytes     = 64 * 1024
 	maxTemplates        = 64
+	maxFixtures         = 64
+	maxSchemaFields     = 64
 	maxRecipes          = 32
 	maxBindings         = 64
 	maxKnowledgeRefs    = 32
+	maxNestedItems      = 64
+	maxProfileBlobBytes = prompttmpl.MaxBundleBytes
+	maxTemplateRefBytes = prompttmpl.MaxTemplateBytes
+	maxRecipeBytes      = prompttmpl.MaxBundleBytes
+	maxRecipeDuration   = 24 * time.Hour
 	profileHashVersion  = "vertical-profile-v1"
 	snapshotHashVersion = "vertical-profile-snapshot-v1"
 )
@@ -70,7 +83,7 @@ func (blob Blob) Clone() Blob {
 }
 
 func (blob Blob) Canonical() (Blob, error) {
-	if blob.MediaType == "" || !utf8.ValidString(blob.MediaType) || blob.ContentBytes != 0 && blob.ContentBytes != len(blob.Content) {
+	if !validShortText(blob.MediaType) || len(blob.Content) > maxProfileBlobBytes || blob.ContentBytes < 0 || blob.ContentBytes != 0 && blob.ContentBytes != len(blob.Content) {
 		return Blob{}, ErrInvalidProfile
 	}
 	owned := blob.Clone()
@@ -88,7 +101,7 @@ type TemplateRef struct {
 }
 
 func (ref TemplateRef) Validate() error {
-	if !validHash(ref.Hash) || ref.MediaType == "" || !utf8.ValidString(ref.MediaType) || ref.Bytes < 0 {
+	if !validHash(ref.Hash) || !validShortText(ref.MediaType) || ref.Bytes < 0 || ref.Bytes > maxTemplateRefBytes {
 		return ErrInvalidProfile
 	}
 	return nil
@@ -119,7 +132,7 @@ func (bundle PromptBundle) Clone() PromptBundle {
 }
 
 func (bundle PromptBundle) Validate() error {
-	if len(bundle.Templates) == 0 || len(bundle.Templates) > maxTemplates {
+	if len(bundle.Templates) == 0 || len(bundle.Templates) > maxTemplates || len(bundle.Fixtures) > maxFixtures || len(bundle.Schema.Fields) > maxSchemaFields || !validRefMap(bundle.Templates) || !validRefMap(bundle.Fixtures) {
 		return ErrInvalidProfile
 	}
 	for name, ref := range bundle.Templates {
@@ -136,7 +149,7 @@ func (bundle PromptBundle) Validate() error {
 		}
 	}
 	for name, field := range bundle.Schema.Fields {
-		if name == "" || !utf8.ValidString(name) || !validField(field) {
+		if !validShortText(name) || !validField(field) {
 			return ErrInvalidProfile
 		}
 		for _, template := range field.Templates {
@@ -231,46 +244,10 @@ func (manifest Manifest) Clone() Manifest {
 }
 
 func (manifest Manifest) Validate() error {
-	if !utf8.ValidString(manifest.Description) || manifest.Bundle.Validate() != nil || len(manifest.Recipes) > maxRecipes || len(manifest.Bindings) > maxBindings || len(manifest.Knowledge) > maxKnowledgeRefs {
+	if !validProfileText(manifest.Description) || manifest.Bundle.Validate() != nil {
 		return ErrInvalidProfile
 	}
-	bindingIDs := make(map[string]struct{}, len(manifest.Bindings))
-	for _, binding := range manifest.Bindings {
-		if !validIdentifier(binding.AdapterID) || !validIdentifier(binding.Version) || binding.MaxResultBytes < 0 || !uniqueStrings(binding.ToolIDs) {
-			return ErrInvalidProfile
-		}
-		if _, exists := bindingIDs[binding.AdapterID]; exists {
-			return ErrInvalidProfile
-		}
-		bindingIDs[binding.AdapterID] = struct{}{}
-	}
-	recipeIDs := make(map[string]struct{}, len(manifest.Recipes))
-	for _, recipe := range manifest.Recipes {
-		if !validIdentifier(recipe.ID) || recipe.Version == 0 || recipe.Objective.Validate() != nil || !hasTemplateHash(manifest.Bundle.Templates, recipe.Objective.Hash) || !uniqueStrings(recipe.BindingIDs) || !uniqueStrings(recipe.RequiredEvidence) || !uniqueStrings(recipe.OptionalEvidence) || recipe.MaxObjectiveBytes < 0 || recipe.MaxEvidenceBytes < 0 || recipe.MaxToolResultBytes < 0 || recipe.MaxFinalResultBytes < 0 || !validJSON(recipe.ResultSchema) {
-			return ErrInvalidProfile
-		}
-		if _, exists := recipeIDs[recipe.ID]; exists {
-			return ErrInvalidProfile
-		}
-		recipeIDs[recipe.ID] = struct{}{}
-		for _, bindingID := range recipe.BindingIDs {
-			if _, exists := bindingIDs[bindingID]; !exists {
-				return ErrInvalidProfile
-			}
-		}
-	}
-	knowledgeIDs := make(map[string]struct{}, len(manifest.Knowledge))
-	for _, knowledge := range manifest.Knowledge {
-		if !validIdentifier(knowledge.ID) || knowledge.Version == 0 || !validHash(knowledge.Hash) {
-			return ErrInvalidProfile
-		}
-		key := knowledge.ID + "\x00" + string(rune(knowledge.Version))
-		if _, exists := knowledgeIDs[key]; exists {
-			return ErrInvalidProfile
-		}
-		knowledgeIDs[key] = struct{}{}
-	}
-	return nil
+	return validateComponents(manifest.Recipes, manifest.Bindings, manifest.Knowledge, manifest.Bundle.Templates)
 }
 
 func (manifest Manifest) Hash() (string, error) {
@@ -278,6 +255,24 @@ func (manifest Manifest) Hash() (string, error) {
 		return "", err
 	}
 	return hashCanonical(profileHashVersion, canonicalManifest(manifest)), nil
+}
+
+// ValidateSnapshot verifies that a snapshot pins this exact manifest's prompt
+// bundle, optional prompt refs, and component records.
+func (manifest Manifest) ValidateSnapshot(snapshot Snapshot) error {
+	if manifest.Validate() != nil || snapshot.Validate() != nil {
+		return ErrInvalidProfile
+	}
+	bundleHash, err := manifest.Bundle.Hash()
+	if err != nil || snapshot.BundleHash != bundleHash || snapshot.System != manifest.Bundle.Templates["system.j2"] || snapshot.Opening != manifest.Bundle.Templates["opening_message.j2"] || snapshot.Turn != manifest.Bundle.Templates["turn_instruction.j2"] {
+		return ErrInvalidProfile
+	}
+	canonicalizedManifest := canonicalManifest(manifest)
+	canonicalizedSnapshot := canonicalSnapshot(snapshot)
+	if !reflect.DeepEqual(canonicalizedManifest.Recipes, canonicalizedSnapshot.Recipes) || !reflect.DeepEqual(canonicalizedManifest.Bindings, canonicalizedSnapshot.Bindings) || !reflect.DeepEqual(canonicalizedManifest.Knowledge, canonicalizedSnapshot.Knowledge) {
+		return ErrInvalidProfile
+	}
+	return nil
 }
 
 // Draft is the only mutable persistence record for a profile. Stores return an
@@ -297,7 +292,7 @@ func (draft Draft) Clone() Draft {
 }
 
 func (draft Draft) Validate() error {
-	if draft.TenantID == "" || !utf8.ValidString(draft.TenantID) || draft.Generation < 0 || draft.ID.Validate() != nil || draft.Manifest.Validate() != nil {
+	if !validIdentifier(draft.TenantID) || draft.Generation < 0 || draft.ID.Validate() != nil || !validIdentifier(draft.UpdatedBy) || draft.Manifest.Validate() != nil {
 		return ErrInvalidProfile
 	}
 	return nil
@@ -345,16 +340,19 @@ func (snapshot Snapshot) Validate() error {
 }
 
 func (snapshot Snapshot) validate(requireHash bool) error {
-	if snapshot.TenantID == "" || !utf8.ValidString(snapshot.TenantID) || snapshot.Ref.Validate() != nil || snapshot.EngineVersion == "" || snapshot.AdapterRegistryVersion == "" || !validHash(snapshot.BundleHash) || snapshot.System.Validate() != nil || !validOptionalTemplateRef(snapshot.Opening) || !validOptionalTemplateRef(snapshot.Turn) || len(snapshot.Recipes) > maxRecipes || len(snapshot.Bindings) > maxBindings || len(snapshot.Knowledge) > maxKnowledgeRefs || (requireHash && !validHash(snapshot.SnapshotHash)) {
+	if !validIdentifier(snapshot.TenantID) || snapshot.Ref.Validate() != nil || !validShortText(snapshot.EngineVersion) || !validShortText(snapshot.AdapterRegistryVersion) || !validHash(snapshot.BundleHash) || snapshot.System.Validate() != nil || !validOptionalTemplateRef(snapshot.Opening) || !validOptionalTemplateRef(snapshot.Turn) || (requireHash && !validHash(snapshot.SnapshotHash)) {
 		return ErrInvalidProfile
 	}
-	return validateSnapshotComponents(snapshot.Recipes, snapshot.Bindings, snapshot.Knowledge)
+	return validateComponents(snapshot.Recipes, snapshot.Bindings, snapshot.Knowledge, nil)
 }
 
-func validateSnapshotComponents(recipes []WorkerRecipe, bindings []AdapterBinding, knowledgeRefs []KnowledgeRef) error {
+func validateComponents(recipes []WorkerRecipe, bindings []AdapterBinding, knowledgeRefs []KnowledgeRef, templates map[string]TemplateRef) error {
+	if len(recipes) > maxRecipes || len(bindings) > maxBindings || len(knowledgeRefs) > maxKnowledgeRefs {
+		return ErrInvalidProfile
+	}
 	bindingIDs := make(map[string]struct{}, len(bindings))
 	for _, binding := range bindings {
-		if !validIdentifier(binding.AdapterID) || !validIdentifier(binding.Version) || binding.MaxResultBytes < 0 || !uniqueStrings(binding.ToolIDs) {
+		if !validBinding(binding) {
 			return ErrInvalidProfile
 		}
 		if _, exists := bindingIDs[binding.AdapterID]; exists {
@@ -364,7 +362,7 @@ func validateSnapshotComponents(recipes []WorkerRecipe, bindings []AdapterBindin
 	}
 	recipeIDs := make(map[string]struct{}, len(recipes))
 	for _, recipe := range recipes {
-		if !validIdentifier(recipe.ID) || recipe.Version == 0 || recipe.Objective.Validate() != nil || !uniqueStrings(recipe.BindingIDs) || !uniqueStrings(recipe.RequiredEvidence) || !uniqueStrings(recipe.OptionalEvidence) || recipe.MaxObjectiveBytes < 0 || recipe.MaxEvidenceBytes < 0 || recipe.MaxToolResultBytes < 0 || recipe.MaxFinalResultBytes < 0 || !validJSON(recipe.ResultSchema) {
+		if !validRecipe(recipe) || templates != nil && !hasTemplateRef(templates, recipe.Objective) {
 			return ErrInvalidProfile
 		}
 		if _, exists := recipeIDs[recipe.ID]; exists {
@@ -379,14 +377,13 @@ func validateSnapshotComponents(recipes []WorkerRecipe, bindings []AdapterBindin
 	}
 	knowledgeIDs := make(map[string]struct{}, len(knowledgeRefs))
 	for _, knowledge := range knowledgeRefs {
-		if !validIdentifier(knowledge.ID) || knowledge.Version == 0 || !validHash(knowledge.Hash) {
+		if !validKnowledgeRef(knowledge) {
 			return ErrInvalidProfile
 		}
-		key := knowledge.ID + "\x00" + string(rune(knowledge.Version))
-		if _, exists := knowledgeIDs[key]; exists {
+		if _, exists := knowledgeIDs[knowledge.ID]; exists {
 			return ErrInvalidProfile
 		}
-		knowledgeIDs[key] = struct{}{}
+		knowledgeIDs[knowledge.ID] = struct{}{}
 	}
 	return nil
 }
@@ -415,6 +412,15 @@ func (published Published) Clone() Published {
 	return published
 }
 
+// Validate verifies that persisted published metadata and its snapshot remain
+// mutually consistent and bounded.
+func (published Published) Validate() error {
+	if !validIdentifier(published.TenantID) || published.Ref.Validate() != nil || published.DraftGeneration < 0 || !validShortText(published.EngineVersion) || !validIdentifier(published.PublishedBy) || published.Snapshot.TenantID != published.TenantID || published.Snapshot.Ref != published.Ref || published.Snapshot.EngineVersion != published.EngineVersion || published.Manifest.ValidateSnapshot(published.Snapshot) != nil {
+		return ErrInvalidProfile
+	}
+	return nil
+}
+
 // Resolved is the owned, exact prompt source bundle paired with its immutable
 // snapshot. No caller needs to reopen or choose another blob.
 type Resolved struct {
@@ -441,7 +447,23 @@ func validHash(value string) bool {
 }
 
 func validIdentifier(value string) bool {
-	return value != "" && len(value) <= maxProfileIDBytes && utf8.ValidString(value)
+	return validText(value, maxIdentifierBytes, false)
+}
+
+func validShortText(value string) bool { return validText(value, maxIdentifierBytes, false) }
+
+func validProfileText(value string) bool { return validText(value, maxDescriptionBytes, true) }
+
+func validText(value string, maximum int, allowEmpty bool) bool {
+	if (!allowEmpty && value == "") || len(value) > maximum || !utf8.ValidString(value) {
+		return false
+	}
+	for _, runeValue := range value {
+		if unicode.IsControl(runeValue) {
+			return false
+		}
+	}
+	return true
 }
 
 func validOptionalTemplateRef(ref TemplateRef) bool {
@@ -452,7 +474,7 @@ func validOptionalTemplateRef(ref TemplateRef) bool {
 }
 
 func validLogicalTemplateName(name string) bool {
-	if len(name) < len("a.j2") || !strings.HasSuffix(name, ".j2") || !isLowerAlphaNum(name[0]) {
+	if len(name) < len("a.j2") || len(name) > maxIdentifierBytes || !strings.HasSuffix(name, ".j2") || !isLowerAlphaNum(name[0]) {
 		return false
 	}
 	for _, b := range []byte(name) {
@@ -482,11 +504,24 @@ func isLowerAlphaNum(value byte) bool {
 }
 
 func validFixtureName(name string) bool {
-	return len(name) > 0 && len(name) <= maxProfileIDBytes && utf8.ValidString(name) && !strings.Contains(name, "..") && !strings.HasPrefix(name, "/")
+	if len(name) < len("a.json") || len(name) > maxIdentifierBytes || !strings.HasSuffix(name, ".json") || !isLowerAlphaNum(name[0]) {
+		return false
+	}
+	for _, byteValue := range []byte(name) {
+		if !(byteValue >= 'a' && byteValue <= 'z' || byteValue >= '0' && byteValue <= '9' || byteValue == '_' || byteValue == '.' || byteValue == '/' || byteValue == '-') {
+			return false
+		}
+	}
+	for _, segment := range strings.Split(name, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 func validField(field prompttmpl.Field) bool {
-	if field.Type != prompttmpl.TypeString && field.Type != prompttmpl.TypeBool && field.Type != prompttmpl.TypeNumber && field.Type != prompttmpl.TypeObject && field.Type != prompttmpl.TypeArray || field.MaxBytes < 0 || field.MaxItems < 0 || !utf8.ValidString(field.Sensitivity) || !utf8.ValidString(field.Source) {
+	if field.Type != prompttmpl.TypeString && field.Type != prompttmpl.TypeBool && field.Type != prompttmpl.TypeNumber && field.Type != prompttmpl.TypeObject && field.Type != prompttmpl.TypeArray || field.MaxBytes < 0 || field.MaxBytes > prompttmpl.MaxContextBytes || field.MaxItems < 0 || field.MaxItems > prompttmpl.MaxCollectionItems || !validText(field.Sensitivity, maxIdentifierBytes, true) || !validText(field.Source, maxIdentifierBytes, true) || len(field.Templates) > maxTemplates {
 		return false
 	}
 	for _, template := range field.Templates {
@@ -498,9 +533,12 @@ func validField(field prompttmpl.Field) bool {
 }
 
 func uniqueStrings(values []string) bool {
+	if len(values) > maxNestedItems {
+		return false
+	}
 	seen := make(map[string]struct{}, len(values))
 	for _, value := range values {
-		if value == "" || !utf8.ValidString(value) {
+		if !validShortText(value) {
 			return false
 		}
 		if _, exists := seen[value]; exists {
@@ -511,16 +549,72 @@ func uniqueStrings(values []string) bool {
 	return true
 }
 
-func hasTemplateHash(templates map[string]TemplateRef, hash string) bool {
+func validRefMap(refs map[string]TemplateRef) bool {
+	total := 0
+	for _, ref := range refs {
+		if ref.Validate() != nil || ref.Bytes > maxProfileBlobBytes-total {
+			return false
+		}
+		total += ref.Bytes
+	}
+	return true
+}
+
+func hasTemplateRef(templates map[string]TemplateRef, want TemplateRef) bool {
 	for _, ref := range templates {
-		if ref.Hash == hash {
+		if ref == want {
 			return true
 		}
 	}
 	return false
 }
 
-func validJSON(raw json.RawMessage) bool { return len(raw) == 0 || json.Valid(raw) }
+func validBinding(binding AdapterBinding) bool {
+	return validIdentifier(binding.AdapterID) && validIdentifier(binding.Version) && binding.MaxResultBytes >= 0 && binding.MaxResultBytes <= maxRecipeBytes && uniqueStrings(binding.ToolIDs)
+}
+
+func validRecipe(recipe WorkerRecipe) bool {
+	return validIdentifier(recipe.ID) && recipe.Version != 0 && recipe.Objective.Validate() == nil && uniqueStrings(recipe.BindingIDs) && uniqueStrings(recipe.RequiredEvidence) && uniqueStrings(recipe.OptionalEvidence) && boundedRecipeBytes(recipe.MaxObjectiveBytes) && boundedRecipeBytes(recipe.MaxEvidenceBytes) && boundedRecipeBytes(recipe.MaxToolResultBytes) && boundedRecipeBytes(recipe.MaxFinalResultBytes) && recipe.ExecutionTimeout >= 0 && recipe.ExecutionTimeout <= maxRecipeDuration && recipe.ToolTimeout >= 0 && recipe.ToolTimeout <= maxRecipeDuration && recipe.OverallTimeout >= 0 && recipe.OverallTimeout <= maxRecipeDuration && validJSON(recipe.ResultSchema)
+}
+
+func boundedRecipeBytes(value int) bool { return value >= 0 && value <= maxRecipeBytes }
+
+func validKnowledgeRef(reference KnowledgeRef) bool {
+	return validIdentifier(reference.ID) && reference.Version != 0 && validHash(reference.Hash)
+}
+
+func validJSON(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return true
+	}
+	if len(raw) > maxRawJSONBytes || !json.Valid(raw) {
+		return false
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return false
+	}
+	return decoder.Decode(&struct{}{}) == io.EOF
+}
+
+func canonicalJSON(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return nil
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return nil
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return nil
+	}
+	return json.RawMessage(encoded)
+}
 
 func hashCanonical(version string, value any) string {
 	encoded, _ := json.Marshal(struct {
@@ -552,6 +646,7 @@ func canonicalManifest(manifest Manifest) Manifest {
 		sort.Strings(clone.Recipes[index].BindingIDs)
 		sort.Strings(clone.Recipes[index].RequiredEvidence)
 		sort.Strings(clone.Recipes[index].OptionalEvidence)
+		clone.Recipes[index].ResultSchema = canonicalJSON(clone.Recipes[index].ResultSchema)
 	}
 	for index := range clone.Bindings {
 		sort.Strings(clone.Bindings[index].ToolIDs)

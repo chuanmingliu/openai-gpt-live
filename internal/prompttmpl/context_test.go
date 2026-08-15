@@ -99,3 +99,26 @@ func TestValidateContextReturnsAnOwnedTree(t *testing.T) {
 	require.Equal(t, "A", got["items"].([]any)[0].(map[string]any)["code"])
 	require.Equal(t, json.Number("42"), got["number"])
 }
+
+func TestValidateContextAcceptsJSONGrammarNumbersOutsideMachineRange(t *testing.T) {
+	schema := ContextSchema{Fields: map[string]Field{"number": {Type: TypeNumber}}}
+	for _, number := range []json.Number{"9223372036854775808", "1e309", "-0.0000000000000000000000000000000000001"} {
+		got, err := ValidateContext(schema, Context{"number": number}, "system.j2")
+		require.NoError(t, err, number)
+		require.Equal(t, number, got["number"])
+	}
+}
+
+func TestValidateContextRejectsInvalidSchemaMetadataWithoutInput(t *testing.T) {
+	invalid := []ContextSchema{
+		{Fields: map[string]Field{"bad\nname": {Type: TypeString}}},
+		{Fields: map[string]Field{"field": {Type: TypeString, MaxBytes: -1}}},
+		{Fields: map[string]Field{"field": {Type: TypeArray, MaxItems: DefaultCollectionItems + 1}}},
+		{Fields: map[string]Field{"field": {Type: TypeString, Templates: []string{"system.j2", "system.j2"}}}},
+		{Fields: map[string]Field{"field": {Type: TypeString, Templates: []string{"bad\xff.j2"}}}},
+	}
+	for _, schema := range invalid {
+		_, err := ValidateContext(schema, Context{}, "system.j2")
+		require.ErrorIs(t, err, ErrContextInvalid)
+	}
+}

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -13,10 +15,15 @@ var ErrContextInvalid = errors.New("context_invalid")
 
 const maxContextSchemaDepth = 16
 
+const maxContextSchemaTextBytes = 256
+
 // ValidateContext admits only the declared values a template may access and
 // returns a fully owned copy. Nil is the explicit representation of an
 // optional value; a required value must be present and non-nil.
 func ValidateContext(schema ContextSchema, input Context, templateName string) (Context, error) {
+	if !validContextSchema(schema) || !validContextTemplateName(templateName) {
+		return nil, ErrContextInvalid
+	}
 	if input == nil {
 		input = Context{}
 	}
@@ -27,7 +34,7 @@ func ValidateContext(schema ContextSchema, input Context, templateName string) (
 	owned := make(Context, len(input))
 	for name, value := range input {
 		field, ok := schema.Fields[name]
-		if !ok || !validContextFieldType(field.Type) || !contextFieldAllows(field, templateName) || !utf8.ValidString(name) {
+		if !ok || !contextFieldAllows(field, templateName) || !validContextText(name, false) {
 			return nil, ErrContextInvalid
 		}
 		if err := budget.item(); err != nil {
@@ -58,9 +65,6 @@ func ValidateContext(schema ContextSchema, input Context, templateName string) (
 		}
 	}
 	for name, field := range schema.Fields {
-		if !validContextFieldType(field.Type) {
-			return nil, ErrContextInvalid
-		}
 		if field.Required && contextFieldAllows(field, templateName) {
 			if value, ok := input[name]; !ok || value == nil {
 				return nil, ErrContextInvalid
@@ -68,6 +72,65 @@ func ValidateContext(schema ContextSchema, input Context, templateName string) (
 		}
 	}
 	return owned, nil
+}
+
+func validContextSchema(schema ContextSchema) bool {
+	if len(schema.Fields) > DefaultCollectionItems {
+		return false
+	}
+	for name, field := range schema.Fields {
+		if !validContextText(name, false) || !validContextFieldType(field.Type) || field.MaxBytes < 0 || field.MaxBytes > MaxContextBytes || field.MaxItems < 0 || field.MaxItems > MaxCollectionItems || !validContextText(field.Sensitivity, true) || !validContextText(field.Source, true) || len(field.Templates) > DefaultCollectionItems || !validContextACL(field.Templates) {
+			return false
+		}
+	}
+	return true
+}
+
+func validContextACL(templates []string) bool {
+	seen := make(map[string]struct{}, len(templates))
+	for _, template := range templates {
+		if !validContextTemplateName(template) {
+			return false
+		}
+		if _, exists := seen[template]; exists {
+			return false
+		}
+		seen[template] = struct{}{}
+	}
+	return true
+}
+
+func validContextTemplateName(name string) bool {
+	if !validContextText(name, false) || len(name) < len("a.j2") || !strings.HasSuffix(name, ".j2") || !isContextLowerAlphaNum(name[0]) {
+		return false
+	}
+	for _, byteValue := range []byte(name) {
+		if !(byteValue >= 'a' && byteValue <= 'z' || byteValue >= '0' && byteValue <= '9' || byteValue == '_' || byteValue == '.' || byteValue == '/' || byteValue == '-') {
+			return false
+		}
+	}
+	for _, segment := range strings.Split(name, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+func isContextLowerAlphaNum(value byte) bool {
+	return value >= 'a' && value <= 'z' || value >= '0' && value <= '9'
+}
+
+func validContextText(value string, allowEmpty bool) bool {
+	if (!allowEmpty && value == "") || len(value) > maxContextSchemaTextBytes || !utf8.ValidString(value) {
+		return false
+	}
+	for _, runeValue := range value {
+		if unicode.IsControl(runeValue) {
+			return false
+		}
+	}
+	return true
 }
 
 func validContextFieldType(fieldType FieldType) bool {
@@ -181,7 +244,7 @@ func cloneValidatedContextValue(budget *contextValidationBudget, value any, dept
 		}
 		return value, budget.add(5)
 	case json.Number:
-		if _, err := normalizeJSONNumber(value); err != nil {
+		if !validJSONNumber(value) {
 			return nil, ErrContextInvalid
 		}
 		if err := budget.add(len(value)); err != nil {
@@ -263,4 +326,19 @@ func cloneValidatedContextValue(budget *contextValidationBudget, value any, dept
 	default:
 		return nil, ErrContextInvalid
 	}
+}
+
+func validJSONNumber(value json.Number) bool {
+	raw := string(value)
+	if raw == "" || strings.TrimSpace(raw) != raw || (raw[0] != '-' && (raw[0] < '0' || raw[0] > '9')) || !json.Valid([]byte(raw)) {
+		return false
+	}
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.UseNumber()
+	var decoded any
+	if err := decoder.Decode(&decoded); err != nil {
+		return false
+	}
+	_, ok := decoded.(json.Number)
+	return ok
 }

@@ -20,6 +20,15 @@ type PublishRecord struct {
 	PublishedAt        time.Time
 }
 
+// Validate ensures the record cannot persist a different manifest, snapshot,
+// tenant, or actor than the exact publication it names.
+func (record PublishRecord) Validate() error {
+	if !validIdentifier(record.TenantID) || record.ProfileID.Validate() != nil || record.ExpectedGeneration < 0 || record.DraftGeneration < 0 || !validIdentifier(record.Actor) || !validShortText(record.EngineVersion) || record.Snapshot.TenantID != record.TenantID || record.Snapshot.Ref.ID != record.ProfileID || record.Snapshot.EngineVersion != record.EngineVersion || record.Manifest.ValidateSnapshot(record.Snapshot) != nil {
+		return ErrInvalidProfile
+	}
+	return nil
+}
+
 // PublishedSummary is safe metadata for paging a tenant's published versions.
 type PublishedSummary struct {
 	Ref           VersionRef
