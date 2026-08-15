@@ -34,9 +34,22 @@ chmod +x "$scratch/docker"
 PATH="$scratch:$PATH" POSTGRES_PASSWORD='p@ss:/?#% with space' \
   "$root/deploy/scripts/durable-compose.sh" migrate-check
 
-for verb in postgres-start postgres-migrate postgres-ready postgres-id postgres-stop gateway-start gateway-id gateway-stop worker-start worker-id worker-stop; do
+for verb in postgres-start postgres-migrate postgres-ready gateway-start worker-start; do
   PATH="$scratch:$PATH" POSTGRES_PASSWORD='p@ss:/?#% with space' \
+    S2S_API_KEY=test LIVE_STATIC_BEARER_TOKEN=test LIVE_ADMIN_BEARER_TOKEN=test \
+    LIVE_PRIVACY_HMAC_KEY=test LIVE_RETENTION_HMAC_KEY=test LIVE_RECONNECT_HMAC_KEY=test \
+    LIVE_TOOL_ENCRYPTION_KEY=test LIVE_EXPECTED_CONFIG_HASH=test DEEPSEEK_API_KEY=test \
     "$root/deploy/scripts/durable-compose.sh" "$verb"
+done
+
+# Compose always parses the complete merged model.  These identity and stop
+# verbs are deliberately credential-independent; no service secret is needed
+# merely to determine whether a private owner proof still matches.
+for verb in postgres-id postgres-stop gateway-id gateway-stop worker-id worker-stop; do
+  env -u POSTGRES_PASSWORD -u S2S_API_KEY -u DEEPSEEK_API_KEY -u LIVE_STATIC_BEARER_TOKEN \
+    -u LIVE_ADMIN_BEARER_TOKEN -u LIVE_PRIVACY_HMAC_KEY -u LIVE_RETENTION_HMAC_KEY \
+    -u LIVE_RECONNECT_HMAC_KEY -u LIVE_TOOL_ENCRYPTION_KEY -u LIVE_EXPECTED_CONFIG_HASH \
+    PATH="$scratch:$PATH" "$root/deploy/scripts/durable-compose.sh" "$verb"
 done
 
 if env -u POSTGRES_PASSWORD "$root/deploy/scripts/durable-compose.sh" migrate-check \

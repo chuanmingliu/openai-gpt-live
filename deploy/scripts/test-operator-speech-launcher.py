@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import subprocess
+import time
 import unittest
 
 
@@ -82,6 +84,13 @@ class OperatorSpeechLauncherTest(unittest.TestCase):
         self.assertNotIn("POSTGRES_PASSWORD", child)
         self.assertNotIn("LIVE_STATIC_BEARER_TOKEN", child)
 
+    def test_runtime_import_resolves_to_the_reviewed_checkout(self):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            MODULE.validate_runtime_source()
+        self.assertEqual("", stdout.getvalue())
+        self.assertEqual("", stderr.getvalue())
+
     def test_validated_private_file_swap_fails_closed_without_output(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -99,6 +108,46 @@ class OperatorSpeechLauncherTest(unittest.TestCase):
                     MODULE.load_private_environment(environment, expected)
             self.assertEqual("", stdout.getvalue())
             self.assertEqual("", stderr.getvalue())
+
+    def test_terminating_launcher_kills_term_ignoring_child_and_removes_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            child = root / "speech-to-speech"
+            pid_file = root / "pid"
+            child.write_text("#!" + sys.executable + "\nimport os, signal, sys, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\nopen(os.environ['SPEECH_TEST_PID'], 'w').write(str(os.getpid()))\nwhile True: time.sleep(1)\n")
+            child.chmod(0o700)
+            profile = root / "profile.json"
+            profile.write_text('{"mode":"realtime"}')
+            profile.chmod(0o600)
+            environment = root / ".env.local"
+            environment.write_text("SPEECH_TEST_PID=" + str(pid_file) + "\n")
+            environment.chmod(0o600)
+            package = root / "src" / "speech_to_speech"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text("")
+            original = (MODULE.SPEECH_PROFILE, MODULE.SPEECH_EXECUTABLE, MODULE.SPEECH_ROOT, MODULE.SPEECH_EXECUTABLE_ROOT, MODULE.SPEECH_ENVIRONMENT, MODULE.SPEECH_ENVIRONMENT_ROOT, MODULE.SPEECH_PYTHON, MODULE.SPEECH_REVISION)
+            try:
+                MODULE.SPEECH_ROOT = root
+                MODULE.SPEECH_EXECUTABLE_ROOT = root
+                MODULE.SPEECH_PROFILE = profile
+                MODULE.SPEECH_EXECUTABLE = child
+                MODULE.SPEECH_ENVIRONMENT = environment
+                MODULE.SPEECH_ENVIRONMENT_ROOT = root
+                MODULE.SPEECH_PYTHON = Path(sys.executable)
+                MODULE.SPEECH_REVISION = "test-revision"
+                program = "import importlib.util,sys; s=importlib.util.spec_from_file_location('x',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); P=m.Path; m.SPEECH_ROOT=P(sys.argv[2]); m.SPEECH_EXECUTABLE_ROOT=P(sys.argv[2]); m.SPEECH_PROFILE=P(sys.argv[3]); m.SPEECH_EXECUTABLE=P(sys.argv[4]); m.SPEECH_ENVIRONMENT=P(sys.argv[5]); m.SPEECH_ENVIRONMENT_ROOT=P(sys.argv[2]); m.SPEECH_PYTHON=P(sys.executable); m.SPEECH_REVISION='test-revision'; m.validate_runtime_source=lambda:None; raise SystemExit(m.launch(P(sys.argv[3])))"
+                process = subprocess.Popen([sys.executable, "-c", program, str(SCRIPT), str(root), str(profile), str(child), str(environment)], env={"PATH": os.environ.get("PATH", ""), "SPEECH_TEST_PID": str(pid_file)})
+                deadline = time.time() + 2
+                while not pid_file.exists() and time.time() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(pid_file.exists())
+                process.terminate()
+                process.wait(timeout=3)
+                child_pid = int(pid_file.read_text())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(child_pid, 0)
+            finally:
+                MODULE.SPEECH_PROFILE, MODULE.SPEECH_EXECUTABLE, MODULE.SPEECH_ROOT, MODULE.SPEECH_EXECUTABLE_ROOT, MODULE.SPEECH_ENVIRONMENT, MODULE.SPEECH_ENVIRONMENT_ROOT, MODULE.SPEECH_PYTHON, MODULE.SPEECH_REVISION = original
 
 
 if __name__ == "__main__":

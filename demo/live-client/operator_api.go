@@ -12,7 +12,9 @@ import (
 
 const (
 	maximumOperatorActionBytes = 4 << 10
-	operatorActionTimeout      = 10 * time.Second
+	// Compose may build images, wait for health checks, and honour service stop
+	// grace periods.  This is intentionally longer than those reviewed bounds.
+	operatorActionTimeout = 150 * time.Second
 )
 
 type operatorActionRequest struct {

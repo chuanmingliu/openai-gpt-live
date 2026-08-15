@@ -106,6 +106,10 @@ func (handler *demoHandler) ServeHTTP(writer http.ResponseWriter, request *http.
 			writer.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
+		if handler.operator != nil && !handler.operator.runner.Ready(request.Context(), componentClient) {
+			writer.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		handler.serveAsset(writer, "web/index.html", "text/html; charset=utf-8")
 	case "/styles.css":
 		if request.Method != http.MethodGet {
@@ -268,7 +272,6 @@ func run(ctx context.Context, cfg demoConfig, bearer []byte) error {
 	defer stopServer()
 	if cfg.Operator.Enabled {
 		cfg.Operator.ClientStop = func(context.Context) error {
-			stopServer()
 			return nil
 		}
 	}
@@ -295,13 +298,14 @@ func run(ctx context.Context, cfg demoConfig, bearer []byte) error {
 	go func() {
 		defer close(shutdownComplete)
 		<-serverContext.Done()
-		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = server.Shutdown(shutdown)
 	}()
 	serveErr := server.Serve(listener)
 	if serverContext.Err() != nil {
 		<-shutdownComplete
+		waitOperatorActions(demo.operator)
 		shutdownOwnedOperator(demo.operator)
 	}
 	if errors.Is(serveErr, http.ErrServerClosed) && serverContext.Err() != nil {
@@ -310,15 +314,25 @@ func run(ctx context.Context, cfg demoConfig, bearer []byte) error {
 	return serveErr
 }
 
+func waitOperatorActions(supervisor *operatorSupervisor) {
+	if supervisor == nil {
+		return
+	}
+	// Every action has its own bounded deadline.  Do not close the state root
+	// while one is still unwinding; otherwise its ownership cleanup can race a
+	// replacement runner.
+	supervisor.WaitIdle(context.Background())
+}
+
 func shutdownOwnedOperator(supervisor *operatorSupervisor) {
 	if supervisor == nil || supervisor.runner == nil {
 		return
 	}
-	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	for _, component := range []operatorComponent{componentWorker, componentGateway, componentPostgres, componentSpeech} {
 		if supervisor.runner.Owned(component) {
-			_ = supervisor.Apply(shutdown, component, actionStop)
+			step, cancel := context.WithTimeout(context.Background(), operatorActionTimeout)
+			_ = supervisor.runner.Run(step, fixedOperation{Component: component, Action: actionStop})
+			cancel()
 		}
 	}
 }

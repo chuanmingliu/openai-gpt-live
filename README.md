@@ -88,6 +88,11 @@ release-evidence controller. Use the [complete realtime
 browser operator guide](docs/demo/realtime-browser-client.md) for manual
 audible-playback/barge-in acceptance, pool-idle checks, and troubleshooting.
 
+The control-panel speech launcher uses the reviewed local
+`/Users/chuanmingliu/speech-to-speech` checkout at
+`d0270d79ccb6f5c99f76499bb1dbe8a65608cf51`. Any raw child diagnostic stays in
+the operator terminal; the browser/API receives only fixed status codes.
+
 For realtime-only voice, you need a speech service, the local gateway, and the
 browser BFF. You do not need a DeepSeek API key, PostgreSQL handoff
 configuration, or `live-worker`. Once the guide's gateway is ready, supply the

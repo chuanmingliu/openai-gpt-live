@@ -15,14 +15,17 @@ import sys
 import tempfile
 
 
-SPEECH_ROOT = Path("/Users/chuanmingliu/speech-to-speech/.worktrees/provider-native-streaming")
-SPEECH_EXECUTABLE_ROOT = Path("/Users/chuanmingliu/speech-to-speech/.venv")
+SPEECH_ROOT = Path("/Users/chuanmingliu/speech-to-speech")
+SPEECH_EXECUTABLE_ROOT = SPEECH_ROOT / ".venv"
 SPEECH_EXECUTABLE = SPEECH_EXECUTABLE_ROOT / "bin/speech-to-speech"
+SPEECH_PYTHON = SPEECH_EXECUTABLE_ROOT / "bin/python"
 SPEECH_ENVIRONMENT_ROOT = Path("/Users/chuanmingliu/speech-to-speech")
 SPEECH_ENVIRONMENT = SPEECH_ENVIRONMENT_ROOT / ".env.local"
 SPEECH_PROFILE = SPEECH_ROOT / "configs/tencent-deepseek-minimax.json"
+SPEECH_REVISION = "d0270d79ccb6f5c99f76499bb1dbe8a65608cf51"
 ENVIRONMENT_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 SAFE_PARENT_ENVIRONMENT = ("PATH", "HOME", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR")
+CHILD_TERMINATE_WAIT_SECONDS = 1
 
 
 class LauncherError(Exception):
@@ -144,21 +147,68 @@ def remove_runtime_profile(path: Path) -> None:
         pass
 
 
+def terminate_child_group(child: subprocess.Popen[bytes], signum: int) -> None:
+    if child.poll() is not None:
+        return
+    try:
+        os.killpg(child.pid, signum)
+        child.wait(timeout=CHILD_TERMINATE_WAIT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def validate_runtime_source() -> None:
+    expected = (SPEECH_ROOT / "src" / "speech_to_speech" / "__init__.py").resolve(strict=True)
+    try:
+        imported = subprocess.run(
+            (str(SPEECH_PYTHON), "-c", "import speech_to_speech; print(speech_to_speech.__file__)"),
+            env={"PATH": os.environ.get("PATH", "")},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=3,
+            check=True,
+        ).stdout.strip()
+        revision = subprocess.run(
+            ("git", "-C", str(SPEECH_ROOT), "rev-parse", "HEAD"),
+            env={"PATH": os.environ.get("PATH", "")},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=3,
+            check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        raise LauncherError() from error
+    try:
+        if Path(imported).resolve(strict=True) != expected or revision != SPEECH_REVISION:
+            raise LauncherError()
+    except OSError as error:
+        raise LauncherError() from error
+
+
 def launch(profile: Path) -> int:
     if profile != SPEECH_PROFILE:
         raise LauncherError()
     validate_trusted_file(SPEECH_EXECUTABLE, SPEECH_EXECUTABLE_ROOT, executable=True)
+    validate_runtime_source()
     environment_file = validate_trusted_file(SPEECH_ENVIRONMENT, SPEECH_ENVIRONMENT_ROOT, private=True)
     profile_file = validate_trusted_file(profile, SPEECH_ROOT)
     environment = build_child_environment(dict(os.environ), load_private_environment(SPEECH_ENVIRONMENT, environment_file))
     runtime_profile = create_runtime_profile(profile, profile_file)
     child: subprocess.Popen[bytes] | None = None
     try:
-        child = subprocess.Popen((str(SPEECH_EXECUTABLE), str(runtime_profile)), env=environment)
+        # The service gets its own group.  The launcher's handlers terminate
+        # that complete group and wait before exit; the BFF separately owns the
+        # launcher group, so either bounded shutdown path leaves no child.
+        child = subprocess.Popen((str(SPEECH_EXECUTABLE), str(runtime_profile)), env=environment, start_new_session=True)
 
         def forward(signum: int, _frame: object) -> None:
-            if child is not None and child.poll() is None:
-                child.send_signal(signum)
+            if child is not None:
+                terminate_child_group(child, signum)
 
         signal.signal(signal.SIGTERM, forward)
         signal.signal(signal.SIGINT, forward)

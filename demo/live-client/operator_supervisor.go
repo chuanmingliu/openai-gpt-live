@@ -59,15 +59,18 @@ type operatorSupervisor struct {
 	inFlight map[operatorComponent]operatorAction
 	failed   map[operatorComponent]string
 	migrated bool
+	idle     *sync.Cond
 }
 
 func newOperatorSupervisor(runner operatorRunner, timeout time.Duration) *operatorSupervisor {
 	if timeout <= 0 {
 		timeout = time.Second
 	}
-	return &operatorSupervisor{
+	supervisor := &operatorSupervisor{
 		runner: runner, timeout: timeout, inFlight: make(map[operatorComponent]operatorAction), failed: make(map[operatorComponent]string),
 	}
+	supervisor.idle = sync.NewCond(&supervisor.mu)
+	return supervisor
 }
 
 func (supervisor *operatorSupervisor) Snapshot(ctx context.Context) []componentStatus {
@@ -117,6 +120,7 @@ func (supervisor *operatorSupervisor) Apply(ctx context.Context, component opera
 		supervisor.inFlight[component] = actionStop
 	} else {
 		delete(supervisor.inFlight, component)
+		supervisor.idle.Broadcast()
 	}
 	supervisor.mu.Unlock()
 
@@ -126,9 +130,33 @@ func (supervisor *operatorSupervisor) Apply(ctx context.Context, component opera
 		cleanupCancel()
 		supervisor.mu.Lock()
 		delete(supervisor.inFlight, component)
+		supervisor.idle.Broadcast()
 		supervisor.mu.Unlock()
 	}
 	return supervisor.status(ctx, component)
+}
+
+// WaitIdle is used only after the HTTP server has stopped accepting actions.
+// It prevents runner state from being closed beneath a still-running command.
+func (supervisor *operatorSupervisor) WaitIdle(ctx context.Context) bool {
+	if supervisor == nil {
+		return true
+	}
+	done := make(chan struct{})
+	go func() {
+		supervisor.mu.Lock()
+		defer supervisor.mu.Unlock()
+		for len(supervisor.inFlight) != 0 {
+			supervisor.idle.Wait()
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func (supervisor *operatorSupervisor) status(ctx context.Context, component operatorComponent) componentStatus {

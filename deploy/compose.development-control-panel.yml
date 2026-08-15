@@ -1,10 +1,37 @@
 services:
+  # The operator calls `ps` and `rm` with no credentials.  Compose still
+  # interpolates the entire merged model, so empty defaults make those
+  # credential-independent identity/stop paths renderable.  The wrapper and
+  # runner enforce the real per-start requirements before a service is run.
+  migrate:
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-}
+
   gateway:
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-}
+      S2S_API_KEY: ${S2S_API_KEY:-}
+      LIVE_STATIC_BEARER_TOKEN: ${LIVE_STATIC_BEARER_TOKEN:-}
+      LIVE_ADMIN_BEARER_TOKEN: ${LIVE_ADMIN_BEARER_TOKEN:-}
+      LIVE_PRIVACY_HMAC_KEY: ${LIVE_PRIVACY_HMAC_KEY:-}
+      LIVE_RETENTION_HMAC_KEY: ${LIVE_RETENTION_HMAC_KEY:-}
+      LIVE_RECONNECT_HMAC_KEY: ${LIVE_RECONNECT_HMAC_KEY:-}
+      LIVE_TOOL_ENCRYPTION_KEY: ${LIVE_TOOL_ENCRYPTION_KEY:-}
+      LIVE_EXPECTED_CONFIG_HASH: ${LIVE_EXPECTED_CONFIG_HASH:-}
     volumes:
       - ./config/development-control-panel.yaml:/etc/live/config.yaml:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
   worker:
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      LIVE_STATIC_BEARER_TOKEN: ${LIVE_STATIC_BEARER_TOKEN:-}
+      LIVE_ADMIN_BEARER_TOKEN: ${LIVE_ADMIN_BEARER_TOKEN:-}
+      LIVE_PRIVACY_HMAC_KEY: ${LIVE_PRIVACY_HMAC_KEY:-}
+      LIVE_RETENTION_HMAC_KEY: ${LIVE_RETENTION_HMAC_KEY:-}
+      LIVE_TOOL_ENCRYPTION_KEY: ${LIVE_TOOL_ENCRYPTION_KEY:-}
+      LIVE_EXPECTED_CONFIG_HASH: ${LIVE_EXPECTED_CONFIG_HASH:-}
     volumes:
       - ./config/development-control-panel.yaml:/etc/live/config.yaml:ro

@@ -1,4 +1,4 @@
-.PHONY: test test-race vet fmt verify-deploy verify-deploy-static smoke-deploy durable-demo-migrate durable-demo-up durable-demo-down test-durable-web-search load-unit chaos capacity barge soak load-smoke load-evidence release-gate release-gate-verify demo-wizard demo-live-client test-demo-live-client
+.PHONY: test test-race vet fmt verify-deploy verify-deploy-static smoke-deploy durable-demo-migrate durable-demo-up durable-demo-down test-durable-web-search load-unit chaos capacity barge soak load-smoke load-evidence release-gate release-gate-verify demo-wizard demo-live-client test-demo-live-client test-control-panel-compose-render
 
 test:
 	go test ./...
@@ -25,6 +25,10 @@ test-demo-live-client:
 	python3 deploy/scripts/test-operator-speech-launcher.py
 	./deploy/scripts/test-demo-wizard.sh
 	./deploy/scripts/test-durable-compose.sh
+	./deploy/scripts/test-control-panel-compose-render.sh
+
+test-control-panel-compose-render:
+	./deploy/scripts/test-control-panel-compose-render.sh
 
 # Builds and validates every deployable artifact. Tool absence is an explicit
 # prerequisite failure; the validator never silently skips a deployment gate.

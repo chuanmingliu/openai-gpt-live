@@ -70,13 +70,21 @@ stop_current_bff() {
     command=$(ps -p "$pid" -o command= 2>/dev/null || true)
     if [[ "$command" == "$state_dir/live-client"* ]]; then
       kill "$pid" 2>/dev/null || true
-      for _ in {1..20}; do
+      # The BFF owns four reverse-order cleanup actions, each with its own
+      # reviewed deadline. Keep proof for that complete bounded contract.
+      for _ in {1..12000}; do
         kill -0 "$pid" 2>/dev/null || break
         sleep 0.05
       done
     else
       warn "saved browser PID is not owned by this wizard; leaving it untouched"
+      return 1
     fi
+  fi
+
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    warn "browser BFF cleanup is still in progress; preserving ownership proof"
+    return 1
   fi
   rm -f "$state_dir/bff.pid" "$state_dir/live-client"
 }
@@ -157,7 +165,7 @@ start_operator_bff() {
     LIVE_DEMO_BEARER="$LIVE_DEMO_BEARER" \
     POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
     S2S_API_KEY="$S2S_API_KEY" \
-    DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY" \
+    DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY:-}" \
     LIVE_STATIC_BEARER_TOKEN="$LIVE_STATIC_BEARER_TOKEN" \
     LIVE_ADMIN_BEARER_TOKEN="$LIVE_ADMIN_BEARER_TOKEN" \
     LIVE_PRIVACY_HMAC_KEY="$LIVE_PRIVACY_HMAC_KEY" \
@@ -175,7 +183,7 @@ start_operator_bff() {
     -operator-speech-command "$root/deploy/scripts/operator-speech-launcher.py" \
     -operator-speech-profile "$speech_profile" \
     -operator-speech-ready-url http://127.0.0.1:8766/v1/pool \
-    >/dev/null 2>&1 &
+    &
   bff_pid=$!
   printf '%s\n' "$bff_pid" >"$state_dir/bff.pid"
   wait_ready browser-bff http://127.0.0.1:3000/health/ready
@@ -295,13 +303,12 @@ run_control_panel() {
   ask_secret POSTGRES_PASSWORD "Disposable PostgreSQL password:"
   ask_secret LIVE_STATIC_BEARER_TOKEN "New local gateway bearer:"
   ask_secret S2S_API_KEY "Gateway-to-speech bearer:"
-  ask_secret DEEPSEEK_API_KEY "Worker DeepSeek bearer:"
+  ask_secret DEEPSEEK_API_KEY "Worker DeepSeek bearer (optional for voice-only):"
   require_nonempty "PostgreSQL password" "$POSTGRES_PASSWORD"
   require_nonempty "local gateway bearer" "$LIVE_STATIC_BEARER_TOKEN"
   require_nonempty "gateway-to-speech bearer" "$S2S_API_KEY"
-  require_nonempty "DeepSeek bearer" "$DEEPSEEK_API_KEY"
 
-  speech_root=${DEMO_OPERATOR_SPEECH_ROOT:-/Users/chuanmingliu/speech-to-speech/.worktrees/provider-native-streaming}
+  speech_root=${DEMO_OPERATOR_SPEECH_ROOT:-/Users/chuanmingliu/speech-to-speech}
   speech_profile=${DEMO_OPERATOR_SPEECH_PROFILE:-$speech_root/configs/tencent-deepseek-minimax.json}
   speech_environment=${DEMO_OPERATOR_SPEECH_ENV:-/Users/chuanmingliu/speech-to-speech/.env.local}
   speech_executable=${DEMO_OPERATOR_SPEECH_EXECUTABLE:-/Users/chuanmingliu/speech-to-speech/.venv/bin/speech-to-speech}

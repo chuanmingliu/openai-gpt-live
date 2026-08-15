@@ -53,9 +53,10 @@ if [[ "$*" != *'-operator'* ]]; then
 fi
 [[ "$*" == *'-model gpt-live-simulator'* || "$*" == *'-model client-model'* ]] || exit 92
 if [[ "$*" == *'-operator'* ]]; then
-  for required in POSTGRES_PASSWORD S2S_API_KEY DEEPSEEK_API_KEY LIVE_STATIC_BEARER_TOKEN LIVE_ADMIN_BEARER_TOKEN LIVE_PRIVACY_HMAC_KEY LIVE_RETENTION_HMAC_KEY LIVE_RECONNECT_HMAC_KEY LIVE_TOOL_ENCRYPTION_KEY LIVE_EXPECTED_CONFIG_HASH; do
+  for required in POSTGRES_PASSWORD S2S_API_KEY LIVE_STATIC_BEARER_TOKEN LIVE_ADMIN_BEARER_TOKEN LIVE_PRIVACY_HMAC_KEY LIVE_RETENTION_HMAC_KEY LIVE_RECONNECT_HMAC_KEY LIVE_TOOL_ENCRYPTION_KEY LIVE_EXPECTED_CONFIG_HASH; do
     [[ -n "${!required:-}" ]] || exit 95
   done
+  printf '%s\n' 'operator diagnostic sentinel' >&2
 fi
 trap 'exit 0' TERM INT
 while :; do sleep 1; done
@@ -171,13 +172,14 @@ grep -F 'worker: ready' "$scratch/status.out" >/dev/null || fail "status omitted
 run_wizard stop $'4\npostgres-password-sentinel\n'
 grep -Fx 'durable-demo-down' "$scratch/stop.calls" >/dev/null || fail "stop mode skipped durable shutdown"
 
-control_input=$(printf '5\n%s\n%s\n%s\n%s\n' \
-  'postgres-password-sentinel' 'local-bearer-sentinel' 'speech-key-sentinel' 'deepseek-key-sentinel')
+control_input=$(printf '5\n%s\n%s\n%s\n\n' \
+  'postgres-password-sentinel' 'local-bearer-sentinel' 'speech-key-sentinel')
 run_wizard control "$control_input"
 grep -F 'http://127.0.0.1:3000/setup' "$scratch/control.out" >/dev/null || fail "control-panel mode omitted the setup URL"
 grep -F -- '-operator -operator-state-dir' "$scratch/state-control/live-client.calls" >/dev/null || fail "control-panel mode did not explicitly enable local operator controls"
 grep -F -- '-operator-speech-ready-url http://127.0.0.1:8766/v1/pool' "$scratch/state-control/live-client.calls" >/dev/null || fail "control-panel mode did not fix external speech readiness"
 grep -F -- '-operator-repository-root' "$scratch/state-control/live-client.calls" >/dev/null || fail "control-panel mode omitted the fixed repository root"
+grep -Fx 'operator diagnostic sentinel' "$scratch/control.err" >/dev/null || fail "control-panel mode discarded the operator-only diagnostic"
 if grep -F 'durable-demo-' "$scratch/control.calls" >/dev/null || grep -F 'docker ' "$scratch/control.calls" >/dev/null; then
   fail "control-panel mode performed live service operations before browser authorization"
 fi

@@ -21,8 +21,11 @@ import (
 const (
 	operatorReadinessTimeout = 100 * time.Millisecond
 	operatorConnectTimeout   = 50 * time.Millisecond
-	operatorTerminateWait    = time.Second
-	operatorIdentityRetry    = 5 * time.Millisecond
+	// The launcher has a one-second in-process group cleanup. Leave it enough
+	// scheduling headroom to remove the real speech child before the BFF ever
+	// escalates against the launcher itself.
+	operatorTerminateWait = 3 * time.Second
+	operatorIdentityRetry = 5 * time.Millisecond
 )
 
 type operatorConfig struct {
@@ -129,7 +132,26 @@ func newLocalOperatorRunner(cfg operatorConfig, factory commandFactory, probe re
 		children: make(map[operatorComponent]*ownedChild), composeOwned: make(map[operatorComponent]string), composeEphemeral: make(map[operatorComponent]string), composePending: make(map[operatorComponent]bool), composeStale: make(map[operatorComponent]string), clientOwned: cfg.ClientStop != nil, speechFile: speechFile, profileFile: profileFile,
 	}
 	runner.composeIdentity = runner.queryComposeIdentity
+	runner.rehydrateComposeOwnership()
 	return runner, nil
+}
+
+// rehydrateComposeOwnership accepts only a private proof that still names the
+// immutable ID currently returned by Compose.  A stale or malformed proof is
+// deliberately ignored: it must never grant authority over an existing service.
+func (runner *localOperatorRunner) rehydrateComposeOwnership() {
+	for _, component := range []operatorComponent{componentPostgres, componentGateway, componentWorker} {
+		proof, ok := runner.readOwner(component)
+		if !ok {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), runner.identityTimeout)
+		id, exists, err := runner.composeID(ctx, component)
+		cancel()
+		if err == nil && exists && id == proof {
+			runner.composeOwned[component] = id
+		}
+	}
 }
 
 func defaultOperatorRecordOperations() operatorRecordOperations {
@@ -283,7 +305,7 @@ func (runner *localOperatorRunner) Run(ctx context.Context, operation fixedOpera
 	switch operation.Component {
 	case componentClient:
 		if operation.Action == actionStart {
-			if runner.cfg.ClientStop == nil || !runner.Ready(ctx, componentClient) {
+			if runner.cfg.ClientStop == nil {
 				return errOperatorMissingConfiguration
 			}
 			runner.mu.Lock()
@@ -330,6 +352,12 @@ func (runner *localOperatorRunner) Ready(ctx context.Context, component operator
 	if component == componentPostgres {
 		return runner.requiredEnvironment(fixedOperation{Component: componentPostgres, Action: actionStart}) && runner.runFixed(readyCtx, runner.composeCommand(), "postgres-ready") == nil
 	}
+	if component == componentClient {
+		runner.mu.Lock()
+		owned := runner.clientOwned
+		runner.mu.Unlock()
+		return owned && runner.probe(readyCtx, runner.cfg.Readiness[component])
+	}
 	endpoint, ok := runner.cfg.Readiness[component]
 	return ok && runner.probe(readyCtx, endpoint)
 }
@@ -366,19 +394,20 @@ func (runner *localOperatorRunner) startSpeech(ctx context.Context) error {
 		return errOperatorMissingConfiguration
 	}
 	cmd := runner.newCommand(context.Background(), runner.cfg.SpeechCommand, runner.cfg.SpeechProfile)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	if err := cmd.Start(); err != nil {
 		return commandFailure(ctx)
 	}
 	marker, err := newOperatorMarker()
 	if err != nil {
-		_ = cmd.Process.Kill()
+		_ = terminateProcessGroup(cmd.Process.Pid, syscall.SIGKILL)
 		_ = cmd.Wait()
 		return errOperatorProcessExited
 	}
 	child := &ownedChild{cmd: cmd, pid: cmd.Process.Pid, marker: marker, done: make(chan struct{})}
 	if err := runner.writePID(componentSpeech, child); err != nil {
-		_ = cmd.Process.Kill()
+		_ = terminateProcessGroup(cmd.Process.Pid, syscall.SIGKILL)
 		_ = cmd.Wait()
 		return errOperatorProcessExited
 	}
@@ -407,7 +436,7 @@ func (runner *localOperatorRunner) stopSpeech(ctx context.Context) error {
 	if child == nil || !runner.pidMatches(componentSpeech, child) {
 		return errOperatorProcessExited
 	}
-	if err := child.cmd.Process.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) {
+	if err := terminateProcessGroup(child.pid, syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		return errOperatorProcessExited
 	}
 	waitCtx, cancel := context.WithTimeout(nonNilContext(ctx), runner.terminateWait)
@@ -415,7 +444,7 @@ func (runner *localOperatorRunner) stopSpeech(ctx context.Context) error {
 	select {
 	case <-child.done:
 	case <-waitCtx.Done():
-		_ = child.cmd.Process.Kill()
+		_ = terminateProcessGroup(child.pid, syscall.SIGKILL)
 		select {
 		case <-child.done:
 		case <-time.After(runner.terminateWait):
@@ -423,6 +452,13 @@ func (runner *localOperatorRunner) stopSpeech(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func terminateProcessGroup(pid int, signal syscall.Signal) error {
+	if pid <= 0 {
+		return errOperatorProcessExited
+	}
+	return syscall.Kill(-pid, signal)
 }
 
 func (runner *localOperatorRunner) runCompose(ctx context.Context, verb string, component operatorComponent) error {
@@ -702,6 +738,31 @@ func (runner *localOperatorRunner) replaceOwner(component operatorComponent, bef
 
 func (runner *localOperatorRunner) ownerMatches(component operatorComponent, id string) bool {
 	return runner.recordMatches(string(component)+".owner", id+"\n")
+}
+
+func (runner *localOperatorRunner) readOwner(component operatorComponent) (string, bool) {
+	name := string(component) + ".owner"
+	if !runner.stateUnchanged() {
+		return "", false
+	}
+	file, err := runner.stateRoot.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return "", false
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || info.Size() < 2 || info.Size() > 256 {
+		return "", false
+	}
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return "", false
+	}
+	id := strings.TrimSuffix(string(data), "\n")
+	if id == "" || strings.ContainsAny(id, "\r\n\x00") || string(data) != id+"\n" {
+		return "", false
+	}
+	return id, true
 }
 
 func (runner *localOperatorRunner) writePID(component operatorComponent, child *ownedChild) error {

@@ -1071,6 +1071,32 @@ func TestLocalOperatorRunnerClientStopUsesOnlyServerCallback(t *testing.T) {
 	assert.False(t, runner.Owned(componentClient))
 }
 
+func TestLocalOperatorRunnerRehydratesMatchingComposeOwnershipAfterRestart(t *testing.T) {
+	setRequiredOperatorEnvironment(t)
+	root, speech, profile := newRunnerRepository(t)
+	state := filepath.Join(t.TempDir(), "state")
+	newRunner := func() *localOperatorRunner {
+		runnerInterface, err := newLocalOperatorRunner(operatorConfig{Enabled: true, StateDir: state, RepositoryRoot: root, SpeechCommand: speech, SpeechProfile: profile, Readiness: fixedReadiness()}, func(ctx context.Context, program string, args ...string) *exec.Cmd {
+			if len(args) == 1 && args[0] == "gateway-id" {
+				return exec.CommandContext(ctx, "/bin/sh", "-c", "printf gateway-owned")
+			}
+			return exec.CommandContext(ctx, "/usr/bin/true")
+		}, func(context.Context, string) bool { return true })
+		require.NoError(t, err)
+		runner := runnerInterface.(*localOperatorRunner)
+		runner.composeIdentity = func(context.Context, operatorComponent) (string, bool, error) { return "gateway-owned", true, nil }
+		return runner
+	}
+	first := newRunner()
+	require.NoError(t, first.writeOwner(componentGateway, "gateway-owned"))
+	require.NoError(t, first.stateRoot.Close())
+
+	second := newRunner()
+	t.Cleanup(func() { _ = second.stateRoot.Close() })
+	assert.True(t, second.Owned(componentGateway), "a matching private owner proof must survive a BFF restart")
+	require.NoError(t, second.Run(t.Context(), fixedOperation{Component: componentGateway, Action: actionStop}))
+}
+
 func TestLocalOperatorRunnerFreshPostgresStartReadyMigrateWithoutDocker(t *testing.T) {
 	setRequiredOperatorEnvironment(t)
 	root, speech, profile := newRunnerRepository(t)

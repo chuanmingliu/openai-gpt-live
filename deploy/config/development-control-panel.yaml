@@ -51,7 +51,9 @@ telemetry:
   service_name: gpt-live
   protocol: http/protobuf
 admin:
-  listen_addr: 127.0.0.1:9090
+  # Docker forwards host-loopback ports to the container interface, not the
+  # container's `lo`.  Publication remains 127.0.0.1 on the host.
+  listen_addr: :9090
 shutdown:
   gateway_drain_timeout: 30s
   worker_drain_timeout: 120s

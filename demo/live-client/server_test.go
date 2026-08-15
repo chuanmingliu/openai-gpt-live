@@ -24,8 +24,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestOperatorMainClientStopEndsExplicitLocalServer(t *testing.T) {
+func TestOperatorMainClientStopLeavesPersistentOperatorSurfaceForRestart(t *testing.T) {
 	cfg := testOperatorMainConfig(t)
+	gateway := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writer.WriteHeader(http.StatusOK) }))
+	t.Cleanup(gateway.Close)
+	cfg.Operator.Readiness[componentGateway] = gateway.URL
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	done := make(chan error, 1)
@@ -41,11 +44,30 @@ func TestOperatorMainClientStopEndsExplicitLocalServer(t *testing.T) {
 	assert.Equal(t, http.StatusOK, response.StatusCode)
 	_ = response.Body.Close()
 
+	waitForOperatorMainReady(t, cfg.Origin)
+	response, err = http.Get(cfg.Origin + "/")
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusServiceUnavailable, response.StatusCode)
+	_ = response.Body.Close()
+
+	request, err = http.NewRequest(http.MethodPost, cfg.Origin+"/api/operator/action", strings.NewReader(`{"component":"client","action":"start"}`))
+	require.NoError(t, err)
+	request.Header.Set("Origin", cfg.Origin)
+	request.Header.Set("Content-Type", "application/json")
+	response, err = http.DefaultClient.Do(request)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, response.StatusCode)
+	_ = response.Body.Close()
+	response, err = http.Get(cfg.Origin + "/")
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, response.StatusCode)
+	_ = response.Body.Close()
+	cancel()
 	select {
 	case err := <-done:
 		require.NoError(t, err)
 	case <-time.After(3 * time.Second):
-		t.Fatal("client stop did not end the operator server")
+		t.Fatal("operator server did not shut down")
 	}
 }
 
