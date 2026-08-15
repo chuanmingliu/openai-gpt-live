@@ -146,10 +146,12 @@ type CompiledBundle interface {
 	Render(context.Context, string, Context) (string, error)
 	Hash() string
 	EngineVersion() string
+	ResidentBytes() int
 }
 
 // Engine compiles a source Bundle with explicit resource limits.
 type Engine interface {
+	Version() string
 	Compile(context.Context, Bundle, Limits) (CompiledBundle, error)
 }
 

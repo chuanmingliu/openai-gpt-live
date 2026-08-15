@@ -7,6 +7,8 @@ import (
 	"sync"
 )
 
+const cacheEntryOverhead = 256
+
 // Cache retains a bounded, immutable set of compiled template bundles.
 type Cache struct {
 	engine               Engine
@@ -56,7 +58,8 @@ func (c *Cache) Compile(ctx context.Context, bundle Bundle, requested Limits) (C
 		return nil, &CompileError{Err: ErrLimitsInvalid}
 	}
 	owned := cloneBundle(bundle)
-	key := bundleFingerprint(owned, limits)
+	engineVersion := c.engine.Version()
+	key := cacheFingerprint(engineVersion, owned, limits)
 
 	c.mu.Lock()
 	if element := c.byKey[key]; element != nil {
@@ -87,7 +90,7 @@ func (c *Cache) Compile(ctx context.Context, bundle Bundle, requested Limits) (C
 	delete(c.inflight, key)
 	call.value, call.err = value, err
 	if err == nil {
-		c.admit(key, value, estimateCacheBytes(owned, value))
+		c.admit(key, value, estimateCacheBytes(engineVersion, key, owned, limits, value))
 	}
 	close(call.done)
 	c.mu.Unlock()
@@ -110,17 +113,18 @@ func (c *Cache) admit(key string, value CompiledBundle, bytes int) {
 	c.residentBytes += bytes
 }
 
-func estimateCacheBytes(bundle Bundle, compiled CompiledBundle) int {
-	bytes := 0
-	for name, source := range bundle.Templates {
-		bytes += len(name) + len(source)
-	}
-	for name, field := range bundle.Schema.Fields {
-		bytes += len(name) + len(field.Type) + len(field.Sensitivity) + len(field.Source)
-		for _, template := range field.Templates {
-			bytes += len(template)
-		}
-	}
-	bytes += len(compiled.Hash()) + len(compiled.EngineVersion())
+func estimateCacheBytes(engineVersion, key string, bundle Bundle, limits Limits, compiled CompiledBundle) int {
+	bytes := cacheEntryOverhead
+	bytes = saturatingAdd(bytes, len(key))
+	bytes = saturatingAdd(bytes, canonicalBundleBytes(engineVersion, bundle, limits))
+	bytes = saturatingAdd(bytes, compiled.ResidentBytes())
 	return bytes
+}
+
+func saturatingAdd(current, added int) int {
+	maxInt := int(^uint(0) >> 1)
+	if added < 0 || current > maxInt-added {
+		return maxInt
+	}
+	return current + added
 }

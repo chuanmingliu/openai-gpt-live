@@ -4,11 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"hash"
 	"sort"
+	"unicode/utf8"
 
 	minijinja "github.com/mitsuhiko/minijinja/minijinja-go/v2"
 	"github.com/mitsuhiko/minijinja/minijinja-go/v2/filters"
@@ -21,6 +22,8 @@ type miniJinjaEngine struct{}
 
 // NewMiniJinja returns the native, deliberately minimal MiniJinja engine.
 func NewMiniJinja() Engine { return miniJinjaEngine{} }
+
+func (miniJinjaEngine) Version() string { return miniJinjaVersion }
 
 func (miniJinjaEngine) Compile(ctx context.Context, bundle Bundle, requested Limits) (CompiledBundle, error) {
 	limits, err := requested.Validate()
@@ -71,16 +74,18 @@ func (miniJinjaEngine) Compile(ctx context.Context, bundle Bundle, requested Lim
 		templates[name] = template
 	}
 	return &miniJinjaBundle{
-		templates: templates,
-		limits:    limits,
-		hash:      bundleFingerprint(owned, limits),
+		templates:     templates,
+		limits:        limits,
+		hash:          bundleFingerprint(owned, limits),
+		residentBytes: estimateMiniJinjaResidentBytes(owned),
 	}, nil
 }
 
 type miniJinjaBundle struct {
-	templates map[string]*minijinja.Template
-	limits    Limits
-	hash      string
+	templates     map[string]*minijinja.Template
+	limits        Limits
+	hash          string
+	residentBytes int
 }
 
 func (b *miniJinjaBundle) Render(ctx context.Context, name string, values Context) (string, error) {
@@ -88,18 +93,15 @@ func (b *miniJinjaBundle) Render(ctx context.Context, name string, values Contex
 	if !ok {
 		return "", &RenderError{Err: nil}
 	}
-	data, err := boundedJSONContext(values, b.limits.ContextBytes)
+	renderCtx, cancel := context.WithTimeout(nonNilContext(ctx), b.limits.RenderTimeout)
+	defer cancel()
+	data, err := cloneBoundedContext(renderCtx, values, b.limits)
 	if err != nil {
 		return "", &RenderError{Template: name, Err: ErrRenderLimit}
 	}
-	if err := validateCollectionSize(data, b.limits.CollectionItems); err != nil {
+	if err := ctxErr(renderCtx); err != nil {
 		return "", &RenderError{Template: name, Err: ErrRenderLimit}
 	}
-	if err := ctxErr(ctx); err != nil {
-		return "", &RenderError{Template: name, Err: ErrRenderLimit}
-	}
-	renderCtx, cancel := context.WithTimeout(nonNilContext(ctx), b.limits.RenderTimeout)
-	defer cancel()
 	var output bytes.Buffer
 	writer := &contextCappedWriter{ctx: renderCtx, capped: NewCappedWriter(&output, b.limits.OutputBytes)}
 	if err := template.RenderToWriteCtx(renderCtx, data, writer); err != nil {
@@ -113,6 +115,7 @@ func (b *miniJinjaBundle) Render(ctx context.Context, name string, values Contex
 
 func (b *miniJinjaBundle) Hash() string          { return b.hash }
 func (b *miniJinjaBundle) EngineVersion() string { return miniJinjaVersion }
+func (b *miniJinjaBundle) ResidentBytes() int    { return b.residentBytes }
 
 type contextCappedWriter struct {
 	ctx    context.Context
@@ -137,38 +140,170 @@ func normalizedRenderCause(ctx context.Context, err error) error {
 	return nil
 }
 
-func boundedJSONContext(values Context, max int) (any, error) {
-	encoded, err := json.Marshal(values)
-	if err != nil || len(encoded) > max {
-		return nil, ErrRenderLimit
-	}
-	var normalized any
-	if err := json.Unmarshal(encoded, &normalized); err != nil {
-		return nil, ErrRenderLimit
-	}
-	return normalized, nil
+type contextBudget struct {
+	ctx                context.Context
+	bytes, items       int
+	maxBytes, maxItems int
 }
 
-func validateCollectionSize(value any, max int) error {
+func cloneBoundedContext(ctx context.Context, values Context, limits Limits) (map[string]any, error) {
+	budget := &contextBudget{ctx: ctx, maxBytes: limits.ContextBytes, maxItems: limits.CollectionItems}
+	return cloneContextMap(budget, map[string]any(values), 1, limits.RecursionDepth)
+}
+
+func cloneContextMap(budget *contextBudget, input map[string]any, depth, maxDepth int) (map[string]any, error) {
+	if depth > maxDepth {
+		return nil, ErrRenderLimit
+	}
+	if len(input) > budget.maxItems-budget.items {
+		return nil, ErrRenderLimit
+	}
+	if err := budget.add(1); err != nil { // {
+		return nil, err
+	}
+	cloned := make(map[string]any, len(input))
+	for key, value := range input {
+		if err := budget.item(); err != nil {
+			return nil, err
+		}
+		if err := budget.jsonString(key); err != nil {
+			return nil, err
+		}
+		if err := budget.add(1); err != nil { // :
+			return nil, err
+		}
+		copied, err := cloneContextValue(budget, value, depth, maxDepth)
+		if err != nil {
+			return nil, err
+		}
+		cloned[key] = copied
+		if err := budget.add(1); err != nil { // comma or }
+			return nil, err
+		}
+	}
+	if len(input) == 0 {
+		return cloned, budget.add(1) // }
+	}
+	return cloned, nil
+}
+
+func cloneContextValue(budget *contextBudget, value any, depth, maxDepth int) (any, error) {
+	if err := budget.check(); err != nil {
+		return nil, err
+	}
 	switch value := value.(type) {
-	case []any:
-		if len(value) > max {
-			return ErrRenderLimit
+	case nil:
+		return nil, budget.add(4)
+	case string:
+		return value, budget.jsonString(value)
+	case bool:
+		if value {
+			return value, budget.add(4)
 		}
-		for _, item := range value {
-			if err := validateCollectionSize(item, max); err != nil {
-				return err
-			}
+		return value, budget.add(5)
+	case json.Number:
+		if err := budget.add(len(value)); err != nil {
+			return nil, err
 		}
+		if value == "" || (value[0] != '-' && (value[0] < '0' || value[0] > '9')) || !json.Valid([]byte(value)) {
+			return nil, ErrRenderLimit
+		}
+		return value, nil
 	case map[string]any:
-		if len(value) > max {
-			return ErrRenderLimit
+		return cloneContextMap(budget, value, depth+1, maxDepth)
+	case []any:
+		return cloneContextSlice(budget, value, depth+1, maxDepth)
+	default:
+		return nil, ErrRenderLimit
+	}
+}
+
+func cloneContextSlice(budget *contextBudget, input []any, depth, maxDepth int) ([]any, error) {
+	if depth > maxDepth {
+		return nil, ErrRenderLimit
+	}
+	if len(input) > budget.maxItems-budget.items {
+		return nil, ErrRenderLimit
+	}
+	if err := budget.add(1); err != nil { // [
+		return nil, err
+	}
+	cloned := make([]any, len(input))
+	for index, value := range input {
+		if err := budget.item(); err != nil {
+			return nil, err
 		}
-		for _, item := range value {
-			if err := validateCollectionSize(item, max); err != nil {
+		copied, err := cloneContextValue(budget, value, depth, maxDepth)
+		if err != nil {
+			return nil, err
+		}
+		cloned[index] = copied
+		if err := budget.add(1); err != nil { // comma or ]
+			return nil, err
+		}
+	}
+	if len(input) == 0 {
+		return cloned, budget.add(1) // ]
+	}
+	return cloned, nil
+}
+
+func (b *contextBudget) item() error {
+	if err := b.check(); err != nil {
+		return err
+	}
+	if b.items >= b.maxItems {
+		return ErrRenderLimit
+	}
+	b.items++
+	return nil
+}
+
+func (b *contextBudget) add(n int) error {
+	if err := b.check(); err != nil {
+		return err
+	}
+	if n < 0 || n > b.maxBytes-b.bytes {
+		return ErrRenderLimit
+	}
+	b.bytes += n
+	return nil
+}
+
+func (b *contextBudget) jsonString(value string) error {
+	if !utf8.ValidString(value) {
+		return ErrRenderLimit
+	}
+	if err := b.add(1); err != nil { // opening quote
+		return err
+	}
+	for index, runeValue := range value {
+		if index%1024 == 0 {
+			if err := b.check(); err != nil {
 				return err
 			}
 		}
+		switch {
+		case runeValue == '\\' || runeValue == '"', runeValue == '\b' || runeValue == '\f' || runeValue == '\n' || runeValue == '\r' || runeValue == '\t':
+			if err := b.add(2); err != nil {
+				return err
+			}
+		case runeValue < 0x20 || runeValue == 0x2028 || runeValue == 0x2029:
+			if err := b.add(6); err != nil {
+				return err
+			}
+		default:
+			if err := b.add(utf8.RuneLen(runeValue)); err != nil {
+				return err
+			}
+		}
+	}
+	return b.add(1) // closing quote
+}
+
+func (b *contextBudget) check() error {
+	if err := ctxErr(b.ctx); err != nil {
+		return ErrRenderLimit
 	}
 	return nil
 }
@@ -218,27 +353,104 @@ func ctxErr(ctx context.Context) error {
 }
 
 func bundleFingerprint(bundle Bundle, limits Limits) string {
-	hash := sha256.New()
-	writeBundleFingerprint(hash, bundle, limits)
-	return stringHash(hash.Sum(nil))
+	return canonicalFingerprint("", bundle, limits)
 }
 
-func writeBundleFingerprint(hash hash.Hash, bundle Bundle, limits Limits) {
-	for _, name := range sortedTemplateNames(bundle.Templates) {
-		fmt.Fprintf(hash, "template:%d:%s:%d:%s\n", len(name), name, len(bundle.Templates[name]), bundle.Templates[name])
+func cacheFingerprint(engineVersion string, bundle Bundle, limits Limits) string {
+	return canonicalFingerprint(engineVersion, bundle, limits)
+}
+
+func canonicalFingerprint(engineVersion string, bundle Bundle, limits Limits) string {
+	digest := sha256.New()
+	encodeCanonicalBundle(digest, engineVersion, bundle, limits)
+	return string(digest.Sum(nil))
+}
+
+func canonicalBundleBytes(engineVersion string, bundle Bundle, limits Limits) int {
+	return encodeCanonicalBundle(nil, engineVersion, bundle, limits)
+}
+
+func encodeCanonicalBundle(destination hash.Hash, engineVersion string, bundle Bundle, limits Limits) int {
+	encoder := canonicalEncoder{destination: destination}
+	encoder.string("prompttmpl-cache-v2")
+	encoder.string(engineVersion)
+	templateNames := sortedTemplateNames(bundle.Templates)
+	encoder.uint64(uint64(len(templateNames)))
+	for _, name := range templateNames {
+		encoder.string(name)
+		encoder.string(bundle.Templates[name])
 	}
-	for _, name := range sortedSchemaNames(bundle.Schema.Fields) {
+	fieldNames := sortedSchemaNames(bundle.Schema.Fields)
+	encoder.uint64(uint64(len(fieldNames)))
+	for _, name := range fieldNames {
 		field := bundle.Schema.Fields[name]
-		fmt.Fprintf(hash, "field:%d:%s:%s:%t:%d:%d:%s:%s", len(name), name, field.Type, field.Required, field.MaxBytes, field.MaxItems, field.Sensitivity, field.Source)
-		for _, template := range field.Templates {
-			fmt.Fprintf(hash, ":%d:%s", len(template), template)
+		encoder.string(name)
+		encoder.string(string(field.Type))
+		encoder.bool(field.Required)
+		encoder.int(field.MaxBytes)
+		encoder.int(field.MaxItems)
+		encoder.string(field.Sensitivity)
+		encoder.string(field.Source)
+		templates := append([]string(nil), field.Templates...)
+		sort.Strings(templates)
+		encoder.uint64(uint64(len(templates)))
+		for _, template := range templates {
+			encoder.string(template)
 		}
-		fmt.Fprintln(hash)
 	}
-	fmt.Fprintf(hash, "limits:%d:%d:%d:%d:%d:%d:%d:%d:%d", limits.TemplateBytes, limits.BundleBytes, limits.ContextBytes, limits.OutputBytes, limits.CollectionItems, limits.IncludeDepth, limits.RecursionDepth, limits.Fuel, limits.RenderTimeout)
+	encoder.int(limits.TemplateBytes)
+	encoder.int(limits.BundleBytes)
+	encoder.int(limits.ContextBytes)
+	encoder.int(limits.OutputBytes)
+	encoder.int(limits.CollectionItems)
+	encoder.int(limits.IncludeDepth)
+	encoder.int(limits.RecursionDepth)
+	encoder.uint64(limits.Fuel)
+	encoder.int64(int64(limits.RenderTimeout))
+	return encoder.bytes
 }
 
-func stringHash(sum []byte) string { return fmt.Sprintf("%x", sum) }
+type canonicalEncoder struct {
+	destination hash.Hash
+	bytes       int
+}
+
+func (e *canonicalEncoder) string(value string) {
+	e.uint64(uint64(len(value)))
+	e.bytes += len(value)
+	if e.destination != nil {
+		_, _ = e.destination.Write([]byte(value))
+	}
+}
+
+func (e *canonicalEncoder) bool(value bool) {
+	if value {
+		e.uint64(1)
+		return
+	}
+	e.uint64(0)
+}
+
+func (e *canonicalEncoder) int(value int) { e.int64(int64(value)) }
+
+func (e *canonicalEncoder) int64(value int64) { e.uint64(uint64(value)) }
+
+func (e *canonicalEncoder) uint64(value uint64) {
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], value)
+	e.bytes += len(encoded)
+	if e.destination != nil {
+		_, _ = e.destination.Write(encoded[:])
+	}
+}
+
+func estimateMiniJinjaResidentBytes(bundle Bundle) int {
+	bytes := 1024
+	for name, source := range bundle.Templates {
+		bytes += 256 + len(name) + 4*len(source)
+	}
+	return bytes
+}
 
 func cloneBundle(bundle Bundle) Bundle {
 	cloned := Bundle{Templates: make(map[string]string, len(bundle.Templates)), Schema: ContextSchema{Fields: make(map[string]Field, len(bundle.Schema.Fields))}}

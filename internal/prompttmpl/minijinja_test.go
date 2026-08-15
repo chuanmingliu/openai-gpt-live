@@ -2,6 +2,7 @@ package prompttmpl
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -37,7 +38,7 @@ func renderWithFuel(t *testing.T, source string, values Context, fuel uint64) (s
 func hugeValues() []any {
 	values := make([]any, DefaultCollectionItems)
 	for i := range values {
-		values[i] = i
+		values[i] = json.Number("1")
 	}
 	return values
 }
@@ -64,6 +65,104 @@ func TestMiniJinjaCancellationReturnsRenderLimit(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	_, err := compiled.Render(ctx, "system.j2", Context{"values": hugeValues()})
+	require.ErrorIs(t, err, ErrRenderLimit)
+}
+
+type blockingMarshaler struct {
+	entered chan struct{}
+	release <-chan struct{}
+}
+
+func (m blockingMarshaler) MarshalJSON() ([]byte, error) {
+	close(m.entered)
+	<-m.release
+	return []byte(`"unexpected"`), nil
+}
+
+func TestMiniJinjaRejectsCustomMarshalersWithoutCallingThem(t *testing.T) {
+	compiled := compile(t, Bundle{Templates: map[string]string{"system.j2": `safe`}})
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	type result struct {
+		got string
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		got, err := compiled.Render(t.Context(), "system.j2", Context{"value": blockingMarshaler{entered: entered, release: release}})
+		done <- result{got: got, err: err}
+	}()
+	select {
+	case <-entered:
+		close(release)
+		<-done
+		t.Fatal("custom Marshaler was invoked")
+	case result := <-done:
+		require.ErrorIs(t, result.err, ErrRenderLimit)
+		assert.Empty(t, result.got)
+	case <-time.After(time.Second):
+		t.Fatal("render did not finish")
+	}
+}
+
+func TestMiniJinjaCancelledContextSkipsBlockingMarshaler(t *testing.T) {
+	compiled := compile(t, Bundle{Templates: map[string]string{"system.j2": `safe`}})
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	type result struct {
+		got string
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		got, err := compiled.Render(ctx, "system.j2", Context{"value": blockingMarshaler{entered: entered, release: release}})
+		done <- result{got: got, err: err}
+	}()
+	select {
+	case <-entered:
+		close(release)
+		<-done
+		t.Fatal("cancelled render invoked custom Marshaler")
+	case result := <-done:
+		require.ErrorIs(t, result.err, ErrRenderLimit)
+		assert.Empty(t, result.got)
+	case <-time.After(time.Second):
+		t.Fatal("cancelled render did not finish")
+	}
+}
+
+func TestMiniJinjaCountsNestedCollectionItemsGlobally(t *testing.T) {
+	compiled := compile(t, Bundle{Templates: map[string]string{"system.j2": `safe`}})
+	within := make([]any, DefaultCollectionItems-1)
+	for i := range within {
+		within[i] = json.Number("1")
+	}
+	got, err := compiled.Render(t.Context(), "system.j2", Context{"values": within})
+	require.NoError(t, err)
+	assert.Equal(t, "safe", got)
+	tooMany := append(within, json.Number("1"))
+	_, err = compiled.Render(t.Context(), "system.j2", Context{"values": tooMany})
+	require.ErrorIs(t, err, ErrRenderLimit)
+}
+
+func TestMiniJinjaRejectsContextDeeperThanRecursionLimit(t *testing.T) {
+	compiled := compile(t, Bundle{Templates: map[string]string{"system.j2": `safe`}})
+	var value any = nil
+	for i := 0; i < DefaultRecursionDepth; i++ {
+		value = map[string]any{"next": value}
+	}
+	_, err := compiled.Render(t.Context(), "system.j2", Context{"root": value})
+	require.ErrorIs(t, err, ErrRenderLimit)
+}
+
+func TestMiniJinjaCapsContextBytesDuringOwnedTraversal(t *testing.T) {
+	limits := DefaultLimits()
+	limits.ContextBytes = 8
+	compiled, err := NewMiniJinja().Compile(t.Context(), Bundle{Templates: map[string]string{"system.j2": `safe`}}, limits)
+	require.NoError(t, err)
+	_, err = compiled.Render(t.Context(), "system.j2", Context{"value": "too long"})
 	require.ErrorIs(t, err, ErrRenderLimit)
 }
 
@@ -148,10 +247,16 @@ func TestMiniJinjaErrorsNeverExposeSourceOrRenderedBytes(t *testing.T) {
 	_, err := NewMiniJinja().Compile(t.Context(), Bundle{Templates: map[string]string{"system.j2": "{{ " + secret + ".append(1) }}"}}, DefaultLimits())
 	require.Error(t, err)
 	assert.NotContains(t, err.Error(), secret)
-	compiled := compile(t, Bundle{Templates: map[string]string{"system.j2": `{{ value }}`}})
-	_, err = compiled.Render(t.Context(), "system.j2", Context{"value": secret})
-	require.NoError(t, err)
-	assert.NotContains(t, strings.ToLower((&RenderError{Template: "system.j2", Err: err}).Error()), secret)
+	const sourceProbe = "source-probe-do-not-disclose"
+	compiled := compile(t, Bundle{Templates: map[string]string{"system.j2": `{{ value }}` + sourceProbe + `{{ missing }}`}})
+	got, err := compiled.Render(t.Context(), "system.j2", Context{"value": secret})
+	require.Error(t, err)
+	assert.Empty(t, got)
+	assert.NotContains(t, strings.ToLower(err.Error()), secret)
+	assert.NotContains(t, err.Error(), sourceProbe)
+	var renderErr *RenderError
+	require.ErrorAs(t, err, &renderErr)
+	assert.Equal(t, "system.j2", renderErr.Template)
 }
 
 func TestMiniJinjaRenderTimeout(t *testing.T) {

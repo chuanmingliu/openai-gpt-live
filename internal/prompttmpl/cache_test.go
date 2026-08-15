@@ -18,6 +18,8 @@ type countingEngine struct {
 	compiled int
 }
 
+func (e *countingEngine) Version() string { return "counting-v1" }
+
 func (e *countingEngine) Compile(ctx context.Context, bundle Bundle, _ Limits) (CompiledBundle, error) {
 	e.mu.Lock()
 	e.calls++
@@ -46,6 +48,7 @@ type fakeCompiled struct{ hash string }
 func (f fakeCompiled) Render(context.Context, string, Context) (string, error) { return f.hash, nil }
 func (f fakeCompiled) Hash() string                                            { return f.hash }
 func (f fakeCompiled) EngineVersion() string                                   { return "fake-v1" }
+func (f fakeCompiled) ResidentBytes() int                                      { return 64 }
 
 func cacheBundle(name, source string) Bundle {
 	return Bundle{Templates: map[string]string{name: source}, Schema: ContextSchema{Fields: map[string]Field{"customer": {Type: TypeString}}}}
@@ -127,9 +130,100 @@ func TestCacheDoesNotCacheCompileFailures(t *testing.T) {
 
 type failingEngine struct{ calls int }
 
+func (e *failingEngine) Version() string { return "failing-v1" }
+
 func (e *failingEngine) Compile(context.Context, Bundle, Limits) (CompiledBundle, error) {
 	e.calls++
 	return nil, ErrTemplateInvalid
+}
+
+type sizedCompiled struct {
+	hash, version string
+	resident      int
+}
+
+func (f sizedCompiled) Render(context.Context, string, Context) (string, error) { return f.hash, nil }
+func (f sizedCompiled) Hash() string                                            { return f.hash }
+func (f sizedCompiled) EngineVersion() string                                   { return f.version }
+func (f sizedCompiled) ResidentBytes() int                                      { return f.resident }
+
+type versionedEngine struct {
+	calls    int
+	version  string
+	resident int
+	seen     Bundle
+}
+
+func (e *versionedEngine) Version() string { return e.version }
+func (e *versionedEngine) Compile(_ context.Context, bundle Bundle, _ Limits) (CompiledBundle, error) {
+	e.calls++
+	e.seen = bundle
+	return sizedCompiled{hash: fmt.Sprintf("%s-%d", e.version, e.calls), version: e.version, resident: e.resident}, nil
+}
+
+func TestCacheSeparatesSchemaEncodingAndEngineVersion(t *testing.T) {
+	engine := &versionedEngine{version: "engine-v1", resident: 64}
+	cache, err := NewCache(engine, 8, 4096)
+	require.NoError(t, err)
+	first := cacheBundle("system.j2", "safe")
+	first.Schema.Fields["customer"] = Field{Type: TypeString, Sensitivity: "a:b", Source: "c"}
+	second := cacheBundle("system.j2", "safe")
+	second.Schema.Fields["customer"] = Field{Type: TypeString, Sensitivity: "a", Source: "b:c"}
+	_, err = cache.Compile(t.Context(), first, DefaultLimits())
+	require.NoError(t, err)
+	_, err = cache.Compile(t.Context(), second, DefaultLimits())
+	require.NoError(t, err)
+	assert.Equal(t, 2, engine.calls)
+	engine.version = "engine-v2"
+	_, err = cache.Compile(t.Context(), second, DefaultLimits())
+	require.NoError(t, err)
+	assert.Equal(t, 3, engine.calls)
+}
+
+func TestCacheDoesNotAdmitOversizeCompiledBundle(t *testing.T) {
+	engine := &versionedEngine{version: "engine-v1", resident: 1 << 20}
+	cache, err := NewCache(engine, 8, 1024)
+	require.NoError(t, err)
+	bundle := cacheBundle("system.j2", "safe")
+	_, err = cache.Compile(t.Context(), bundle, DefaultLimits())
+	require.NoError(t, err)
+	_, err = cache.Compile(t.Context(), bundle, DefaultLimits())
+	require.NoError(t, err)
+	assert.Equal(t, 2, engine.calls)
+}
+
+func TestCacheEvictsWhenCompiledResidentBytesExceedBudget(t *testing.T) {
+	engine := &versionedEngine{version: "engine-v1", resident: 1024}
+	cache, err := NewCache(engine, 8, 1800)
+	require.NoError(t, err)
+	_, err = cache.Compile(t.Context(), cacheBundle("a.j2", "safe"), DefaultLimits())
+	require.NoError(t, err)
+	_, err = cache.Compile(t.Context(), cacheBundle("b.j2", "safe"), DefaultLimits())
+	require.NoError(t, err)
+	_, err = cache.Compile(t.Context(), cacheBundle("a.j2", "safe"), DefaultLimits())
+	require.NoError(t, err)
+	assert.Equal(t, 3, engine.calls)
+}
+
+func TestCacheClonesBundleBeforeAdmission(t *testing.T) {
+	engine := &versionedEngine{version: "engine-v1", resident: 64}
+	cache, err := NewCache(engine, 8, 4096)
+	require.NoError(t, err)
+	bundle := cacheBundle("system.j2", "safe")
+	bundle.Schema.Fields["customer"] = Field{Type: TypeString, Templates: []string{"system.j2"}}
+	lookup := cloneBundle(bundle)
+	_, err = cache.Compile(t.Context(), bundle, DefaultLimits())
+	require.NoError(t, err)
+	bundle.Templates["system.j2"] = "mutated"
+	field := bundle.Schema.Fields["customer"]
+	field.Templates[0] = "mutated.j2"
+	bundle.Schema.Fields["customer"] = Field{Type: TypeBool, Templates: []string{"other.j2"}}
+	assert.Equal(t, "safe", engine.seen.Templates["system.j2"])
+	assert.Equal(t, TypeString, engine.seen.Schema.Fields["customer"].Type)
+	assert.Equal(t, []string{"system.j2"}, engine.seen.Schema.Fields["customer"].Templates)
+	_, err = cache.Compile(t.Context(), lookup, DefaultLimits())
+	require.NoError(t, err)
+	assert.Equal(t, 1, engine.calls)
 }
 
 func TestNewCacheRejectsInvalidLimits(t *testing.T) {
