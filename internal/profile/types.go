@@ -598,7 +598,7 @@ func validJSON(raw json.RawMessage) bool {
 	if len(raw) == 0 {
 		return true
 	}
-	if len(raw) > maxRawJSONBytes || !utf8.Valid(raw) || !json.Valid(raw) {
+	if len(raw) > maxRawJSONBytes || !utf8.Valid(raw) || !validJSONSurrogates(raw) || !json.Valid(raw) {
 		return false
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
@@ -608,6 +608,74 @@ func validJSON(raw json.RawMessage) bool {
 		return false
 	}
 	return decoder.Decode(&struct{}{}) == io.EOF
+}
+
+// validJSONSurrogates rejects escaped UTF-16 code units that encoding/json
+// would otherwise replace with U+FFFD during decoding. JSON grammar is checked
+// separately; this scanner only gives surrogate pairs their strict semantics.
+func validJSONSurrogates(raw []byte) bool {
+	for index := 0; index < len(raw); index++ {
+		if raw[index] != '"' {
+			continue
+		}
+		index++
+		for index < len(raw) && raw[index] != '"' {
+			if raw[index] != '\\' {
+				index++
+				continue
+			}
+			if index+1 >= len(raw) {
+				return false
+			}
+			if raw[index+1] != 'u' {
+				index += 2
+				continue
+			}
+			unit, ok := escapedUTF16Unit(raw, index+2)
+			if !ok {
+				return false
+			}
+			index += 6
+			switch {
+			case unit >= 0xD800 && unit <= 0xDBFF:
+				if index+1 >= len(raw) || raw[index] != '\\' || raw[index+1] != 'u' {
+					return false
+				}
+				low, ok := escapedUTF16Unit(raw, index+2)
+				if !ok || low < 0xDC00 || low > 0xDFFF {
+					return false
+				}
+				index += 6
+			case unit >= 0xDC00 && unit <= 0xDFFF:
+				return false
+			}
+		}
+		if index >= len(raw) {
+			return false
+		}
+	}
+	return true
+}
+
+func escapedUTF16Unit(raw []byte, start int) (uint16, bool) {
+	if start+4 > len(raw) {
+		return 0, false
+	}
+	var value uint16
+	for _, byteValue := range raw[start : start+4] {
+		value <<= 4
+		switch {
+		case byteValue >= '0' && byteValue <= '9':
+			value |= uint16(byteValue - '0')
+		case byteValue >= 'a' && byteValue <= 'f':
+			value |= uint16(byteValue-'a') + 10
+		case byteValue >= 'A' && byteValue <= 'F':
+			value |= uint16(byteValue-'A') + 10
+		default:
+			return 0, false
+		}
+	}
+	return value, true
 }
 
 func canonicalJSON(raw json.RawMessage) (json.RawMessage, bool) {

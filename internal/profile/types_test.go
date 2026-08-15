@@ -45,6 +45,41 @@ func TestSnapshotRejectsInvalidUTF8ResultSchemaBeforeHashing(t *testing.T) {
 	}
 }
 
+func TestManifestRejectsUnpairedSurrogateResultSchemaBeforeHashing(t *testing.T) {
+	for _, raw := range unpairedSurrogateSchemas() {
+		manifest := validManifest(map[string]TemplateRef{"system.j2": {Hash: strings.Repeat("a", 64), MediaType: "text/plain", Bytes: 4}})
+		manifest.Recipes = []WorkerRecipe{{ID: "research", Version: 1, Objective: manifest.Bundle.Templates["system.j2"], ResultSchema: raw}}
+		hash, err := manifest.Hash()
+		require.ErrorIs(t, err, ErrInvalidProfile)
+		require.Empty(t, hash)
+	}
+}
+
+func TestSnapshotRejectsUnpairedSurrogateResultSchemaBeforeHashing(t *testing.T) {
+	manifest := validManifest(map[string]TemplateRef{"system.j2": {Hash: strings.Repeat("a", 64), MediaType: "text/plain", Bytes: 4}})
+	manifest.Recipes = []WorkerRecipe{{ID: "research", Version: 1, Objective: manifest.Bundle.Templates["system.j2"], ResultSchema: json.RawMessage(`{"x":"valid"}`)}}
+	for _, raw := range unpairedSurrogateSchemas() {
+		snapshot := snapshotFor(t, manifest)
+		snapshot.Recipes[0].ResultSchema = raw
+		hash, err := snapshot.Hash()
+		require.ErrorIs(t, err, ErrInvalidProfile)
+		require.Empty(t, hash)
+	}
+}
+
+func TestResultSchemaAcceptsPairedSurrogatesAndOrdinaryEscapes(t *testing.T) {
+	for _, raw := range []json.RawMessage{
+		json.RawMessage(`{"x":"\ud83d\ude00"}`),
+		json.RawMessage(`{"x":"quote:\" slash:\\/ line:\n tab:\t latin:\u0061"}`),
+		json.RawMessage(`{"object":{"b":2,"a":1}}`),
+	} {
+		manifest := validManifest(map[string]TemplateRef{"system.j2": {Hash: strings.Repeat("a", 64), MediaType: "text/plain", Bytes: 4}})
+		manifest.Recipes = []WorkerRecipe{{ID: "research", Version: 1, Objective: manifest.Bundle.Templates["system.j2"], ResultSchema: raw}}
+		_, err := manifest.Hash()
+		require.NoError(t, err, raw)
+	}
+}
+
 func TestManifestRejectsInvalidReferencesAndDuplicateBindings(t *testing.T) {
 	manifest := validManifest(map[string]TemplateRef{"system.j2": {Hash: strings.Repeat("a", 64), MediaType: "text/plain", Bytes: 4}})
 	manifest.Bundle.Templates["../secret.j2"] = TemplateRef{Hash: strings.Repeat("b", 64), MediaType: "text/plain", Bytes: 1}
@@ -317,5 +352,13 @@ func invalidUTF8Schemas() []json.RawMessage {
 	return []json.RawMessage{
 		[]byte{'{', '"', 'x', '"', ':', '"', 0xff, '"', '}'},
 		[]byte{'{', '"', 'x', '"', ':', '"', 0xfe, '"', '}'},
+	}
+}
+
+func unpairedSurrogateSchemas() []json.RawMessage {
+	return []json.RawMessage{
+		json.RawMessage(`{"x":"\ud800"}`),
+		json.RawMessage(`{"x":"\ud801"}`),
+		json.RawMessage(`{"x":"\udc00"}`),
 	}
 }
