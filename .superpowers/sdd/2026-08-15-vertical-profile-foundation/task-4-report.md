@@ -135,3 +135,50 @@ The same real disposable `postgres:16-alpine` harness was used; no integration t
   - PASS (exit 0, no diagnostics).
 
 Fix-round privacy/ownership audit: exact canonical payloads remain tenant-scoped and are never emitted in errors; both failpoint and closed-pool raw causes collapse to the public content-free sentinel. Only review-authorized Task 4 paths will be staged. Protected browser/audio changes and unrelated notes remain untouched. Concerns: none.
+
+## Fix round 2/5 — exact raw database readbacks
+
+Review range: `d19258c871d9c1800a736d14f7258d5d89cad34d..HEAD`.
+
+### Strict RED evidence
+
+- `env GOCACHE=/private/tmp/codex-task4-fix2-go-cache go test -tags=integration ./internal/store/postgres -run 'TestProfileSaveDraftRejectsDomainValidNoncanonicalDatabaseReadback|TestProfileSaveDraftRejectsDatabaseMetadataRewrite|TestProfileLoadDraftRejectsNoncanonicalStoredManifest|TestProfileTemplateMutationsRejectNoncanonicalDatabaseReadback|TestProfileResolveRejectsNoncanonicalStoredDocuments' -count=1 -v`
+  - RED on real PostgreSQL 16 in 8.920s. Domain-valid whitespace rewrites committed both SaveDraft insert and update; the update advanced generation 1→2. An actor rewrite also committed. LoadDraft normalized a whitespace-corrupt manifest. SaveTemplate committed its blob/ref/generation and DeleteTemplate committed its removal/generation despite noncanonical returned bytes. Resolve normalized both whitespace-corrupt manifest and snapshot documents.
+  - The first sandboxed invocation could not access Docker and was not accepted as RED; the elevated invocation connected to Docker Desktop 29.2.1 and produced the behavioral failures above.
+
+### Fix implementation
+
+- Added a raw draft readback envelope that owns `manifest::text`. SaveDraft, SaveTemplate, and DeleteTemplate compare the exact returned tenant, profile ID, generation, timestamp, actor, and manifest bytes with their intended values before any JSON decode and before transaction commit.
+- Draft decoding now re-encodes through `Manifest.CanonicalJSON` and requires byte-for-byte identity, so LoadDraft and draft-for-update paths reject persisted whitespace, key-order, component-order, or numeric-representation corruption instead of normalizing it.
+- Published decoding now requires both raw manifest and snapshot bytes to equal `Manifest.CanonicalJSON` and `Snapshot.CanonicalJSON`; valid canonical numeric lexemes and snapshot hashes remain unchanged.
+- Added real PostgreSQL BEFORE INSERT/UPDATE domain-valid representation-changing triggers for initial/update SaveDraft and both template mutations, with rollback/no-generation-change/no-orphan-blob assertions. Added direct stored-draft and published manifest/snapshot corruption tests plus exhaustive returned-field mismatch coverage.
+
+### Fix-round final verification
+
+The real integration harness used disposable `postgres:16-alpine` containers through Docker Desktop 29.2.1. No PostgreSQL test was accepted through a skip.
+
+- Focused GREEN command matching the RED selection:
+  - PASS for every regression. One unrelated testcontainer address lookup transiently failed during the combined rerun; its isolated retry, `... -run '^TestProfileSaveDraftRejectsDatabaseMetadataRewrite$'`, passed in 2.744s.
+- `env GOCACHE=/private/tmp/codex-task4-fix2-go-cache go test -tags=integration ./internal/store/postgres -run 'TestProfile|TestSchemaProfileV9' -count=1 -v`
+  - PASS: PostgreSQL repository 28.360s.
+- `env GOCACHE=/private/tmp/codex-task4-fix2-go-cache go test -race -tags=integration ./migrations ./internal/store/postgres -run 'TestProfile|TestSchema|TestEmbedded' -count=1`
+  - Initial combined attempt: migrations PASS 3.949s; PostgreSQL package encountered an external testcontainer startup failure in the first harness after 61.51s, with no code or race diagnostic.
+  - Clean retry without package-level Docker contention, `... go test -race -tags=integration ./internal/store/postgres -run 'TestProfile|TestSchema|TestEmbedded' -count=1`, PASS: 64.813s.
+- `env GOCACHE=/private/tmp/codex-task4-fix2-go-cache go test ./migrations ./internal/profile ./internal/store/postgres -count=1`
+  - PASS: migrations 1.116s; profile 1.432s; PostgreSQL 1.748s.
+- `env GOCACHE=/private/tmp/codex-task4-fix2-go-cache go test ./... -count=1`
+  - PASS for every package after running with localhost bind authority; slowest package was `demo/live-client` at 31.412s. The sandbox-only attempt failed solely because `httptest` could not bind ephemeral loopback ports and was not accepted.
+- `env GOCACHE=/private/tmp/codex-task4-fix2-go-cache go vet ./...`
+  - PASS (exit 0, no diagnostics).
+- `env GOCACHE=/private/tmp/codex-task4-fix2-go-cache go build ./...`
+  - PASS (exit 0, no diagnostics) on a clean authorized rerun.
+- `env GOCACHE=/private/tmp/codex-task4-fix2-go-cache go mod tidy -diff`
+  - PASS (exit 0, no diff).
+- `env GOCACHE=/private/tmp/codex-task4-fix2-go-cache go test -race ./internal/prompttmpl ./internal/profile ./internal/store/postgres ./migrations -count=3`
+  - PASS: prompttmpl 4.527s; profile 4.096s; PostgreSQL 5.005s; migrations 4.618s.
+- `env CGO_ENABLED=0 GOCACHE=/private/tmp/codex-task4-fix2-go-cache go test ./internal/prompttmpl ./internal/profile -count=1`
+  - PASS: prompttmpl 2.483s; profile 2.097s.
+- `git diff --check`
+  - PASS (exit 0, no diagnostics).
+
+Fix-round privacy/ownership audit: exact raw bytes are retained only long enough to validate and are never included in returned errors. All corruption and trigger failures collapse to `profile.ErrInvalidProfile`; transaction rollback prevents failed mutations from becoming visible. Only `internal/store/postgres/profiles.go`, `internal/store/postgres/profiles_integration_test.go`, and this authorized report are part of this round. Protected browser/audio changes and unrelated notes remain untouched. Concerns: none.

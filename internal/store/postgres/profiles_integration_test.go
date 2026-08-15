@@ -167,6 +167,87 @@ func TestProfileSaveDraftUpdateRollsBackInvalidDatabaseReadback(t *testing.T) {
 	assert.Equal(t, string(wantJSON), storedJSON)
 }
 
+func TestProfileSaveDraftRejectsDomainValidNoncanonicalDatabaseReadback(t *testing.T) {
+	t.Run("insert", func(t *testing.T) {
+		repo, pool, _ := repositoryHarness(t)
+		require.NoError(t, repo.PutBlob(t.Context(), "tenant-a", mustProfileBlob(t, []byte("system"))))
+		installNoncanonicalProfileDraftRewriteTrigger(t, pool)
+
+		_, err := repo.SaveDraft(t.Context(), profileDraft("tenant-a", "rewrite-insert-valid", profileManifest(t)), 0)
+		assert.ErrorIs(t, err, profile.ErrInvalidProfile)
+		assert.Equal(t, int64(0), tableCount(t, pool, "profile_drafts"), "a representation-changing insert must roll back")
+	})
+
+	t.Run("update", func(t *testing.T) {
+		repo, pool, _ := repositoryHarness(t)
+		draft := seedProfileDraft(t, repo, "tenant-a", "rewrite-update-valid")
+		wantJSON, err := draft.Manifest.CanonicalJSON()
+		require.NoError(t, err)
+		installNoncanonicalProfileDraftRewriteTrigger(t, pool)
+
+		draft.Manifest.Description = "must roll back"
+		draft.UpdatedAt = profileTestTime().Add(time.Minute)
+		_, err = repo.SaveDraft(t.Context(), draft, draft.Generation)
+		assert.ErrorIs(t, err, profile.ErrInvalidProfile)
+		var generation int64
+		var storedJSON string
+		require.NoError(t, pool.QueryRow(t.Context(), `SELECT generation,manifest::text FROM profile_drafts
+			WHERE tenant_id='tenant-a' AND profile_id='rewrite-update-valid'`).Scan(&generation, &storedJSON))
+		assert.Equal(t, int64(1), generation)
+		assert.Equal(t, string(wantJSON), storedJSON)
+	})
+}
+
+func TestProfileSaveDraftRejectsDatabaseMetadataRewrite(t *testing.T) {
+	repo, pool, _ := repositoryHarness(t)
+	require.NoError(t, repo.PutBlob(t.Context(), "tenant-a", mustProfileBlob(t, []byte("system"))))
+	installProfileDraftActorRewriteTrigger(t, pool)
+
+	_, err := repo.SaveDraft(t.Context(), profileDraft("tenant-a", "rewrite-metadata", profileManifest(t)), 0)
+	assert.ErrorIs(t, err, profile.ErrInvalidProfile)
+	assert.Equal(t, int64(0), tableCount(t, pool, "profile_drafts"), "a metadata-changing insert must roll back")
+}
+
+func TestProfileDraftReadbackRequiresEveryExactReturnedField(t *testing.T) {
+	manifestJSON, err := profileManifest(t).CanonicalJSON()
+	require.NoError(t, err)
+	updatedAt := canonicalProfileTime(profileTestTime())
+	want := profileDraftReadback{
+		tenantID: "tenant-a", profileID: "profile-a", generation: 2,
+		manifestJSON: append([]byte(nil), manifestJSON...), updatedAt: updatedAt, updatedBy: "editor-a",
+	}
+
+	tests := map[string]func(*profileDraftReadback){
+		"tenant":     func(stored *profileDraftReadback) { stored.tenantID = "tenant-b" },
+		"profile":    func(stored *profileDraftReadback) { stored.profileID = "profile-b" },
+		"generation": func(stored *profileDraftReadback) { stored.generation++ },
+		"timestamp":  func(stored *profileDraftReadback) { stored.updatedAt = stored.updatedAt.Add(time.Microsecond) },
+		"actor":      func(stored *profileDraftReadback) { stored.updatedBy = "editor-b" },
+		"manifest":   func(stored *profileDraftReadback) { stored.manifestJSON = append([]byte(" "), stored.manifestJSON...) },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			stored := want
+			stored.manifestJSON = append([]byte(nil), want.manifestJSON...)
+			mutate(&stored)
+			_, err := validateProfileDraftReadback(stored, "tenant-a", "profile-a", 2, manifestJSON, updatedAt, "editor-a")
+			assert.ErrorIs(t, err, profile.ErrInvalidProfile)
+		})
+	}
+}
+
+func TestProfileLoadDraftRejectsNoncanonicalStoredManifest(t *testing.T) {
+	repo, pool, _ := repositoryHarness(t)
+	draft := seedProfileDraft(t, repo, "tenant-a", "noncanonical-load")
+	_, err := pool.Exec(t.Context(), `UPDATE profile_drafts
+		SET manifest=(' ' || manifest::text || ' ')::json
+		WHERE tenant_id=$1 AND profile_id=$2`, draft.TenantID, draft.ID)
+	require.NoError(t, err)
+
+	_, _, err = repo.LoadDraft(t.Context(), draft.TenantID, draft.ID)
+	assert.ErrorIs(t, err, profile.ErrInvalidProfile)
+}
+
 func TestProfileSaveDraftRequiresExactTenantBlobReferences(t *testing.T) {
 	repo, pool, _ := repositoryHarness(t)
 	systemBlob := mustProfileBlob(t, []byte("system"))
@@ -333,6 +414,49 @@ func TestProfileTemplateSaveDeleteIsAtomicAndAcceptsZeroBytes(t *testing.T) {
 	_, ok, err = repo.LoadBlob(t.Context(), draft.TenantID, emptyRef.Hash)
 	require.NoError(t, err)
 	assert.True(t, ok, "content-addressed blobs remain available to other immutable refs")
+}
+
+func TestProfileTemplateMutationsRejectNoncanonicalDatabaseReadback(t *testing.T) {
+	t.Run("save", func(t *testing.T) {
+		repo, pool, _ := repositoryHarness(t)
+		draft := seedProfileDraft(t, repo, "tenant-a", "rewrite-template-save")
+		wantJSON, err := draft.Manifest.CanonicalJSON()
+		require.NoError(t, err)
+		source := []byte("must roll back")
+		blob := mustProfileBlob(t, source)
+		installNoncanonicalProfileDraftRewriteTrigger(t, pool)
+
+		_, err = repo.SaveTemplate(t.Context(), draft.TenantID, draft.ID, "opening_message.j2", source, draft.Generation, "editor-b")
+		assert.ErrorIs(t, err, profile.ErrInvalidProfile)
+		var generation int64
+		var storedJSON string
+		require.NoError(t, pool.QueryRow(t.Context(), `SELECT generation,manifest::text FROM profile_drafts
+			WHERE tenant_id=$1 AND profile_id=$2`, draft.TenantID, draft.ID).Scan(&generation, &storedJSON))
+		assert.Equal(t, draft.Generation, generation)
+		assert.Equal(t, string(wantJSON), storedJSON)
+		_, ok, loadErr := repo.LoadBlob(t.Context(), draft.TenantID, blob.Hash)
+		require.NoError(t, loadErr)
+		assert.False(t, ok, "the template blob must roll back with its noncanonical draft readback")
+	})
+
+	t.Run("delete", func(t *testing.T) {
+		repo, pool, _ := repositoryHarness(t)
+		draft := seedProfileDraft(t, repo, "tenant-a", "rewrite-template-delete")
+		draft, err := repo.SaveTemplate(t.Context(), draft.TenantID, draft.ID, "opening_message.j2", []byte("opening"), draft.Generation, "editor-a")
+		require.NoError(t, err)
+		wantJSON, err := draft.Manifest.CanonicalJSON()
+		require.NoError(t, err)
+		installNoncanonicalProfileDraftRewriteTrigger(t, pool)
+
+		_, err = repo.DeleteTemplate(t.Context(), draft.TenantID, draft.ID, "opening_message.j2", draft.Generation, "editor-b")
+		assert.ErrorIs(t, err, profile.ErrInvalidProfile)
+		var generation int64
+		var storedJSON string
+		require.NoError(t, pool.QueryRow(t.Context(), `SELECT generation,manifest::text FROM profile_drafts
+			WHERE tenant_id=$1 AND profile_id=$2`, draft.TenantID, draft.ID).Scan(&generation, &storedJSON))
+		assert.Equal(t, draft.Generation, generation)
+		assert.Equal(t, string(wantJSON), storedJSON)
+	})
 }
 
 func TestProfileBlobCanonicalIntegrityTenantIsolationAndOwnedBytes(t *testing.T) {
@@ -736,6 +860,24 @@ func TestProfileResolvePreservesTask3CanonicalRawJSONAndHash(t *testing.T) {
 	assert.Equal(t, record.Snapshot.SnapshotHash, published.Snapshot.SnapshotHash)
 }
 
+func TestProfileResolveRejectsNoncanonicalStoredDocuments(t *testing.T) {
+	for _, document := range []string{"manifest", "snapshot"} {
+		t.Run(document, func(t *testing.T) {
+			repo, pool, _ := repositoryHarness(t)
+			draft := seedProfileDraft(t, repo, "tenant-a", profile.ID("noncanonical-"+document))
+			_, err := repo.Publish(t.Context(), profilePublishRecord(t, draft, 1, false))
+			require.NoError(t, err)
+			_, err = pool.Exec(t.Context(), `UPDATE profile_versions
+				SET `+document+`=(' ' || `+document+`::text || ' ')::json
+				WHERE tenant_id=$1 AND profile_id=$2 AND version=1`, draft.TenantID, draft.ID)
+			require.NoError(t, err)
+
+			_, _, err = repo.Resolve(t.Context(), draft.TenantID, draft.ID, 1)
+			assert.ErrorIs(t, err, profile.ErrInvalidProfile)
+		})
+	}
+}
+
 func TestProfileErrorsAreStableContentFreeAndValidateBeforeSQL(t *testing.T) {
 	repo, pool, _ := repositoryHarness(t)
 	secret := "private-prompt SELECT postgres://credential"
@@ -927,5 +1069,39 @@ func installProfileDraftRewriteTrigger(t *testing.T, pool interface {
 		CREATE TRIGGER rewrite_profile_draft_manifest
 		BEFORE INSERT OR UPDATE ON profile_drafts
 		FOR EACH ROW EXECUTE FUNCTION rewrite_profile_draft_manifest()`)
+	require.NoError(t, err)
+}
+
+func installNoncanonicalProfileDraftRewriteTrigger(t *testing.T, pool interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}) {
+	t.Helper()
+	_, err := pool.Exec(t.Context(), `CREATE FUNCTION rewrite_profile_draft_manifest_noncanonical()
+		RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			NEW.manifest = (' ' || NEW.manifest::text || ' ')::json;
+			RETURN NEW;
+		END;
+		$$;
+		CREATE TRIGGER rewrite_profile_draft_manifest_noncanonical
+		BEFORE INSERT OR UPDATE ON profile_drafts
+		FOR EACH ROW EXECUTE FUNCTION rewrite_profile_draft_manifest_noncanonical()`)
+	require.NoError(t, err)
+}
+
+func installProfileDraftActorRewriteTrigger(t *testing.T, pool interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}) {
+	t.Helper()
+	_, err := pool.Exec(t.Context(), `CREATE FUNCTION rewrite_profile_draft_actor()
+		RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			NEW.updated_by = 'database-actor';
+			RETURN NEW;
+		END;
+		$$;
+		CREATE TRIGGER rewrite_profile_draft_actor
+		BEFORE INSERT OR UPDATE ON profile_drafts
+		FOR EACH ROW EXECUTE FUNCTION rewrite_profile_draft_actor()`)
 	require.NoError(t, err)
 }

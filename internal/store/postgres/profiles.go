@@ -146,9 +146,9 @@ func (r *Repository) SaveDraft(ctx context.Context, draft profile.Draft, expecte
 		return profile.Draft{}, mapProfileStoreError(ctx, err, nil)
 	}
 	defer rollback(tx)
-	var saved profile.Draft
+	var stored profileDraftReadback
 	if expectedGeneration == 0 {
-		saved, err = scanProfileDraft(tx.QueryRow(ctx, `INSERT INTO profile_drafts
+		stored, err = scanProfileDraftReadback(tx.QueryRow(ctx, `INSERT INTO profile_drafts
 			(tenant_id,profile_id,generation,manifest,updated_at,updated_by)
 			VALUES ($1,$2,1,$3::json,$4,$5)
 			RETURNING tenant_id,profile_id,generation,manifest::text,updated_at,updated_by`,
@@ -157,7 +157,7 @@ func (r *Repository) SaveDraft(ctx context.Context, draft profile.Draft, expecte
 			return profile.Draft{}, mapProfileStoreError(ctx, err, profile.ErrStaleDraft)
 		}
 	} else {
-		saved, err = scanProfileDraft(tx.QueryRow(ctx, `UPDATE profile_drafts SET
+		stored, err = scanProfileDraftReadback(tx.QueryRow(ctx, `UPDATE profile_drafts SET
 			generation=generation+1,manifest=$4::json,updated_at=$5,updated_by=$6
 			WHERE tenant_id=$1 AND profile_id=$2 AND generation=$3
 			RETURNING tenant_id,profile_id,generation,manifest::text,updated_at,updated_by`,
@@ -169,7 +169,10 @@ func (r *Repository) SaveDraft(ctx context.Context, draft profile.Draft, expecte
 			return profile.Draft{}, mapProfileStoreError(ctx, err, profile.ErrStaleDraft)
 		}
 	}
-	if err := validateStoredProfileManifest(saved.Manifest, manifestJSON); err != nil {
+	saved, err := validateProfileDraftReadback(
+		stored, owned.TenantID, owned.ID, expectedGeneration+1, manifestJSON, owned.UpdatedAt, owned.UpdatedBy,
+	)
+	if err != nil {
 		return profile.Draft{}, err
 	}
 	if err := validatePublishedBlobRefs(ctx, tx, owned.TenantID, saved.Manifest); err != nil {
@@ -235,7 +238,7 @@ func (r *Repository) SaveTemplate(
 	if err != nil {
 		return profile.Draft{}, err
 	}
-	storedDraft, err := scanProfileDraft(tx.QueryRow(ctx, `UPDATE profile_drafts SET
+	stored, err := scanProfileDraftReadback(tx.QueryRow(ctx, `UPDATE profile_drafts SET
 		generation=generation+1,manifest=$4::json,updated_at=$5,updated_by=$6
 		WHERE tenant_id=$1 AND profile_id=$2 AND generation=$3
 		RETURNING tenant_id,profile_id,generation,manifest::text,updated_at,updated_by`,
@@ -246,7 +249,10 @@ func (r *Repository) SaveTemplate(
 	if err != nil {
 		return profile.Draft{}, mapProfileStoreError(ctx, err, profile.ErrStaleDraft)
 	}
-	if err := validateStoredProfileManifest(storedDraft.Manifest, manifestJSON); err != nil {
+	storedDraft, err := validateProfileDraftReadback(
+		stored, tenantID, profileID, expectedGeneration+1, manifestJSON, draft.UpdatedAt, actor,
+	)
+	if err != nil {
 		return profile.Draft{}, err
 	}
 	if err := validatePublishedBlobRefs(ctx, tx, tenantID, storedDraft.Manifest); err != nil {
@@ -303,7 +309,7 @@ func (r *Repository) DeleteTemplate(
 	if err != nil {
 		return profile.Draft{}, err
 	}
-	storedDraft, err := scanProfileDraft(tx.QueryRow(ctx, `UPDATE profile_drafts SET
+	stored, err := scanProfileDraftReadback(tx.QueryRow(ctx, `UPDATE profile_drafts SET
 		generation=generation+1,manifest=$4::json,updated_at=$5,updated_by=$6
 		WHERE tenant_id=$1 AND profile_id=$2 AND generation=$3
 		RETURNING tenant_id,profile_id,generation,manifest::text,updated_at,updated_by`,
@@ -314,7 +320,10 @@ func (r *Repository) DeleteTemplate(
 	if err != nil {
 		return profile.Draft{}, mapProfileStoreError(ctx, err, profile.ErrStaleDraft)
 	}
-	if err := validateStoredProfileManifest(storedDraft.Manifest, manifestJSON); err != nil {
+	storedDraft, err := validateProfileDraftReadback(
+		stored, tenantID, profileID, expectedGeneration+1, manifestJSON, draft.UpdatedAt, actor,
+	)
+	if err != nil {
 		return profile.Draft{}, err
 	}
 	if err := validatePublishedBlobRefs(ctx, tx, tenantID, storedDraft.Manifest); err != nil {
@@ -661,26 +670,67 @@ func lockProfileDraft(ctx context.Context, tx pgx.Tx, tenantID string, profileID
 	return nil
 }
 
+type profileDraftReadback struct {
+	tenantID     string
+	profileID    string
+	generation   int64
+	manifestJSON []byte
+	updatedAt    time.Time
+	updatedBy    string
+}
+
+func scanProfileDraftReadback(row pgx.Row) (profileDraftReadback, error) {
+	var stored profileDraftReadback
+	if err := row.Scan(
+		&stored.tenantID, &stored.profileID, &stored.generation, &stored.manifestJSON, &stored.updatedAt, &stored.updatedBy,
+	); err != nil {
+		return profileDraftReadback{}, err
+	}
+	stored.manifestJSON = append([]byte(nil), stored.manifestJSON...)
+	return stored, nil
+}
+
 func scanProfileDraft(row pgx.Row) (profile.Draft, error) {
-	var tenantID, profileID, updatedBy string
-	var generation int64
-	var manifestJSON []byte
-	var updatedAt time.Time
-	if err := row.Scan(&tenantID, &profileID, &generation, &manifestJSON, &updatedAt, &updatedBy); err != nil {
+	stored, err := scanProfileDraftReadback(row)
+	if err != nil {
 		return profile.Draft{}, err
 	}
+	return stored.canonicalDraft()
+}
+
+func (stored profileDraftReadback) canonicalDraft() (profile.Draft, error) {
 	var manifest profile.Manifest
-	if decodeProfileDocument(manifestJSON, &manifest) != nil {
+	if decodeProfileDocument(stored.manifestJSON, &manifest) != nil {
+		return profile.Draft{}, profile.ErrInvalidProfile
+	}
+	canonical, err := encodeProfileManifest(manifest)
+	if err != nil || !bytes.Equal(stored.manifestJSON, canonical) {
 		return profile.Draft{}, profile.ErrInvalidProfile
 	}
 	draft := profile.Draft{
-		TenantID: tenantID, ID: profile.ID(profileID), Generation: generation,
-		Manifest: manifest, UpdatedAt: updatedAt.UTC(), UpdatedBy: updatedBy,
+		TenantID: stored.tenantID, ID: profile.ID(stored.profileID), Generation: stored.generation,
+		Manifest: manifest, UpdatedAt: stored.updatedAt.UTC(), UpdatedBy: stored.updatedBy,
 	}
-	if generation <= 0 || !validProfileTime(updatedAt) || draft.Validate() != nil {
+	if stored.generation <= 0 || !validProfileTime(stored.updatedAt) || draft.Validate() != nil {
 		return profile.Draft{}, profile.ErrInvalidProfile
 	}
 	return draft.Clone(), nil
+}
+
+func validateProfileDraftReadback(
+	stored profileDraftReadback,
+	tenantID string,
+	profileID profile.ID,
+	generation int64,
+	manifestJSON []byte,
+	updatedAt time.Time,
+	updatedBy string,
+) (profile.Draft, error) {
+	if stored.tenantID != tenantID || stored.profileID != string(profileID) || stored.generation != generation ||
+		!stored.updatedAt.Equal(updatedAt) || stored.updatedBy != updatedBy || !bytes.Equal(stored.manifestJSON, manifestJSON) {
+		return profile.Draft{}, profile.ErrInvalidProfile
+	}
+	return stored.canonicalDraft()
 }
 
 func putProfileBlobTx(ctx context.Context, tx pgx.Tx, tenantID string, blob profile.Blob, createdAt time.Time) error {
@@ -761,6 +811,12 @@ func scanProfilePublished(row pgx.Row) (profile.Published, error) {
 	if decodeProfileDocument(manifestJSON, &manifest) != nil || decodeProfileDocument(snapshotJSON, &snapshot) != nil {
 		return profile.Published{}, profile.ErrInvalidProfile
 	}
+	canonicalManifest, manifestErr := encodeProfileManifest(manifest)
+	canonicalSnapshot, snapshotErr := encodeProfileSnapshot(snapshot)
+	if manifestErr != nil || snapshotErr != nil ||
+		!bytes.Equal(manifestJSON, canonicalManifest) || !bytes.Equal(snapshotJSON, canonicalSnapshot) {
+		return profile.Published{}, profile.ErrInvalidProfile
+	}
 	if version <= 0 || draftGeneration <= 0 || !validProfileTime(publishedAt) ||
 		revokedAt.Valid != revokedBy.Valid || activatedAt.Valid != activatedBy.Valid ||
 		revokedAt.Valid && (!validProfileTime(revokedAt.Time) || !validProfileIdentifier(revokedBy.String) || revokedAt.Time.Before(publishedAt)) ||
@@ -799,14 +855,6 @@ func encodeProfileSnapshot(snapshot profile.Snapshot) ([]byte, error) {
 		return nil, profile.ErrInvalidProfile
 	}
 	return canonical, nil
-}
-
-func validateStoredProfileManifest(manifest profile.Manifest, want []byte) error {
-	stored, err := encodeProfileManifest(manifest)
-	if err != nil || !bytes.Equal(stored, want) {
-		return profile.ErrInvalidProfile
-	}
-	return nil
 }
 
 func decodeProfileDocument(raw []byte, target any) error {
