@@ -3,6 +3,7 @@ package prompttmpl
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -223,6 +224,56 @@ func TestCacheClonesBundleBeforeAdmission(t *testing.T) {
 	assert.Equal(t, []string{"system.j2"}, engine.seen.Schema.Fields["customer"].Templates)
 	_, err = cache.Compile(t.Context(), lookup, DefaultLimits())
 	require.NoError(t, err)
+	assert.Equal(t, 1, engine.calls)
+}
+
+type bundleDerivedCompiled struct {
+	bundle Bundle
+	limits Limits
+}
+
+func (f bundleDerivedCompiled) Render(_ context.Context, name string, _ Context) (string, error) {
+	field := f.bundle.Schema.Fields["customer"]
+	return f.bundle.Templates[name] + "|" + strings.Join(field.Templates, ","), nil
+}
+func (f bundleDerivedCompiled) Hash() string          { return bundleFingerprint(f.bundle, f.limits) }
+func (f bundleDerivedCompiled) EngineVersion() string { return "bundle-derived-v1" }
+func (f bundleDerivedCompiled) ResidentBytes() int    { return 64 }
+
+type bundleDerivedEngine struct{ calls int }
+
+func (e *bundleDerivedEngine) Version() string { return "bundle-derived-v1" }
+func (e *bundleDerivedEngine) Compile(_ context.Context, bundle Bundle, limits Limits) (CompiledBundle, error) {
+	e.calls++
+	return bundleDerivedCompiled{bundle: bundle, limits: limits}, nil
+}
+
+func TestCacheAdmissionKeepsBundleDerivedResultsImmutable(t *testing.T) {
+	engine := &bundleDerivedEngine{}
+	cache, err := NewCache(engine, 8, 4096)
+	require.NoError(t, err)
+	bundle := cacheBundle("system.j2", "safe")
+	bundle.Schema.Fields["customer"] = Field{Type: TypeString, Templates: []string{"system.j2"}}
+	lookup := cloneBundle(bundle)
+	compiled, err := cache.Compile(t.Context(), bundle, DefaultLimits())
+	require.NoError(t, err)
+	before, err := compiled.Render(t.Context(), "system.j2", Context{})
+	require.NoError(t, err)
+	beforeHash := compiled.Hash()
+	bundle.Templates["system.j2"] = "mutated"
+	field := bundle.Schema.Fields["customer"]
+	field.Templates[0] = "mutated.j2"
+	bundle.Schema.Fields["customer"] = Field{Type: TypeBool, Templates: []string{"other.j2"}}
+	after, err := compiled.Render(t.Context(), "system.j2", Context{})
+	require.NoError(t, err)
+	assert.Equal(t, before, after)
+	assert.Equal(t, beforeHash, compiled.Hash())
+	cached, err := cache.Compile(t.Context(), lookup, DefaultLimits())
+	require.NoError(t, err)
+	cachedResult, err := cached.Render(t.Context(), "system.j2", Context{})
+	require.NoError(t, err)
+	assert.Equal(t, before, cachedResult)
+	assert.Equal(t, beforeHash, cached.Hash())
 	assert.Equal(t, 1, engine.calls)
 }
 

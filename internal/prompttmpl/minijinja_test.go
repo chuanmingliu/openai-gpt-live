@@ -166,6 +166,36 @@ func TestMiniJinjaCapsContextBytesDuringOwnedTraversal(t *testing.T) {
 	require.ErrorIs(t, err, ErrRenderLimit)
 }
 
+func TestMiniJinjaNormalizesJSONNumbersForArithmeticAndComparison(t *testing.T) {
+	compiled := compile(t, Bundle{Templates: map[string]string{
+		"system.j2": `{% if whole > 1 and decimal > 1 %}{{ whole + 1 }} {{ decimal * 2 }}{% endif %}`,
+	}})
+	got, err := compiled.Render(t.Context(), "system.j2", Context{
+		"whole":   json.Number("2"),
+		"decimal": json.Number("1.25"),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "3 2.5", got)
+}
+
+func TestMiniJinjaRejectsInvalidOrOverflowJSONNumbers(t *testing.T) {
+	compiled := compile(t, Bundle{Templates: map[string]string{"system.j2": `safe`}})
+	for _, number := range []json.Number{"01", "9223372036854775808", "1e999"} {
+		t.Run(string(number), func(t *testing.T) {
+			_, err := compiled.Render(t.Context(), "system.j2", Context{"number": number})
+			require.ErrorIs(t, err, ErrRenderLimit)
+		})
+	}
+}
+
+func TestMiniJinjaRejectsNonJSONNumericTypes(t *testing.T) {
+	compiled := compile(t, Bundle{Templates: map[string]string{"system.j2": `safe`}})
+	for _, value := range []any{int(1), int64(1), float64(1)} {
+		_, err := compiled.Render(t.Context(), "system.j2", Context{"number": value})
+		require.ErrorIs(t, err, ErrRenderLimit)
+	}
+}
+
 func TestMiniJinjaRejectsRecursion(t *testing.T) {
 	compiled := compile(t, Bundle{Templates: map[string]string{
 		"system.j2": `{% macro recurse() %}{{ recurse() }}{% endmacro %}{{ recurse() }}`,

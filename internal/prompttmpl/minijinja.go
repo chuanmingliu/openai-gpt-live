@@ -8,7 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"hash"
+	"math"
 	"sort"
+	"strconv"
+	"strings"
 	"unicode/utf8"
 
 	minijinja "github.com/mitsuhiko/minijinja/minijinja-go/v2"
@@ -205,10 +208,7 @@ func cloneContextValue(budget *contextBudget, value any, depth, maxDepth int) (a
 		if err := budget.add(len(value)); err != nil {
 			return nil, err
 		}
-		if value == "" || (value[0] != '-' && (value[0] < '0' || value[0] > '9')) || !json.Valid([]byte(value)) {
-			return nil, ErrRenderLimit
-		}
-		return value, nil
+		return normalizeJSONNumber(value)
 	case map[string]any:
 		return cloneContextMap(budget, value, depth+1, maxDepth)
 	case []any:
@@ -216,6 +216,25 @@ func cloneContextValue(budget *contextBudget, value any, depth, maxDepth int) (a
 	default:
 		return nil, ErrRenderLimit
 	}
+}
+
+func normalizeJSONNumber(value json.Number) (any, error) {
+	raw := string(value)
+	if raw == "" || (raw[0] != '-' && (raw[0] < '0' || raw[0] > '9')) || !json.Valid([]byte(raw)) {
+		return nil, ErrRenderLimit
+	}
+	if strings.ContainsAny(raw, ".eE") {
+		parsed, err := strconv.ParseFloat(raw, 64)
+		if err != nil || math.IsNaN(parsed) || math.IsInf(parsed, 0) {
+			return nil, ErrRenderLimit
+		}
+		return parsed, nil
+	}
+	parsed, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return nil, ErrRenderLimit
+	}
+	return parsed, nil
 }
 
 func cloneContextSlice(budget *contextBudget, input []any, depth, maxDepth int) ([]any, error) {
