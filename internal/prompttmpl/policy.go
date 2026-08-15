@@ -279,7 +279,7 @@ func (p *sourcePolicy) validateExpression(token sourceToken) error {
 }
 
 func (p *sourcePolicy) validateExpressionAt(expression string, line, col int) error {
-	if hasIndirectPostfixCall(expression) {
+	if !p.validCallTargets(expression) {
 		return invalidAt(line, col)
 	}
 	for i := 0; i < len(expression); {
@@ -304,22 +304,6 @@ func (p *sourcePolicy) validateExpressionAt(expression string, line, col int) er
 		if word == "random" {
 			return invalidAt(line, col)
 		}
-		next := skipSpaces(expression, i)
-		if next < len(expression) && expression[next] == '(' {
-			previous := previousNonSpace(expression, start)
-			if previous == '.' {
-				return invalidAt(line, col)
-			}
-			if previous == '|' {
-				if !allowedFilter(word) {
-					return invalidAt(line, col)
-				}
-				continue
-			}
-			if _, ok := p.macros[word]; !ok {
-				return invalidAt(line, col)
-			}
-		}
 		if previousNonSpace(expression, start) == '|' && !allowedFilter(word) {
 			return invalidAt(line, col)
 		}
@@ -340,26 +324,108 @@ func localSetAssignment(rest string) (string, string, bool) {
 	return target, expression, true
 }
 
-// hasIndirectPostfixCall detects calls whose target is the result of another
-// expression. Only directly named, locally declared macros may be called.
-func hasIndirectPostfixCall(expression string) bool {
+type expressionTarget uint8
+
+const (
+	targetNone expressionTarget = iota
+	targetOperator
+	targetIdentifier
+	targetValue
+)
+
+// validCallTargets classifies every opening parenthesis. A call is valid only
+// when its target is a direct name declared as a local macro or reviewed
+// filter; all values and postfix expression results are non-callable.
+func (p *sourcePolicy) validCallTargets(expression string) bool {
+	target := targetNone
+	nameStart := 0
+	name := ""
 	for i := 0; i < len(expression); i++ {
 		if expression[i] == '\'' || expression[i] == '"' {
 			next, ok := skipQuoted(expression, i)
 			if !ok {
-				return true
+				return false
 			}
 			i = next - 1
+			target, name = targetValue, ""
 			continue
 		}
-		if expression[i] != ')' && expression[i] != ']' {
+		if isIdentifierStart(expression[i]) {
+			nameStart = i
+			i++
+			for i < len(expression) && isIdentifierContinue(expression[i]) {
+				i++
+			}
+			name = expression[nameStart:i]
+			if isExpressionOperatorWord(name) {
+				target, name = targetOperator, ""
+			} else if isExpressionLiteralWord(name) {
+				target, name = targetValue, ""
+			} else {
+				target = targetIdentifier
+			}
+			i--
 			continue
 		}
-		if next := skipSpaces(expression, i+1); next < len(expression) && expression[next] == '(' {
-			return true
+		if expression[i] >= '0' && expression[i] <= '9' {
+			i++
+			for i < len(expression) && (expression[i] >= '0' && expression[i] <= '9' || expression[i] == '.') {
+				i++
+			}
+			target, name = targetValue, ""
+			i--
+			continue
+		}
+		switch expression[i] {
+		case '(':
+			switch target {
+			case targetValue:
+				return false
+			case targetIdentifier:
+				if !p.directCallAllowed(name, expression, nameStart) {
+					return false
+				}
+			}
+			target, name = targetNone, ""
+		case ')', ']', '}':
+			target, name = targetValue, ""
+		case '[', '{':
+			target, name = targetNone, ""
+		case '+', '-', '*', '/', '%', '=', '!', '<', '>', '|', '&', '.', ',', ':':
+			target, name = targetOperator, ""
 		}
 	}
-	return false
+	return true
+}
+
+func (p *sourcePolicy) directCallAllowed(name, expression string, start int) bool {
+	previous := previousNonSpace(expression, start)
+	if previous == '|' {
+		return allowedFilter(name)
+	}
+	if previous == '.' {
+		return false
+	}
+	_, ok := p.macros[name]
+	return ok
+}
+
+func isExpressionOperatorWord(word string) bool {
+	switch word {
+	case "and", "or", "not", "in", "is":
+		return true
+	default:
+		return false
+	}
+}
+
+func isExpressionLiteralWord(word string) bool {
+	switch word {
+	case "true", "false", "none":
+		return true
+	default:
+		return false
+	}
 }
 
 func allowedFilter(name string) bool {

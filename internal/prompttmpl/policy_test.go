@@ -43,6 +43,11 @@ func TestValidateSourceIgnoresDelimiterInsideQuotedString(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestValidateSourceAllowsGroupingAndIndexingWithoutCalls(t *testing.T) {
+	err := ValidateSource("system.j2", `{% if not (customer.blocked) %}{{ products[0].label }}{% endif %}`, []string{"system.j2"})
+	require.NoError(t, err)
+}
+
 func TestValidateSourceReturnsContentFreeLocation(t *testing.T) {
 	secret := "credential=do-not-disclose"
 	err := ValidateSource("system.j2", "{{ "+secret+".append(1) }}", []string{"system.j2"})

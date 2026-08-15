@@ -71,6 +71,48 @@
     }
   },
   {
+    "name": "numeric_literal_call_target",
+    "accepted": false,
+    "templates": {
+      "system.j2": "{{ 1(customer.name) }}"
+    }
+  },
+  {
+    "name": "string_literal_call_target",
+    "accepted": false,
+    "templates": {
+      "system.j2": "{{ \"handler\"(customer.name) }}"
+    }
+  },
+  {
+    "name": "bool_literal_call_target",
+    "accepted": false,
+    "templates": {
+      "system.j2": "{{ true(customer.name) }}"
+    }
+  },
+  {
+    "name": "none_literal_call_target",
+    "accepted": false,
+    "templates": {
+      "system.j2": "{{ none(customer.name) }}"
+    }
+  },
+  {
+    "name": "map_literal_call_target",
+    "accepted": false,
+    "templates": {
+      "system.j2": "{{ {\"handler\": customer}(customer.name) }}"
+    }
+  },
+  {
+    "name": "list_literal_call_target",
+    "accepted": false,
+    "templates": {
+      "system.j2": "{{ [customer](customer.name) }}"
+    }
+  },
+  {
     "name": "indexed_call_target",
     "accepted": false,
     "templates": {
