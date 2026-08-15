@@ -160,6 +160,23 @@ test('uses fixed error-code copy and never renders unknown response strings', as
   assert.equal(dom.renders.at(-1).components[0].state, 'unknown');
 });
 
+test('owned-unready failed services remain stoppable and block dependency removal', async () => {
+  const dom = fakeDOM();
+  const value = snapshot({ready: ['speech', 'postgres']});
+  const gateway = value.components.find((component) => component.component === 'gateway');
+  gateway.state = 'failed';
+  gateway.code = 'process_exited';
+  const controller = createSetupController({fetch: async () => response(value), timers: fakeTimers(), dom});
+
+  await controller.refresh();
+
+  const cards = dom.renders.at(-1).components;
+  assert.equal(cards.find((item) => item.component === 'gateway').actions.stop, true);
+  assert.equal(cards.find((item) => item.component === 'gateway').actions.start, false);
+  assert.equal(cards.find((item) => item.component === 'speech').actions.stop, false);
+  assert.equal(cards.find((item) => item.component === 'postgres').actions.stop, false);
+});
+
 test('suppresses double clicks and fences a late poll behind a newer action response', async () => {
   const dom = fakeDOM();
   const timers = fakeTimers();

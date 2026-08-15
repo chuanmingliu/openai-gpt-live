@@ -64,6 +64,7 @@ func TestOperatorSupervisorRejectsUnsafeStops(t *testing.T) {
 		runner.setOwned(component, true)
 	}
 	runner.setMigrated(true)
+	supervisor.migrated = true
 
 	assert.Equal(t, "dependency_running", supervisor.Apply(t.Context(), componentSpeech, actionStop).Code)
 	assert.Equal(t, "dependency_running", supervisor.Apply(t.Context(), componentPostgres, actionStop).Code)
@@ -154,6 +155,61 @@ func TestOperatorSupervisorRejectsStopWhileDependantIsStarting(t *testing.T) {
 	assert.Equal(t, "ready", (<-gatewayDone).State)
 }
 
+func TestOperatorSupervisorRejectsStartWhileDependencyStopIsInFlight(t *testing.T) {
+	runner := newFakeOperatorRunner()
+	supervisor := newOperatorSupervisor(runner, time.Second)
+	supervisor.migrated = true
+	for _, component := range []operatorComponent{componentSpeech, componentPostgres} {
+		runner.setReady(component, true)
+		runner.setOwned(component, true)
+	}
+	runner.setMigrated(true)
+	runner.stopKeepsReady = true
+	runner.stopBlock = make(chan struct{})
+	stopping := make(chan componentStatus, 1)
+	go func() { stopping <- supervisor.Apply(context.Background(), componentSpeech, actionStop) }()
+	require.Eventually(t, func() bool { return runner.callsFor(componentSpeech, actionStop) == 1 }, time.Second, time.Millisecond)
+	assert.Equal(t, "dependency_not_ready", supervisor.Apply(t.Context(), componentGateway, actionStart).Code)
+	close(runner.stopBlock)
+	<-stopping
+}
+
+func TestOperatorSupervisorRejectsParentStopWhileDependantStopIsInFlight(t *testing.T) {
+	runner := newFakeOperatorRunner()
+	supervisor := newOperatorSupervisor(runner, time.Second)
+	for _, component := range []operatorComponent{componentSpeech, componentPostgres, componentGateway} {
+		runner.setReady(component, true)
+		runner.setOwned(component, true)
+	}
+	runner.stopBlock = make(chan struct{})
+	stopping := make(chan componentStatus, 1)
+	go func() { stopping <- supervisor.Apply(context.Background(), componentGateway, actionStop) }()
+	require.Eventually(t, func() bool { return runner.callsFor(componentGateway, actionStop) == 1 }, time.Second, time.Millisecond)
+	assert.Equal(t, "dependency_running", supervisor.Apply(t.Context(), componentSpeech, actionStop).Code)
+	assert.Equal(t, "dependency_running", supervisor.Apply(t.Context(), componentPostgres, actionStop).Code)
+	close(runner.stopBlock)
+	<-stopping
+}
+
+func TestOperatorSupervisorReportsOwnedUnreadyAsFailedAndProtectsDependencies(t *testing.T) {
+	runner := newFakeOperatorRunner()
+	supervisor := newOperatorSupervisor(runner, time.Second)
+	for _, edge := range []struct{ parent, child operatorComponent }{
+		{componentSpeech, componentGateway},
+		{componentPostgres, componentGateway},
+		{componentPostgres, componentWorker},
+		{componentGateway, componentClient},
+	} {
+		parent, child := edge.parent, edge.child
+		runner.setOwned(parent, true)
+		runner.setOwned(child, true)
+		status := supervisor.status(t.Context(), child)
+		assert.Equal(t, "failed", status.State)
+		assert.Equal(t, "process_exited", status.Code)
+		assert.Equal(t, "dependency_running", supervisor.Apply(t.Context(), parent, actionStop).Code)
+	}
+}
+
 func TestOperatorSupervisorRejectsStopOfUnownedComponent(t *testing.T) {
 	supervisor := newOperatorSupervisor(newFakeOperatorRunner(), 100*time.Millisecond)
 
@@ -188,6 +244,7 @@ type fakeOperatorRunner struct {
 	err                error
 	block              chan struct{}
 	stopBlock          chan struct{}
+	stopKeepsReady     bool
 	startOwnsThenWaits bool
 }
 
@@ -205,7 +262,9 @@ func (runner *fakeOperatorRunner) Run(ctx context.Context, operation fixedOperat
 	}
 	if operation.Action == actionStop {
 		runner.owned[operation.Component] = false
-		runner.ready[operation.Component] = false
+		if !runner.stopKeepsReady {
+			runner.ready[operation.Component] = false
+		}
 	}
 	err, block, stopBlock, wait := runner.err, runner.block, runner.stopBlock, runner.startOwnsThenWaits
 	runner.mu.Unlock()

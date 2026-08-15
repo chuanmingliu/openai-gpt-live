@@ -178,6 +178,9 @@ func (supervisor *operatorSupervisor) status(ctx context.Context, component oper
 	if ready {
 		return componentStatus{Component: component, State: "ready", Code: "ready", Ready: true}
 	}
+	if supervisor.runner != nil && supervisor.runner.Owned(component) {
+		return componentStatus{Component: component, State: "failed", Code: "process_exited"}
+	}
 	return componentStatus{Component: component, State: "stopped", Code: "stopped"}
 }
 
@@ -187,10 +190,10 @@ func (supervisor *operatorSupervisor) dependencyCodeLocked(ctx context.Context, 
 			return "process_exited"
 		}
 		for _, dependant := range dependants[component] {
-			if dependantAction, busy := supervisor.inFlight[dependant]; busy && dependantAction != actionStop {
+			if _, busy := supervisor.inFlight[dependant]; busy {
 				return "dependency_running"
 			}
-			if supervisor.runner.Ready(ctx, dependant) {
+			if supervisor.runner.Ready(ctx, dependant) || supervisor.runner.Owned(dependant) {
 				return "dependency_running"
 			}
 		}
@@ -203,6 +206,9 @@ func (supervisor *operatorSupervisor) dependencyCodeLocked(ctx context.Context, 
 		return ""
 	}
 	for _, dependency := range dependencies[component] {
+		if dependencyAction, busy := supervisor.inFlight[dependency]; busy && dependencyAction == actionStop {
+			return "dependency_not_ready"
+		}
 		if !supervisor.runner.Ready(ctx, dependency) {
 			return "dependency_not_ready"
 		}

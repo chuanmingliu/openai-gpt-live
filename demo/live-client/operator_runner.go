@@ -24,8 +24,9 @@ const (
 	// The launcher has a one-second in-process group cleanup. Leave it enough
 	// scheduling headroom to remove the real speech child before the BFF ever
 	// escalates against the launcher itself.
-	operatorTerminateWait = 3 * time.Second
-	operatorIdentityRetry = 5 * time.Millisecond
+	operatorTerminateWait        = 3 * time.Second
+	operatorIdentityRetry        = 5 * time.Millisecond
+	operatorSpeechReadinessRetry = 10 * time.Millisecond
 	// Compose identity discovery starts a local CLI and Docker Desktop client;
 	// it is independent from a short HTTP readiness probe.
 	operatorIdentityTimeout = 3 * time.Second
@@ -432,7 +433,18 @@ func (runner *localOperatorRunner) startSpeech(ctx context.Context) error {
 	runner.children[componentSpeech] = child
 	runner.mu.Unlock()
 	go runner.waitForSpeech(child)
-	return nil
+	for {
+		if runner.probe(ctx, runner.cfg.Readiness[componentSpeech]) {
+			return nil
+		}
+		select {
+		case <-child.done:
+			return errOperatorProcessExited
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(operatorSpeechReadinessRetry):
+		}
+	}
 }
 
 func (runner *localOperatorRunner) waitForSpeech(child *ownedChild) {

@@ -78,10 +78,12 @@ function createModel(snapshot, localBusy, migrationConfirmed) {
       const dependenciesReady = DEPENDENCIES[component].every(ready)
         && (!['gateway', 'worker'].includes(component) || migrationConfirmed);
       const dependantsStopped = DEPENDANTS[component].every((dependant) => !ready(dependant)
+        && snapshot.get(dependant)?.state !== 'failed'
         && !localBusy.has(dependant) && !snapshot.get(dependant)?.busy);
+      const ownedUnready = status.state === 'failed';
       const actions = {
-        start: !actionInFlight && !busy && !status.ready && dependenciesReady,
-        stop: !actionInFlight && !busy && status.ready && dependantsStopped,
+        start: !actionInFlight && !busy && !status.ready && !ownedUnready && dependenciesReady,
+        stop: !actionInFlight && !busy && (status.ready || ownedUnready) && dependantsStopped,
       };
       if (component === 'postgres') actions.migrate = !actionInFlight && !busy && status.ready;
       return {

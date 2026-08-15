@@ -1071,6 +1071,46 @@ func TestLocalOperatorRunnerClientStopUsesOnlyServerCallback(t *testing.T) {
 	assert.False(t, runner.Owned(componentClient))
 }
 
+func TestLocalOperatorRunnerSpeechStartWaitsForDelayedReadiness(t *testing.T) {
+	t.Setenv("S2S_API_KEY", "test-speech-key")
+	root, speech, profile := newRunnerRepository(t)
+	var probes atomic.Int32
+	runnerInterface, err := newLocalOperatorRunner(operatorConfig{Enabled: true, StateDir: filepath.Join(t.TempDir(), "state"), RepositoryRoot: root, SpeechCommand: speech, SpeechProfile: profile, Readiness: fixedReadiness()}, nil, func(context.Context, string) bool {
+		return probes.Add(1) >= 3
+	})
+	require.NoError(t, err)
+	runner := runnerInterface.(*localOperatorRunner)
+	require.NoError(t, runner.Run(t.Context(), fixedOperation{Component: componentSpeech, Action: actionStart}))
+	assert.GreaterOrEqual(t, probes.Load(), int32(3))
+	assert.True(t, runner.Owned(componentSpeech))
+	require.NoError(t, runner.Run(t.Context(), fixedOperation{Component: componentSpeech, Action: actionStop}))
+}
+
+func TestLocalOperatorRunnerSpeechStartFailsForEarlyExitAndNeverReadyCleanup(t *testing.T) {
+	t.Run("early exit", func(t *testing.T) {
+		t.Setenv("S2S_API_KEY", "test-speech-key")
+		root, _, profile := newRunnerRepository(t)
+		speech := writeRunnerScript(t, root, "tools/early-exit.sh", "#!/bin/sh\nexit 0\n")
+		runnerInterface, err := newLocalOperatorRunner(operatorConfig{Enabled: true, StateDir: filepath.Join(t.TempDir(), "state"), RepositoryRoot: root, SpeechCommand: speech, SpeechProfile: profile, Readiness: fixedReadiness()}, nil, func(context.Context, string) bool { return false })
+		require.NoError(t, err)
+		runner := runnerInterface.(*localOperatorRunner)
+		require.ErrorIs(t, runner.Run(t.Context(), fixedOperation{Component: componentSpeech, Action: actionStart}), errOperatorProcessExited)
+		assert.False(t, runner.Owned(componentSpeech))
+	})
+
+	t.Run("never ready cleans owned child", func(t *testing.T) {
+		t.Setenv("S2S_API_KEY", "test-speech-key")
+		root, speech, profile := newRunnerRepository(t)
+		runnerInterface, err := newLocalOperatorRunner(operatorConfig{Enabled: true, StateDir: filepath.Join(t.TempDir(), "state"), RepositoryRoot: root, SpeechCommand: speech, SpeechProfile: profile, Readiness: fixedReadiness()}, nil, func(context.Context, string) bool { return false })
+		require.NoError(t, err)
+		runner := runnerInterface.(*localOperatorRunner)
+		supervisor := newOperatorSupervisor(runner, 40*time.Millisecond)
+		status := supervisor.Apply(t.Context(), componentSpeech, actionStart)
+		assert.Equal(t, "startup_timeout", status.Code)
+		assert.False(t, runner.Owned(componentSpeech))
+	})
+}
+
 func TestLocalOperatorRunnerClientStopStaysClosedAfterDeadline(t *testing.T) {
 	root, speech, profile := newRunnerRepository(t)
 	runnerInterface, err := newLocalOperatorRunner(operatorConfig{

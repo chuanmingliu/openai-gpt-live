@@ -162,6 +162,7 @@ def terminate_child_group(child: subprocess.Popen[bytes], signum: int) -> None:
 
 def validate_runtime_source() -> None:
     expected = (SPEECH_ROOT / "src" / "speech_to_speech" / "__init__.py").resolve(strict=True)
+    reviewed_paths = ("src/speech_to_speech", "configs/tencent-deepseek-minimax.json")
     try:
         imported = subprocess.run(
             (str(SPEECH_PYTHON), "-c", "import speech_to_speech; print(speech_to_speech.__file__)"),
@@ -181,10 +182,27 @@ def validate_runtime_source() -> None:
             timeout=3,
             check=True,
         ).stdout.strip()
+        tracked = subprocess.run(
+            ("git", "-C", str(SPEECH_ROOT), "diff", "--quiet", SPEECH_REVISION, "--", *reviewed_paths),
+            env={"PATH": os.environ.get("PATH", "")},
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+        ).returncode
+        untracked = subprocess.run(
+            ("git", "-C", str(SPEECH_ROOT), "status", "--porcelain", "--untracked-files=all", "--", *reviewed_paths),
+            env={"PATH": os.environ.get("PATH", "")},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=3,
+            check=True,
+        ).stdout
     except (OSError, subprocess.SubprocessError) as error:
         raise LauncherError() from error
     try:
-        if Path(imported).resolve(strict=True) != expected or revision != SPEECH_REVISION:
+        if Path(imported).resolve(strict=True) != expected or revision != SPEECH_REVISION or tracked != 0 or untracked:
             raise LauncherError()
     except OSError as error:
         raise LauncherError() from error
@@ -204,14 +222,20 @@ def launch(profile: Path) -> int:
         # The service gets its own group.  The launcher's handlers terminate
         # that complete group and wait before exit; the BFF separately owns the
         # launcher group, so either bounded shutdown path leaves no child.
-        child = subprocess.Popen((str(SPEECH_EXECUTABLE), str(runtime_profile)), env=environment, start_new_session=True)
-
         def forward(signum: int, _frame: object) -> None:
             if child is not None:
                 terminate_child_group(child, signum)
 
-        signal.signal(signal.SIGTERM, forward)
-        signal.signal(signal.SIGINT, forward)
+        watched = {signal.SIGTERM, signal.SIGINT}
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, watched)
+        try:
+            child = subprocess.Popen((str(SPEECH_EXECUTABLE), str(runtime_profile)), env=environment, start_new_session=True)
+            signal.signal(signal.SIGTERM, forward)
+            signal.signal(signal.SIGINT, forward)
+            for pending in signal.sigpending() & watched:
+                forward(pending, None)
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         return child.wait()
     finally:
         remove_runtime_profile(runtime_profile)

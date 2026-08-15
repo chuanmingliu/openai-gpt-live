@@ -116,6 +116,9 @@ checks; automated tests do not claim them. Run the content-free gate with:
 make test-demo-live-client
 ```
 
+This default gate never starts Docker. The optional local-engine port-publication
+check is manual only: `make test-control-panel-port-publish-live`.
+
 For durable asynchronous Web Search, use the same guide's ordered
 `development_durable` flow. It prompts for external PostgreSQL, bearer, HMAC,
 encryption, speech, and DeepSeek secret references without echoing values;

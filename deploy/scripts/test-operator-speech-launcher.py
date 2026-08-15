@@ -10,6 +10,8 @@ import tempfile
 import subprocess
 import time
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 
 sys.dont_write_bytecode = True
@@ -91,6 +93,36 @@ class OperatorSpeechLauncherTest(unittest.TestCase):
         self.assertEqual("", stdout.getvalue())
         self.assertEqual("", stderr.getvalue())
 
+    def test_runtime_source_rejects_dirty_reviewed_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            package = root / "src" / "speech_to_speech"
+            package.mkdir(parents=True)
+            expected = package / "__init__.py"
+            expected.write_text("")
+            original = (MODULE.SPEECH_ROOT, MODULE.SPEECH_PYTHON, MODULE.SPEECH_REVISION)
+            try:
+                MODULE.SPEECH_ROOT = root
+                MODULE.SPEECH_PYTHON = Path(sys.executable)
+                MODULE.SPEECH_REVISION = "reviewed-revision"
+
+                def reviewed_run(command, **_kwargs):
+                    if command[0] == str(sys.executable):
+                        return SimpleNamespace(stdout=str(expected) + "\n")
+                    if "rev-parse" in command:
+                        return SimpleNamespace(stdout="reviewed-revision\n")
+                    if "diff" in command:
+                        return SimpleNamespace(returncode=1)
+                    if "status" in command:
+                        return SimpleNamespace(stdout="")
+                    raise AssertionError(command)
+
+                with mock.patch.object(MODULE.subprocess, "run", side_effect=reviewed_run):
+                    with self.assertRaises(MODULE.LauncherError):
+                        MODULE.validate_runtime_source()
+            finally:
+                MODULE.SPEECH_ROOT, MODULE.SPEECH_PYTHON, MODULE.SPEECH_REVISION = original
+
     def test_validated_private_file_swap_fails_closed_without_output(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -148,6 +180,31 @@ class OperatorSpeechLauncherTest(unittest.TestCase):
                     os.kill(child_pid, 0)
             finally:
                 MODULE.SPEECH_PROFILE, MODULE.SPEECH_EXECUTABLE, MODULE.SPEECH_ROOT, MODULE.SPEECH_EXECUTABLE_ROOT, MODULE.SPEECH_ENVIRONMENT, MODULE.SPEECH_ENVIRONMENT_ROOT, MODULE.SPEECH_PYTHON, MODULE.SPEECH_REVISION = original
+
+    def test_child_immediately_signalling_launcher_cleans_its_group_and_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            child = root / "speech-to-speech"
+            pid_file = root / "pid"
+            child.write_text("#!" + sys.executable + "\nimport os, signal, time\nopen(os.environ['SPEECH_TEST_PID'], 'w').write(str(os.getpid()))\nos.kill(os.getppid(), signal.SIGTERM)\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\nwhile True: time.sleep(1)\n")
+            child.chmod(0o700)
+            profile = root / "profile.json"
+            profile.write_text('{"mode":"realtime"}')
+            profile.chmod(0o600)
+            environment = root / ".env.local"
+            environment.write_text("SPEECH_TEST_PID=" + str(pid_file) + "\n")
+            environment.chmod(0o600)
+            package = root / "src" / "speech_to_speech"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text("")
+            program = "import importlib.util,sys; s=importlib.util.spec_from_file_location('x',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); P=m.Path; m.SPEECH_ROOT=P(sys.argv[2]); m.SPEECH_EXECUTABLE_ROOT=P(sys.argv[2]); m.SPEECH_PROFILE=P(sys.argv[3]); m.SPEECH_EXECUTABLE=P(sys.argv[4]); m.SPEECH_ENVIRONMENT=P(sys.argv[5]); m.SPEECH_ENVIRONMENT_ROOT=P(sys.argv[2]); m.SPEECH_PYTHON=P(sys.executable); m.SPEECH_REVISION='test-revision'; m.validate_runtime_source=lambda:None; raise SystemExit(m.launch(P(sys.argv[3])))"
+            process = subprocess.Popen([sys.executable, "-c", program, str(SCRIPT), str(root), str(profile), str(child), str(environment)], env={"PATH": os.environ.get("PATH", ""), "TMPDIR": str(root), "SPEECH_TEST_PID": str(pid_file)})
+            process.wait(timeout=3)
+            self.assertTrue(pid_file.exists())
+            child_pid = int(pid_file.read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child_pid, 0)
+            self.assertEqual([], list(root.glob("gpt-live-operator-speech-*.json")))
 
 
 if __name__ == "__main__":

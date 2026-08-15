@@ -1,4 +1,4 @@
-.PHONY: test test-race vet fmt verify-deploy verify-deploy-static smoke-deploy durable-demo-migrate durable-demo-up durable-demo-down test-durable-web-search load-unit chaos capacity barge soak load-smoke load-evidence release-gate release-gate-verify demo-wizard demo-live-client test-demo-live-client test-control-panel-compose-render test-control-panel-port-publish
+.PHONY: test test-race vet fmt verify-deploy verify-deploy-static smoke-deploy durable-demo-migrate durable-demo-up durable-demo-down test-durable-web-search load-unit chaos capacity barge soak load-smoke load-evidence release-gate release-gate-verify demo-wizard demo-live-client test-demo-live-client test-control-panel-compose-render test-control-panel-port-publish test-control-panel-port-publish-live
 
 test:
 	go test ./...
@@ -27,12 +27,14 @@ test-demo-live-client:
 	./deploy/scripts/test-durable-compose.sh
 	./deploy/scripts/test-control-panel-compose-render.sh
 	./deploy/scripts/test-control-panel-port-publish-boundary.sh
-	./deploy/scripts/test-control-panel-port-publish.sh
 
 test-control-panel-compose-render:
 	./deploy/scripts/test-control-panel-compose-render.sh
 
 test-control-panel-port-publish:
+	@echo "manual Docker engine check only; run make test-control-panel-port-publish-live"
+
+test-control-panel-port-publish-live:
 	./deploy/scripts/test-control-panel-port-publish.sh
 
 # Builds and validates every deployable artifact. Tool absence is an explicit

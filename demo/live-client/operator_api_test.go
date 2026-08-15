@@ -28,6 +28,19 @@ func TestOperatorAPIStatusReturnsOnlyFixedSnapshotSchema(t *testing.T) {
 	assertContentFreeOperatorResponse(t, response, "sentinel-browser-secret")
 }
 
+func TestOperatorAPIOwnedUnreadyComponentIsFailedAndCanBeStopped(t *testing.T) {
+	handler, runner := newOperatorAPIHandler(t)
+	runner.owned[componentSpeech] = true
+
+	status := httptest.NewRecorder()
+	handler.ServeHTTP(status, httptest.NewRequest(http.MethodGet, "/api/operator/status", nil))
+	assert.Contains(t, status.Body.String(), `{"component":"speech","state":"failed","code":"process_exited","ready":false,"busy":false}`)
+
+	response := makeOperatorActionRequest(handler, http.MethodPost, `{"component":"speech","action":"stop"}`, "http://127.0.0.1:3000", "application/json")
+	assert.Equal(t, http.StatusOK, response.Code)
+	assert.JSONEq(t, `{"component":"speech","state":"stopped","code":"stopped","ready":false,"busy":false}`, response.Body.String())
+}
+
 func TestOperatorAPIActionAcceptsOnlyExactValidJSON(t *testing.T) {
 	handler, runner := newOperatorAPIHandler(t)
 
@@ -114,6 +127,49 @@ func TestOperatorAPIReportsDependencyAndInFlightConflicts(t *testing.T) {
 	<-completed
 }
 
+func TestOperatorAPIRejectsDependencyInterleavingsDuringStops(t *testing.T) {
+	t.Run("dependant start while required stop is in flight", func(t *testing.T) {
+		handler, runner := newOperatorAPIHandler(t)
+		for _, component := range []operatorComponent{componentSpeech, componentPostgres} {
+			runner.ready[component], runner.owned[component] = true, true
+		}
+		handler.operator.migrated = true
+		runner.blockStop = make(chan struct{})
+		stopped := make(chan struct{})
+		go func() {
+			defer close(stopped)
+			makeOperatorActionRequest(handler, http.MethodPost, `{"component":"speech","action":"stop"}`, "http://127.0.0.1:3000", "application/json")
+		}()
+		<-runner.stopStarted
+		response := makeOperatorActionRequest(handler, http.MethodPost, `{"component":"gateway","action":"start"}`, "http://127.0.0.1:3000", "application/json")
+		assert.Equal(t, http.StatusConflict, response.Code)
+		assert.JSONEq(t, `{"component":"gateway","state":"failed","code":"dependency_not_ready","ready":false,"busy":false}`, response.Body.String())
+		close(runner.blockStop)
+		<-stopped
+	})
+
+	t.Run("parent stop while dependant stop is in flight", func(t *testing.T) {
+		handler, runner := newOperatorAPIHandler(t)
+		for _, component := range []operatorComponent{componentSpeech, componentPostgres, componentGateway} {
+			runner.ready[component], runner.owned[component] = true, true
+		}
+		runner.blockStop = make(chan struct{})
+		stopped := make(chan struct{})
+		go func() {
+			defer close(stopped)
+			makeOperatorActionRequest(handler, http.MethodPost, `{"component":"gateway","action":"stop"}`, "http://127.0.0.1:3000", "application/json")
+		}()
+		<-runner.stopStarted
+		for _, component := range []operatorComponent{componentSpeech, componentPostgres} {
+			response := makeOperatorActionRequest(handler, http.MethodPost, `{"component":"`+string(component)+`","action":"stop"}`, "http://127.0.0.1:3000", "application/json")
+			assert.Equal(t, http.StatusConflict, response.Code)
+			assert.Contains(t, response.Body.String(), `"dependency_running"`)
+		}
+		close(runner.blockStop)
+		<-stopped
+	})
+}
+
 func TestOperatorAPIFailedActionsUseUnavailableStatus(t *testing.T) {
 	for _, test := range []struct {
 		name string
@@ -191,7 +247,7 @@ func newOperatorAPIHandler(t *testing.T) (*demoHandler, *operatorAPIRunner) {
 	handler, err := newHandler(parseTestConfig(t), []byte("sentinel-browser-secret"), nil)
 	require.NoError(t, err)
 	demo := handler.(*demoHandler)
-	runner := &operatorAPIRunner{ready: make(map[operatorComponent]bool), owned: make(map[operatorComponent]bool), started: make(chan struct{})}
+	runner := &operatorAPIRunner{ready: make(map[operatorComponent]bool), owned: make(map[operatorComponent]bool), started: make(chan struct{}), stopStarted: make(chan struct{})}
 	demo.operator = newOperatorSupervisor(runner, 5*time.Second)
 	return demo, runner
 }
@@ -225,13 +281,15 @@ func assertContentFreeOperatorResponse(t *testing.T, response *httptest.Response
 }
 
 type operatorAPIRunner struct {
-	mu      sync.Mutex
-	ready   map[operatorComponent]bool
-	owned   map[operatorComponent]bool
-	runs    []fixedOperation
-	block   chan struct{}
-	started chan struct{}
-	err     error
+	mu          sync.Mutex
+	ready       map[operatorComponent]bool
+	owned       map[operatorComponent]bool
+	runs        []fixedOperation
+	block       chan struct{}
+	blockStop   chan struct{}
+	started     chan struct{}
+	stopStarted chan struct{}
+	err         error
 }
 
 func (runner *operatorAPIRunner) Run(ctx context.Context, operation fixedOperation) error {
@@ -245,6 +303,16 @@ func (runner *operatorAPIRunner) Run(ctx context.Context, operation fixedOperati
 		close(started)
 		select {
 		case <-block:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if runner.blockStop != nil && operation.Action == actionStop {
+		if runner.stopStarted != nil {
+			close(runner.stopStarted)
+		}
+		select {
+		case <-runner.blockStop:
 		case <-ctx.Done():
 			return ctx.Err()
 		}
