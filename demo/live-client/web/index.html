@@ -11,15 +11,16 @@
     <header>
       <p class="eyebrow">Custom GPT-Live</p>
       <h1>Speech-to-speech + DeepSeek</h1>
-      <p class="lede">Loopback demo. The browser never sees the gateway bearer. Audio stays 24 kHz PCM through the local BFF.</p>
+      <p class="lede">Trusted-edge voice client. The browser never sees the gateway credential. Audio is 24 kHz PCM through this BFF to speech-to-speech; DeepSeek stays on the worker.</p>
     </header>
     <section class="controls" aria-label="Session controls">
       <button id="start" type="button">Start</button>
       <button id="stop" type="button" disabled>Stop</button>
-      <button id="mute" type="button" disabled>Mute mic</button>
+      <button id="mute" type="button" disabled aria-pressed="false">Mute mic</button>
     </section>
     <p id="status" class="status" aria-live="polite">idle</p>
     <p id="error" class="error" hidden aria-live="polite"></p>
+    <p id="live-announce" class="visually-hidden" aria-live="assertive"></p>
     <section class="transcript-wrap">
       <h2>Transcript</h2>
       <ol id="transcript"></ol>

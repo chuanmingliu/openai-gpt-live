@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -17,35 +18,66 @@ const (
 	defaultOrigin        = "http://127.0.0.1:3000"
 	defaultBearerEnv     = "LIVE_DEMO_BEARER"
 	defaultMaxFrameBytes = int64(64 << 10)
+	defaultMaxSessions   = 8
+	defaultHandshake     = 10 * time.Second
+	defaultIdleTimeout   = 5 * time.Minute
+	defaultMaxSession    = 2 * time.Hour
+	defaultDrainTimeout  = 15 * time.Second
 	maxBearerBytes       = 16 << 10
 	maxIdentityBytes     = 128
+	modeLocal            = "local"
+	modeProduction       = "production"
 )
 
 type demoConfig struct {
+	Mode          string
 	ListenAddr    string
 	GatewayURL    string
 	Model         string
 	Origin        string
 	BearerEnv     string
+	TLSCertFile   string
+	TLSKeyFile    string
+	BehindIngress bool
 	MaxFrameBytes int64
+	MaxSessions   int
+	Handshake     time.Duration
+	IdleTimeout   time.Duration
+	MaxSession    time.Duration
+	DrainTimeout  time.Duration
 }
 
 func parseConfig(args []string) (demoConfig, error) {
 	cfg := demoConfig{
+		Mode:          modeLocal,
 		ListenAddr:    defaultListenAddr,
 		GatewayURL:    defaultGatewayURL,
 		Model:         defaultModel,
 		Origin:        defaultOrigin,
 		BearerEnv:     defaultBearerEnv,
 		MaxFrameBytes: defaultMaxFrameBytes,
+		MaxSessions:   defaultMaxSessions,
+		Handshake:     defaultHandshake,
+		IdleTimeout:   defaultIdleTimeout,
+		MaxSession:    defaultMaxSession,
+		DrainTimeout:  defaultDrainTimeout,
 	}
 	flags := flag.NewFlagSet("live-client", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	flags.StringVar(&cfg.ListenAddr, "listen", cfg.ListenAddr, "loopback HTTP listen address")
+	flags.StringVar(&cfg.Mode, "mode", cfg.Mode, "local or production")
+	flags.StringVar(&cfg.ListenAddr, "listen", cfg.ListenAddr, "HTTP listen address")
 	flags.StringVar(&cfg.GatewayURL, "gateway-url", cfg.GatewayURL, "GPT Live WebSocket URL without query")
 	flags.StringVar(&cfg.Model, "model", cfg.Model, "advertised gateway model")
 	flags.StringVar(&cfg.Origin, "origin", cfg.Origin, "exact browser origin")
 	flags.StringVar(&cfg.BearerEnv, "bearer-env", cfg.BearerEnv, "environment variable containing the bearer")
+	flags.StringVar(&cfg.TLSCertFile, "tls-cert", "", "TLS certificate file")
+	flags.StringVar(&cfg.TLSKeyFile, "tls-key", "", "TLS key file")
+	flags.BoolVar(&cfg.BehindIngress, "behind-ingress", false, "TLS terminates at ingress")
+	flags.IntVar(&cfg.MaxSessions, "max-sessions", cfg.MaxSessions, "maximum concurrent browser sessions")
+	flags.DurationVar(&cfg.Handshake, "handshake-timeout", cfg.Handshake, "upstream dial timeout")
+	flags.DurationVar(&cfg.IdleTimeout, "idle-timeout", cfg.IdleTimeout, "session idle timeout")
+	flags.DurationVar(&cfg.MaxSession, "max-session", cfg.MaxSession, "maximum session lifetime")
+	flags.DurationVar(&cfg.DrainTimeout, "drain-timeout", cfg.DrainTimeout, "shutdown drain timeout")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
 		return demoConfig{}, errors.New("invalid demo arguments")
 	}
@@ -56,16 +88,31 @@ func parseConfig(args []string) (demoConfig, error) {
 }
 
 func (cfg demoConfig) validate() error {
+	if cfg.Mode != modeLocal && cfg.Mode != modeProduction {
+		return errors.New("mode must be local or production")
+	}
 	if cfg.MaxFrameBytes <= 0 || cfg.MaxFrameBytes > 1<<20 {
 		return errors.New("demo frame limit is invalid")
 	}
-	if err := validateLoopbackAddr(cfg.ListenAddr); err != nil {
+	if cfg.MaxSessions <= 0 || cfg.MaxSessions > 1024 {
+		return errors.New("demo session limit is invalid")
+	}
+	if cfg.Handshake < time.Second || cfg.Handshake > time.Minute ||
+		cfg.IdleTimeout < 5*time.Second || cfg.IdleTimeout > 10*time.Minute ||
+		cfg.MaxSession < time.Minute || cfg.MaxSession > 2*time.Hour ||
+		cfg.DrainTimeout < time.Second || cfg.DrainTimeout > 2*time.Minute {
+		return errors.New("demo timeouts are out of bounds")
+	}
+	if (cfg.TLSCertFile == "") != (cfg.TLSKeyFile == "") {
+		return errors.New("TLS certificate and key must be configured together")
+	}
+	if err := validateListenAddr(cfg); err != nil {
 		return err
 	}
-	if err := validateGatewayURL(cfg.GatewayURL); err != nil {
+	if err := validateGatewayURL(cfg); err != nil {
 		return err
 	}
-	if err := validateOrigin(cfg.Origin, cfg.ListenAddr); err != nil {
+	if err := validateOrigin(cfg); err != nil {
 		return err
 	}
 	if !boundedToken(cfg.Model, maxIdentityBytes) || strings.ContainsAny(cfg.Model, " \t\r\n") {
@@ -73,6 +120,14 @@ func (cfg demoConfig) validate() error {
 	}
 	if !environmentName(cfg.BearerEnv) {
 		return errors.New("demo bearer environment name is invalid")
+	}
+	if cfg.Mode == modeProduction {
+		if !cfg.BehindIngress && cfg.TLSCertFile == "" {
+			return errors.New("production requires TLS files or behind-ingress")
+		}
+		if cfg.BehindIngress && cfg.TLSCertFile != "" {
+			return errors.New("production ingress mode must not set TLS files")
+		}
 	}
 	return nil
 }
@@ -116,51 +171,82 @@ func resolveBearer(cfg demoConfig, lookup func(string) (string, bool)) ([]byte, 
 	return []byte(value), nil
 }
 
-func validateLoopbackAddr(raw string) error {
-	host, port, err := net.SplitHostPort(raw)
+func validateListenAddr(cfg demoConfig) error {
+	host, port, err := net.SplitHostPort(cfg.ListenAddr)
 	if err != nil || port == "" {
-		return errors.New("demo listen address must be loopback host:port")
+		return errors.New("demo listen address must be host:port")
+	}
+	if host == "" {
+		if cfg.Mode != modeProduction {
+			return errors.New("demo listen address must be loopback")
+		}
+		return nil
 	}
 	ip := net.ParseIP(host)
-	if ip == nil || !ip.IsLoopback() {
+	if ip == nil {
+		return errors.New("demo listen address must be an IP")
+	}
+	if cfg.Mode == modeLocal && !ip.IsLoopback() {
 		return errors.New("demo listen address must be loopback")
 	}
 	return nil
 }
 
-func validateGatewayURL(raw string) error {
-	parsed, err := url.Parse(raw)
+func validateGatewayURL(cfg demoConfig) error {
+	parsed, err := url.Parse(cfg.GatewayURL)
 	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.Opaque != "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.ForceQuery || parsed.OmitHost {
 		return errors.New("demo gateway URL is invalid")
-	}
-	if parsed.Scheme != "ws" && parsed.Scheme != "wss" {
-		return errors.New("demo gateway URL must be ws or wss")
 	}
 	if parsed.Path != "/v1/realtime" {
 		return errors.New("demo gateway path must be /v1/realtime")
 	}
+	host := parsed.Hostname()
+	ip := net.ParseIP(host)
+	switch cfg.Mode {
+	case modeLocal:
+		if parsed.Scheme != "ws" && parsed.Scheme != "wss" {
+			return errors.New("demo gateway URL must be ws or wss")
+		}
+		if ip == nil || !ip.IsLoopback() {
+			return errors.New("local gateway must be loopback")
+		}
+	default:
+		if parsed.Scheme != "wss" && !(parsed.Scheme == "ws" && ip != nil && (ip.IsLoopback() || ip.IsPrivate())) {
+			return errors.New("production gateway must be wss or private ws")
+		}
+	}
 	return nil
 }
 
-func validateOrigin(raw, listenAddr string) error {
-	parsed, err := url.Parse(raw)
-	if err != nil || parsed.Scheme != "http" || parsed.Host == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Opaque != "" {
+func validateOrigin(cfg demoConfig) error {
+	parsed, err := url.Parse(cfg.Origin)
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Opaque != "" {
 		return errors.New("demo origin is invalid")
 	}
-	originHost, originPort, err := net.SplitHostPort(parsed.Host)
-	if err != nil {
-		if parsed.Scheme == "http" {
+	if cfg.Mode == modeLocal && parsed.Scheme != "http" {
+		return errors.New("local origin must be http")
+	}
+	if cfg.Mode == modeProduction && parsed.Scheme != "https" {
+		return errors.New("production origin must be https")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return errors.New("demo origin is invalid")
+	}
+	if cfg.Mode == modeLocal {
+		originHost, originPort, err := net.SplitHostPort(parsed.Host)
+		if err != nil {
 			originHost, originPort = parsed.Hostname(), "80"
-		} else {
-			return errors.New("demo origin is invalid")
+		}
+		listenHost, listenPort, err := net.SplitHostPort(cfg.ListenAddr)
+		if err != nil {
+			return errors.New("demo listen address must be host:port")
+		}
+		if !sameLoopbackHost(originHost, listenHost) || originPort != listenPort {
+			return errors.New("demo origin must match the listen address")
 		}
 	}
-	listenHost, listenPort, err := net.SplitHostPort(listenAddr)
-	if err != nil {
-		return errors.New("demo listen address must be loopback host:port")
-	}
-	if !sameLoopbackHost(originHost, listenHost) || originPort != listenPort {
-		return errors.New("demo origin must match the listen address")
+	if strings.Contains(cfg.Origin, "*") {
+		return errors.New("wildcard origins are not allowed")
 	}
 	return nil
 }

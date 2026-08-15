@@ -1,12 +1,15 @@
 import { ProtocolState } from "./protocol-state.mjs";
+import { SessionController } from "./session-controller.mjs";
 import { decodePCM16Base64, encodePCM16Base64 } from "./audio-core.mjs";
 
 const statusNode = document.getElementById("status");
 const errorNode = document.getElementById("error");
 const transcriptNode = document.getElementById("transcript");
+const liveRegion = document.getElementById("live-announce");
 const startButton = document.getElementById("start");
 const stopButton = document.getElementById("stop");
 const muteButton = document.getElementById("mute");
+const MAX_VISIBLE_TURNS = 50;
 
 const SESSION_UPDATE = {
   type: "session.update",
@@ -34,10 +37,9 @@ let playbackContext = null;
 let captureNode = null;
 let playbackNode = null;
 let mediaStream = null;
-let muted = false;
 let protocol = new ProtocolState();
-let userTurn = null;
-let assistantTurn = null;
+let session = new SessionController();
+let renderers = new Map();
 let stopped = true;
 
 startButton.addEventListener("click", () => {
@@ -47,7 +49,7 @@ startButton.addEventListener("click", () => {
   });
 });
 stopButton.addEventListener("click", () => stopSession());
-muteButton.addEventListener("click", () => setMuted(!muted));
+muteButton.addEventListener("click", () => applyAll(session.setMuted(!session.muted)));
 window.addEventListener("pagehide", () => stopSession());
 
 async function startSession() {
@@ -56,41 +58,46 @@ async function startSession() {
   }
   stopped = false;
   hideError();
-  setStatus("connecting");
+  applyAll(session.start());
   startButton.disabled = true;
   stopButton.disabled = false;
   muteButton.disabled = false;
   protocol = new ProtocolState();
+  renderers = new Map();
   mediaStream = await navigator.mediaDevices.getUserMedia({
     audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
   });
-  captureContext = new AudioContext();
-  const playbackOptions = {};
-  if (typeof AudioContext !== "undefined") {
-    playbackOptions.sampleRate = 24000;
+  if (stopped) {
+    stopTracks(mediaStream);
+    mediaStream = null;
+    return;
   }
+  captureContext = new AudioContext();
   try {
-    playbackContext = new AudioContext(playbackOptions);
+    playbackContext = new AudioContext({ sampleRate: 24000 });
   } catch {
     playbackContext = new AudioContext();
   }
   await captureContext.audioWorklet.addModule("/capture-worklet.js");
   await playbackContext.audioWorklet.addModule("/playback-worklet.js");
+  if (stopped) {
+    stopSession();
+    return;
+  }
   captureNode = new AudioWorkletNode(captureContext, "capture-processor");
   playbackNode = new AudioWorkletNode(playbackContext, "playback-processor");
-  const source = captureContext.createMediaStreamSource(mediaStream);
-  source.connect(captureNode);
+  playbackNode.port.postMessage({ type: "clear", generation: session.generation });
+  captureContext.createMediaStreamSource(mediaStream).connect(captureNode);
   playbackNode.connect(playbackContext.destination);
   captureNode.port.onmessage = (event) => {
-    if (!socket || socket.readyState !== WebSocket.OPEN || !event.data || event.data.type !== "frame") {
+    if (!event.data || event.data.type !== "frame") {
       return;
     }
-    socket.send(JSON.stringify({
+    sendJSON({
       type: "input_audio_buffer.append",
       audio: encodePCM16Base64(new Uint8Array(event.data.pcm)),
-    }));
+    });
   };
-  playbackNode.port.onmessage = () => {};
   socket = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
   socket.addEventListener("message", onSocketMessage);
   socket.addEventListener("close", () => stopSession());
@@ -108,10 +115,30 @@ function onSocketMessage(event) {
     showError("invalid-event");
     return;
   }
-  if (payload && payload.type === "session.created" && socket && socket.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify(SESSION_UPDATE));
+  if (payload && payload.type === "session.created") {
+    sendJSON(SESSION_UPDATE);
   }
   for (const effect of protocol.consume(payload)) {
+    applyAll(session.apply(effect));
+  }
+}
+
+function sendJSON(payload) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    return false;
+  }
+  try {
+    socket.send(JSON.stringify(payload));
+    return true;
+  } catch {
+    showError("socket-failed");
+    stopSession();
+    return false;
+  }
+}
+
+function applyAll(effects) {
+  for (const effect of effects) {
     applyEffect(effect);
   }
 }
@@ -119,18 +146,22 @@ function onSocketMessage(event) {
 function applyEffect(effect) {
   switch (effect.type) {
     case "status":
-      setStatus(effect.value);
+      statusNode.textContent = effect.value;
+      break;
+    case "clear-transcript":
+      transcriptNode.replaceChildren();
+      renderers = new Map();
       break;
     case "clear-playback":
       if (playbackNode) {
-        playbackNode.port.postMessage({ type: "clear" });
+        playbackNode.port.postMessage({ type: "clear", generation: effect.generation });
       }
       break;
     case "audio":
       try {
         const pcm = decodePCM16Base64(effect.encoded);
         if (playbackNode) {
-          playbackNode.port.postMessage({ type: "append", pcm: pcm.buffer }, [pcm.buffer]);
+          playbackNode.port.postMessage({ type: "append", pcm: pcm.buffer, generation: effect.generation }, [pcm.buffer]);
         }
         if (playbackContext && playbackContext.state === "suspended") {
           playbackContext.resume();
@@ -139,19 +170,20 @@ function applyEffect(effect) {
         showError("invalid-audio");
       }
       break;
-    case "user-delta":
-      userTurn = writeTurn("user", effect.text, userTurn);
+    case "render-turn":
+      writeTurn(effect.role, effect.text);
       break;
-    case "user-done":
-      userTurn = writeTurn("user", effect.text, userTurn);
-      userTurn = null;
+    case "announce":
+      if (liveRegion) {
+        liveRegion.textContent = effect.text;
+      }
       break;
-    case "assistant-delta":
-      assistantTurn = writeTurn("assistant", effect.text, assistantTurn);
-      break;
-    case "assistant-done":
-      assistantTurn = writeTurn("assistant", effect.text, assistantTurn);
-      assistantTurn = null;
+    case "mute":
+      muteButton.textContent = effect.value ? "Unmute mic" : "Mute mic";
+      muteButton.setAttribute("aria-pressed", effect.value ? "true" : "false");
+      if (captureNode) {
+        captureNode.port.postMessage({ type: "mute", value: effect.value });
+      }
       break;
     case "error":
       showError(effect.code);
@@ -161,26 +193,21 @@ function applyEffect(effect) {
   }
 }
 
-function writeTurn(role, text, existing) {
-  const item = existing || document.createElement("li");
-  item.className = role;
-  item.textContent = text;
-  if (!existing) {
+function writeTurn(role, text) {
+  let item = renderers.get(role);
+  if (!item) {
+    item = document.createElement("li");
+    item.className = role;
     transcriptNode.appendChild(item);
+    renderers.set(role, item);
   }
-  return item;
-}
-
-function setMuted(next) {
-  muted = next;
-  muteButton.textContent = muted ? "Unmute mic" : "Mute mic";
-  if (captureNode) {
-    captureNode.port.postMessage({ type: "mute", value: muted });
+  item.textContent = text;
+  if (session[role === "user" ? "userOpen" : "assistantOpen"] === null) {
+    renderers.delete(role);
   }
-}
-
-function setStatus(value) {
-  statusNode.textContent = value;
+  while (transcriptNode.children.length > MAX_VISIBLE_TURNS) {
+    transcriptNode.removeChild(transcriptNode.firstElementChild);
+  }
 }
 
 function showError(code) {
@@ -193,14 +220,25 @@ function hideError() {
   errorNode.textContent = "";
 }
 
+function stopTracks(stream) {
+  if (!stream) {
+    return;
+  }
+  for (const track of stream.getTracks()) {
+    track.stop();
+  }
+}
+
 function stopSession() {
   if (stopped && !socket && !mediaStream) {
     return;
   }
   stopped = true;
-  if (socket) {
-    socket.close();
-    socket = null;
+  applyAll(session.stop());
+  const current = socket;
+  socket = null;
+  if (current) {
+    current.close();
   }
   if (captureNode) {
     captureNode.port.onmessage = null;
@@ -208,16 +246,11 @@ function stopSession() {
     captureNode = null;
   }
   if (playbackNode) {
-    playbackNode.port.postMessage({ type: "clear" });
     playbackNode.disconnect();
     playbackNode = null;
   }
-  if (mediaStream) {
-    for (const track of mediaStream.getTracks()) {
-      track.stop();
-    }
-    mediaStream = null;
-  }
+  stopTracks(mediaStream);
+  mediaStream = null;
   if (captureContext) {
     captureContext.close();
     captureContext = null;
@@ -229,9 +262,6 @@ function stopSession() {
   startButton.disabled = false;
   stopButton.disabled = true;
   muteButton.disabled = true;
-  muted = false;
   muteButton.textContent = "Mute mic";
-  if (statusNode.textContent !== "idle") {
-    setStatus("idle");
-  }
+  muteButton.setAttribute("aria-pressed", "false");
 }

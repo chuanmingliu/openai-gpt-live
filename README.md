@@ -252,7 +252,7 @@ The local gateway exercises authenticated speech sessions. The local worker exer
 
 ## Local browser demo (custom GPT-Live client)
 
-A loopback BFF in `demo/live-client` streams 24 kHz microphone PCM through `live-gateway` to the speech-to-speech service and plays assistant audio. DeepSeek remains the worker reasoner; the browser never receives the bearer.
+A fail-closed BFF in `demo/live-client` streams 24 kHz microphone PCM through `live-gateway` to the speech-to-speech service and plays assistant audio. DeepSeek remains the worker reasoner; the browser never receives the bearer. Local mode binds loopback only. Production mode (`-mode production`) requires HTTPS and TLS files or `-behind-ingress`.
 
 ```sh
 export LIVE_DEMO_BEARER="$LIVE_STATIC_BEARER_TOKEN"

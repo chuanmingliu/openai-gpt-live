@@ -6,18 +6,28 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     this.queue = [];
     this.offset = 0;
     this.playing = false;
+    this.generation = 0;
     this.port.onmessage = (event) => {
       const message = event.data || {};
+      if (message.type === "clear") {
+        this.generation = Number(message.generation) || this.generation + 1;
+        this.queue = [];
+        this.offset = 0;
+        this.setPlaying(false);
+        return;
+      }
       if (message.type === "append" && message.pcm) {
+        if (message.generation !== undefined) {
+          if (this.generation === 0) {
+            this.generation = message.generation;
+          } else if (message.generation !== this.generation) {
+            return;
+          }
+        }
         const samples = new Int16Array(message.pcm);
         if (this.queuedSamples() + samples.length <= MAX_SAMPLES) {
           this.queue.push(samples);
         }
-      }
-      if (message.type === "clear") {
-        this.queue = [];
-        this.offset = 0;
-        this.setPlaying(false);
       }
     };
   }

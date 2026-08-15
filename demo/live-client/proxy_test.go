@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/stretchr/testify/assert"
@@ -35,6 +36,56 @@ func TestProxyRejectsBinaryAndOversizedFrames(t *testing.T) {
 	oversized := dialDemo(t, demo.URL, "http://127.0.0.1:3000")
 	require.NoError(t, oversized.Write(t.Context(), websocket.MessageText, make([]byte, (64<<10)+1)))
 	_, _, err = oversized.Read(t.Context())
+	require.Error(t, err)
+}
+
+func TestIdleWatchCancelsWithoutTraffic(t *testing.T) {
+	ctx, _, stop := withIdle(context.Background(), 20*time.Millisecond)
+	defer stop()
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("idle did not fire")
+	}
+}
+
+func TestIdleWatchResetKeepsAlive(t *testing.T) {
+	ctx, bump, stop := withIdle(context.Background(), 40*time.Millisecond)
+	defer stop()
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for i := 0; i < 8; i++ {
+			bump()
+			<-ticker.C
+		}
+		close(done)
+	}()
+	select {
+	case <-ctx.Done():
+		t.Fatal("idle fired while traffic continued")
+	case <-done:
+	}
+}
+
+func TestDrainCancelsActiveProxy(t *testing.T) {
+	upstream, _ := newEchoUpstream(t, "Bearer sentinel")
+	cfg, err := parseConfig(nil)
+	require.NoError(t, err)
+	rt, err := newRuntime(cfg, []byte("sentinel"), func(ctx context.Context, endpoint *url.URL, header http.Header) (*websocket.Conn, error) {
+		conn, _, err := websocket.Dial(ctx, wsURL(upstream.URL), &websocket.DialOptions{HTTPHeader: header})
+		return conn, err
+	})
+	require.NoError(t, err)
+	server := httptest.NewServer(rt.handler())
+	t.Cleanup(server.Close)
+	conn := dialDemo(t, server.URL, "http://127.0.0.1:3000")
+	require.Equal(t, 1, rt.sessions.Active())
+	rt.sessions.BeginDrain()
+	readCtx, cancelRead := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancelRead()
+	_, _, err = conn.Read(readCtx)
 	require.Error(t, err)
 }
 

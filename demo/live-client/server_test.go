@@ -17,7 +17,7 @@ import (
 
 func TestStaticAssetsCarryStrictHeaders(t *testing.T) {
 	handler := mustTestHandler(t, nil)
-	for _, path := range []string{"/", "/styles.css", "/app.js", "/audio-core.mjs", "/capture-worklet.js", "/playback-worklet.js"} {
+	for _, path := range []string{"/", "/styles.css", "/app.js", "/audio-core.mjs", "/capture-worklet.js", "/playback-worklet.js", "/session-controller.mjs"} {
 		request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:3000"+path, nil)
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, request)
@@ -25,6 +25,11 @@ func TestStaticAssetsCarryStrictHeaders(t *testing.T) {
 		assert.Contains(t, response.Header().Get("Content-Security-Policy"), "default-src 'self'")
 		assert.Equal(t, "nosniff", response.Header().Get("X-Content-Type-Options"))
 		assert.Equal(t, "no-store", response.Header().Get("Cache-Control"))
+		assert.Equal(t, "DENY", response.Header().Get("X-Frame-Options"))
+		assert.Equal(t, "same-origin", response.Header().Get("Cross-Origin-Resource-Policy"))
+		assert.Empty(t, response.Header().Get("Strict-Transport-Security"))
+		assert.NotContains(t, response.Body.String(), "LIVE_DEMO_BEARER")
+		assert.NotContains(t, response.Body.String(), "Authorization")
 	}
 }
 
@@ -35,6 +40,106 @@ func TestHealthReadyIsContentFree(t *testing.T) {
 	handler.ServeHTTP(response, request)
 	assert.Equal(t, http.StatusOK, response.Code)
 	assert.Equal(t, "ready\n", response.Body.String())
+}
+
+func TestHealthLiveIsIndependentOfReady(t *testing.T) {
+	rt := mustTestRuntime(t, nil)
+	rt.sessions.BeginDrain()
+	live := httptest.NewRecorder()
+	rt.handler().ServeHTTP(live, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:3000/health/live", nil))
+	assert.Equal(t, http.StatusOK, live.Code)
+	ready := httptest.NewRecorder()
+	rt.handler().ServeHTTP(ready, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:3000/health/ready", nil))
+	assert.Equal(t, http.StatusServiceUnavailable, ready.Code)
+}
+
+func TestFaviconIsContentFree(t *testing.T) {
+	handler := mustTestHandler(t, nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:3000/favicon.ico", nil))
+	assert.Equal(t, http.StatusNoContent, response.Code)
+	assert.Empty(t, response.Body.String())
+}
+
+func TestStaticAssetsDoNotServeTests(t *testing.T) {
+	handler := mustTestHandler(t, nil)
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:3000/audio-core.test.mjs", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	assert.Equal(t, http.StatusNotFound, response.Code)
+}
+
+func TestWebSocketRejectsWhenDrainingBeforeDial(t *testing.T) {
+	var calls atomic.Int32
+	rt := mustTestRuntime(t, func(context.Context, *url.URL, http.Header) (*websocket.Conn, error) {
+		calls.Add(1)
+		return nil, errors.New("must not dial")
+	})
+	rt.sessions.BeginDrain()
+	server := httptest.NewServer(rt.handler())
+	t.Cleanup(server.Close)
+	header := http.Header{"Origin": []string{"http://127.0.0.1:3000"}}
+	_, response, err := websocket.Dial(t.Context(), wsURL(server.URL)+"/ws", &websocket.DialOptions{HTTPHeader: header})
+	require.Error(t, err)
+	require.NotNil(t, response)
+	assert.Equal(t, http.StatusServiceUnavailable, response.StatusCode)
+	assert.Zero(t, calls.Load())
+}
+
+func TestProductionHeadersIncludeHSTS(t *testing.T) {
+	cfg, err := parseConfig([]string{
+		"-mode", "production",
+		"-behind-ingress",
+		"-origin", "https://voice.example",
+		"-gateway-url", "wss://gateway.example/v1/realtime",
+		"-listen", "0.0.0.0:3000",
+	})
+	require.NoError(t, err)
+	rt, err := newRuntime(cfg, []byte("sentinel"), func(context.Context, *url.URL, http.Header) (*websocket.Conn, error) {
+		return nil, errors.New("unused dial")
+	})
+	require.NoError(t, err)
+	response := httptest.NewRecorder()
+	rt.handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "https://voice.example/", nil))
+	assert.Equal(t, http.StatusOK, response.Code)
+	assert.Contains(t, response.Header().Get("Strict-Transport-Security"), "max-age=31536000")
+	assert.Contains(t, response.Header().Get("Content-Security-Policy"), "wss://voice.example")
+}
+
+func TestWebSocketRejectsQueryBeforeDial(t *testing.T) {
+	var calls atomic.Int32
+	handler := mustTestHandler(t, func(context.Context, *url.URL, http.Header) (*websocket.Conn, error) {
+		calls.Add(1)
+		return nil, errors.New("must not dial")
+	})
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	header := http.Header{"Origin": []string{"http://127.0.0.1:3000"}}
+	_, response, err := websocket.Dial(t.Context(), wsURL(server.URL)+"/ws?token=1", &websocket.DialOptions{HTTPHeader: header})
+	require.Error(t, err)
+	require.NotNil(t, response)
+	assert.Equal(t, http.StatusBadRequest, response.StatusCode)
+	assert.Zero(t, calls.Load())
+}
+
+func TestWebSocketRejectsWhenAtCapacity(t *testing.T) {
+	var calls atomic.Int32
+	rt := mustTestRuntime(t, func(context.Context, *url.URL, http.Header) (*websocket.Conn, error) {
+		calls.Add(1)
+		return nil, errors.New("must not dial")
+	})
+	for i := 0; i < rt.cfg.MaxSessions; i++ {
+		_, ok := rt.sessions.Acquire(func() {})
+		require.True(t, ok)
+	}
+	server := httptest.NewServer(rt.handler())
+	t.Cleanup(server.Close)
+	header := http.Header{"Origin": []string{"http://127.0.0.1:3000"}}
+	_, response, err := websocket.Dial(t.Context(), wsURL(server.URL)+"/ws", &websocket.DialOptions{HTTPHeader: header})
+	require.Error(t, err)
+	require.NotNil(t, response)
+	assert.Equal(t, http.StatusServiceUnavailable, response.StatusCode)
+	assert.Zero(t, calls.Load())
 }
 
 func TestWebSocketRejectsForeignOriginBeforeDial(t *testing.T) {
@@ -55,6 +160,11 @@ func TestWebSocketRejectsForeignOriginBeforeDial(t *testing.T) {
 
 func mustTestHandler(t *testing.T, dial dialUpstream) http.Handler {
 	t.Helper()
+	return mustTestRuntime(t, dial).handler()
+}
+
+func mustTestRuntime(t *testing.T, dial dialUpstream) *runtime {
+	t.Helper()
 	cfg, err := parseConfig(nil)
 	require.NoError(t, err)
 	if dial == nil {
@@ -62,9 +172,9 @@ func mustTestHandler(t *testing.T, dial dialUpstream) http.Handler {
 			return nil, errors.New("unused dial")
 		}
 	}
-	handler, err := newHandler(cfg, []byte("sentinel"), dial)
+	rt, err := newRuntime(cfg, []byte("sentinel"), dial)
 	require.NoError(t, err)
-	return handler
+	return rt
 }
 
 func wsURL(raw string) string {

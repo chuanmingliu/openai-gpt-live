@@ -32,6 +32,76 @@ func TestParseConfigRejectsUnsafeNetworkAndURLInputs(t *testing.T) {
 	}
 }
 
+func TestParseConfigRejectsProductionWithoutTLSOrIngress(t *testing.T) {
+	_, err := parseConfig([]string{
+		"-mode", "production",
+		"-origin", "https://voice.example",
+		"-gateway-url", "wss://gateway.example/v1/realtime",
+		"-listen", "0.0.0.0:3000",
+	})
+	require.Error(t, err)
+}
+
+func TestParseConfigAcceptsProductionBehindIngress(t *testing.T) {
+	cfg, err := parseConfig([]string{
+		"-mode", "production",
+		"-behind-ingress",
+		"-origin", "https://voice.example",
+		"-gateway-url", "wss://gateway.example/v1/realtime",
+		"-listen", "0.0.0.0:3000",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, modeProduction, cfg.Mode)
+	assert.True(t, cfg.BehindIngress)
+}
+
+func TestParseConfigRejectsLocalNonLoopbackGateway(t *testing.T) {
+	_, err := parseConfig([]string{"-gateway-url", "ws://10.0.0.8/v1/realtime"})
+	require.Error(t, err)
+}
+
+func TestParseConfigRejectsProductionPublicPlaintextAndSplitTLS(t *testing.T) {
+	_, err := parseConfig([]string{
+		"-mode", "production",
+		"-behind-ingress",
+		"-origin", "https://voice.example",
+		"-gateway-url", "ws://203.0.113.8/v1/realtime",
+		"-listen", "0.0.0.0:3000",
+	})
+	require.Error(t, err)
+	_, err = parseConfig([]string{
+		"-mode", "production",
+		"-origin", "https://voice.example",
+		"-gateway-url", "wss://gateway.example/v1/realtime",
+		"-listen", "0.0.0.0:3000",
+		"-tls-cert", "cert.pem",
+	})
+	require.Error(t, err)
+	_, err = parseConfig([]string{
+		"-mode", "production",
+		"-behind-ingress",
+		"-origin", "http://voice.example",
+		"-gateway-url", "wss://gateway.example/v1/realtime",
+		"-listen", "0.0.0.0:3000",
+	})
+	require.Error(t, err)
+}
+
+func TestParseConfigAcceptsProductionTLSFiles(t *testing.T) {
+	cfg, err := parseConfig([]string{
+		"-mode", "production",
+		"-origin", "https://voice.example",
+		"-gateway-url", "wss://gateway.example/v1/realtime",
+		"-listen", "0.0.0.0:3000",
+		"-tls-cert", "cert.pem",
+		"-tls-key", "key.pem",
+		"-max-sessions", "64",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 64, cfg.MaxSessions)
+	assert.False(t, cfg.BehindIngress)
+}
+
 func TestResolveBearerRequiresNonemptyBoundedValueWithoutEchoingIt(t *testing.T) {
 	cfg, err := parseConfig(nil)
 	require.NoError(t, err)

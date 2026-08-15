@@ -16,6 +16,14 @@ test("transcript deltas finalize once despite duplicate done", () => {
   assert.deepEqual(duplicate, []);
 });
 
+test("accumulated transcript drafts fail closed", () => {
+  const state = new ProtocolState();
+  const chunk = "x".repeat(32 * 1024);
+  state.consume({ type: "response.output_text.delta", response_id: "r1", delta: chunk });
+  const overflow = state.consume({ type: "response.output_text.delta", response_id: "r1", delta: chunk + "y" });
+  assert.deepEqual(overflow, [{ type: "error", code: "invalid-transcript" }]);
+});
+
 test("audio and assistant transcript events are classified without retaining raw envelopes", () => {
   const state = new ProtocolState();
   assert.deepEqual(state.consume({ type: "response.output_audio.delta", delta: "AAA=" }), [{ type: "audio", encoded: "AAA=" }]);

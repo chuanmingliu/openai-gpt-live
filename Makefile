@@ -93,4 +93,4 @@ demo-live-client:
 
 test-demo-live-client:
 	go test -race -count=1 ./demo/live-client
-	node --test demo/live-client/web/audio-core.test.mjs demo/live-client/web/protocol-state.test.mjs
+	node --test demo/live-client/web/*.test.mjs

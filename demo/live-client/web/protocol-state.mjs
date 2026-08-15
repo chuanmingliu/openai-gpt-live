@@ -1,6 +1,7 @@
 const MAX_IDS = 64;
 const MAX_ID_BYTES = 256;
 const MAX_TEXT_BYTES = 64 * 1024;
+const MAX_DRAFT_BYTES = 64 * 1024;
 
 export class ProtocolState {
   constructor() {
@@ -60,6 +61,9 @@ export class ProtocolState {
       return [];
     }
     const next = (this.userDrafts.get(id) || "") + text;
+    if (next.length > MAX_DRAFT_BYTES) {
+      return [{ type: "error", code: "invalid-transcript" }];
+    }
     remember(this.userDrafts, id, next);
     return [{ type: "user-delta", text: next }];
   }
@@ -84,6 +88,9 @@ export class ProtocolState {
       return [];
     }
     const next = (this.assistantDrafts.get(id) || "") + text;
+    if (next.length > MAX_DRAFT_BYTES) {
+      return [{ type: "error", code: "invalid-transcript" }];
+    }
     remember(this.assistantDrafts, id, next);
     return [{ type: "assistant-delta", text: next }];
   }
