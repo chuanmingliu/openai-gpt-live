@@ -1,4 +1,4 @@
-.PHONY: test test-race vet fmt verify-deploy verify-deploy-static smoke-deploy load-unit chaos capacity barge soak load-smoke load-evidence release-gate release-gate-verify
+.PHONY: test test-race vet fmt verify-deploy verify-deploy-static smoke-deploy load-unit chaos capacity barge soak load-smoke load-evidence release-gate release-gate-verify demo-live-client test-demo-live-client
 
 test:
 	go test ./...
@@ -86,3 +86,11 @@ release-gate-verify:
 		--evidence-out "$(RELEASE_EVIDENCE_OUT)" \
 		--attestation "$$RELEASE_ATTESTATION_FILE" \
 		--attestation-key "$$RELEASE_ATTESTATION_KEY"
+
+demo-live-client:
+	@test -n "$$LIVE_DEMO_BEARER"
+	go run ./demo/live-client
+
+test-demo-live-client:
+	go test -race -count=1 ./demo/live-client
+	node --test demo/live-client/web/audio-core.test.mjs demo/live-client/web/protocol-state.test.mjs

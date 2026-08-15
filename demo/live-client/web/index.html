@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Custom GPT-Live</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <p class="eyebrow">Custom GPT-Live</p>
+      <h1>Speech-to-speech + DeepSeek</h1>
+      <p class="lede">Loopback demo. The browser never sees the gateway bearer. Audio stays 24 kHz PCM through the local BFF.</p>
+    </header>
+    <section class="controls" aria-label="Session controls">
+      <button id="start" type="button">Start</button>
+      <button id="stop" type="button" disabled>Stop</button>
+      <button id="mute" type="button" disabled>Mute mic</button>
+    </section>
+    <p id="status" class="status" aria-live="polite">idle</p>
+    <p id="error" class="error" hidden aria-live="polite"></p>
+    <section class="transcript-wrap">
+      <h2>Transcript</h2>
+      <ol id="transcript"></ol>
+    </section>
+  </main>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

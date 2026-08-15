@@ -250,6 +250,21 @@ go run ./cmd/live-worker -config configs/worker.example.yaml
 
 The local gateway exercises authenticated speech sessions. The local worker exercises the adapter/lease runtime, but the full gateway-to-worker handoff path remains production-only as described above.
 
+## Local browser demo (custom GPT-Live client)
+
+A loopback BFF in `demo/live-client` streams 24 kHz microphone PCM through `live-gateway` to the speech-to-speech service and plays assistant audio. DeepSeek remains the worker reasoner; the browser never receives the bearer.
+
+```sh
+export LIVE_DEMO_BEARER="$LIVE_STATIC_BEARER_TOKEN"
+make demo-live-client
+```
+
+Open `http://127.0.0.1:3000`. The default upstream is `ws://127.0.0.1:18080/v1/realtime?model=gpt-live-simulator`. See [demo/live-client/README.md](demo/live-client/README.md).
+
+```sh
+LIVE_DEMO_BEARER=test-only-bearer make test-demo-live-client
+```
+
 ## Run the local Compose topology
 
 The canonical topology is [deploy/docker-compose.yml](deploy/docker-compose.yml). PostgreSQL health gates the one-shot migration; gateway waits for migration completion and S2S startup, while worker independently waits for migration completion. It publishes only loopback ports.
