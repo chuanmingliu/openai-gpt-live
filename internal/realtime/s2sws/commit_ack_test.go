@@ -25,24 +25,25 @@ func newCommitAckTestSession(
 
 	ctx, cancel := context.WithCancel(context.Background())
 	session := &voiceSession{
-		ctx:              ctx,
-		cancel:           cancel,
-		writeMessage:     writeMessage,
-		closeHandshake:   func(websocket.StatusCode, string) error { return nil },
-		closeNow:         func() error { return nil },
-		maxFrameBytes:    1 << 20,
-		commitAckTimeout: timeout,
-		writes:           make(chan writeRequest, writeQueueCapacity),
-		closeWrites:      make(chan struct{}, 1),
-		reads:            make(chan socketRead),
-		correlations:     make(chan correlationRequest),
-		events:           make(chan realtime.Event, 8),
-		closing:          make(chan struct{}),
-		closeDone:        make(chan struct{}),
-		done:             make(chan struct{}),
-		responses:        make(map[string]*responseCorrelation),
-		pending:          make(map[identity.ResponseEpoch]struct{}),
-		cancelledPending: make(map[identity.ResponseEpoch]identity.ResponseEpoch),
+		ctx:                ctx,
+		cancel:             cancel,
+		writeMessage:       writeMessage,
+		closeHandshake:     func(websocket.StatusCode, string) error { return nil },
+		closeNow:           func() error { return nil },
+		maxFrameBytes:      1 << 20,
+		commitAckTimeout:   timeout,
+		writes:             make(chan writeRequest, writeQueueCapacity),
+		closeWrites:        make(chan struct{}, 1),
+		reads:              make(chan socketRead),
+		correlations:       make(chan correlationRequest),
+		events:             make(chan realtime.Event, 8),
+		closing:            make(chan struct{}),
+		closeDone:          make(chan struct{}),
+		done:               make(chan struct{}),
+		responses:          make(map[string]*responseCorrelation),
+		pending:            make(map[identity.ResponseEpoch]struct{}),
+		cancelledPending:   make(map[identity.ResponseEpoch]identity.ResponseEpoch),
+		inputTurnConfirmed: realtime.InputTurnModeManual,
 	}
 	mappingDone := make(chan struct{})
 	go func() {
@@ -70,11 +71,19 @@ func newCommitAckTestSession(
 	return session
 }
 
+func resetInputTurnModeForTest(session *voiceSession) {
+	session.inputTurnMu.Lock()
+	session.inputTurnUpdatePending = false
+	session.inputTurnRequested = realtime.InputTurnModeUnspecified
+	session.inputTurnConfirmed = realtime.InputTurnModeUnspecified
+	session.inputTurnMu.Unlock()
+}
+
 func sendCommitAckTestRead(t *testing.T, session *voiceSession, raw string) {
 	t.Helper()
 	select {
 	case session.reads <- socketRead{
-		messageType: websocket.MessageText, raw: []byte(raw), sequence: session.readSequence.Add(1),
+		messageType: websocket.MessageText, raw: []byte(raw),
 	}:
 	case <-time.After(time.Second):
 		t.Fatal("mapping loop did not accept provider event")
@@ -114,7 +123,7 @@ func TestCommitAckTimeoutConfig(t *testing.T) {
 func TestCloneCommandOwnsInputItemID(t *testing.T) {
 	backing := []byte("owned-input")
 	command := realtime.Command{
-		Kind: realtime.CommandCommitAudio, InputItemID: unsafe.String(&backing[0], len(backing)),
+		Kind: realtime.CommandAcknowledgeAudioCommit, InputItemID: unsafe.String(&backing[0], len(backing)),
 	}
 	cloned := cloneCommand(command)
 	backing[0] = 'X'
@@ -205,7 +214,7 @@ func TestPendingCommitRejectsWithoutWriteAndAckReopens(t *testing.T) {
 	require.NoError(t, receiveErr)
 	require.Equal(t, realtime.EventInputAudioCommitted, event.Kind)
 	require.Equal(t, "input-a", event.ItemID)
-	require.True(t, event.InputAudioCommitCandidate)
+	require.Equal(t, uint64(1), event.InputAudioCommitSequence)
 	require.ErrorIs(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio, Sequence: 2}), ErrPendingAudioCommit,
 		"raw arrival cannot release the slot before semantic correlation")
 	authorizeCommitAck(t, session, "input-a", 1)
@@ -220,65 +229,15 @@ func TestPendingCommitRejectsWithoutWriteAndAckReopens(t *testing.T) {
 	authorizeCommitAck(t, session, "input-b", 2)
 }
 
-// TestPreRegistrationAckIsIneligibleForLaterCommit catches cross-loop
-// reordering where an older automatic ack is delivered to the reactor only
-// after a newer client commit has been applied. The transport's registration
-// boundary makes the older event ineligible and refuses its release control.
-func TestPreRegistrationAckIsIneligibleForLaterCommit(t *testing.T) {
+func TestManualCommittedWithoutPendingFailsClosed(t *testing.T) {
 	session := newCommitAckTestSession(t, time.Second, func(context.Context, websocket.MessageType, []byte) error { return nil })
 
-	sendCommitAckTestRead(t, session, `{"type":"input_audio_buffer.committed","event_id":"old-auto","item_id":"old-input","previous_item_id":null}`)
-	old, err := session.Receive(t.Context())
-	require.NoError(t, err)
-	require.False(t, old.InputAudioCommitCandidate)
-
-	require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio, Sequence: 1}))
-	err = session.Send(t.Context(), realtime.Command{
-		Kind: realtime.CommandAcknowledgeAudioCommit, InputItemID: "old-input", InputAudioCommitSequence: 1,
-	})
-	require.ErrorContains(t, err, "was not observed")
-	require.ErrorIs(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio, Sequence: 2}), ErrPendingAudioCommit)
-
-	sendCommitAckTestRead(t, session, `{"type":"input_audio_buffer.committed","event_id":"current","item_id":"current-input","previous_item_id":null}`)
-	current, err := session.Receive(t.Context())
-	require.NoError(t, err)
-	require.True(t, current.InputAudioCommitCandidate)
-	authorizeCommitAck(t, session, "current-input", 1)
+	sendCommitAckTestRead(t, session, `{"type":"input_audio_buffer.committed","event_id":"unsolicited","item_id":"input","previous_item_id":null}`)
+	_, err := session.Receive(t.Context())
+	require.ErrorContains(t, err, "has no pending commit")
 }
 
-func TestReadBufferedBeforeRegistrationRemainsIneligible(t *testing.T) {
-	for iteration := range 32 {
-		ctx, cancel := context.WithCancel(context.Background())
-		session := &voiceSession{
-			ctx: ctx, cancel: cancel, maxFrameBytes: 1 << 20, commitAckTimeout: time.Second,
-			reads: make(chan socketRead, 1), correlations: make(chan correlationRequest, 1),
-			events: make(chan realtime.Event, 1), closing: make(chan struct{}), done: make(chan struct{}),
-			responses: make(map[string]*responseCorrelation), pending: make(map[identity.ResponseEpoch]struct{}),
-			cancelledPending: make(map[identity.ResponseEpoch]identity.ResponseEpoch), closeNow: func() error { return nil },
-		}
-		session.readSequence.Store(1)
-		session.reads <- socketRead{
-			messageType: websocket.MessageText,
-			raw:         []byte(`{"type":"input_audio_buffer.committed","event_id":"buffered","item_id":"buffered","previous_item_id":null}`),
-			sequence:    1,
-		}
-		registered := make(chan error, 1)
-		session.correlations <- correlationRequest{
-			kind: correlationRegisterAudioCommit, ctx: context.Background(), inputAudioCommitSequence: 77, result: registered,
-		}
-		go session.mappingLoop()
-		require.NoError(t, <-registered, "iteration %d", iteration)
-		event, err := session.Receive(t.Context())
-		require.NoError(t, err, "iteration %d", iteration)
-		require.False(t, event.InputAudioCommitCandidate, "iteration %d", iteration)
-		require.Zero(t, event.InputAudioCommitSequence, "iteration %d", iteration)
-		session.publishTerminal(errors.New("watermark test cleanup"))
-		<-session.done
-		cancel()
-	}
-}
-
-func TestBufferedCandidateFromPriorSlotCannotAuthorizeNextSlot(t *testing.T) {
+func TestManualSlotRejectsMultipleFreshAcknowledgements(t *testing.T) {
 	session := newCommitAckTestSession(t, time.Second, func(context.Context, websocket.MessageType, []byte) error { return nil })
 
 	require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio, Sequence: 11}))
@@ -286,28 +245,9 @@ func TestBufferedCandidateFromPriorSlotCannotAuthorizeNextSlot(t *testing.T) {
 	sendCommitAckTestRead(t, session, `{"type":"input_audio_buffer.committed","event_id":"slot-one-b","item_id":"slot-one-b","previous_item_id":null}`)
 	first, err := session.Receive(t.Context())
 	require.NoError(t, err)
-	buffered, err := session.Receive(t.Context())
-	require.NoError(t, err)
 	require.Equal(t, uint64(11), first.InputAudioCommitSequence)
-	require.Equal(t, uint64(11), buffered.InputAudioCommitSequence)
-	require.NoError(t, session.Send(t.Context(), realtime.Command{
-		Kind: realtime.CommandAcknowledgeAudioCommit, InputItemID: first.ItemID, InputAudioCommitSequence: 11,
-	}))
-
-	require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio, Sequence: 22}))
-	err = session.Send(t.Context(), realtime.Command{
-		Kind: realtime.CommandAcknowledgeAudioCommit, InputItemID: buffered.ItemID, InputAudioCommitSequence: 11,
-	})
-	require.ErrorContains(t, err, "does not match pending generation")
-	require.ErrorIs(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio, Sequence: 23}), ErrPendingAudioCommit)
-
-	sendCommitAckTestRead(t, session, `{"type":"input_audio_buffer.committed","event_id":"slot-two","item_id":"slot-two","previous_item_id":null}`)
-	current, err := session.Receive(t.Context())
-	require.NoError(t, err)
-	require.Equal(t, uint64(22), current.InputAudioCommitSequence)
-	require.NoError(t, session.Send(t.Context(), realtime.Command{
-		Kind: realtime.CommandAcknowledgeAudioCommit, InputItemID: current.ItemID, InputAudioCommitSequence: 22,
-	}))
+	_, err = session.Receive(t.Context())
+	require.ErrorContains(t, err, "multiple acknowledgements")
 }
 
 // TestCommitAckStopsDeadline catches a stale timer terminating a healthy
@@ -344,8 +284,8 @@ func TestCommitAckTimeoutDrainsAcceptedFIFO(t *testing.T) {
 	session.events <- realtime.Event{Kind: realtime.EventSessionUpdated, ProviderEventID: "accepted-prefix"}
 
 	require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio, Sequence: 1}))
-	sendCommitAckTestRead(t, session, `{"type":"input_audio_buffer.speech_started","event_id":"accepted-one","item_id":"input-one","audio_start_ms":1}`)
-	sendCommitAckTestRead(t, session, `{"type":"input_audio_buffer.speech_started","event_id":"accepted-two","item_id":"input-two","audio_start_ms":2}`)
+	sendCommitAckTestRead(t, session, `{"type":"session.created","event_id":"accepted-one","session":{}}`)
+	sendCommitAckTestRead(t, session, `{"type":"session.created","event_id":"accepted-two","session":{}}`)
 	// A synchronous request to the sole mapping owner proves both unbuffered
 	// reads were fully mapped, rather than merely handed to the loop.
 	require.NoError(t, session.correlate(t.Context(), correlationRequest{kind: correlationRegister, epoch: 1}))
@@ -376,20 +316,21 @@ func TestHistoricalAckCannotReleaseNewCommit(t *testing.T) {
 			return nil
 		})
 
-		// This auto-VAD acknowledgment predates the manual slot and must remain
-		// a tombstone even though no local commit was pending when it arrived.
-		sendCommitAckTestRead(t, session, `{"type":"input_audio_buffer.committed","event_id":"ack-a","item_id":"input-a","previous_item_id":"assistant-tail"}`)
-		_, err := session.Receive(t.Context())
-		require.NoError(t, err)
-
 		require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio, Sequence: 1}))
+		sendCommitAckTestRead(t, session, `{"type":"input_audio_buffer.committed","event_id":"ack-a","item_id":"input-a","previous_item_id":"assistant-tail"}`)
+		ack, err := session.Receive(t.Context())
+		require.NoError(t, err)
+		authorizeCommitAck(t, session, ack.ItemID, 1)
+
+		require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio, Sequence: 2}))
 		sendCommitAckTestRead(t, session, `{"type":"input_audio_buffer.committed","event_id":"ack-a-duplicate","item_id":"input-a","previous_item_id":"different-tool-tail"}`)
 		duplicate, err := session.Receive(t.Context())
 		require.NoError(t, err)
 		require.Equal(t, "input-a", duplicate.ItemID)
+		require.Zero(t, duplicate.InputAudioCommitSequence)
 
-		require.ErrorIs(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio, Sequence: 2}), ErrPendingAudioCommit)
-		require.Equal(t, int32(1), writes.Load())
+		require.ErrorIs(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio, Sequence: 3}), ErrPendingAudioCommit)
+		require.Equal(t, int32(2), writes.Load())
 		_, err = session.Receive(t.Context())
 		require.ErrorIs(t, err, ErrAudioCommitAckTimeout)
 	})
@@ -398,116 +339,55 @@ func TestHistoricalAckCannotReleaseNewCommit(t *testing.T) {
 		const timeout = 20 * time.Millisecond
 		session := newCommitAckTestSession(t, timeout, func(context.Context, websocket.MessageType, []byte) error { return nil })
 
-		sendCommitAckTestRead(t, session, `{"type":"input_audio_buffer.committed","event_id":"ack-a","item_id":"input-a","previous_item_id":null}`)
-		_, err := session.Receive(t.Context())
-		require.NoError(t, err)
 		require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio, Sequence: 1}))
+		sendCommitAckTestRead(t, session, `{"type":"input_audio_buffer.committed","event_id":"ack-a","item_id":"input-a","previous_item_id":null}`)
+		ack, err := session.Receive(t.Context())
+		require.NoError(t, err)
+		authorizeCommitAck(t, session, ack.ItemID, 1)
+		require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio, Sequence: 2}))
 
 		sendCommitAckTestRead(t, session, `{"type":"input_audio_buffer.committed","event_id":"ack-a-duplicate","item_id":"input-a","previous_item_id":"assistant-tail"}`)
-		_, err = session.Receive(t.Context())
+		duplicate, err := session.Receive(t.Context())
 		require.NoError(t, err)
+		require.Zero(t, duplicate.InputAudioCommitSequence)
 		sendCommitAckTestRead(t, session, `{"type":"input_audio_buffer.committed","event_id":"ack-c","item_id":"input-c","previous_item_id":"tool-tail"}`)
 		committed, err := session.Receive(t.Context())
 		require.NoError(t, err)
 		require.Equal(t, "input-c", committed.ItemID)
-		authorizeCommitAck(t, session, "input-c", 1)
+		authorizeCommitAck(t, session, "input-c", 2)
 
 		select {
 		case <-session.done:
 			t.Fatalf("new acknowledgment did not clear the later commit: %v", session.sessionError())
 		case <-time.After(3 * timeout):
 		}
-		require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio, Sequence: 2}))
+		require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio, Sequence: 3}))
 		sendCommitAckTestRead(t, session, `{"type":"input_audio_buffer.committed","event_id":"ack-d","item_id":"input-d","previous_item_id":null}`)
 		_, err = session.Receive(t.Context())
 		require.NoError(t, err)
-		authorizeCommitAck(t, session, "input-d", 2)
+		authorizeCommitAck(t, session, "input-d", 3)
 	})
 }
 
-// TestDifferentAutoCommitCannotReleaseKnownManualCommit catches an unrelated
-// automatic VAD commit cancelling the deadline for the sole manual slot. The
-// event is still delivered, but only the exact manual item reopens admission.
-func TestDifferentAutoCommitCannotReleaseKnownManualCommit(t *testing.T) {
-	const timeout = 100 * time.Millisecond
-	session := newCommitAckTestSession(t, timeout, func(context.Context, websocket.MessageType, []byte) error { return nil })
-
-	require.NoError(t, session.Send(t.Context(), realtime.Command{
-		Kind: realtime.CommandCommitAudio, Sequence: 1, InputItemID: "manual-input",
-	}))
-	sendCommitAckTestRead(t, session, `{"type":"input_audio_buffer.committed","event_id":"auto-ack","item_id":"auto-input","previous_item_id":null}`)
-	auto, err := session.Receive(t.Context())
-	require.NoError(t, err)
-	require.Equal(t, "auto-input", auto.ItemID)
-	require.False(t, auto.InputAudioCommitCandidate)
-	require.ErrorIs(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio, Sequence: 2}), ErrPendingAudioCommit)
-
-	sendCommitAckTestRead(t, session, `{"type":"input_audio_buffer.committed","event_id":"manual-ack","item_id":"manual-input","previous_item_id":"tool-tail"}`)
-	manual, err := session.Receive(t.Context())
-	require.NoError(t, err)
-	require.Equal(t, "manual-input", manual.ItemID)
-	require.True(t, manual.InputAudioCommitCandidate)
-	authorizeCommitAck(t, session, "manual-input", 1)
-	require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio, Sequence: 2}))
-	sendCommitAckTestRead(t, session, `{"type":"input_audio_buffer.committed","event_id":"next-ack","item_id":"next-input","previous_item_id":null}`)
-	_, err = session.Receive(t.Context())
-	require.NoError(t, err)
-	authorizeCommitAck(t, session, "next-input", 2)
-}
-
-// TestKnownManualItemMayReuseHistoricalAckID catches tombstones overriding an
-// explicit fresh speech generation. Provider item IDs may be reused after a
-// new speech_started edge, so an exact live binding is stronger than history.
-func TestKnownManualItemMayReuseHistoricalAckID(t *testing.T) {
-	const timeout = 100 * time.Millisecond
-	session := newCommitAckTestSession(t, timeout, func(context.Context, websocket.MessageType, []byte) error { return nil })
-
-	sendCommitAckTestRead(t, session, `{"type":"input_audio_buffer.committed","event_id":"old-ack","item_id":"reused-input","previous_item_id":null}`)
-	_, err := session.Receive(t.Context())
-	require.NoError(t, err)
-
-	require.NoError(t, session.Send(t.Context(), realtime.Command{
-		Kind: realtime.CommandCommitAudio, Sequence: 1, InputItemID: "reused-input",
-	}))
-	sendCommitAckTestRead(t, session, `{"type":"input_audio_buffer.committed","event_id":"fresh-ack","item_id":"reused-input","previous_item_id":"assistant-tail"}`)
-	_, err = session.Receive(t.Context())
-	require.NoError(t, err)
-	authorizeCommitAck(t, session, "reused-input", 1)
-	require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio, Sequence: 2}))
-	sendCommitAckTestRead(t, session, `{"type":"input_audio_buffer.committed","event_id":"next-ack","item_id":"next-input","previous_item_id":null}`)
-	_, err = session.Receive(t.Context())
-	require.NoError(t, err)
-	authorizeCommitAck(t, session, "next-input", 2)
-}
-
-// TestSemanticAckReleasesUnknownManualCommit catches the same deadline leak
-// when the provider supplies the manual item's exact ID only after the commit
-// was sent. Raw speech/commit arrival cannot replace reactor authorization.
-func TestSemanticAckReleasesUnknownManualCommit(t *testing.T) {
+func TestHistoricalManualItemIDCannotBeReused(t *testing.T) {
 	const timeout = 100 * time.Millisecond
 	session := newCommitAckTestSession(t, timeout, func(context.Context, websocket.MessageType, []byte) error { return nil })
 
 	require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio, Sequence: 1}))
-	sendCommitAckTestRead(t, session, `{"type":"input_audio_buffer.speech_started","event_id":"speech-manual","item_id":"manual-input","audio_start_ms":1}`)
-	_, err := session.Receive(t.Context())
+	sendCommitAckTestRead(t, session, `{"type":"input_audio_buffer.committed","event_id":"old-ack","item_id":"reused-input","previous_item_id":null}`)
+	old, err := session.Receive(t.Context())
 	require.NoError(t, err)
-	sendCommitAckTestRead(t, session, `{"type":"input_audio_buffer.speech_started","event_id":"speech-auto","item_id":"auto-input","audio_start_ms":2}`)
-	_, err = session.Receive(t.Context())
-	require.NoError(t, err)
-	sendCommitAckTestRead(t, session, `{"type":"input_audio_buffer.committed","event_id":"auto-ack","item_id":"auto-input","previous_item_id":null}`)
-	_, err = session.Receive(t.Context())
-	require.NoError(t, err)
-	require.ErrorIs(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio, Sequence: 2}), ErrPendingAudioCommit)
+	authorizeCommitAck(t, session, old.ItemID, 1)
 
-	sendCommitAckTestRead(t, session, `{"type":"input_audio_buffer.committed","event_id":"manual-ack","item_id":"manual-input","previous_item_id":null}`)
-	_, err = session.Receive(t.Context())
-	require.NoError(t, err)
-	authorizeCommitAck(t, session, "manual-input", 1)
 	require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio, Sequence: 2}))
-	sendCommitAckTestRead(t, session, `{"type":"input_audio_buffer.committed","event_id":"next-ack","item_id":"next-input","previous_item_id":null}`)
-	_, err = session.Receive(t.Context())
+	sendCommitAckTestRead(t, session, `{"type":"input_audio_buffer.committed","event_id":"fresh-ack","item_id":"reused-input","previous_item_id":"assistant-tail"}`)
+	duplicate, err := session.Receive(t.Context())
 	require.NoError(t, err)
-	authorizeCommitAck(t, session, "next-input", 2)
+	require.Zero(t, duplicate.InputAudioCommitSequence)
+	err = session.Send(t.Context(), realtime.Command{
+		Kind: realtime.CommandAcknowledgeAudioCommit, InputItemID: "reused-input", InputAudioCommitSequence: 2,
+	})
+	require.ErrorContains(t, err, "was not observed")
 }
 
 // TestAudioCommitAckHistoryExactBoundary catches eviction, off-by-one

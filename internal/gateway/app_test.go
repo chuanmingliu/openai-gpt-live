@@ -745,6 +745,7 @@ func TestRunDrainsWebSocketsOnSignalAndAdminTrigger(t *testing.T) {
 			gatewayClient.expectType("session.created")
 			voice, err := connector.NextSession(dialContext)
 			require.NoError(t, err)
+			configureGatewayInputTurnMode(t, gatewayClient, voice, json.RawMessage(`null`), realtime.InputTurnModeManual)
 
 			if trigger == "signal" {
 				cancelRun()
@@ -905,6 +906,40 @@ func emit(t *testing.T, voice *testkit.FakeVoiceSession, event realtime.Event) {
 	require.NoError(t, voice.Emit(ctx, event))
 }
 
+func configureGatewayInputTurnMode(
+	t *testing.T,
+	client *gatewayClient,
+	voice *testkit.FakeVoiceSession,
+	turnDetection json.RawMessage,
+	mode realtime.InputTurnMode,
+) uint64 {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{
+		"type": "session.update",
+		"session": map[string]any{
+			"type": "realtime",
+			"audio": map[string]any{
+				"input": map[string]any{"turn_detection": turnDetection},
+			},
+		},
+	})
+	require.NoError(t, err)
+	client.write(raw)
+	update := nextCommand(t, voice)
+	require.Equal(t, realtime.CommandSessionUpdate, update.Kind)
+	require.JSONEq(t, string(turnDetection), string(update.Session.TurnDetection))
+	emit(t, voice, realtime.Event{
+		Kind:                         realtime.EventSessionUpdated,
+		ProviderEventID:              "provider-input-turn-mode-confirmed",
+		InputTurnMode:                mode,
+		InputTurnModeSpecified:       true,
+		SessionUpdateAcknowledgement: true,
+		SessionUpdateSequence:        update.Sequence,
+	})
+	client.expectType("session.updated")
+	return update.Sequence
+}
+
 func establishResponse(t *testing.T, client *gatewayClient, voice *testkit.FakeVoiceSession) {
 	t.Helper()
 	// The provider connector marks unsolicited response.created events for an
@@ -922,6 +957,7 @@ func establishResponse(t *testing.T, client *gatewayClient, voice *testkit.FakeV
 func TestGatewayAudioVerticalSlice(t *testing.T) {
 	client, voice := startGatewayHarness(t)
 	client.expectType("session.created")
+	configureGatewayInputTurnMode(t, client, voice, json.RawMessage(`null`), realtime.InputTurnModeManual)
 	client.appendPCM(testkit.RampPCM(1_920))
 	client.commitAudio()
 	first := nextCommand(t, voice)
@@ -948,13 +984,33 @@ func TestGatewayAudioVerticalSlice(t *testing.T) {
 func TestGatewayFeatureOffKeepsSessionUpdatesTranscriptsAndReservedLookingProviderCallsOrdinary(t *testing.T) {
 	client, voice := startGatewayHarness(t)
 	client.expectType("session.created")
+	configureGatewayInputTurnMode(t, client, voice, json.RawMessage(`null`), realtime.InputTurnModeManual)
 	client.write([]byte(`{"type":"session.update","session":{"type":"realtime","tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]}}`))
 	update := nextCommand(t, voice)
 	require.Equal(t, realtime.CommandSessionUpdate, update.Kind)
 	require.Len(t, update.Session.Tools, 1)
 	assert.Equal(t, "lookup", update.Session.Tools[0].Name)
+	emit(t, voice, realtime.Event{
+		Kind:                         realtime.EventSessionUpdated,
+		ProviderEventID:              "provider-tools-confirmed",
+		SessionUpdateAcknowledgement: true,
+		SessionUpdateSequence:        update.Sequence,
+	})
 	client.expectType("session.updated")
 
+	client.appendPCM(testkit.RampPCM(960))
+	appendCommand := nextCommand(t, voice)
+	require.Equal(t, realtime.CommandAppendAudio, appendCommand.Kind)
+	client.commitAudio()
+	commit := nextCommand(t, voice)
+	require.Equal(t, realtime.CommandCommitAudio, commit.Kind)
+	emit(t, voice, realtime.Event{
+		Kind: realtime.EventInputAudioCommitted, ProviderEventID: "provider-commit-disabled",
+		ItemID: "user-turn-disabled", InputAudioCommitSequence: commit.Sequence,
+	})
+	acknowledgement := nextCommand(t, voice)
+	require.Equal(t, realtime.CommandAcknowledgeAudioCommit, acknowledgement.Kind)
+	client.expectType("input_audio_buffer.committed")
 	emit(t, voice, realtime.Event{
 		Kind: realtime.EventTranscriptionCompleted, ProviderEventID: "provider-transcript-disabled",
 		ItemID: "user-turn-disabled", Text: "ordinary transcript",
@@ -978,6 +1034,7 @@ func TestGatewayFeatureOffKeepsSessionUpdatesTranscriptsAndReservedLookingProvid
 func TestGatewayDropsLateAudioFromInterruptedEpoch(t *testing.T) {
 	client, voice := startGatewayHarness(t)
 	client.expectType("session.created")
+	configureGatewayInputTurnMode(t, client, voice, json.RawMessage(`{"type":"server_vad"}`), realtime.InputTurnModeProviderVAD)
 	establishResponse(t, client, voice)
 	emit(t, voice, realtime.Event{Kind: realtime.EventSpeechStarted, ProviderEventID: "provider-speech-started", ItemID: "user-item"})
 	emit(t, voice, realtime.Event{

@@ -538,15 +538,16 @@ func (b *voiceSendBarrier) wait(ctx context.Context) error {
 }
 
 type clientControl struct {
-	order              uint64
-	afterSeq           uint64
-	afterVoice         *voiceSendBarrier
-	event              protocol.ServerEvent
-	close              *CloseEffect
-	completionSequence uint64
-	writeCtx           context.Context
-	epoch              identity.ResponseEpoch
-	incarnation        identity.Incarnation
+	order                 uint64
+	afterSeq              uint64
+	afterVoice            *voiceSendBarrier
+	event                 protocol.ServerEvent
+	inputTurnModeBoundary realtime.InputTurnMode
+	close                 *CloseEffect
+	completionSequence    uint64
+	writeCtx              context.Context
+	epoch                 identity.ResponseEpoch
+	incarnation           identity.Incarnation
 }
 
 type durableEffectControl struct {
@@ -2806,6 +2807,11 @@ func (s *runState) clientReader(ctx context.Context) error {
 				// this session incarnation.
 				return true, nil
 			case protocol.InputAudioBufferAppendEvent:
+				if s.currentInputTurnMode() == realtime.InputTurnModeUnspecified {
+					return true, s.enqueueClientControl(clientControl{event: s.inputAudioModeError(
+						"input_turn_mode_unconfirmed", "input turn mode is awaiting provider confirmation",
+					)})
+				}
 				pcm, decodeErr := protocol.DecodePCM24k(typed, s.cfg.IngressFrames*pcmFrameBytes)
 				if decodeErr != nil {
 					return false, decodeErr
@@ -2824,6 +2830,17 @@ func (s *runState) clientReader(ctx context.Context) error {
 					}
 				}
 			case protocol.InputAudioBufferCommitEvent:
+				mode := s.currentInputTurnMode()
+				if mode == realtime.InputTurnModeUnspecified {
+					return true, s.enqueueClientControl(clientControl{event: s.inputAudioModeError(
+						"input_turn_mode_unconfirmed", "input turn mode is awaiting provider confirmation",
+					)})
+				}
+				if mode != realtime.InputTurnModeManual {
+					return true, s.enqueueClientControl(clientControl{event: s.inputAudioModeError(
+						"manual_audio_commit_disabled", "manual input audio commit is disabled by provider VAD",
+					)})
+				}
 				if !s.commitPending.CompareAndSwap(false, true) {
 					return true, s.enqueueClientControl(clientControl{event: protocol.ErrorEvent{
 						Type:    "error",
@@ -2866,6 +2883,23 @@ func (s *runState) clientReader(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+	}
+}
+
+func (s *runState) currentInputTurnMode() realtime.InputTurnMode {
+	s.boundaryMu.RLock()
+	mode := s.boundary.InputTurnMode
+	s.boundaryMu.RUnlock()
+	return mode
+}
+
+func (s *runState) inputAudioModeError(code, message string) protocol.ErrorEvent {
+	return protocol.ErrorEvent{
+		Type:    "error",
+		EventID: s.nextManagerEventID(),
+		Error: protocol.ProtocolError{
+			Type: "invalid_request_error", Code: code, Message: message,
+		},
 	}
 }
 
@@ -3266,6 +3300,9 @@ func (s *runState) enqueueEgress(ctx context.Context, event realtime.Event, audi
 
 func (s *runState) reactorLoop(ctx context.Context) error {
 	reactor := newReactorWithPresentationAndHandoffTools(s.ids, s.fence, s.cfg.PresentationPolicy, s.cfg.SafetyPolicy, s.cfg.HandoffToolsEnabled)
+	if err := reactor.expectInitialInputTurnMode(s.cfg.InitialSession.TurnDetection); err != nil {
+		return fmt.Errorf("initial input turn mode: %w", err)
+	}
 	reactor.deferPresentationSafety = s.runtime != nil
 	var deferredCreate *reactorMessage
 	for {
@@ -3332,7 +3369,8 @@ func (s *runState) reactorLoop(ctx context.Context) error {
 				}
 			}
 			effects, err := reactor.ApplyContext(ctx, message.input)
-			recoverableCommitError := errors.Is(err, ErrAudioCommitInFlight)
+			recoverableCommitError := errors.Is(err, ErrAudioCommitInFlight) ||
+				errors.Is(err, ErrInputTurnModeUnconfirmed) || errors.Is(err, ErrManualAudioCommitDisabled)
 			if recoverableCommitError && message.clientAudioCommit {
 				effects = []Effect{{ClientEvent: protocol.ErrorEvent{
 					Type:    "error",
@@ -3487,7 +3525,9 @@ func (s *runState) dispatchEffectsQueued(ctx context.Context, effects []Effect, 
 			s.activeControlWrite.cancelActive()
 		}
 		if effect.ClientEvent != nil {
-			control := clientControl{afterSeq: egressAfter, afterVoice: voiceBarrier, event: effect.ClientEvent, writeCtx: ctx, epoch: effect.ResponseEpoch, incarnation: effect.Incarnation,
+			control := clientControl{afterSeq: egressAfter, afterVoice: voiceBarrier, event: effect.ClientEvent,
+				inputTurnModeBoundary: effect.InputTurnModeBoundary,
+				writeCtx:              ctx, epoch: effect.ResponseEpoch, incarnation: effect.Incarnation,
 				completionSequence: s.nextEffectSequence()}
 			if effect.RequireClientWrite {
 				clientCompletion = control.completionSequence
@@ -3717,6 +3757,14 @@ func (s *runState) clientWriter(ctx context.Context) error {
 						return err
 					}
 					continue
+				}
+				// A client may send its first audio as soon as this write is
+				// observable. Publish the provider-confirmed mode first so that
+				// clientReader cannot reject that causally later audio.
+				if control.inputTurnModeBoundary != realtime.InputTurnModeUnspecified {
+					s.boundaryMu.Lock()
+					s.boundary.InputTurnMode = control.inputTurnModeBoundary
+					s.boundaryMu.Unlock()
 				}
 				err := s.client.Write(writeCtx, control.event)
 				finish()

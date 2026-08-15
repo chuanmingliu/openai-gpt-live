@@ -317,6 +317,12 @@ func mapServerEvent(raw []byte, maxFrameBytes int64) (mappedServerEvent, error) 
 		mapped.event.Kind = realtime.EventSessionCreated
 	case "session.updated":
 		mapped.event.Kind = realtime.EventSessionUpdated
+		mode, specified, err := realtime.ParseSessionUpdatedInputTurnMode(mapped.event.Payload)
+		if err != nil {
+			return mappedServerEvent{}, err
+		}
+		mapped.event.InputTurnMode = mode
+		mapped.event.InputTurnModeSpecified = specified
 	case "conversation.item.created":
 		mapped.ignore = true
 	case "input_audio_buffer.committed":

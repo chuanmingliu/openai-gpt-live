@@ -318,6 +318,52 @@ func receiveEvent(t *testing.T, session realtime.Session) realtime.Event {
 	return event
 }
 
+func configureInputTurnMode(
+	t *testing.T,
+	server *testVoiceServer,
+	session realtime.Session,
+	turnDetection json.RawMessage,
+	providerTurnDetection any,
+	want realtime.InputTurnMode,
+) {
+	t.Helper()
+	const sequence = uint64(9001)
+	require.NoError(t, session.Send(t.Context(), realtime.Command{
+		Kind:     realtime.CommandSessionUpdate,
+		Sequence: sequence,
+		Session:  realtime.SessionConfig{TurnDetection: turnDetection},
+	}))
+	var update struct {
+		Type string `json:"type"`
+	}
+	require.NoError(t, json.Unmarshal(server.nextClientFrame(t), &update))
+	require.Equal(t, "session.update", update.Type)
+	server.sendEvent(t, map[string]any{
+		"type": "session.updated",
+		"session": map[string]any{
+			"type": "realtime",
+			"audio": map[string]any{
+				"input": map[string]any{"turn_detection": providerTurnDetection},
+			},
+		},
+	})
+	confirmed := receiveEvent(t, session)
+	require.Equal(t, realtime.EventSessionUpdated, confirmed.Kind)
+	require.True(t, confirmed.SessionUpdateAcknowledgement)
+	require.Equal(t, sequence, confirmed.SessionUpdateSequence)
+	require.Equal(t, want, confirmed.InputTurnMode)
+}
+
+func configureManualInputTurn(t *testing.T, server *testVoiceServer, session realtime.Session) {
+	t.Helper()
+	configureInputTurnMode(t, server, session, json.RawMessage(`null`), nil, realtime.InputTurnModeManual)
+}
+
+func configureProviderVADInputTurn(t *testing.T, server *testVoiceServer, session realtime.Session) {
+	t.Helper()
+	configureInputTurnMode(t, server, session, json.RawMessage(`{"type":"server_vad"}`), map[string]any{"type": "server_vad"}, realtime.InputTurnModeProviderVAD)
+}
+
 func TestManagerBargeCancelProgressesThroughSaturatedAdapterDelivery(t *testing.T) {
 	server := newTestVoiceServer(t)
 	connector, err := s2sws.New(s2sws.Config{
@@ -327,6 +373,7 @@ func TestManagerBargeCancelProgressesThroughSaturatedAdapterDelivery(t *testing.
 	manager := sessionpkg.NewManager(sessionpkg.Config{
 		ControlEvents: 1000, WriterControlEvents: 1000,
 		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		InitialSession: realtime.SessionConfig{TurnDetection: json.RawMessage(`{"type":"server_vad"}`)},
 	}, connector, compositionIDs{})
 	client := &compositionClient{createdStarted: make(chan struct{}), createdRelease: make(chan struct{})}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -343,6 +390,20 @@ func TestManagerBargeCancelProgressesThroughSaturatedAdapterDelivery(t *testing.
 	case <-time.After(time.Second):
 		t.Fatal("session.created did not reach gate")
 	}
+	var initial struct {
+		Type string `json:"type"`
+	}
+	require.NoError(t, json.Unmarshal(server.nextClientFrame(t), &initial))
+	require.Equal(t, "session.update", initial.Type)
+	server.sendEvent(t, map[string]any{
+		"type": "session.updated",
+		"session": map[string]any{
+			"type": "realtime",
+			"audio": map[string]any{
+				"input": map[string]any{"turn_detection": map[string]any{"type": "server_vad"}},
+			},
+		},
+	})
 
 	server.sendEvent(t, map[string]any{
 		"type": "response.created", "event_id": "composition-created",
@@ -542,24 +603,42 @@ func TestSendMapsEveryCommandToGoldenJSON(t *testing.T) {
 	server := newTestVoiceServer(t)
 	session := connectTestSession(t, server.URL, nil, realtime.OpenRequest{Model: "request-model"})
 
-	commands := []realtime.Command{
-		{
-			Kind: realtime.CommandSessionUpdate,
-			Session: realtime.SessionConfig{
-				Instructions: "be concise",
-				InputFormat:  realtime.AudioFormat{Encoding: "pcm16le", SampleRate: 24_000, Channels: 1},
-				OutputFormat: realtime.AudioFormat{Encoding: "pcm16le", SampleRate: 24_000, Channels: 1},
-				Voice:        "alloy",
-				Tools: []realtime.Tool{{
-					Type:        "function",
-					Name:        "lookup",
-					Description: "look it up",
-					Parameters:  json.RawMessage(`{"type":"object","required":["q"]}`),
-				}},
-				ToolChoice:    json.RawMessage(`{"type":"function","name":"lookup"}`),
-				TurnDetection: json.RawMessage(`{"type":"server_vad","threshold":0.5}`),
+	update := realtime.Command{
+		Kind: realtime.CommandSessionUpdate,
+		Session: realtime.SessionConfig{
+			Instructions: "be concise",
+			InputFormat:  realtime.AudioFormat{Encoding: "pcm16le", SampleRate: 24_000, Channels: 1},
+			OutputFormat: realtime.AudioFormat{Encoding: "pcm16le", SampleRate: 24_000, Channels: 1},
+			Voice:        "alloy",
+			Tools: []realtime.Tool{{
+				Type:        "function",
+				Name:        "lookup",
+				Description: "look it up",
+				Parameters:  json.RawMessage(`{"type":"object","required":["q"]}`),
+			}},
+			ToolChoice:    json.RawMessage(`{"type":"function","name":"lookup"}`),
+			TurnDetection: json.RawMessage(`null`),
+		},
+	}
+	require.NoError(t, session.Send(t.Context(), update))
+	assert.JSONEq(t,
+		`{"type":"session.update","session":{"type":"realtime","instructions":"be concise","audio":{"input":{"format":{"type":"audio/pcm","rate":24000},"turn_detection":null},"output":{"format":{"type":"audio/pcm","rate":24000},"voice":"alloy"}},"tools":[{"type":"function","name":"lookup","description":"look it up","parameters":{"type":"object","required":["q"]}}],"tool_choice":{"type":"function","name":"lookup"}}}`,
+		string(server.nextClientFrame(t)),
+	)
+	server.sendEvent(t, map[string]any{
+		"type": "session.updated",
+		"session": map[string]any{
+			"type": "realtime",
+			"audio": map[string]any{
+				"input": map[string]any{"turn_detection": nil},
 			},
 		},
+	})
+	confirmed := receiveEvent(t, session)
+	require.True(t, confirmed.SessionUpdateAcknowledgement)
+	require.Equal(t, realtime.InputTurnModeManual, confirmed.InputTurnMode)
+
+	commands := []realtime.Command{
 		{Kind: realtime.CommandAppendAudio, Sequence: 3, Audio: []byte{1, 2}},
 		{Kind: realtime.CommandCommitAudio, Sequence: 4, AfterSeq: 3},
 		{Kind: realtime.CommandCreateItem, Item: json.RawMessage(`{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}`)},
@@ -569,7 +648,6 @@ func TestSendMapsEveryCommandToGoldenJSON(t *testing.T) {
 	}
 
 	want := []string{
-		`{"type":"session.update","session":{"type":"realtime","instructions":"be concise","audio":{"input":{"format":{"type":"audio/pcm","rate":24000},"turn_detection":{"type":"server_vad","threshold":0.5}},"output":{"format":{"type":"audio/pcm","rate":24000},"voice":"alloy"}},"tools":[{"type":"function","name":"lookup","description":"look it up","parameters":{"type":"object","required":["q"]}}],"tool_choice":{"type":"function","name":"lookup"}}}`,
 		`{"type":"input_audio_buffer.append","audio":"AQI="}`,
 		`{"type":"input_audio_buffer.commit"}`,
 		`{"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}`,
@@ -631,6 +709,7 @@ func TestCancelOmitsAnEmptyResponseID(t *testing.T) {
 func TestEmptyIDCancelTombstonesExactlyOnePendingCreateAndAllowsNextImplicitResponse(t *testing.T) {
 	server := newTestVoiceServer(t)
 	session := connectTestSession(t, server.URL, nil, realtime.OpenRequest{Model: "model"})
+	configureProviderVADInputTurn(t, server, session)
 
 	require.NoError(t, session.Send(t.Context(), realtime.Command{
 		Kind: realtime.CommandCreateResponse, Epoch: 7,
@@ -841,6 +920,7 @@ func sendAndReceiveEvent(t *testing.T, server *testVoiceServer, session realtime
 func TestReceiveMapsEveryProviderEvent(t *testing.T) {
 	server := newTestVoiceServer(t)
 	session := connectTestSession(t, server.URL, nil, realtime.OpenRequest{Model: "model"})
+	configureProviderVADInputTurn(t, server, session)
 	previousItemID := "assistant-or-tool-item"
 
 	tests := []struct {
@@ -1404,8 +1484,11 @@ func TestExplicitPendingResponseLimit(t *testing.T) {
 
 		err := session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCreateResponse, Epoch: limit + 1})
 		require.ErrorIs(t, err, s2sws.ErrPendingResponseLimit)
-		require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio, Sequence: 1}))
-		assert.JSONEq(t, `{"type":"input_audio_buffer.commit"}`, string(server.nextClientFrame(t)))
+		require.NoError(t, session.Send(t.Context(), realtime.Command{
+			Kind: realtime.CommandCreateItem,
+			Item: json.RawMessage(`{"type":"message"}`),
+		}))
+		assert.JSONEq(t, `{"type":"conversation.item.create","item":{"type":"message"}}`, string(server.nextClientFrame(t)))
 	})
 
 	t.Run("matching response created restores capacity", func(t *testing.T) {
@@ -1503,6 +1586,7 @@ func TestExplicitCreateRegistersBeforeProviderEcho(t *testing.T) {
 func TestConcurrentSendSerializesFrames(t *testing.T) {
 	server := newTestVoiceServer(t)
 	session := connectTestSession(t, server.URL, nil, realtime.OpenRequest{Model: "model"})
+	configureManualInputTurn(t, server, session)
 	const sends = 128
 	start := make(chan struct{})
 	results := make(chan error, sends)
@@ -1547,6 +1631,7 @@ func TestConcurrentSendSerializesFrames(t *testing.T) {
 func TestSendOwnsCommandBytesOnReturn(t *testing.T) {
 	server := newTestVoiceServer(t)
 	session := connectTestSession(t, server.URL, nil, realtime.OpenRequest{Model: "model"})
+	configureManualInputTurn(t, server, session)
 	audio := []byte{1, 2, 3, 4}
 	require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandAppendAudio, Audio: audio}))
 	for index := range audio {
@@ -1578,8 +1663,8 @@ func TestSendRejectsMalformedOrOversizedCommands(t *testing.T) {
 			server := newTestVoiceServer(t)
 			session := connectTestSession(t, server.URL, test.mutate, realtime.OpenRequest{Model: "model"})
 			require.Error(t, session.Send(t.Context(), test.command))
-			require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio, Sequence: 1}))
-			assert.JSONEq(t, `{"type":"input_audio_buffer.commit"}`, string(server.nextClientFrame(t)))
+			require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCancelResponse}))
+			assert.JSONEq(t, `{"type":"response.cancel"}`, string(server.nextClientFrame(t)))
 		})
 	}
 }
@@ -1629,8 +1714,8 @@ func TestCanceledOperationsDoNotPoisonSession(t *testing.T) {
 	_, err := session.Receive(canceled)
 	require.ErrorIs(t, err, context.Canceled)
 
-	require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio, Sequence: 1}))
-	assert.JSONEq(t, `{"type":"input_audio_buffer.commit"}`, string(server.nextClientFrame(t)))
+	require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCancelResponse}))
+	assert.JSONEq(t, `{"type":"response.cancel"}`, string(server.nextClientFrame(t)))
 	server.sendEvent(t, map[string]any{"type": "session.created", "event_id": "still-open", "session": map[string]any{}})
 	assert.Equal(t, "still-open", receiveEvent(t, session).ProviderEventID)
 }

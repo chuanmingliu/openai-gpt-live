@@ -26,9 +26,8 @@ type Command struct {
 	Sequence uint64
 	AfterSeq uint64
 	Epoch    identity.ResponseEpoch
-	// InputItemID is internal audio-commit correlation. CommitAudio sets it when
-	// an explicit speech edge established the provider item; AcknowledgeAudioCommit
-	// sets it to the exact committed item. It is never serialized onto the wire.
+	// InputItemID is the exact committed item carried by the internal
+	// AcknowledgeAudioCommit release. It is never serialized onto the wire.
 	InputItemID              string
 	InputAudioCommitSequence uint64
 	Session                  SessionConfig
@@ -95,27 +94,33 @@ const (
 )
 
 type Event struct {
-	Kind            EventKind
-	Epoch           identity.ResponseEpoch
-	ProviderEventID string
-	ResponseID      string
-	ItemID          string
-	PreviousItemID  *string
-	// InputAudioCommitCandidate is set only when the transport observed this
-	// committed event after registering the sole outstanding manual commit.
-	// The reactor remains the authority that decides whether it resolves that
-	// generation.
-	InputAudioCommitCandidate bool
-	InputAudioCommitSequence  uint64
-	CallID                    string
-	Name                      string
-	Audio                     []byte
-	Text                      string
-	Arguments                 json.RawMessage
-	Status                    string
-	Reason                    string
-	Payload                   json.RawMessage
-	NeedsEpochBinding         bool
+	Kind                   EventKind
+	Epoch                  identity.ResponseEpoch
+	ProviderEventID        string
+	ResponseID             string
+	ItemID                 string
+	PreviousItemID         *string
+	InputTurnMode          InputTurnMode
+	InputTurnModeSpecified bool
+	// SessionUpdateAcknowledgement is true only when the adapter observed this
+	// provider event while one local session.update was outstanding.
+	SessionUpdateAcknowledgement bool
+	// SessionUpdateSequence identifies the sole local session.update whose
+	// provider acknowledgement produced this event. Sequence zero is reserved
+	// for manager-owned initial configuration or unsolicited provider updates.
+	SessionUpdateSequence uint64
+	// InputAudioCommitSequence is non-zero only in manual mode and identifies
+	// the sole client commit generation that the provider acknowledgement closes.
+	InputAudioCommitSequence uint64
+	CallID                   string
+	Name                     string
+	Audio                    []byte
+	Text                     string
+	Arguments                json.RawMessage
+	Status                   string
+	Reason                   string
+	Payload                  json.RawMessage
+	NeedsEpochBinding        bool
 }
 
 type Session interface {

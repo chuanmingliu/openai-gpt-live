@@ -48,6 +48,12 @@ func presentationReactor(policy safety.Policy) *Reactor {
 	)
 }
 
+func presentationProviderVADReactor(policy safety.Policy) *Reactor {
+	reactor := presentationReactor(policy)
+	reactor.inputTurnMode = realtime.InputTurnModeProviderVAD
+	return reactor
+}
+
 func presentationEvent(kind string, state handoff.State, payload string) HandoffEventInput {
 	return HandoffEventInput{
 		Scope: handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "conversation"},
@@ -94,10 +100,11 @@ func TestHandoffNeedsInputWritesVisualBeforeFixedTemplateSpeech(t *testing.T) {
 
 func TestHandoffCompletionWhileSpeakingOrRespondingStaysVisual(t *testing.T) {
 	for _, setup := range []struct {
-		name string
-		run  func(*Reactor)
+		name        string
+		providerVAD bool
+		run         func(*Reactor)
 	}{
-		{name: "user speaking", run: func(reactor *Reactor) {
+		{name: "user speaking", providerVAD: true, run: func(reactor *Reactor) {
 			applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventSpeechStarted, ItemID: "turn"}))
 		}},
 		{name: "response active", run: func(reactor *Reactor) {
@@ -106,6 +113,9 @@ func TestHandoffCompletionWhileSpeakingOrRespondingStaysVisual(t *testing.T) {
 	} {
 		t.Run(setup.name, func(t *testing.T) {
 			reactor := presentationReactor(&presentationSafety{})
+			if setup.providerVAD {
+				reactor.inputTurnMode = realtime.InputTurnModeProviderVAD
+			}
 			setup.run(reactor)
 			effects := applyOK(t, reactor, presentationEvent("handoff.complete", handoff.StateSucceeded, `{"Result":{"Summary":"done","Structured":{}}}`))
 			require.Len(t, effects, 1)
@@ -150,7 +160,7 @@ func TestUrgentPresentationBargeInBeforeCancelCompletionNeverSpeaks(t *testing.T
 		safety.ChannelVisual: {Action: safety.ActionAllow, ReasonCode: "visual"},
 		safety.ChannelSpeech: {Action: safety.ActionCancelResponse, ReasonCode: "urgent"},
 	}}
-	reactor := presentationReactor(safetyPolicy)
+	reactor := presentationProviderVADReactor(safetyPolicy)
 	epoch := startStreaming(t, reactor, "active")
 	urgent := applyOK(t, reactor, presentationEvent("handoff.needs-input", handoff.StateNeedsInput, `{"Prompt":"urgent","Schema":{}}`))
 	cancel := urgent[1].VoiceCommand
@@ -289,7 +299,7 @@ func TestRecentPresentationErrorsNeverLeakOrDamageLaterHealthyResponse(t *testin
 	assert.Empty(t, lateAgainstHealthy)
 	assert.Equal(t, ResponseStreaming, reactor.Snapshot().Response)
 
-	other := presentationReactor(&presentationSafety{})
+	other := presentationProviderVADReactor(&presentationSafety{})
 	start := applyOK(t, other, presentationEvent("handoff.needs-input", handoff.StateNeedsInput, `{"Prompt":"cancel me","Schema":{}}`))
 	cancelledEpoch := start[1].VoiceCommand.Epoch
 	applyOK(t, other, currentVoice(other, realtime.Event{Kind: realtime.EventResponseCreated, Epoch: cancelledEpoch, ResponseID: "cancelled-presentation", Status: "in_progress"}))

@@ -2,6 +2,7 @@ package s2sws
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
@@ -57,6 +58,7 @@ func TestMappingLoopServicesCorrelationWhileEventDeliveryIsBackpressured(t *test
 		responses: map[string]*responseCorrelation{"response": {unbound: true}}, pending: make(map[identity.ResponseEpoch]struct{}),
 		implicitUnbound: 1,
 		maxFrameBytes:   1 << 20, closeNow: func() error { return nil },
+		inputTurnConfirmed: realtime.InputTurnModeProviderVAD,
 	}
 	go session.mappingLoop()
 	t.Cleanup(cancel)
@@ -109,7 +111,7 @@ func TestConcurrentTerminationDrainsAcceptedMappedFIFO(t *testing.T) {
 		reads: make(chan socketRead), correlations: make(chan correlationRequest),
 		events: make(chan realtime.Event, 1), closing: make(chan struct{}), done: make(chan struct{}),
 		responses: make(map[string]*responseCorrelation), pending: make(map[identity.ResponseEpoch]struct{}),
-		maxFrameBytes: 1 << 20, closeNow: func() error { return nil },
+		maxFrameBytes: 1 << 20, closeNow: func() error { return nil }, inputTurnConfirmed: realtime.InputTurnModeProviderVAD,
 	}
 	go session.mappingLoop()
 	for index := 1; index <= 3; index++ {
@@ -144,6 +146,7 @@ func TestCloseAfterWriterTerminalHandoffCompletes(t *testing.T) {
 		reads: make(chan socketRead), correlations: make(chan correlationRequest), events: make(chan realtime.Event, 1),
 		closing: make(chan struct{}), closeDone: make(chan struct{}), done: make(chan struct{}),
 		responses: make(map[string]*responseCorrelation), pending: make(map[identity.ResponseEpoch]struct{}),
+		inputTurnConfirmed: realtime.InputTurnModeProviderVAD,
 	}
 	go session.mappingLoop()
 	writerExited := make(chan struct{})
@@ -157,7 +160,7 @@ func TestCloseAfterWriterTerminalHandoffCompletes(t *testing.T) {
 		session.reads <- socketRead{messageType: websocket.MessageText, raw: raw}
 		require.NoError(t, session.correlate(t.Context(), correlationRequest{kind: correlationRegister, epoch: identity.ResponseEpoch(index)}))
 	}
-	require.ErrorIs(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio}), writeErr)
+	require.ErrorIs(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCreateItem, Item: json.RawMessage(`{"type":"message"}`)}), writeErr)
 	select {
 	case <-writerExited:
 	case <-time.After(time.Second):
@@ -172,7 +175,7 @@ func TestCloseAfterWriterTerminalHandoffCompletes(t *testing.T) {
 		go func() { closeResults <- session.Close(closeCtx) }()
 	}
 	require.Eventually(t, session.isClosing, time.Second, time.Millisecond)
-	require.ErrorIs(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio}), ErrSessionClosed)
+	require.ErrorIs(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCreateItem, Item: json.RawMessage(`{"type":"message"}`)}), ErrSessionClosed)
 
 	for index := 1; index <= 2; index++ {
 		event, err := session.Receive(t.Context())
@@ -203,6 +206,7 @@ func TestReceiveBlockedBeforeWriterTerminalHandoffPreservesAcceptedTail(t *testi
 		reads: make(chan socketRead), correlations: make(chan correlationRequest), events: make(chan realtime.Event, 1),
 		closing: make(chan struct{}), closeDone: make(chan struct{}), done: make(chan struct{}),
 		responses: make(map[string]*responseCorrelation), pending: make(map[identity.ResponseEpoch]struct{}),
+		inputTurnConfirmed: realtime.InputTurnModeProviderVAD,
 	}
 	go session.mappingLoop()
 	writerExited := make(chan struct{})
@@ -234,7 +238,7 @@ func TestReceiveBlockedBeforeWriterTerminalHandoffPreservesAcceptedTail(t *testi
 	}()
 	<-receiveContext.observed
 
-	require.ErrorIs(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCommitAudio}), writeErr)
+	require.ErrorIs(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandCreateItem, Item: json.RawMessage(`{"type":"message"}`)}), writeErr)
 	select {
 	case <-writerExited:
 	case <-time.After(time.Second):

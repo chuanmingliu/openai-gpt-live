@@ -4,6 +4,7 @@ package s2sws
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,7 +13,6 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -160,7 +160,6 @@ type socketRead struct {
 	messageType websocket.MessageType
 	raw         []byte
 	err         error
-	sequence    uint64
 }
 
 type correlationKind uint8
@@ -252,7 +251,6 @@ type voiceSession struct {
 	closeNow         func() error
 	maxFrameBytes    int64
 	commitAckTimeout time.Duration
-	readSequence     atomic.Uint64
 
 	writes       chan writeRequest
 	closeWrites  chan struct{}
@@ -274,19 +272,25 @@ type voiceSession struct {
 	mappedEvents           []realtime.Event
 	mappingActive          bool
 
-	terminalOnce        sync.Once
-	terminalMu          sync.RWMutex
-	terminalErr         error
-	closeOnce           sync.Once
-	closeCompleteOnce   sync.Once
-	closeStateMu        sync.Mutex
-	terminalHandedOff   bool
-	closeResultMu       sync.RWMutex
-	closeResult         error
-	activeWriteMu       sync.Mutex
-	activeWriteCancel   context.CancelFunc
-	terminalRequestOnce sync.Once
-	terminalRequests    chan error
+	terminalOnce            sync.Once
+	terminalMu              sync.RWMutex
+	terminalErr             error
+	closeOnce               sync.Once
+	closeCompleteOnce       sync.Once
+	closeStateMu            sync.Mutex
+	terminalHandedOff       bool
+	closeResultMu           sync.RWMutex
+	closeResult             error
+	activeWriteMu           sync.Mutex
+	activeWriteCancel       context.CancelFunc
+	inputTurnMu             sync.Mutex
+	inputTurnUpdatePending  bool
+	inputTurnUpdateDone     chan struct{}
+	inputTurnUpdateSequence uint64
+	inputTurnRequested      realtime.InputTurnMode
+	inputTurnConfirmed      realtime.InputTurnMode
+	terminalRequestOnce     sync.Once
+	terminalRequests        chan error
 }
 
 func (s *voiceSession) Send(ctx context.Context, command realtime.Command) error {
@@ -447,7 +451,7 @@ func (s *voiceSession) startClose() closeStartMode {
 func (s *voiceSession) readLoop() {
 	for {
 		messageType, raw, err := s.conn.Read(s.ctx)
-		result := socketRead{messageType: messageType, raw: raw, err: err, sequence: s.readSequence.Add(1)}
+		result := socketRead{messageType: messageType, raw: raw, err: err}
 		select {
 		case s.reads <- result:
 		case <-s.done:
@@ -500,13 +504,22 @@ func (s *voiceSession) writeLoop() {
 			if err == nil && int64(len(raw)) > s.maxFrameBytes {
 				err = fmt.Errorf("outbound frame is %d bytes, limit is %d", len(raw), s.maxFrameBytes)
 			}
+			if err == nil && request.command.Kind == realtime.CommandSessionUpdate {
+				err = s.registerInputTurnUpdate(request.ctx, request.command.Session.TurnDetection, request.command.Sequence)
+			}
+			if err == nil && request.command.Kind == realtime.CommandAppendAudio {
+				err = s.authorizeInputAudioCommand(request.command.Kind)
+			}
+			if err == nil && request.command.Kind == realtime.CommandCommitAudio {
+				err = s.authorizeInputAudioCommand(request.command.Kind)
+			}
 			if err == nil && request.command.Kind == realtime.CommandCreateResponse {
 				err = s.correlate(request.ctx, correlationRequest{kind: correlationRegister, epoch: request.command.Epoch})
 				correlationCommitted = err == nil
 			}
 			if err == nil && request.command.Kind == realtime.CommandCommitAudio && s.commitAckTimeout > 0 {
 				err = s.correlate(request.ctx, correlationRequest{
-					kind: correlationRegisterAudioCommit, inputItemID: request.command.InputItemID,
+					kind:                     correlationRegisterAudioCommit,
 					inputAudioCommitSequence: request.command.Sequence,
 				})
 				correlationCommitted = err == nil
@@ -656,6 +669,94 @@ func (s *voiceSession) isClosing() bool {
 	}
 }
 
+func (s *voiceSession) registerInputTurnUpdate(ctx context.Context, turnDetection json.RawMessage, sequence uint64) error {
+	mode, specified, err := realtime.ParseInputTurnMode(turnDetection)
+	if err != nil {
+		return err
+	}
+	for {
+		s.inputTurnMu.Lock()
+		if !s.inputTurnUpdatePending {
+			if s.inputTurnConfirmed == realtime.InputTurnModeUnspecified {
+				if specified {
+					s.inputTurnRequested = mode
+				}
+			} else if specified && mode != s.inputTurnConfirmed {
+				s.inputTurnMu.Unlock()
+				return realtime.ErrInputTurnModeImmutable
+			}
+			s.inputTurnUpdatePending = true
+			s.inputTurnUpdateDone = make(chan struct{})
+			s.inputTurnUpdateSequence = sequence
+			s.inputTurnMu.Unlock()
+			return nil
+		}
+		wait := s.inputTurnUpdateDone
+		s.inputTurnMu.Unlock()
+		select {
+		case <-wait:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.closing:
+			return ErrSessionClosed
+		case <-s.done:
+			return s.sessionError()
+		}
+	}
+}
+
+func (s *voiceSession) confirmInputTurnMode(event realtime.Event) (uint64, bool, error) {
+	s.inputTurnMu.Lock()
+	defer s.inputTurnMu.Unlock()
+	if !s.inputTurnUpdatePending {
+		if s.inputTurnConfirmed != realtime.InputTurnModeUnspecified && event.InputTurnModeSpecified &&
+			event.InputTurnMode != s.inputTurnConfirmed {
+			return 0, false, realtime.ErrInputTurnModeImmutable
+		}
+		return 0, false, nil
+	}
+	sequence := s.inputTurnUpdateSequence
+	if s.inputTurnRequested != realtime.InputTurnModeUnspecified {
+		if !event.InputTurnModeSpecified {
+			return 0, false, errors.New("provider session.updated omitted input turn mode")
+		}
+		if event.InputTurnMode != s.inputTurnRequested {
+			return 0, false, realtime.ErrInputTurnModeImmutable
+		}
+		s.inputTurnConfirmed = event.InputTurnMode
+		s.inputTurnRequested = realtime.InputTurnModeUnspecified
+	} else if event.InputTurnModeSpecified && event.InputTurnMode != s.inputTurnConfirmed {
+		if s.inputTurnConfirmed != realtime.InputTurnModeUnspecified {
+			return 0, false, realtime.ErrInputTurnModeImmutable
+		}
+	}
+	s.inputTurnUpdatePending = false
+	s.inputTurnUpdateSequence = 0
+	close(s.inputTurnUpdateDone)
+	s.inputTurnUpdateDone = nil
+	return sequence, true, nil
+}
+
+func (s *voiceSession) authorizeInputAudioCommand(kind realtime.CommandKind) error {
+	s.inputTurnMu.Lock()
+	mode := s.inputTurnConfirmed
+	s.inputTurnMu.Unlock()
+	if mode == realtime.InputTurnModeUnspecified {
+		return realtime.ErrInputTurnModeUnconfirmed
+	}
+	if kind == realtime.CommandCommitAudio && mode != realtime.InputTurnModeManual {
+		return realtime.ErrManualAudioCommitDisabled
+	}
+	return nil
+}
+
+func (s *voiceSession) confirmedInputTurnMode() realtime.InputTurnMode {
+	s.inputTurnMu.Lock()
+	mode := s.inputTurnConfirmed
+	s.inputTurnMu.Unlock()
+	return mode
+}
+
 func (s *voiceSession) correlate(ctx context.Context, request correlationRequest) error {
 	request.ctx = ctx
 	request.result = make(chan error, 1)
@@ -682,18 +783,14 @@ func (s *voiceSession) mappingLoop() {
 	terminalRequests := s.terminationRequests()
 	var commitAckTimer *time.Timer
 	var commitAckDeadline <-chan time.Time
-	var commitAckItemID string
 	var commitAckSequence uint64
 	var lastCommitSequence uint64
-	var commitAckReadBoundary uint64
-	var commitAckObserved map[string]struct{}
+	var observedManualAckItemID string
 	var acknowledgedAudioItems audioCommitAckHistory
 	stopCommitAckTimer := func() {
 		commitAckDeadline = nil
-		commitAckItemID = ""
 		commitAckSequence = 0
-		commitAckReadBoundary = 0
-		commitAckObserved = nil
+		observedManualAckItemID = ""
 		if commitAckTimer == nil {
 			return
 		}
@@ -739,10 +836,8 @@ func (s *voiceSession) mappingLoop() {
 		case <-commitAckDeadline:
 			commitAckDeadline = nil
 			commitAckTimer = nil
-			commitAckItemID = ""
 			commitAckSequence = 0
-			commitAckReadBoundary = 0
-			commitAckObserved = nil
+			observedManualAckItemID = ""
 			if terminalReadErr == nil {
 				terminalReadErr = ErrAudioCommitAckTimeout
 			}
@@ -772,21 +867,46 @@ func (s *voiceSession) mappingLoop() {
 				terminalReadErr = fmt.Errorf("%w: maximum %d", ErrAcceptedEventLimit, receiveQueueCapacity)
 				continue
 			}
-			if mapped.event.Kind == realtime.EventInputAudioCommitted {
-				_, err := acknowledgedAudioItems.remember(mapped.event.ItemID)
+			switch mapped.event.Kind {
+			case realtime.EventSessionUpdated:
+				sequence, acknowledged, err := s.confirmInputTurnMode(mapped.event)
 				if err != nil {
 					terminalReadErr = err
 					continue
 				}
-				mapped.event.InputAudioCommitCandidate = commitAckDeadline != nil &&
-					read.sequence > commitAckReadBoundary &&
-					(commitAckItemID == "" || commitAckItemID == mapped.event.ItemID)
-				if mapped.event.InputAudioCommitCandidate {
-					mapped.event.InputAudioCommitSequence = commitAckSequence
-					if commitAckObserved == nil {
-						commitAckObserved = make(map[string]struct{})
+				mapped.event.SessionUpdateAcknowledgement = acknowledged
+				mapped.event.SessionUpdateSequence = sequence
+			case realtime.EventSpeechStarted, realtime.EventSpeechStopped:
+				if s.confirmedInputTurnMode() != realtime.InputTurnModeProviderVAD {
+					terminalReadErr = errors.New("provider speech edge is invalid outside provider VAD mode")
+					continue
+				}
+			case realtime.EventInputAudioCommitted:
+				switch s.confirmedInputTurnMode() {
+				case realtime.InputTurnModeManual:
+					duplicate, err := acknowledgedAudioItems.remember(mapped.event.ItemID)
+					if err != nil {
+						terminalReadErr = err
+						continue
 					}
-					commitAckObserved[acknowledgedAudioItems.canonical(mapped.event.ItemID)] = struct{}{}
+					if duplicate {
+						break
+					}
+					if commitAckDeadline == nil {
+						terminalReadErr = errors.New("manual input audio acknowledgement has no pending commit")
+						continue
+					}
+					if observedManualAckItemID != "" {
+						terminalReadErr = errors.New("manual input audio commit produced multiple acknowledgements")
+						continue
+					}
+					mapped.event.InputAudioCommitSequence = commitAckSequence
+					observedManualAckItemID = acknowledgedAudioItems.canonical(mapped.event.ItemID)
+				case realtime.InputTurnModeProviderVAD:
+					// Provider-owned commits never participate in the manual slot.
+				default:
+					terminalReadErr = realtime.ErrInputTurnModeUnconfirmed
+					continue
 				}
 			}
 			if err := s.handleMapped(mapped); err != nil {
@@ -815,20 +935,9 @@ func (s *voiceSession) mappingLoop() {
 					err = ErrPendingAudioCommit
 				} else if request.inputAudioCommitSequence == 0 || request.inputAudioCommitSequence <= lastCommitSequence {
 					err = errInvalidAudioCommitSequence
-				} else if request.inputItemID != "" {
-					if err = validateAudioCommitAckItemID(request.inputItemID); err == nil {
-						lastCommitSequence = request.inputAudioCommitSequence
-						commitAckItemID = strings.Clone(request.inputItemID)
-						commitAckSequence = request.inputAudioCommitSequence
-						commitAckReadBoundary = s.readSequence.Load()
-						commitAckTimer = time.NewTimer(s.commitAckTimeout)
-						commitAckDeadline = commitAckTimer.C
-					}
 				} else {
 					lastCommitSequence = request.inputAudioCommitSequence
-					commitAckItemID = ""
 					commitAckSequence = request.inputAudioCommitSequence
-					commitAckReadBoundary = s.readSequence.Load()
 					commitAckTimer = time.NewTimer(s.commitAckTimeout)
 					commitAckDeadline = commitAckTimer.C
 				}
@@ -840,11 +949,8 @@ func (s *voiceSession) mappingLoop() {
 				} else if request.inputAudioCommitSequence != commitAckSequence {
 					err = errors.New("input audio commit acknowledgement does not match pending generation")
 				} else if err = validateAudioCommitAckItemID(request.inputItemID); err == nil {
-					_, observed := commitAckObserved[request.inputItemID]
-					if !observed {
+					if observedManualAckItemID != request.inputItemID {
 						err = errors.New("input audio commit acknowledgement was not observed")
-					} else if commitAckItemID != "" && commitAckItemID != request.inputItemID {
-						err = errors.New("input audio commit acknowledgement does not match pending item")
 					} else {
 						stopCommitAckTimer()
 					}

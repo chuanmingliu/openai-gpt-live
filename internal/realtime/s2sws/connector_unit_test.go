@@ -2,6 +2,7 @@ package s2sws
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"sync"
@@ -91,7 +92,9 @@ func TestSendPreservesWriteErrorWithoutLocalClose(t *testing.T) {
 		func(websocket.StatusCode, string) error { return nil },
 	)
 
-	err := session.Send(context.Background(), realtime.Command{Kind: realtime.CommandCommitAudio})
+	err := session.Send(context.Background(), realtime.Command{
+		Kind: realtime.CommandCreateItem, Item: json.RawMessage(`{"type":"message"}`),
+	})
 	require.ErrorIs(t, err, rawWriteError)
 	<-writerDone
 }

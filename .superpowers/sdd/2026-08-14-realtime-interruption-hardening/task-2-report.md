@@ -6,9 +6,14 @@ Base: `b15252e`
 
 Approved single-flight correction base: `8090b21`
 
+Final mode-boundary Go base: `0456d4aa58ba98de8ad696e657a5c6a5c9067dbe`
+
+Native speech base: `919560114785c7220e209710b06d1f2620e9add8`
+
 Owned production files:
 
 - `internal/session/reactor.go`
+- `internal/session/effect.go`
 - `internal/realtime/voice.go`
 - `internal/realtime/s2sws/mapping.go`
 - `internal/session/manager.go`
@@ -30,6 +35,20 @@ Owned tests:
 - `internal/realtime/s2sws/commit_ack_test.go`
 - `internal/protocol/codec_test.go`
 - `internal/protocol/capabilities_test.go`
+
+Final mode-boundary additions/updates are confined to:
+
+- `internal/realtime/input_turn_mode.go`
+- `internal/realtime/voice.go`
+- `internal/realtime/s2sws/connector.go`
+- `internal/realtime/s2sws/mapping.go`
+- `internal/session/state.go`
+- `internal/session/effect.go`
+- `internal/session/reactor.go`
+- `internal/session/manager.go`
+- `internal/realtime/s2sws/{commit_ack,input_turn_mode,connector,connector_internal,connector_unit}_test.go`
+- `internal/session/{input_turn_mode,reactor,manager,presentation}_test.go`
+- `internal/gateway/app_test.go`
 
 The pre-existing dirty `demo/live-client/web`, `docs/research`, and plan files were not edited or staged. Review item 8 was not implemented.
 
@@ -76,7 +95,7 @@ Review-fix round 4 REDs and boundary characterization:
 8. `TestProviderInputHistoryExactCapacityNeverEvictsRejectsClientReuseAndAllowsSpeechReuse` characterized the already-correct count boundary and made it load-bearing: exactly 1024 retained 256-byte IDs are accepted, the 1025th fails before turn/sequence/history mutation, neither endpoint is evicted, client reuse is rejected, and explicit speech reuse remains valid. The added exact byte-account assertion was initially absent from the implementation.
 9. The final provider-seam audit invalidated hypothesis 3's binding premise. Neither the official success event nor the configured simulator provides an exact commit-command correlation, and the official protocol does not declare FIFO acknowledgement pairing. The hypothesis implementation and tests were therefore returned to `HEAD` instead of being committed.
 
-Approved single-flight correction REDs:
+Interim single-flight correction REDs:
 
 1. The protocol, adapter, and reactor tests failed to compile because `InputAudioBufferCommittedEvent`, `EventInputAudioCommitted`, nullable `PreviousItemID`, and `ErrAudioCommitInFlight` did not exist.
 2. The local speech service's focused tests produced seven expected failures: successful commits returned `None`, the router emitted no success event, and the OpenAI SDK loopback timed out waiting for `input_audio_buffer.committed`.
@@ -86,6 +105,60 @@ Approved single-flight correction REDs:
 6. `TestCorrelateWaitsForDefinitiveResultAfterEnqueue` showed cancellation could win after mapper mutation and leave a ghost timeout for a commit that was never written. `TestCommitSequenceMustBePositiveAndNeverReused` showed zero/reused transport tokens collapsed the cross-slot ABA fence.
 7. Provider mapping accepted a committed event with an omitted `previous_item_id`, while the public codec correctly required the standard field. The RED distinguishes omission from the valid first-conversation value `null`.
 8. `TestClientCommitSemanticErrorDispatchOverflowRemainsFatal` showed the nonfatal duplicate-commit flag also suppressed a later client-control overflow, silently losing the rejection instead of tearing down.
+
+Final mode-boundary correction REDs:
+
+1. `TestInputTurnModeRequiresActualProviderSessionUpdated`,
+   `TestAudioWaitsForMatchingProviderSessionUpdated`, and the mismatch/missing/unknown confirmation
+   table showed that socket write completion synthesized acceptance, pre-confirmation audio reached
+   the wire, and incomplete or contradictory provider configuration could enable the wrong owner.
+2. `TestProviderVADRejectsManualCommitAfterProviderConfirmation` and
+   `TestProviderVADNeverWritesManualCommit` showed both `server_vad` and `semantic_vad` still admitted
+   explicit client commits. `TestManualModeRejectsProviderOwnedSpeechAndUnsolicitedCommit` showed the
+   inverse: provider speech/automatic commit could enter a manual stream. Mode switching was also
+   accepted after confirmation.
+3. Pure-manual delayed duplicate/ABA, multiple-fresh-acknowledgement, and client-supersession tests
+   showed the interim read watermark could let an old or provider-owned acknowledgement release a
+   newer slot. A separate 1025-ack provider-VAD test showed automatic traffic incorrectly consumed
+   the bounded manual acknowledgement history.
+4. The native speech RED suite produced nine expected failures: explicit commit was accepted in
+   provider-VAD configurations; a transcript could overtake the matching committed event; and
+   client, assistant, tool-call, and function-output interposition all allowed a stale speculative
+   input item to be reused while rolling the conversation tail backward. Reopen after a tail advance
+   exposed the same rollback. A transport-gated router test then made the two concurrent outbound
+   producers deterministic without timing sleeps.
+5. A final cross-layer RED showed that serialization at the connector was not sufficient by itself:
+   the reactor could register browser update 73 while the connector still held it behind the
+   manager's sequence-zero initial update, then consume the initial provider acknowledgement as if
+   it acknowledged 73. `TestSequenceZeroInitialAckCannotConsumePendingClientMode` and
+   `TestSessionUpdatedCarriesOutstandingLocalSequence` failed to compile until the event could carry
+   the sole locally outstanding session-update sequence. This sequence identifies an already
+   serialized causal slot; it does not infer a provider correlation from arrival.
+6. Sequence zero was then shown to be insufficient on its own because it represented both the real
+   manager bootstrap command and an unsolicited event observed before any update was outstanding.
+   `TestUnsolicitedSequenceZeroCannotConfirmExpectedInitialMode` and
+   `TestUnsolicitedSessionUpdatedIsNotMarkedAsAcknowledgement` forced an explicit acknowledgement-
+   present bit. Only `present + exact sequence` can now confirm configuration; a false bit or wrong
+   sequence leaves all pending state unchanged.
+7. Final independent review found that `speech_started(A) -> speech_started(B) -> delayed
+   speech_stopped(A)` cleared `UserSpeaking` for B. That reopened the implicit-response path across
+   the live barge fence. The stop path also omitted the shared 256-byte/UTF-8/content-free item-ID
+   validation. The corrected tests failed first on the stale stop event, the cleared snapshot, the
+   missing stop for B, and every invalid-ID case. The reactor now tracks the active speech item
+   independently of the active conversation turn, ignores a validated stale stop without mutation,
+   and clears the fence only for the matching item.
+8. The next independent pass showed that accepting the superseding `speech_started(B)` internally
+   while suppressing its client event exposed `speech_started(A) -> speech_stopped(B)`. The corrected
+   tests first failed because B produced no public start. A distinct B now emits its own start without
+   another epoch advance, flush, or cancel; a same-ID duplicate and delayed stop A remain no-ops, and
+   the matching stop B carries B's identity.
+9. `TestClientWriterPublishesInputTurnModeBeforeSessionUpdated` showed the final manager ordering
+   gap: the reactor queued the acknowledged `session.updated` client effect before publishing the
+   confirmed mode snapshot. The client writer could therefore expose the acknowledgement while the
+   reader still saw `Unspecified` and rejected an immediate append/commit. The RED initially failed
+   to compile without an explicit effect boundary. The acknowledged effect now carries the confirmed
+   mode through the output queue, and the writer publishes it under the boundary lock immediately
+   before the external write.
 
 ## Implemented contracts
 
@@ -106,18 +179,55 @@ The audit identified two safe architecture options:
 1. **Recommended: one outstanding manual commit plus a mandatory committed acknowledgement.** Do not admit/send the next manual commit until the prior `input_audio_buffer.committed` arrives. Its `item_id` is then unambiguous without assuming acknowledgement FIFO or inspecting `previous_item_id`. This is compatible with the official event shape, but it changes the current multiple-outstanding-commit requirement and requires controller approval. The local speech service must import/add `InputAudioBufferCommittedEvent` to its server-event union, retain the whole-conversation predecessor when it allocates the input item, return that exact item/predecessor on successful commit, and synchronously send it from the already-serial WebSocket dispatch loop. Provider tests must prove one success acknowledgement per nonempty commit, the acknowledgement item ID equals later transcription IDs, assistant/tool predecessors are preserved but not used as correlation, empty commit still returns only the error, and the next commit is not admitted before acknowledgement.
 2. **Provider-specific echoed commit correlation.** Add a client commit correlation ID and require the custom speech service to echo it on the success event, preserving multiple outstanding commits and exact B/C interleaving. Because the official committed event has no such field, this needs explicitly split adapter/provider modes plus separate contract tests; presenting it as generic OpenAI compatibility would be incorrect.
 
-The controller approved option 1. It is now implemented end to end:
+The controller initially approved option 1. Final adversarial review then found that its
+read-watermark implementation was still unsound: a provider-owned VAD acknowledgement and a
+client-owned manual acknowledgement can share the same uncorrelated event shape. Arrival,
+watermark, item-predecessor, and FIFO rules cannot prove which authority produced such an event.
+The following final mode-boundary correction supersedes that interim implementation:
 
-- The Go reactor admits exactly one unacknowledged manual `input_audio_buffer.commit`. A second commit returns the stable `ErrAudioCommitInFlight` before sequence or ledger mutation. WebSocket intake maps that condition to the fixed, content-free `input_audio_buffer_commit_in_flight` protocol error and keeps the session alive; direct `Manager.Submit` receives the typed error without terminating the runtime.
-- The adapter registers the sole commit before writing it, requires a standard `input_audio_buffer.committed` event, and terminates deterministically with `ErrAudioCommitAckTimeout` after five seconds by default. Accepted events drain before the timeout is published. A raw acknowledgement never stops the timer by itself: only the reactor's ordered semantic-release command can do so.
-- Every manual commit carries a positive, strictly increasing generation token. The adapter stamps an eligible post-registration acknowledgement with that token, the reactor requires the exact pending token, and the semantic release must echo the same token and an item observed in that transport slot. A read-loop watermark excludes frames already read or buffered at registration. Historical committed-item tombstones and the token jointly prevent duplicate, ABA, automatic-VAD, and delayed prior-slot acknowledgements from clearing later commit C; an exact known item re-established by `speech_started` remains valid.
-- The acknowledgement's exact `item_id` binds the sole pending generation. `previous_item_id` is preserved as nullable protocol data and forwarded to the client, but it is never used for correlation. No client event-ID echo, predecessor graph, deferred acknowledgement chain, or ASR arrival-order heuristic exists.
-- Provider ingress and the public codec require the `previous_item_id` member while accepting explicit JSON `null` for the first conversation item. Omission and non-string/non-null values fail closed.
-- A newer client user item suppresses the unknown older generation without discarding its acknowledgement slot. The eventual old acknowledgement records and retires only that tombstone; it cannot replace the client turn. A later commit/ack receives a new immutable turn, and late old acknowledgement/transcript events remain no-ops.
-- Explicit `speech_started` authority and transcript-only compatibility remain available on their unambiguous paths. A transcript cannot claim an unacknowledged manual commit. Acknowledged live generations retain immutable turns through interleaved deltas until their exact completion, with an aggregate limit of 64.
-- Retained item IDs are cloned, valid UTF-8, free of whitespace/control characters, and at most 256 bytes. History is exactly bounded to 1024 entries and 256 KiB with no eviction. Capacity/validation failures leave the full deep-copied ledger, turn/revision, transcript sequence, and effect sequence unchanged.
-- The manager processes committed acknowledgements synchronously before accepting later provider transcript/media ordering, exposes pending-ack state in its reconnect boundary, preserves buffered client audio across a rejected early commit, and does not deadlock across repeated commit/ack/barge cycles.
-- The native `/Users/chuanmingliu/speech-to-speech` service now allocates or reuses the input-audio item at successful commit, captures the whole-conversation predecessor before advancing the tail, and emits the SDK's standard `InputAudioBufferCommittedEvent` from the serialized router result path. Empty commits remain error-only. Assistant/tool predecessors, two sequential commits, event ordering, and SDK decoding are covered without any cross-repository runtime link.
+- Go now has an explicit provider-neutral input-turn mode: `manual` for
+  `turn_detection:null`, and provider-VAD for `server_vad` or `semantic_vad`. The mode is
+  requested through session configuration, confirmed only by the provider's actual
+  `session.updated`, and immutable for the lifetime of the audio stream. Socket write completion
+  is not confirmation. Session updates are serialized because provider acknowledgements carry no
+  request correlation; the connector stamps the acknowledgement with the sole locally outstanding
+  command sequence plus an explicit acknowledgement-present bit. The bit distinguishes a real
+  sequence-zero manager bootstrap acknowledgement from unsolicited/pre-registration provider
+  events; the exact sequence prevents that bootstrap acknowledgement from consuming a later
+  browser update. Audio is rejected content-free and nonfatally until exact confirmation. The
+  acknowledged client effect also carries a pre-write boundary, so the confirmed mode is published
+  before `session.updated` can become observable and immediate causally later audio cannot be falsely
+  rejected.
+- In provider-VAD mode the client and gateway never send `input_audio_buffer.commit`; an attempted
+  explicit commit receives a nonfatal `manual_audio_commit_disabled` error. Provider
+  `speech_started`, `speech_stopped`, and `input_audio_buffer.committed` events own the item
+  directly and never enter or consume the manual acknowledgement slot/history. A stop must match
+  the independently tracked active speech item; a delayed stop for a superseded item cannot clear
+  `UserSpeaking` or reopen the implicit-response path. A distinct overlapping start is forwarded
+  with its new item identity but does not repeat the epoch advance, flush, or cancel.
+- In manual mode provider speech edges are invalid. Exactly one outstanding client commit means
+  the sole fresh committed acknowledgement is causal. The private positive command sequence is
+  used only to carry that already-established local slot through adapter/reactor handoff; it does
+  not infer provider correlation. Delayed duplicate/ABA item IDs are permanent bounded history
+  no-ops and cannot release a later slot. Multiple fresh acknowledgements fail closed.
+- No read watermark, `previous_item_id`, arrival order, ASR order, or cross-direction FIFO is used
+  for correlation. `previous_item_id` remains required protocol data; explicit JSON `null` is
+  valid for the first conversation item, while omission is rejected.
+- Provider transcripts have no independent authority: a same-item transcription is accepted only
+  after its item has a committed owner. Client supersession, assistant/tool/function-output
+  interposition, and delayed duplicate ABA events cannot revive or steal a turn.
+- The native `/Users/chuanmingliu/speech-to-speech` service deliberately exposes only the
+  provider-VAD capability. It rejects `turn_detection:null` and every explicit client commit,
+  emits the standard `input_audio_buffer.committed` event and mutates commit state at provider
+  speech-stop, and uses a per-item readiness fence so the committed event's transport send finishes
+  before any same-item transcript is emitted. Conversation-tail advancement is monotonic: a
+  speculative input item is reused only while it is still current and its predecessor snapshot
+  matches; client, assistant, tool-call, or function-output advancement forces a fresh item without
+  rolling the tail backward.
+- Retained item IDs remain cloned, valid UTF-8, free of whitespace/control characters, and at most
+  256 bytes. Manual duplicate history remains exactly bounded to 1024 entries and 256 KiB with no
+  eviction; provider-VAD traffic does not consume that capacity. Live input generations remain
+  bounded to 64, and admission/capacity failures remain mutation-free.
 
 ### Implicit response while speaking
 
@@ -245,7 +355,7 @@ git diff --check -- .superpowers/sdd/2026-08-14-realtime-interruption-hardening/
 
 Both passed at the provider-seam checkpoint. Controller approval then authorized the single-flight correction described above.
 
-Approved single-flight correction gates:
+Interim single-flight correction gates (superseded by the final mode boundary):
 
 ```text
 go test ./internal/protocol ./internal/session -count=1
@@ -258,26 +368,144 @@ go vet ./...
 git diff --check
 ```
 
-All passed. The repeated tests cover acknowledgement-before-next-commit, deterministic no-ack teardown, pre-registration/buffered/delayed event causality, duplicate and explicit ABA behavior, automatic VAD separation, client supersession, semantic-error backpressure, and continuous commit/ack/barge progress. Final independent review reported P0/P1/P2 = 0/0/0.
+These passed at the interim revision. They remain useful historical regression evidence for admission,
+timeouts, error backpressure, and commit/barge progress, but they are not final completion evidence:
+the subsequent adversarial review proved that its automatic-VAD separation still depended on an
+uncorrelated read watermark. The final mode-boundary gates below supersede this result.
 
-Native speech-service gates at commit `919560114785c7220e209710b06d1f2620e9add8`:
+Final Go mode-boundary/adversarial gates:
 
 ```text
-PYTHONPATH=src .venv/bin/pytest -q tests/openai_realtime
-.venv/bin/ruff check src/speech_to_speech/api/openai_realtime/handlers/audio.py src/speech_to_speech/api/openai_realtime/service.py src/speech_to_speech/api/openai_realtime/websocket_router.py tests/openai_realtime/test_openai_client.py tests/openai_realtime/test_realtime_service.py tests/openai_realtime/test_webrtc.py tests/openai_realtime/test_websocket_router.py
+GOCACHE=/private/tmp/task2-breaker5-go-cache go test ./internal/session ./internal/realtime/s2sws -run 'Test(HistoricalAckCannotReleaseNewCommit|HistoricalManualItemIDCannotBeReused|PriorManualSequenceCannotStealNextCommit|UnknownTranscriptAndDuplicateAckCannotReleaseLaterCommit|ClientTurnSupersedesPendingManualCommitWithoutLateAckStealingAuthority|ClientSupersessionRetainsOnlyUnknownAckTombstone|ManualSlotRejectsMultipleFreshAcknowledgements|ProviderVADAcknowledgementsDoNotConsumeManualHistory|SequenceZeroInitialAckCannotConsumePendingClientMode|UnsolicitedSequenceZeroCannotConfirmExpectedInitialMode|WrongNonzeroSessionUpdateSequenceCannotConsumePendingMode|ManagerInitialSessionAckCannotConsumePendingBrowserMode|SessionUpdatedCarriesOutstandingLocalSequence|UnsolicitedSessionUpdatedIsNotMarkedAsAcknowledgement|ClientWriterPublishesInputTurnModeBeforeSessionUpdated|ImplicitCreatedWhileSpeakingBindsCancelsAndNeverPublishes|SpeechEdgesAndExplicitCancelFenceInOrder|DifferentSpeechItemWhileSpeakingSupersedesCommittedEligibility)$' -count=100 -timeout=180s
+GOCACHE=/private/tmp/task2-breaker5-go-cache go test -race ./internal/session ./internal/realtime/s2sws -run 'Test(HistoricalAckCannotReleaseNewCommit|HistoricalManualItemIDCannotBeReused|PriorManualSequenceCannotStealNextCommit|UnknownTranscriptAndDuplicateAckCannotReleaseLaterCommit|ClientTurnSupersedesPendingManualCommitWithoutLateAckStealingAuthority|ClientSupersessionRetainsOnlyUnknownAckTombstone|ManualSlotRejectsMultipleFreshAcknowledgements|ProviderVADAcknowledgementsDoNotConsumeManualHistory|SequenceZeroInitialAckCannotConsumePendingClientMode|UnsolicitedSequenceZeroCannotConfirmExpectedInitialMode|WrongNonzeroSessionUpdateSequenceCannotConsumePendingMode|ManagerInitialSessionAckCannotConsumePendingBrowserMode|SessionUpdatedCarriesOutstandingLocalSequence|UnsolicitedSessionUpdatedIsNotMarkedAsAcknowledgement|ClientWriterPublishesInputTurnModeBeforeSessionUpdated|ImplicitCreatedWhileSpeakingBindsCancelsAndNeverPublishes|SpeechEdgesAndExplicitCancelFenceInOrder|DifferentSpeechItemWhileSpeakingSupersedesCommittedEligibility)$' -count=20 -timeout=240s
+GOCACHE=/private/tmp/task2-breaker5-go-cache go test ./internal/session ./internal/realtime/s2sws -count=10
+GOCACHE=/private/tmp/task2-breaker5-go-cache go test -race ./internal/session ./internal/realtime/s2sws -count=1
+GOCACHE=/private/tmp/task2-breaker5-go-cache go test ./... -count=1 -timeout=180s
+GOCACHE=/private/tmp/task2-breaker5-go-cache go test -race ./... -count=1 -timeout=180s
+GOCACHE=/private/tmp/task2-breaker5-go-cache go test -race ./internal/protocol ./internal/realtime/s2sws ./internal/session ./internal/gateway -count=3
+GOCACHE=/private/tmp/task2-breaker5-go-cache go vet ./...
+GOCACHE=/private/tmp/task2-breaker5-go-cache go build ./...
+GOCACHE=/private/tmp/task2-breaker5-go-cache go mod tidy -diff
+git diff --check
 ```
 
-The test package passed 228 tests with one pre-existing Starlette deprecation warning; Ruff passed. Tests used local service/router/WebRTC/SDK loopback paths only, with no live provider calls or credential access.
+All passed. The final 18-test causality/edge/publication slice passed 100 consecutive ordinary runs
+(session 0.871s, adapter 12.239s) and 20 race-enabled runs (session 1.576s, adapter 4.730s).
+Full session/adapter packages passed 10 consecutive runs (30.838s/6.079s); the whole repository
+passed fresh ordinary and race runs. Protocol/adapter/session/gateway passed three race-enabled
+runs (2.150s/7.895s/12.036s/6.125s). Vet, the clean permissioned build, module tidiness,
+formatting, and whitespace verification were clean.
+
+An earlier independent review exposed the stale `speech_stopped` fence bug. The corrected focused
+speech-edge/identifier/implicit-response slice passed 20 ordinary and 20 race-enabled runs. Full
+session/adapter passed 10 runs (30.880s/5.169s); protocol/adapter/session/gateway passed three race
+runs (2.346s/7.797s/12.214s/6.304s); the full repository passed ordinary (26.62s) and a clean fresh
+race rerun (16.19s). The first race attempt hit the pre-existing unrelated
+`internal/handoff::TestEventPumpScopesNotificationsAndRepairsLostWakeups` ordering flake; that exact
+test immediately passed 20 race runs before the complete clean rerun. Vet, clean permissioned build,
+module tidiness, formatting, and `git diff --check` passed again.
+
+The next independent pass reported P0/P1/P2 = 0/2/1: the two P1s were the overlapping public
+speech-edge mismatch and the `session.updated`/mode-publication race described above; the P2 was
+this report's missing final verdict. Both code findings were reproduced before their production
+changes and passed the final gates above. The report was then refreshed and the exact post-fix diff
+was submitted to a fresh independent reviewer; its final verdict is recorded below.
+
+Final independent Go rereview: P0/P1/P2 = 0/0/0, READY TO COMMIT. The reviewer confirmed the
+overlapping speech edge is identity-coherent without a second fence/cancel, the exact acknowledged
+mode crosses the ordered effect queue and is locked into the reader boundary before client write,
+failed/cancelled runtimes do not share that state, reconnect starts unconfirmed, and the connector's
+acknowledgement-presence/exact-sequence separation remains intact. Its focused race slice passed 20
+runs, full session/adapter/gateway suites passed with loopback permission, and `git diff --check`
+was clean on the reviewed diff.
+
+Pre-review native speech-service mode/fence gates (superseded; working tree based on
+`919560114785c7220e209710b06d1f2620e9add8`):
+
+```text
+PYTHONPATH=src .venv/bin/pytest -q -p no:cacheprovider tests/openai_realtime/test_realtime_service.py::TestInputCommitOwnershipAndTailIntegrity tests/openai_realtime/test_realtime_service.py::TestHandleAudioCommit tests/openai_realtime/test_websocket_router.py::TestClientEventDispatch::test_same_item_transcript_waits_for_commit_transport_send tests/openai_realtime/test_websocket_router.py::TestClientEventDispatch::test_session_update_success_emits_effective_session_updated
+PYTHONPATH=src .venv/bin/pytest -q -p no:cacheprovider tests/openai_realtime/test_realtime_service.py tests/openai_realtime/test_websocket_router.py tests/openai_realtime/test_webrtc.py -k 'not WebRTCLoopback'
+PYTHONPATH=src .venv/bin/pytest -q -p no:cacheprovider tests/openai_realtime
+PYTHONPATH=src .venv/bin/pytest -q -p no:cacheprovider tests/openai_realtime/test_openai_client.py tests/openai_realtime/test_webrtc.py
+PYTHONPATH=src .venv/bin/ruff check --no-cache src/speech_to_speech/api/openai_realtime/handlers/audio.py src/speech_to_speech/api/openai_realtime/handlers/conversation.py src/speech_to_speech/api/openai_realtime/handlers/response.py src/speech_to_speech/api/openai_realtime/handlers/session.py src/speech_to_speech/api/openai_realtime/runtime_config.py src/speech_to_speech/api/openai_realtime/service.py src/speech_to_speech/api/openai_realtime/websocket_router.py tests/openai_realtime/test_openai_client.py tests/openai_realtime/test_realtime_service.py tests/openai_realtime/test_webrtc.py tests/openai_realtime/test_websocket_router.py
+git diff --check
+```
+
+The focused ownership/fence slice passed 12 tests. The non-listener service/router/WebRTC slice
+passed 202 tests with 6 loopback tests deselected. The complete Realtime suite passed 234 tests in
+50.53 seconds with one pre-existing Starlette deprecation warning; the separate SDK/WebRTC
+loopback slice passed 35 tests in 43.58 seconds with the same warning. Ruff and `git diff --check`
+passed. These gates were not sufficient completion evidence: the ensuing independent review found
+five P1 and three P2 issues, so this revision was not committed. Direct Task 2 findings were that
+speech-start and speech-stop could expose different item identities; failed/no-op sends could open
+the fence and lose staged events; an unserialized conversation event could overtake a blocked
+commit; `semantic_vad` was advertised without being honored; and cumulative STT snapshots were
+mis-emitted as deltas. It also found unbounded item records/staged bytes, four static-format/type
+errors, and incomplete capability documentation. The final speech hardening and fresh gates below
+supersede these results. Tests used only local service/router/WebRTC/SDK loopback paths, with no live
+provider calls or credential access.
+
+The first hardened replacement then passed 247 tests plus mypy/Ruff/format/diff gates, but its fresh
+adversarial rereview still failed P0/P1/P2 = 0/5/0, so it also remained uncommitted. The five P1s
+were: missing identified-transcript mappings fell back to the current assistant item; an evicted
+duplicate stop synthesized and committed a new input item; in-band `response.input` items did not
+advance the conversation tail; response creation could overtake speech-start cleanup after the
+outbound lock was released; and WebRTC send-failure close could hang/cancel before releasing the
+claimed pipeline unit. Those mechanisms were corrected, but the next rereview found one further P1:
+a multi-item `response.input` batch could apply its valid prefix to chat/tail state before rejecting a
+later invalid item. The final implementation validates and stages the entire batch against isolated
+chat state, then publishes all normalized items and tail advances atomically only after full success.
+
+Final native speech evidence at commit `d0270d79ccb6f5c99f76499bb1dbe8a65608cf51`:
+
+```text
+PYTHONPATH=src .venv/bin/pytest -q -p no:cacheprovider tests/openai_realtime
+```
+
+The exact suite passed 255 tests with one unrelated Starlette/httpx deprecation warning. Mypy over
+the 15 changed source files was clean; Ruff lint was clean; Ruff `format --check` over 24 files was
+clean; and `git diff --check` passed. The commit contains exactly 15 owned tracked source, README,
+and test files, with unrelated speech-repository dirt preserved. A fresh independent rereview of the
+committed implementation returned P0/P1/P2 = 0/0/0 and READY.
 
 ## Self-review
 
-- Checked stale item rejection occurs before all synth-ID, revision, sequence, active-turn, and durable-effect mutation.
-- Checked no-speech-edge compatibility remains covered by final transcript and ABA revision tests, including pure transcript-only A/B/A before explicit authority and transcript-only A crossing client B and audio commit into transcript-only C.
-- Confirmed the round-3 ledger's counterexample—commit A, client B, commit C, C transcript/completion, then late A—is closed by admission uniqueness and exact per-slot generation tokens, not by predecessor or arrival inference.
-- Confirmed the official success event does not echo the client commit ID and its predecessor is the whole-conversation tail; assistant/tool insertion defeats input-only predecessor matching.
-- Confirmed WebSocket command/event ordering is insufficient to infer FIFO success correlation across directions, and the configured local provider emits no committed success event.
-- Preserved the acceptance criteria: 64 total live generation records including tombstones; 1024 cloned IDs and at most 256 KiB with 256-byte valid-UTF-8/content-free identifiers; exact 1024/1025 no-eviction/reuse coverage; and deep-copied ledger/transcript-sequence fields in failure-atomicity views.
-- Checked raw acknowledgements cannot stop/reset the adapter deadline; only an exact reactor-authorized release does. The token, read watermark, observed-item set, and no-eviction history jointly close prior-slot, duplicate, ABA, auto-VAD, and cancellation races.
+- Checked mode authority comes only from the configured `turn_detection` value and the matching
+  provider `session.updated`; write completion, a missing value, an unknown value, or a mismatched
+  value cannot enable audio.
+- Checked the confirmed mode's output marker is applied before the acknowledged `session.updated`
+  write. The client cannot observe that acknowledgement while the reader still sees `Unspecified`;
+  cancelled, suppressed, or never-admitted writes do not bypass the writer's existing gates.
+- Checked speech-stop ownership is separate from the mutable active conversation turn. A validated
+  delayed stop for A cannot clear B's live speaking fence, publish a stop for A, or let an implicit
+  response stream across the barge boundary.
+- Checked a distinct overlapping speech start B publishes B's identity without a second epoch,
+  flush, or cancellation; a same-ID duplicate stays silent, delayed stop A is ignored, and stop B
+  closes the currently exposed edge with B's identity.
+- Checked manual and provider-VAD ownership cannot coexist or switch within a live audio stream.
+  Provider speech/auto-commit cannot touch the manual slot, and client commit cannot reach the wire
+  in provider-VAD mode.
+- Checked the round-3 counterexample—commit A, client B, commit C, C transcript/completion, then late
+  A—is closed by mutually exclusive authority plus one manual slot and permanent duplicate history,
+  not by predecessor, watermark, arrival, ASR, or FIFO inference.
+- Checked a provider transcript cannot create its own input authority. Same-item transcripts remain
+  closed until committed ownership exists; transcript-before-commit therefore cannot publish or
+  durably advance a turn.
+- Checked the official success event does not echo the client commit ID and its predecessor is the
+  whole-conversation tail; assistant/tool insertion therefore remains test evidence against
+  predecessor correlation rather than an input-generation key.
+- Preserved the acceptance criteria: 64 total live generation records including tombstones; 1024
+  cloned reactor item IDs and at most 256 KiB with 256-byte valid-UTF-8/content-free identifiers;
+  exact 1024/1025 no-eviction/reuse coverage; and deep-copied ledger/transcript-sequence fields in
+  failure-atomicity views. The adapter's separately bounded manual-ack history is not consumed by
+  provider-VAD traffic.
+- Checked raw manual acknowledgements cannot stop/reset the adapter deadline; only the exact
+  reactor-authorized release of the sole pending manual slot does. Duplicate and delayed ABA items
+  remain no-ops, while multiple distinct acknowledgements fail closed.
+- Checked the speech provider emits and sends `input_audio_buffer.committed` before releasing its
+  same-item transcript fence. Its tail version/predecessor snapshot prevents a speculative input
+  item from rolling conversation history backward across client, assistant, tool-call, or
+  function-output interposition.
 - Checked the speech-service change is native to its repository and the Go implementation has no symlink, import, runtime dependency, or copied linkage to Qwen or another reference repository.
 - No protected demo dirt, review item 8 behavior, supported empty-ID cancellation path, or expert item 8 contract was changed.
 - Checked implicit suppression orders bind before flush/cancel and uses a newer cancel fence; old bind-epoch media is therefore rejected even if binding releases buffered adapter frames.

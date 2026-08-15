@@ -1,6 +1,9 @@
 package session
 
-import "github.com/chuanmingliu/openai-gpt-live/internal/identity"
+import (
+	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
+	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
+)
 
 type IDs struct {
 	SessionID      identity.SessionID
@@ -31,6 +34,7 @@ type Snapshot struct {
 	ResponseEpoch           identity.ResponseEpoch
 	UserSpeaking            bool
 	InputAudioCommitPending bool
+	InputTurnMode           realtime.InputTurnMode
 	CommittedTurn           *identity.TurnKey
 	LastDurableSeq          uint64
 }
