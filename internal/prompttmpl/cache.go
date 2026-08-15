@@ -35,7 +35,10 @@ type compileCall struct {
 
 // NewCache creates a cache with independent entry and byte ceilings.
 func NewCache(engine Engine, entries, bytes int) (*Cache, error) {
-	if _, ok := validCacheEngineIdentity(engine); !ok || entries <= 0 || bytes <= 0 {
+	if _, ok := validCacheEngineIdentity(engine); !ok {
+		return nil, ErrEngineIdentity
+	}
+	if entries <= 0 || bytes <= 0 {
 		return nil, ErrLimitsInvalid
 	}
 	return &Cache{

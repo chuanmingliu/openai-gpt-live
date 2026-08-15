@@ -689,6 +689,9 @@ func normalizeCompileBoundaryError(ctx context.Context, err error, templates map
 	if errors.Is(err, prompttmpl.ErrRenderLimit) {
 		return prompttmpl.ErrRenderLimit
 	}
+	if errors.Is(err, prompttmpl.ErrEngineIdentity) {
+		return ErrProfileIncompatible
+	}
 	var compileErr *prompttmpl.CompileError
 	if errors.As(err, &compileErr) && compileErr != nil {
 		if _, ok := templates[compileErr.Template]; ok && ValidateTemplateName(compileErr.Template) == nil {

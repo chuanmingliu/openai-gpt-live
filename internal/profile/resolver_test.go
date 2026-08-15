@@ -113,6 +113,14 @@ func TestResolveRejectsNoncompliantEngineIdentityBeforeStoreAccess(t *testing.T)
 	require.Zero(t, store.resolveCalls)
 }
 
+func TestResolveClassifiesRealCacheEngineDriftAsProfileIncompatible(t *testing.T) {
+	store, _, published := publishedResolverFixture(t)
+
+	_, err := NewResolver(store, newIdentityDriftingCache(t)).Resolve(t.Context(), testTenant, published.Ref, ResolveNewSession)
+	require.ErrorIs(t, err, ErrProfileIncompatible)
+	require.NotErrorIs(t, err, prompttmpl.ErrTemplateInvalid)
+}
+
 func TestResolveRejectsVersionAboveStoreDomainBeforeStoreAccess(t *testing.T) {
 	store, engine, _ := publishedResolverFixture(t)
 	ref := VersionRef{ID: testProfile, Version: uint64(math.MaxInt64) + 1}

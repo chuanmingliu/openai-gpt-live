@@ -179,3 +179,60 @@ Fix-round exact staging audit: `git diff --cached --name-only` contained exactly
 `git diff --cached --check` passed with no diagnostics. `internal/profile/builtin/system.j2` and `context.schema.json` remain byte-for-byte unchanged; the exact terminal newline was already checked in and is now preserved rather than trimmed. Protected browser/audio files, `.zshrc`, research notes, and the realtime interruption plan remain unstaged.
 
 Fix-round concerns: none.
+
+## Fix round 2/5 — built-in byte ownership and cache identity classification
+
+Date: 2026-08-16
+
+This round addresses both Important findings in `task-5-rereview-1.md`. The authorized scope remains the Task 5-owned profile/cache paths plus the narrowly authorized MiniJinja paths; protected browser/audio changes and unrelated untracked files were not edited.
+
+### Strict RED evidence
+
+- The built-in exact-asset tests were changed first to require the checked-in 490-byte `system.j2` without a terminal newline, system blob hash `7010b4fb362643c843f565d446c6f4f16488a27413cfe2817ee811637d47eb43`, and stable snapshot hash `485d0ed01ac9486068d5590891f188567a6ffdf03eaaa493f900fc8dadf4d5e9`.
+  - RED: the embedded source was still 491 bytes, ended in a newline, and produced the prior blob/snapshot hashes.
+  - GREEN after checking in the exact no-newline asset, aligning the fixture expectation, removing the engine-wide `KeepTrailingNewline` configuration, and deleting its generic semantic test.
+- Cache constructor classification was tightened in the test before production code.
+  - RED: malformed and typed-nil engines returned `template_limits_invalid` instead of preserving `engine_identity_invalid`.
+  - GREEN after validating engine identity independently and before cache size limits.
+- Publisher and Resolver regression tests use a real `prompttmpl.Cache` whose underlying engine changes its composite identity during compilation.
+  - RED: Cache correctly returned a wrapped `ErrEngineIdentity`, but both profile boundaries collapsed it to `template_invalid`.
+  - GREEN after the shared compile-boundary normalizer maps `ErrEngineIdentity`, including wrapped `CompileError` instances, to `profile_incompatible` before the generic template-invalid fallback. Neither path reaches a mutation after the drift.
+
+### Fix implementation
+
+- Restored MiniJinja's generic default trailing-newline behavior; no engine-wide whitespace semantic override remains.
+- Made the Task 5-owned built-in exact at its source boundary: the checked-in `system.j2`, embedded source, hashed blob, compiled template, rendered prompt, and fixture expected output all use the same 490 bytes with no terminal newline.
+- Preserved the stable composite engine identity `jinja-go-v1/minijinja-go/v2.24.0`; the corrected built-in snapshot hash is `485d0ed01ac9486068d5590891f188567a6ffdf03eaaa493f900fc8dadf4d5e9`.
+- Made cache construction preserve `ErrEngineIdentity` for invalid, noncompliant, and typed-nil engines while continuing to return `ErrLimitsInvalid` for invalid limits supplied with a valid engine.
+- Classified cache-detected identity drift as `ErrProfileIncompatible` in the single shared Publisher/Resolver compile boundary without exposing dependency strings or weakening sanitized compiler metadata.
+
+### Fix-round final verification
+
+The PostgreSQL commands used real disposable PostgreSQL 16 containers; no integration result was skipped. A sandbox-only full-repository attempt could not bind loopback test servers and was not accepted; the unrestricted repeat passed.
+
+- `env GOCACHE=/private/tmp/codex-task5-fix2-go-cache go test ./internal/prompttmpl ./internal/profile -count=1`
+  - PASS: prompttmpl 0.954s; profile 1.313s.
+- Focused exact-byte, constructor-classification, and real-cache Publisher/Resolver drift tests
+  - PASS: prompttmpl 2.238s; profile 1.777s.
+- `env GOCACHE=/private/tmp/codex-task5-fix2-go-cache go test -race ./internal/prompttmpl ./internal/profile -count=10`
+  - PASS: prompttmpl 2.010s; profile 2.689s.
+- `env GOCACHE=/private/tmp/codex-task5-fix2-go-cache go test -race ./internal/prompttmpl ./internal/profile ./internal/store/postgres ./migrations -count=3`
+  - PASS: prompttmpl 1.548s; profile 2.769s; PostgreSQL 2.511s; migrations 3.023s.
+- `env CGO_ENABLED=0 GOCACHE=/private/tmp/codex-task5-fix2-go-cache go test ./internal/prompttmpl ./internal/profile -count=1`
+  - PASS: prompttmpl 0.948s; profile 0.479s.
+- `env GOCACHE=/private/tmp/codex-task5-fix2-go-cache go test -tags=integration ./internal/store/postgres -run 'TestProfile|TestSchema' -count=1`
+  - PASS against real PostgreSQL: 58.891s.
+- `env GOCACHE=/private/tmp/codex-task5-fix2-go-cache go test -race -tags=integration ./migrations ./internal/store/postgres -run 'TestProfile|TestSchema|TestEmbedded' -count=1`
+  - PASS against real PostgreSQL: migrations 2.451s; PostgreSQL 64.544s.
+- `env GOCACHE=/private/tmp/codex-task5-fix2-go-cache go test ./... -count=1`
+  - PASS for every package; the browser demo package passed in 14.841s.
+- `env GOCACHE=/private/tmp/codex-task5-fix2-go-cache go vet ./...`, `env GOPROXY=off GOCACHE=/private/tmp/codex-task5-fix2-go-cache go build ./...`, `env GOCACHE=/private/tmp/codex-task5-fix2-go-cache go mod tidy -diff`, `git diff --check`, and owned-file `gofmt -d`
+  - PASS with no diagnostic or diff.
+- `make verify-deploy-static`
+  - PASS: durable Compose wrapper, deploy validation, load/loadgen, supply-evidence boundary, release-gate boundary, and final static deployment verification.
+
+Fix-round privacy/ownership audit: focused no-leak and deep-ownership tests passed, including trusted policy locations, allowlisted/untrusted compiler metadata, unknown compiler causes, cache corruption, built-in clone isolation, and the new Publisher/Resolver cache-drift cases. Static scans found no raw-error formatting, logging, filesystem/environment/process/network/database access, or new external built-in input path in the changed production files.
+
+Fix-round self-review: the owned diff is limited to the two rereview findings. The generic MiniJinja change and test are removed, the asset is exactly 490 bytes and its SHA-256 matches the pinned blob hash, error normalization precedes the generic compile fallback, and valid-engine invalid-limit behavior remains covered. Concerns: none.
+
+Fix-round exact staging audit: `git diff --cached --name-only` contained exactly the report plus these 10 authorized code/test/asset paths: `internal/profile/builtin/fixture.json`, `internal/profile/builtin/system.j2`, `internal/profile/builtin_test.go`, `internal/profile/publisher.go`, `internal/profile/publisher_test.go`, `internal/profile/resolver_test.go`, `internal/prompttmpl/cache.go`, `internal/prompttmpl/cache_test.go`, `internal/prompttmpl/minijinja.go`, and `internal/prompttmpl/minijinja_test.go`. `git diff --cached --check` passed. Protected browser/audio files and unrelated untracked files remain untouched and unstaged.

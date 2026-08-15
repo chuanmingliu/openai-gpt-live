@@ -308,11 +308,11 @@ func (e *nilUnsafeEngine) Compile(context.Context, Bundle, Limits) (CompiledBund
 
 func TestCacheRejectsNoncompliantAndTypedNilEngines(t *testing.T) {
 	_, err := NewCache(&versionedEngine{version: "implementation-only", resident: 1}, 1, 1024)
-	require.Error(t, err)
+	require.ErrorIs(t, err, ErrEngineIdentity)
 
 	var typedNil *nilUnsafeEngine
 	_, err = NewCache(typedNil, 1, 1024)
-	require.Error(t, err)
+	require.ErrorIs(t, err, ErrEngineIdentity)
 }
 
 func TestCacheVersionAndCompileFailClosedForCorruptState(t *testing.T) {

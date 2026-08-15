@@ -393,6 +393,18 @@ func newPublisherHarness(t *testing.T) *publisherHarness {
 	return &publisherHarness{store: store, engine: engine, catalog: catalog, knowledge: knowledge, publisher: publisher}
 }
 
+func newIdentityDriftingCache(t *testing.T) *prompttmpl.Cache {
+	t.Helper()
+	engine := &publisherEngine{delegate: prompttmpl.NewMiniJinja()}
+	version := engine.delegate.Version()
+	// NewCache, the caller, and Cache.Compile each observe the original
+	// identity; the post-compile cache fence observes the drift.
+	engine.versions = []string{version, version, version, version + "/changed"}
+	cache, err := prompttmpl.NewCache(engine, 4, 1<<20)
+	require.NoError(t, err)
+	return cache
+}
+
 func publisherManifest(t *testing.T) (Manifest, map[string]Blob) {
 	t.Helper()
 	template := canonicalPublisherBlob(t, "text/plain; charset=utf-8", []byte("Hello {{ customer }}"))
@@ -794,6 +806,16 @@ func TestPublishRejectsNoncompliantEngineIdentityBeforeStoreAccess(t *testing.T)
 	_, err := h.publisher.Publish(t.Context(), publishCommand())
 	require.ErrorIs(t, err, ErrProfileIncompatible)
 	require.Zero(t, h.store.loadDraftCalls)
+}
+
+func TestPublishClassifiesRealCacheEngineDriftAsProfileIncompatible(t *testing.T) {
+	h := newPublisherHarness(t)
+	publisher := NewPublisher(h.store, newIdentityDriftingCache(t), h.catalog, h.knowledge, WithPublisherClock(publisherClock{now: testPublicationTime}))
+
+	_, err := publisher.Publish(t.Context(), publishCommand())
+	require.ErrorIs(t, err, ErrProfileIncompatible)
+	require.NotErrorIs(t, err, prompttmpl.ErrTemplateInvalid)
+	require.Zero(t, h.store.mutationCalls())
 }
 
 func TestPublishKnowledgeValidationDefaultsFailClosedAndOwnsReferences(t *testing.T) {

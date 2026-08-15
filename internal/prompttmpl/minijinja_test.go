@@ -52,12 +52,6 @@ func TestMiniJinjaReportsCompositeEngineIdentity(t *testing.T) {
 	require.Equal(t, engine.Version(), compiled.EngineVersion())
 }
 
-func TestMiniJinjaRendersCheckedInTrailingNewlineExactly(t *testing.T) {
-	got, err := render(t, "safe\n", Context{})
-	require.NoError(t, err)
-	require.Equal(t, "safe\n", got)
-}
-
 func TestMiniJinjaStrictStaticBundle(t *testing.T) {
 	compiled := compile(t, Bundle{Templates: map[string]string{
 		"system.j2":          `{% include "fragments/rules.j2" %} {{ customer.name }}`,

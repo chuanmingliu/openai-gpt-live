@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const builtinSystemPrompt = "You are a realtime spoken assistant. Reply in the user's language using at most three short sentences unless the user explicitly asks for more detail. Use natural speech without markdown, headings, lists, or narrated reasoning. Keep background work silent and mention it only after a result is available. Only use the server-owned reserved background-task tools: start_background_task, steer_background_task, and cancel_background_task. Never invent task IDs, task results, or capabilities.\n"
+const builtinSystemPrompt = "You are a realtime spoken assistant. Reply in the user's language using at most three short sentences unless the user explicitly asks for more detail. Use natural speech without markdown, headings, lists, or narrated reasoning. Keep background work silent and mention it only after a result is available. Only use the server-owned reserved background-task tools: start_background_task, steer_background_task, and cancel_background_task. Never invent task IDs, task results, or capabilities."
 
 func TestBuiltInProfileRequiresNoStoreAndHasStableLiteralHash(t *testing.T) {
 	first, second := Builtin(), Builtin()
@@ -23,7 +23,7 @@ func TestBuiltInProfileRequiresNoStoreAndHasStableLiteralHash(t *testing.T) {
 
 	// This literal is intentionally updated only when the reviewed built-in
 	// assets or canonical snapshot contract changes.
-	const stableSnapshotHash = "70fb32f9d75a9eb5708d9e6d3783243b4aaf9ee551dd6e11f5c26539b2c3ec7c"
+	const stableSnapshotHash = "485d0ed01ac9486068d5590891f188567a6ffdf03eaaa493f900fc8dadf4d5e9"
 	require.Equal(t, stableSnapshotHash, first.Snapshot.SnapshotHash)
 }
 
@@ -31,7 +31,7 @@ func TestBuiltInProfileRendersExactStaticAssetWithEmptyTypedContext(t *testing.T
 	builtin := Builtin()
 	require.Equal(t, builtinSystemPrompt, builtinSystemSource)
 	require.Equal(t, map[string]string{"system.j2": builtinSystemPrompt}, builtin.Bundle.Templates)
-	require.Equal(t, "86141d8177594727d8043b7842762654496d41e0846470c71577f0ea7bb376f4", builtin.Snapshot.System.Hash)
+	require.Equal(t, "7010b4fb362643c843f565d446c6f4f16488a27413cfe2817ee811637d47eb43", builtin.Snapshot.System.Hash)
 	require.Empty(t, builtin.Bundle.Schema.Fields)
 	compiled, err := prompttmpl.NewMiniJinja().Compile(t.Context(), builtin.Bundle, prompttmpl.DefaultLimits())
 	require.NoError(t, err)

@@ -16,7 +16,6 @@ import (
 
 	minijinja "github.com/mitsuhiko/minijinja/minijinja-go/v2"
 	"github.com/mitsuhiko/minijinja/minijinja-go/v2/filters"
-	minijinjasyntax "github.com/mitsuhiko/minijinja/minijinja-go/v2/syntax"
 	"github.com/mitsuhiko/minijinja/minijinja-go/v2/tests"
 )
 
@@ -51,9 +50,6 @@ func (miniJinjaEngine) Compile(ctx context.Context, bundle Bundle, requested Lim
 	names := sortedTemplateNames(owned.Templates)
 	env := minijinja.EmptyEnvironment()
 	env.SetUndefinedBehavior(minijinja.UndefinedStrict)
-	whitespace := minijinjasyntax.DefaultWhitespace()
-	whitespace.KeepTrailingNewline = true
-	env.SetWhitespace(whitespace)
 	env.SetRecursionLimit(limits.RecursionDepth)
 	fuel := limits.Fuel
 	env.SetFuel(&fuel)
