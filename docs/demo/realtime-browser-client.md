@@ -380,6 +380,22 @@ adapter registry version, snapshot hashes, and publication timestamps are
 server-owned. Adapter bindings fail closed because the loopback demo installs no
 adapters, and raw `mcpServers` JSON is intentionally rejected here as well.
 
+### Worker recipes
+
+A worker recipe lets a profile run background work during a live turn. The
+browser may submit only the recipe ID and its numeric guardrails — approval
+requirement, execution, tool and overall timeouts, and the objective, evidence,
+tool-result and final-result byte ceilings. Every value is bounded before it
+reaches the domain: timeouts must be positive and at most 24 hours, byte limits
+positive and at most 1 MiB.
+
+The objective template is never browser-supplied. The service requires
+`workers/<id>.j2` to already exist in the draft bundle, answers
+`422 objective_template_missing` when it does not, and relinks the recipe's
+objective to that logical name on every save. Saving bumps the recipe version
+and the draft generation together, so a stale editor cannot silently rewrite a
+recipe that changed elsewhere.
+
 ### Draft generations
 
 Draft and template writes carry `If-Match: "<generation>"`. A missing header is

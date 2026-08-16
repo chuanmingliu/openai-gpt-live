@@ -7,6 +7,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -17,6 +18,10 @@ import (
 const (
 	profileAPIPrefix      = "/api/setup/v1/"
 	profileRequestTimeout = 10 * time.Second
+	// maximumRecipeTimeoutMS mirrors the domain's 24-hour recipe duration cap.
+	maximumRecipeTimeoutMS = 24 * 60 * 60 * 1000
+	// maximumRecipeResultBytes mirrors the domain's bundle byte cap.
+	maximumRecipeResultBytes = 1 << 20
 )
 
 // serveProfileAPI is the single strict boundary for /api/setup/v1/*.
@@ -76,6 +81,8 @@ func (handler *demoHandler) serveProfileAPI(writer http.ResponseWriter, request 
 		handler.serveProfileTemplate(writer, request, profile.ID(id), strings.Join(segments[3:], "/"))
 	case len(segments) == 4 && segments[2] == "fixtures":
 		handler.serveProfileFixture(writer, request, profile.ID(id), segments[3])
+	case len(segments) == 4 && segments[2] == "recipes":
+		handler.serveProfileRecipe(writer, request, profile.ID(id), segments[3])
 	case len(segments) == 3 && (segments[2] == "validate" || segments[2] == "preview" || segments[2] == "publish"):
 		handler.serveProfilePublication(writer, request, profile.ID(id), segments[2])
 	case len(segments) == 3 && (segments[2] == "activate" || segments[2] == "revoke"):
@@ -362,6 +369,199 @@ func (handler *demoHandler) serveProfileFixture(writer http.ResponseWriter, requ
 	default:
 		writer.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+// recipeBodyFields are the only worker-recipe values a browser may supply.
+// Identity, version, objective reference, and binding IDs stay server-owned.
+var recipeBodyFields = map[string]byte{
+	"require_approval":       'b',
+	"execution_timeout_ms":   'n',
+	"tool_timeout_ms":        'n',
+	"overall_timeout_ms":     'n',
+	"max_objective_bytes":    'n',
+	"max_evidence_bytes":     'n',
+	"max_tool_result_bytes":  'n',
+	"max_final_result_bytes": 'n',
+}
+
+func (handler *demoHandler) serveProfileRecipe(writer http.ResponseWriter, request *http.Request, id profile.ID, recipeID string) {
+	if !validProfileRecipeID(recipeID) {
+		writer.WriteHeader(http.StatusNotFound)
+		return
+	}
+	switch request.Method {
+	case http.MethodPut:
+		if !requireProfileJSON(writer, request) {
+			return
+		}
+		generation, present, err := parseIfMatchGeneration(request)
+		if !present {
+			writer.WriteHeader(http.StatusPreconditionRequired)
+			return
+		}
+		if err != nil {
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		values, err := decodeProfileObject(writer, request, recipeBodyFields)
+		if err != nil {
+			writeProfileBodyError(writer, err)
+			return
+		}
+		recipe, err := recipeFromValues(recipeID, values)
+		if err != nil {
+			writeProfileErrorCode(writer, http.StatusUnprocessableEntity, "profile_invalid")
+			return
+		}
+		handler.mutateProfileDraft(writer, request, id, generation, func(manifest *profile.Manifest) error {
+			objective, ok := manifest.Bundle.Templates[workerObjectiveName(recipeID)]
+			if !ok {
+				return errObjectiveTemplateMissing
+			}
+			// The domain requires the recipe objective to equal the current
+			// template reference exactly, so the server always relinks it.
+			recipe.Objective = objective
+			recipe.Version = 1
+			replaced := false
+			for index, existing := range manifest.Recipes {
+				if existing.ID != recipeID {
+					continue
+				}
+				recipe.Version = existing.Version + 1
+				manifest.Recipes[index] = recipe
+				replaced = true
+				break
+			}
+			if !replaced {
+				manifest.Recipes = append(manifest.Recipes, recipe)
+			}
+			return nil
+		})
+	case http.MethodDelete:
+		generation, present, err := parseIfMatchGeneration(request)
+		if !present {
+			writer.WriteHeader(http.StatusPreconditionRequired)
+			return
+		}
+		if err != nil {
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		handler.mutateProfileDraft(writer, request, id, generation, func(manifest *profile.Manifest) error {
+			remaining := make([]profile.WorkerRecipe, 0, len(manifest.Recipes))
+			for _, existing := range manifest.Recipes {
+				if existing.ID != recipeID {
+					remaining = append(remaining, existing)
+				}
+			}
+			if len(remaining) == len(manifest.Recipes) {
+				return profile.ErrInvalidProfile
+			}
+			manifest.Recipes = remaining
+			return nil
+		}, http.StatusNoContent)
+	default:
+		writer.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+var errObjectiveTemplateMissing = errors.New("objective_template_missing")
+
+// recipeFromValues builds a bounded recipe from the decoded safe fields. Every
+// numeric bound is validated here so an out-of-range value never reaches the
+// domain as a generic decode failure.
+func recipeFromValues(recipeID string, values map[string]string) (profile.WorkerRecipe, error) {
+	recipe := profile.WorkerRecipe{ID: recipeID}
+	recipe.RequireApproval = values["require_approval"] == "true"
+	durations := map[string]*time.Duration{
+		"execution_timeout_ms": &recipe.ExecutionTimeout,
+		"tool_timeout_ms":      &recipe.ToolTimeout,
+		"overall_timeout_ms":   &recipe.OverallTimeout,
+	}
+	for key, target := range durations {
+		raw, ok := values[key]
+		if !ok {
+			continue
+		}
+		milliseconds, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || milliseconds < 0 || milliseconds > maximumRecipeTimeoutMS {
+			return profile.WorkerRecipe{}, errProfileBadRequest
+		}
+		*target = time.Duration(milliseconds) * time.Millisecond
+	}
+	byteFields := map[string]*int{
+		"max_objective_bytes":    &recipe.MaxObjectiveBytes,
+		"max_evidence_bytes":     &recipe.MaxEvidenceBytes,
+		"max_tool_result_bytes":  &recipe.MaxToolResultBytes,
+		"max_final_result_bytes": &recipe.MaxFinalResultBytes,
+	}
+	for key, target := range byteFields {
+		raw, ok := values[key]
+		if !ok {
+			continue
+		}
+		count, err := strconv.Atoi(raw)
+		if err != nil || count < 0 || count > maximumRecipeResultBytes {
+			return profile.WorkerRecipe{}, errProfileBadRequest
+		}
+		*target = count
+	}
+	return recipe, nil
+}
+
+// validProfileRecipeID keeps recipe identities inside the logical template
+// namespace so workers/<id>.j2 is always a valid bundle name.
+func validProfileRecipeID(recipeID string) bool {
+	if len(recipeID) == 0 || len(recipeID) > 64 {
+		return false
+	}
+	for _, value := range []byte(recipeID) {
+		if !(value >= 'a' && value <= 'z' || value >= '0' && value <= '9' || value == '_' || value == '-') {
+			return false
+		}
+	}
+	return profile.ValidateTemplateName(workerObjectiveName(recipeID)) == nil
+}
+
+// mutateProfileDraft applies one bounded manifest change under the exact draft
+// generation and persists it as the next generation.
+func (handler *demoHandler) mutateProfileDraft(writer http.ResponseWriter, request *http.Request, id profile.ID, generation int64, mutate func(*profile.Manifest) error, successStatus ...int) {
+	service := handler.profiles
+	draft, ok, err := service.store.LoadDraft(request.Context(), service.tenantID, id)
+	if err != nil {
+		writeProfileDomainError(writer, err)
+		return
+	}
+	if !ok {
+		writer.WriteHeader(http.StatusNotFound)
+		return
+	}
+	if draft.Generation != generation {
+		writeProfileErrorCode(writer, http.StatusConflict, "stale_draft")
+		return
+	}
+	draft.Manifest = draft.Manifest.Clone()
+	if err := mutate(&draft.Manifest); err != nil {
+		if errors.Is(err, errObjectiveTemplateMissing) {
+			writeProfileErrorCode(writer, http.StatusUnprocessableEntity, "objective_template_missing")
+			return
+		}
+		writeProfileDomainError(writer, err)
+		return
+	}
+	draft.UpdatedAt = service.now()
+	draft.UpdatedBy = service.actor
+	saved, err := service.store.SaveDraft(request.Context(), draft, generation)
+	if err != nil {
+		writeProfileDomainError(writer, err)
+		return
+	}
+	writer.Header().Set("ETag", draftETag(saved.Generation))
+	if len(successStatus) == 1 && successStatus[0] == http.StatusNoContent {
+		writer.WriteHeader(http.StatusNoContent)
+		return
+	}
+	writeProfileJSON(writer, http.StatusOK, draftResponse(saved))
 }
 
 func (handler *demoHandler) mutateProfileFixture(writer http.ResponseWriter, request *http.Request, id profile.ID, generation int64, mutate func(*profile.Manifest) error) {

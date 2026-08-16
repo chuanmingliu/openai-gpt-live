@@ -109,3 +109,66 @@ test('network failures map to a stable class and aborts propagate', async () => 
   });
   await assert.rejects(aborting.listPublished(), (error) => error.name === 'AbortError');
 });
+
+function recipeEntry(overrides = {}) {
+  return {
+    id: 'lookup',
+    version: 1,
+    objective: 'workers/lookup.j2',
+    require_approval: false,
+    execution_timeout_ms: 30000,
+    tool_timeout_ms: 10000,
+    overall_timeout_ms: 60000,
+    max_objective_bytes: 8192,
+    max_evidence_bytes: 32768,
+    max_tool_result_bytes: 16384,
+    max_final_result_bytes: 16384,
+    ...overrides,
+  };
+}
+
+test('decodeDraft maps recipes to camel case and defaults to an empty list', () => {
+  const draft = decodeDraft(draftBody({recipes: [recipeEntry({require_approval: true})]}));
+  assert.equal(draft.recipes.length, 1);
+  assert.equal(draft.recipes[0].objective, 'workers/lookup.j2');
+  assert.equal(draft.recipes[0].requireApproval, true);
+  assert.equal(draft.recipes[0].overallTimeoutMS, 60000);
+  assert.ok(Object.isFrozen(draft.recipes[0]));
+  assert.deepEqual([...decodeDraft(draftBody()).recipes], []);
+});
+
+test('decodeDraft rejects recipes whose objective is not the linked worker template', () => {
+  assert.throws(() => decodeDraft(draftBody({recipes: [recipeEntry({objective: 'system.j2'})]})));
+  assert.throws(() => decodeDraft(draftBody({recipes: [recipeEntry({objective: '../escape.j2'})]})));
+  assert.throws(() => decodeDraft(draftBody({recipes: [recipeEntry({id: 'Lookup'})]})));
+  assert.throws(() => decodeDraft(draftBody({recipes: [recipeEntry({version: 0})]})));
+  assert.throws(() => decodeDraft(draftBody({recipes: [recipeEntry({require_approval: 'yes'})]})));
+  assert.throws(() => decodeDraft(draftBody({recipes: [recipeEntry({overall_timeout_ms: -1})]})));
+  assert.throws(() => decodeDraft(draftBody({recipes: {}})));
+});
+
+test('saveRecipe sends the exact generation and rejects hostile recipe IDs before fetching', async () => {
+  const requests = [];
+  const api = createProfileAPI(async (path, init) => {
+    requests.push({path, init});
+    return jsonResponse(200, draftBody({generation: 3, recipes: [recipeEntry({version: 2})]}));
+  });
+  const draft = await api.saveRecipe('insurance', 2, 'lookup', {require_approval: true});
+  assert.equal(draft.recipes[0].version, 2);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].path, '/api/setup/v1/profiles/insurance/recipes/lookup');
+  assert.equal(requests[0].init.method, 'PUT');
+  assert.equal(requests[0].init.headers['If-Match'], '"2"');
+  assert.equal(requests[0].init.credentials, 'same-origin');
+
+  for (const bad of ['../escape', 'Lookup', 'a/b', '', 'x'.repeat(65)]) {
+    await assert.rejects(() => api.saveRecipe('insurance', 2, bad, {}), (error) => error.code === 'invalid_recipe_id');
+    await assert.rejects(() => api.deleteRecipe('insurance', 2, bad), (error) => error.code === 'invalid_recipe_id');
+  }
+  assert.equal(requests.length, 1);
+});
+
+test('deleteRecipe surfaces the server error code', async () => {
+  const api = createProfileAPI(async () => jsonResponse(409, {error: {code: 'stale_draft'}}));
+  await assert.rejects(() => api.deleteRecipe('insurance', 2, 'lookup'), (error) => error.code === 'stale_draft');
+});

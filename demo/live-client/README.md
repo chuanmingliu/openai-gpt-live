@@ -65,9 +65,9 @@ gateway connection.
 
 ## Vertical profiles in /setup
 
-`/setup` has four tabs. **Runtime** keeps the existing service controls.
-**Profile**, **Prompts**, and **Review & publish** appear when the BFF runs with
-loopback profile administration:
+`/setup` has five tabs. **Runtime** keeps the existing service controls.
+**Profile**, **Prompts**, **Workers**, and **Review & publish** appear when the
+BFF runs with loopback profile administration:
 
 ```bash
 go run ./demo/live-client \
@@ -91,7 +91,13 @@ Typical flow:
 2. **Prompts** — open `system.j2`, edit the source, and **Save template**. Add
    `opening_message.j2` or `turn_instruction.j2` with **Add template**. Paths are
    logical bundle names, never operator filesystem paths.
-3. **Review & publish** — **Validate**, **Preview** the rendered fixtures, then
+3. **Workers** — a worker recipe runs background work while the voice turn
+   keeps talking, so the assistant never narrates its reasoning and mentions a
+   result only once it is back. Add the objective template `workers/<id>.j2` on
+   the Prompts tab first, then set the recipe's timeouts and payload limits and
+   **Save recipe**. The service links the objective itself; the browser never
+   supplies a template reference, a command, or an adapter field.
+4. **Review & publish** — **Validate**, **Preview** the rendered fixtures, then
    **Publish and activate**. Published versions are immutable; use **Activate**
    and **Revoke** to control which version new sessions may select.
 

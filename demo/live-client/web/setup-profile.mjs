@@ -1,6 +1,6 @@
 import {createDraftModel} from './profile-draft-state.mjs';
 
-export const PROFILE_TABS = Object.freeze(['runtime', 'profile', 'prompts', 'publish']);
+export const PROFILE_TABS = Object.freeze(['runtime', 'profile', 'prompts', 'workers', 'publish']);
 
 const NOTICES = Object.freeze({
   '': '',
@@ -9,6 +9,8 @@ const NOTICES = Object.freeze({
   saved: 'Draft saved.',
   template_saved: 'Template saved.',
   template_deleted: 'Template deleted.',
+  recipe_saved: 'Worker recipe saved.',
+  recipe_deleted: 'Worker recipe removed.',
   validated: 'Draft is valid and publishable.',
   previewed: 'Preview rendered.',
   published: 'Profile version published.',
@@ -23,6 +25,9 @@ const NOTICES = Object.freeze({
   network_unavailable: 'Unable to contact the local setup service.',
   invalid_response: 'The setup service returned an invalid response.',
   invalid_template_path: 'Template paths must be lowercase logical .j2 names.',
+  invalid_recipe_id: 'Worker recipe IDs use lowercase letters, digits, hyphen, and underscore.',
+  objective_template_missing: 'Add the objective template for this worker before saving the recipe.',
+  recipe_invalid: 'Worker recipe limits are out of range.',
   admin_disabled: 'Vertical profiles are not enabled on this demo.',
   busy: 'Another profile action is still running.',
 });
@@ -61,6 +66,7 @@ export function createProfileWorkspace({api, dom}) {
       dirty: editor.dirty,
       conflict: editor.conflict,
       preview: editor.preview,
+      recipes: editor.draft === null ? Object.freeze([]) : editor.draft.recipes,
       published,
       notice,
       publishDisabled: editor.draft === null || editor.dirty || editor.conflict,
@@ -160,6 +166,26 @@ export function createProfileWorkspace({api, dom}) {
         const draft = await api.loadDraft(profileID, signal);
         model.loadDraft(draft);
       }, 'template_deleted');
+    },
+    // saveRecipe writes one worker recipe. The objective template must already
+    // exist in the bundle; the service relinks it, so no template reference
+    // ever crosses the browser boundary.
+    saveRecipe(recipeID, settings) {
+      return act(async (signal) => {
+        const current = model.snapshot().draft;
+        if (!current) throw Object.assign(new Error('profile_invalid'), {code: 'profile_invalid'});
+        const draft = await api.saveRecipe(profileID, current.generation, recipeID, settings, signal);
+        model.applySaved(draft);
+      }, 'recipe_saved');
+    },
+    deleteRecipe(recipeID) {
+      return act(async (signal) => {
+        const current = model.snapshot().draft;
+        if (!current) throw Object.assign(new Error('profile_invalid'), {code: 'profile_invalid'});
+        await api.deleteRecipe(profileID, current.generation, recipeID, signal);
+        const draft = await api.loadDraft(profileID, signal);
+        model.loadDraft(draft);
+      }, 'recipe_deleted');
     },
     reloadDraft() {
       return act(async (signal) => {

@@ -42,12 +42,29 @@ type profileTemplateInfo struct {
 	Bytes int    `json:"bytes"`
 }
 
+// profileRecipeInfo is the safe worker-recipe projection. The objective is the
+// logical template name the server linked, never a browser-supplied reference.
+type profileRecipeInfo struct {
+	ID                  string `json:"id"`
+	Version             uint64 `json:"version"`
+	Objective           string `json:"objective"`
+	RequireApproval     bool   `json:"require_approval"`
+	ExecutionTimeoutMS  int64  `json:"execution_timeout_ms"`
+	ToolTimeoutMS       int64  `json:"tool_timeout_ms"`
+	OverallTimeoutMS    int64  `json:"overall_timeout_ms"`
+	MaxObjectiveBytes   int    `json:"max_objective_bytes"`
+	MaxEvidenceBytes    int    `json:"max_evidence_bytes"`
+	MaxToolResultBytes  int    `json:"max_tool_result_bytes"`
+	MaxFinalResultBytes int    `json:"max_final_result_bytes"`
+}
+
 type profileDraftResponse struct {
 	ID          string                `json:"id"`
 	Generation  int64                 `json:"generation"`
 	Description string                `json:"description"`
 	Templates   []profileTemplateInfo `json:"templates"`
 	Fixtures    []profileTemplateInfo `json:"fixtures"`
+	Recipes     []profileRecipeInfo   `json:"recipes"`
 	UpdatedAt   string                `json:"updated_at"`
 }
 
@@ -94,10 +111,35 @@ func draftResponse(draft profile.Draft) profileDraftResponse {
 		Description: draft.Manifest.Description,
 		Templates:   sortedTemplateInfos(draft.Manifest.Bundle.Templates),
 		Fixtures:    sortedTemplateInfos(draft.Manifest.Bundle.Fixtures),
+		Recipes:     recipeInfos(draft.Manifest.Recipes),
 		UpdatedAt:   draft.UpdatedAt.UTC().Format(time.RFC3339Nano),
 	}
 	return response
 }
+
+func recipeInfos(recipes []profile.WorkerRecipe) []profileRecipeInfo {
+	infos := make([]profileRecipeInfo, 0, len(recipes))
+	for _, recipe := range recipes {
+		infos = append(infos, profileRecipeInfo{
+			ID:                  recipe.ID,
+			Version:             recipe.Version,
+			Objective:           workerObjectiveName(recipe.ID),
+			RequireApproval:     recipe.RequireApproval,
+			ExecutionTimeoutMS:  recipe.ExecutionTimeout.Milliseconds(),
+			ToolTimeoutMS:       recipe.ToolTimeout.Milliseconds(),
+			OverallTimeoutMS:    recipe.OverallTimeout.Milliseconds(),
+			MaxObjectiveBytes:   recipe.MaxObjectiveBytes,
+			MaxEvidenceBytes:    recipe.MaxEvidenceBytes,
+			MaxToolResultBytes:  recipe.MaxToolResultBytes,
+			MaxFinalResultBytes: recipe.MaxFinalResultBytes,
+		})
+	}
+	sort.Slice(infos, func(left, right int) bool { return infos[left].ID < infos[right].ID })
+	return infos
+}
+
+// workerObjectiveName is the one logical template a recipe may reference.
+func workerObjectiveName(recipeID string) string { return "workers/" + recipeID + ".j2" }
 
 func sortedTemplateInfos(refs map[string]profile.TemplateRef) []profileTemplateInfo {
 	infos := make([]profileTemplateInfo, 0, len(refs))

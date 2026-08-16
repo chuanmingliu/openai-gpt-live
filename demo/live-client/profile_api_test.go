@@ -557,3 +557,88 @@ func TestProfileFixtureLifecycle(t *testing.T) {
 	invalidName := serveProfile(handler, profileRequest(cfg, http.MethodPut, "/api/setup/v1/profiles/insurance/fixtures/Bad.JSON", "application/json", fixture, map[string]string{"If-Match": `"3"`}))
 	assert.Equal(t, http.StatusNotFound, invalidName.Code)
 }
+
+func TestWorkerRecipeLifecycleLinksObjectiveTemplate(t *testing.T) {
+	handler, _, cfg := newProfileTestHandler(t)
+	created := serveProfile(handler, profileRequest(cfg, http.MethodPost, "/api/setup/v1/profiles", "application/json", `{"id":"insurance"}`, nil))
+	require.Equal(t, http.StatusCreated, created.Code)
+
+	// A recipe cannot exist before its objective template.
+	missing := serveProfile(handler, profileRequest(cfg, http.MethodPut, "/api/setup/v1/profiles/insurance/recipes/lead_research", "application/json", `{"require_approval":false}`, map[string]string{"If-Match": `"1"`}))
+	assert.Equal(t, http.StatusUnprocessableEntity, missing.Code)
+	assert.JSONEq(t, `{"error":{"code":"objective_template_missing"}}`, missing.Body.String())
+
+	objective := serveProfile(handler, profileRequest(cfg, http.MethodPut, "/api/setup/v1/profiles/insurance/templates/workers/lead_research.j2", "text/plain; charset=utf-8", "Research the prospect's stated needs and cite every source.", map[string]string{"If-Match": `"1"`}))
+	require.Equal(t, http.StatusOK, objective.Code)
+
+	saved := serveProfile(handler, profileRequest(cfg, http.MethodPut, "/api/setup/v1/profiles/insurance/recipes/lead_research", "application/json",
+		`{"require_approval":true,"execution_timeout_ms":60000,"tool_timeout_ms":15000,"overall_timeout_ms":120000,"max_final_result_bytes":16384}`,
+		map[string]string{"If-Match": `"2"`}))
+	require.Equal(t, http.StatusOK, saved.Code)
+	assert.Equal(t, `"3"`, saved.Header().Get("ETag"))
+	var draft profileDraftResponse
+	require.NoError(t, json.Unmarshal(saved.Body.Bytes(), &draft))
+	require.Len(t, draft.Recipes, 1)
+	assert.Equal(t, "lead_research", draft.Recipes[0].ID)
+	assert.Equal(t, "workers/lead_research.j2", draft.Recipes[0].Objective)
+	assert.True(t, draft.Recipes[0].RequireApproval)
+	assert.EqualValues(t, 60000, draft.Recipes[0].ExecutionTimeoutMS)
+	assert.EqualValues(t, 1, draft.Recipes[0].Version)
+
+	// The publication pipeline accepts the linked recipe.
+	published := serveProfile(handler, profileRequest(cfg, http.MethodPost, "/api/setup/v1/profiles/insurance/publish", "application/json", `{"expected_generation":3,"activate":true}`, nil))
+	require.Equal(t, http.StatusCreated, published.Code)
+
+	// Re-saving advances the recipe version, not the identity.
+	resaved := serveProfile(handler, profileRequest(cfg, http.MethodPut, "/api/setup/v1/profiles/insurance/recipes/lead_research", "application/json", `{"require_approval":false}`, map[string]string{"If-Match": `"3"`}))
+	require.Equal(t, http.StatusOK, resaved.Code)
+	require.NoError(t, json.Unmarshal(resaved.Body.Bytes(), &draft))
+	require.Len(t, draft.Recipes, 1)
+	assert.EqualValues(t, 2, draft.Recipes[0].Version)
+	assert.False(t, draft.Recipes[0].RequireApproval)
+
+	deleted := serveProfile(handler, profileRequest(cfg, http.MethodDelete, "/api/setup/v1/profiles/insurance/recipes/lead_research", "", "", map[string]string{"If-Match": `"4"`}))
+	assert.Equal(t, http.StatusNoContent, deleted.Code)
+	reread := serveProfile(handler, profileRequest(cfg, http.MethodGet, "/api/setup/v1/profiles/insurance/draft", "", "", nil))
+	require.NoError(t, json.Unmarshal(reread.Body.Bytes(), &draft))
+	assert.Empty(t, draft.Recipes)
+}
+
+func TestWorkerRecipeRejectsHostileFieldsAndBounds(t *testing.T) {
+	handler, store, cfg := newProfileTestHandler(t)
+	require.Equal(t, http.StatusCreated, serveProfile(handler, profileRequest(cfg, http.MethodPost, "/api/setup/v1/profiles", "application/json", `{"id":"insurance"}`, nil)).Code)
+	require.Equal(t, http.StatusOK, serveProfile(handler, profileRequest(cfg, http.MethodPut, "/api/setup/v1/profiles/insurance/templates/workers/research.j2", "text/plain; charset=utf-8", "Research.", map[string]string{"If-Match": `"1"`})).Code)
+	before := store.Calls()
+
+	for name, body := range map[string]string{
+		"server owned objective": `{"objective":"workers/other.j2"}`,
+		"server owned version":   `{"version":9}`,
+		"binding injection":      `{"binding_ids":["web_search"]}`,
+		"tenant injection":       `{"tenant_id":"stolen"}`,
+		"string timeout":         `{"execution_timeout_ms":"60000"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := serveProfile(handler, profileRequest(cfg, http.MethodPut, "/api/setup/v1/profiles/insurance/recipes/research", "application/json", body, map[string]string{"If-Match": `"2"`}))
+			assert.Equal(t, http.StatusBadRequest, response.Code)
+		})
+	}
+	assert.Equal(t, before, store.Calls(), "hostile recipe bodies must be rejected before any store call")
+
+	for name, body := range map[string]string{
+		"negative timeout": `{"execution_timeout_ms":-1}`,
+		"timeout too long": `{"overall_timeout_ms":90000000}`,
+		"negative bytes":   `{"max_final_result_bytes":-1}`,
+		"bytes too large":  `{"max_evidence_bytes":999999999}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := serveProfile(handler, profileRequest(cfg, http.MethodPut, "/api/setup/v1/profiles/insurance/recipes/research", "application/json", body, map[string]string{"If-Match": `"2"`}))
+			assert.Equal(t, http.StatusUnprocessableEntity, response.Code)
+		})
+	}
+
+	badID := serveProfile(handler, profileRequest(cfg, http.MethodPut, "/api/setup/v1/profiles/insurance/recipes/Bad%20ID", "application/json", `{}`, map[string]string{"If-Match": `"2"`}))
+	assert.Equal(t, http.StatusNotFound, badID.Code)
+
+	noIfMatch := serveProfile(handler, profileRequest(cfg, http.MethodPut, "/api/setup/v1/profiles/insurance/recipes/research", "application/json", `{}`, nil))
+	assert.Equal(t, http.StatusPreconditionRequired, noIfMatch.Code)
+}

@@ -46,6 +46,38 @@ function decodeFileInfos(value) {
   });
 }
 
+const RECIPE_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+
+function decodeRecipes(value) {
+  if (!Array.isArray(value) || value.length > MAX_FILE_ENTRIES) fail('invalid_response');
+  return value.map((entry) => {
+    if (entry === null || typeof entry !== 'object'
+        || typeof entry.id !== 'string' || !RECIPE_ID_PATTERN.test(entry.id)
+        || typeof entry.version !== 'number' || !Number.isSafeInteger(entry.version) || entry.version < 1
+        || typeof entry.objective !== 'string' || entry.objective !== `workers/${entry.id}.j2`
+        || typeof entry.require_approval !== 'boolean') {
+      fail('invalid_response');
+    }
+    for (const key of ['execution_timeout_ms', 'tool_timeout_ms', 'overall_timeout_ms',
+      'max_objective_bytes', 'max_evidence_bytes', 'max_tool_result_bytes', 'max_final_result_bytes']) {
+      if (typeof entry[key] !== 'number' || !Number.isSafeInteger(entry[key]) || entry[key] < 0) fail('invalid_response');
+    }
+    return Object.freeze({
+      id: entry.id,
+      version: entry.version,
+      objective: entry.objective,
+      requireApproval: entry.require_approval,
+      executionTimeoutMS: entry.execution_timeout_ms,
+      toolTimeoutMS: entry.tool_timeout_ms,
+      overallTimeoutMS: entry.overall_timeout_ms,
+      maxObjectiveBytes: entry.max_objective_bytes,
+      maxEvidenceBytes: entry.max_evidence_bytes,
+      maxToolResultBytes: entry.max_tool_result_bytes,
+      maxFinalResultBytes: entry.max_final_result_bytes,
+    });
+  });
+}
+
 export function decodeDraft(value) {
   if (value === null || typeof value !== 'object'
       || !validProfileID(value.id)
@@ -59,6 +91,7 @@ export function decodeDraft(value) {
     description: value.description,
     templates: Object.freeze(decodeFileInfos(value.templates)),
     fixtures: Object.freeze(decodeFileInfos(value.fixtures)),
+    recipes: Object.freeze(decodeRecipes(value.recipes ?? [])),
   });
 }
 
@@ -208,6 +241,25 @@ export function createProfileAPI(fetchImpl) {
     },
     async deleteTemplate(id, generation, path, signal) {
       const response = await request('DELETE', `/api/setup/v1/profiles/${encodeURIComponent(id)}/templates/${requireTemplatePath(path)}`, {
+        ifMatch: generation,
+        signal,
+      });
+      if (!response.ok) fail(decodeErrorCode(await jsonBody(response).catch(() => null), response.status));
+      return true;
+    },
+    async saveRecipe(id, generation, recipeID, settings, signal) {
+      if (typeof recipeID !== 'string' || !RECIPE_ID_PATTERN.test(recipeID)) fail('invalid_recipe_id');
+      const response = await request('PUT', `/api/setup/v1/profiles/${encodeURIComponent(id)}/recipes/${recipeID}`, {
+        body: JSON.stringify(settings),
+        contentType: 'application/json',
+        ifMatch: generation,
+        signal,
+      });
+      return expectJSON(response, decodeDraft);
+    },
+    async deleteRecipe(id, generation, recipeID, signal) {
+      if (typeof recipeID !== 'string' || !RECIPE_ID_PATTERN.test(recipeID)) fail('invalid_recipe_id');
+      const response = await request('DELETE', `/api/setup/v1/profiles/${encodeURIComponent(id)}/recipes/${recipeID}`, {
         ifMatch: generation,
         signal,
       });

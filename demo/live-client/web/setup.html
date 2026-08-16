@@ -22,6 +22,7 @@
       <button type="button" role="tab" id="tab-runtime" data-tab="runtime" aria-controls="panel-runtime" aria-selected="true">Runtime</button>
       <button type="button" role="tab" id="tab-profile" data-tab="profile" aria-controls="panel-profile" aria-selected="false" tabindex="-1">Profile</button>
       <button type="button" role="tab" id="tab-prompts" data-tab="prompts" aria-controls="panel-prompts" aria-selected="false" tabindex="-1">Prompts</button>
+      <button type="button" role="tab" id="tab-workers" data-tab="workers" aria-controls="panel-workers" aria-selected="false" tabindex="-1">Workers</button>
       <button type="button" role="tab" id="tab-publish" data-tab="publish" aria-controls="panel-publish" aria-selected="false" tabindex="-1">Review &amp; publish</button>
     </div>
 
@@ -91,6 +92,38 @@
           </form>
         </div>
       </div>
+    </section>
+
+    <section id="panel-workers" role="tabpanel" aria-labelledby="tab-workers" data-panel="workers" hidden>
+      <h2>Worker recipes</h2>
+      <p class="panel-note">A recipe runs background work while the voice turn keeps talking. Add its objective template <code>workers/&lt;id&gt;.j2</code> on the Prompts tab first; the service links it for you.</p>
+      <form id="recipe-form" class="profile-form">
+        <label for="recipe-id">Recipe ID</label>
+        <input id="recipe-id" type="text" autocomplete="off" spellcheck="false" placeholder="policy-lookup" maxlength="64" required>
+        <label for="recipe-execution-timeout">Execution timeout (ms)</label>
+        <input id="recipe-execution-timeout" type="number" min="1" max="86400000" step="1" value="30000" required>
+        <label for="recipe-tool-timeout">Tool timeout (ms)</label>
+        <input id="recipe-tool-timeout" type="number" min="1" max="86400000" step="1" value="10000" required>
+        <label for="recipe-overall-timeout">Overall timeout (ms)</label>
+        <input id="recipe-overall-timeout" type="number" min="1" max="86400000" step="1" value="60000" required>
+        <label for="recipe-objective-bytes">Max objective bytes</label>
+        <input id="recipe-objective-bytes" type="number" min="1" max="1048576" step="1" value="8192" required>
+        <label for="recipe-evidence-bytes">Max evidence bytes</label>
+        <input id="recipe-evidence-bytes" type="number" min="1" max="1048576" step="1" value="32768" required>
+        <label for="recipe-tool-result-bytes">Max tool result bytes</label>
+        <input id="recipe-tool-result-bytes" type="number" min="1" max="1048576" step="1" value="16384" required>
+        <label for="recipe-final-result-bytes">Max final result bytes</label>
+        <input id="recipe-final-result-bytes" type="number" min="1" max="1048576" step="1" value="16384" required>
+        <label class="checkbox-row" for="recipe-require-approval">
+          <input id="recipe-require-approval" type="checkbox">
+          Require operator approval before the worker acts
+        </label>
+        <div class="actions">
+          <button type="submit" id="recipe-save" disabled>Save recipe</button>
+        </div>
+      </form>
+      <h3>Recipes in this draft</h3>
+      <ul id="recipe-list" class="recipe-list" aria-label="Worker recipes"></ul>
     </section>
 
     <section id="panel-publish" role="tabpanel" aria-labelledby="tab-publish" data-panel="publish" hidden>

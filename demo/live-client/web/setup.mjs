@@ -289,6 +289,7 @@ export function createProfileDOMPort(document) {
   const templateList = document.querySelector('#template-list');
   const templateSource = document.querySelector('#template-source');
   const publishedList = document.querySelector('#published-list');
+  const recipeList = document.querySelector('#recipe-list');
   const previewOutput = document.querySelector('#profile-preview-output');
   const buttons = {
     saveDescription: document.querySelector('#profile-save-description'),
@@ -296,6 +297,7 @@ export function createProfileDOMPort(document) {
     templateSave: document.querySelector('#template-save'),
     templateDelete: document.querySelector('#template-delete'),
     templateAdd: document.querySelector('#template-add'),
+    recipeSave: document.querySelector('#recipe-save'),
     validate: document.querySelector('#profile-validate'),
     preview: document.querySelector('#profile-preview'),
     publish: document.querySelector('#profile-publish'),
@@ -330,6 +332,31 @@ export function createProfileDOMPort(document) {
       open.disabled = model.busy;
       row.append(label, open);
       templateList.append(row);
+    }
+  }
+
+  function renderRecipes(model) {
+    if (recipeList === null) return;
+    recipeList.replaceChildren();
+    for (const entry of model.recipes) {
+      const row = document.createElement('li');
+      const label = document.createElement('span');
+      label.textContent = `${entry.id} v${entry.version}`;
+      const meta = document.createElement('span');
+      meta.className = 'recipe-meta';
+      meta.textContent = `${entry.objective} · overall ${entry.overallTimeoutMS} ms`
+        + (entry.requireApproval ? ' · approval required' : '');
+      const controls = document.createElement('span');
+      controls.className = 'actions';
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.dataset.recipeAction = 'delete';
+      remove.dataset.recipeId = entry.id;
+      remove.textContent = 'Remove';
+      remove.disabled = model.busy;
+      controls.append(remove);
+      row.append(label, meta, controls);
+      recipeList.append(row);
     }
   }
 
@@ -384,6 +411,7 @@ export function createProfileDOMPort(document) {
       buttons.templateSave.disabled = !hasTemplate || model.busy || !model.dirty;
       buttons.templateDelete.disabled = !hasTemplate || model.busy || model.selectedPath === 'system.j2';
       buttons.templateAdd.disabled = !hasDraft || model.busy;
+      if (buttons.recipeSave) buttons.recipeSave.disabled = !hasDraft || model.busy;
       buttons.validate.disabled = !hasDraft || model.busy;
       buttons.preview.disabled = !hasDraft || model.busy;
       buttons.publish.disabled = model.publishDisabled || model.busy;
@@ -393,6 +421,7 @@ export function createProfileDOMPort(document) {
         ? Object.entries(model.preview.outputs).map(([name, output]) => `${name}\n${output}`).join('\n\n')
         : "Run Preview to render the profile's synthetic fixtures.";
       renderTemplates(model);
+      renderRecipes(model);
       renderPublished(model);
     },
   };
@@ -428,6 +457,24 @@ function bootProfileWorkspace(document, window) {
     const path = newPathInput.value.trim();
     if (path !== '') void workspace.saveTemplate(path, '');
   });
+  const recipeForm = document.querySelector('#recipe-form');
+  if (recipeForm !== null) {
+    recipeForm.addEventListener('submit', (event) => {
+      event.preventDefault();
+      const recipeID = document.querySelector('#recipe-id').value.trim();
+      if (recipeID === '') return;
+      void workspace.saveRecipe(recipeID, {
+        require_approval: document.querySelector('#recipe-require-approval').checked,
+        execution_timeout_ms: Number(document.querySelector('#recipe-execution-timeout').value),
+        tool_timeout_ms: Number(document.querySelector('#recipe-tool-timeout').value),
+        overall_timeout_ms: Number(document.querySelector('#recipe-overall-timeout').value),
+        max_objective_bytes: Number(document.querySelector('#recipe-objective-bytes').value),
+        max_evidence_bytes: Number(document.querySelector('#recipe-evidence-bytes').value),
+        max_tool_result_bytes: Number(document.querySelector('#recipe-tool-result-bytes').value),
+        max_final_result_bytes: Number(document.querySelector('#recipe-final-result-bytes').value),
+      });
+    });
+  }
   document.querySelector('#profile-validate').addEventListener('click', () => { void workspace.validateDraft(); });
   document.querySelector('#profile-preview').addEventListener('click', () => { void workspace.previewDraft(); });
   document.querySelector('#profile-publish').addEventListener('click', () => { void workspace.publishDraft(true); });
@@ -441,6 +488,11 @@ function bootProfileWorkspace(document, window) {
     const template = event.target.closest('button[data-template-path]');
     if (template && !template.disabled) {
       void workspace.selectTemplate(template.dataset.templatePath);
+      return;
+    }
+    const recipe = event.target.closest('button[data-recipe-action]');
+    if (recipe && !recipe.disabled) {
+      void workspace.deleteRecipe(recipe.dataset.recipeId);
       return;
     }
     const version = event.target.closest('button[data-version-action]');
