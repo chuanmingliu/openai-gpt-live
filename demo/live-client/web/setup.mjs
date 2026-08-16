@@ -1,5 +1,6 @@
 import {createProfileAPI} from './profile-api.mjs';
 import {createProfileWorkspace, profileNoticeText, PROFILE_TABS} from './setup-profile.mjs';
+import {createKnowledgeAPI, createKnowledgeController} from './knowledge-editor.mjs';
 
 export const COMPONENTS = Object.freeze(['speech', 'postgres', 'gateway', 'worker', 'client']);
 
@@ -280,6 +281,71 @@ export function createSetupDOMPort(document) {
 // createProfileDOMPort renders the Profile, Prompts, and Review & publish tabs
 // using text nodes and form values only. No template source, preview output, or
 // notice text is ever injected as HTML.
+// createKnowledgeDOMPort renders the Knowledge tab. Excerpt text is customer
+// material, so it is written as text nodes and never as HTML.
+export function createKnowledgeDOMPort(document) {
+  const notice = document.querySelector('#knowledge-notice');
+  const previewList = document.querySelector('#knowledge-preview-list');
+  const versionList = document.querySelector('#knowledge-version-list');
+  const previewButton = document.querySelector('#knowledge-preview');
+  const publishButton = document.querySelector('#knowledge-publish');
+  const fileInput = document.querySelector('#knowledge-file');
+
+  return function render(model) {
+    if (notice === null) return;
+    notice.textContent = profileNoticeText(model.notice);
+    if (previewButton) previewButton.disabled = model.busy || model.packID === '' || model.filename === '';
+    if (publishButton) publishButton.disabled = model.publishDisabled || model.packID === '';
+
+    if (previewList) {
+      previewList.replaceChildren();
+      const excerpts = model.preview === null ? [] : model.preview.excerpts;
+      for (const excerpt of excerpts) {
+        const row = document.createElement('li');
+        if (excerpt.section !== '') {
+          const section = document.createElement('span');
+          section.className = 'excerpt-section';
+          section.textContent = excerpt.section;
+          row.append(section);
+        }
+        const body = document.createElement('span');
+        body.className = 'excerpt-body';
+        body.textContent = excerpt.text;
+        row.append(body);
+        previewList.append(row);
+      }
+    }
+
+    if (versionList) {
+      versionList.replaceChildren();
+      for (const entry of model.versions) {
+        const row = document.createElement('li');
+        row.dataset.revoked = String(entry.tombstoned);
+        const label = document.createElement('span');
+        label.textContent = `v${entry.version} · ${entry.excerptCount} excerpts`;
+        const meta = document.createElement('span');
+        meta.className = 'version-meta';
+        meta.textContent = entry.tombstoned ? 'Retired' : 'Available to pin';
+        const controls = document.createElement('span');
+        controls.className = 'actions';
+        if (!entry.tombstoned) {
+          const retire = document.createElement('button');
+          retire.type = 'button';
+          retire.dataset.knowledgeVersion = String(entry.version);
+          retire.textContent = 'Retire';
+          retire.disabled = model.busy;
+          controls.append(retire);
+        }
+        row.append(label, meta, controls);
+        versionList.append(row);
+      }
+    }
+
+    // Publishing clears the staged file, so the picker must clear with it.
+    if (fileInput && model.filename === '' && fileInput.value !== '') fileInput.value = '';
+  };
+}
+
 export function createProfileDOMPort(document) {
   const announcement = document.querySelector('#profile-announcement');
   const notice = document.querySelector('#profile-notice');
@@ -473,6 +539,27 @@ function bootProfileWorkspace(document, window) {
         max_tool_result_bytes: Number(document.querySelector('#recipe-tool-result-bytes').value),
         max_final_result_bytes: Number(document.querySelector('#recipe-final-result-bytes').value),
       });
+    });
+  }
+  const knowledgeForm = document.querySelector('#knowledge-form');
+  if (knowledgeForm !== null) {
+    const knowledge = createKnowledgeController({
+      api: createKnowledgeAPI(window.fetch.bind(window)),
+      render: createKnowledgeDOMPort(document),
+    });
+    const packInput = document.querySelector('#knowledge-pack');
+    const fileInput = document.querySelector('#knowledge-file');
+    packInput.addEventListener('input', () => knowledge.setPack(packInput.value));
+    fileInput.addEventListener('change', () => knowledge.selectFile(fileInput.files ? fileInput.files[0] : null));
+    knowledgeForm.addEventListener('submit', (event) => {
+      event.preventDefault();
+      void knowledge.previewFile();
+    });
+    document.querySelector('#knowledge-publish').addEventListener('click', () => { void knowledge.publishPreviewed(); });
+    document.querySelector('#knowledge-refresh').addEventListener('click', () => { void knowledge.refreshVersions(); });
+    document.addEventListener('click', (event) => {
+      const retire = event.target.closest('button[data-knowledge-version]');
+      if (retire && !retire.disabled) void knowledge.tombstoneVersion(Number(retire.dataset.knowledgeVersion));
     });
   }
   document.querySelector('#profile-validate').addEventListener('click', () => { void workspace.validateDraft(); });

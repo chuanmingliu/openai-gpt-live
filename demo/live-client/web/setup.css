@@ -40,13 +40,16 @@ input:disabled, textarea:disabled { opacity: .55; cursor: not-allowed; }
 .profile-notice { min-height: 1.5em; margin-top: 1.25rem; color: #ffd479; }
 .prompt-layout { display: grid; grid-template-columns: minmax(12rem, 18rem) 1fr; gap: 1.5rem; align-items: start; }
 @media (max-width: 52rem) { .prompt-layout { grid-template-columns: 1fr; } }
-.template-list, .published-list, .recipe-list { margin: 1.25rem 0 0; padding: 0; list-style: none; display: grid; gap: .5rem; }
-.template-list li, .published-list li, .recipe-list li { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; justify-content: space-between; padding: .7rem .85rem; border: 1px solid #2a3540; border-radius: .7rem; background: #10161e; }
+.template-list, .published-list, .recipe-list, .excerpt-list { margin: 1.25rem 0 0; padding: 0; list-style: none; display: grid; gap: .5rem; }
+.template-list li, .published-list li, .recipe-list li, .excerpt-list li { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; justify-content: space-between; padding: .7rem .85rem; border: 1px solid #2a3540; border-radius: .7rem; background: #10161e; }
 .template-list li[aria-current="true"] { border-color: #6ff0bf; }
 .template-list button { min-height: 2.2rem; }
 .published-list .version-meta { color: #9ba8b4; font-size: .85rem; }
 .published-list li[data-active="true"] { border-color: #5acb9f; }
 .published-list li[data-revoked="true"] { border-color: #d16d78; opacity: .7; }
+.excerpt-list li { display: block; }
+.excerpt-list .excerpt-section { color: #6ff0bf; font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; }
+.excerpt-list .excerpt-body { display: block; margin-top: .35rem; white-space: pre-wrap; word-break: break-word; }
 .recipe-list .recipe-meta { color: #9ba8b4; font-size: .85rem; word-break: break-word; }
 .checkbox-row { display: flex; align-items: center; gap: .5rem; }
 .checkbox-row input { width: auto; }

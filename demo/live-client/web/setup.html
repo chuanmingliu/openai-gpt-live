@@ -23,6 +23,7 @@
       <button type="button" role="tab" id="tab-profile" data-tab="profile" aria-controls="panel-profile" aria-selected="false" tabindex="-1">Profile</button>
       <button type="button" role="tab" id="tab-prompts" data-tab="prompts" aria-controls="panel-prompts" aria-selected="false" tabindex="-1">Prompts</button>
       <button type="button" role="tab" id="tab-workers" data-tab="workers" aria-controls="panel-workers" aria-selected="false" tabindex="-1">Workers</button>
+      <button type="button" role="tab" id="tab-knowledge" data-tab="knowledge" aria-controls="panel-knowledge" aria-selected="false" tabindex="-1">Knowledge</button>
       <button type="button" role="tab" id="tab-publish" data-tab="publish" aria-controls="panel-publish" aria-selected="false" tabindex="-1">Review &amp; publish</button>
     </div>
 
@@ -124,6 +125,27 @@
       </form>
       <h3>Recipes in this draft</h3>
       <ul id="recipe-list" class="recipe-list" aria-label="Worker recipes"></ul>
+    </section>
+
+    <section id="panel-knowledge" role="tabpanel" aria-labelledby="tab-knowledge" data-panel="knowledge" hidden>
+      <h2>Knowledge</h2>
+      <p class="panel-note">Reference material the background worker can cite. <strong>UTF-8 text and Markdown only</strong> &mdash; convert other documents before uploading. Markdown headings become citation sections. Published versions are immutable; retire one to remove it from new selection.</p>
+      <form id="knowledge-form" class="profile-form">
+        <label for="knowledge-pack">Pack ID</label>
+        <input id="knowledge-pack" type="text" autocomplete="off" spellcheck="false" placeholder="policy" maxlength="64" required>
+        <label for="knowledge-file">Document</label>
+        <input id="knowledge-file" type="file" accept=".md,.markdown,.txt,.text">
+        <div class="actions">
+          <button type="submit" id="knowledge-preview" disabled>Preview excerpts</button>
+          <button type="button" id="knowledge-publish" disabled>Publish version</button>
+          <button type="button" id="knowledge-refresh">Refresh versions</button>
+        </div>
+      </form>
+      <p id="knowledge-notice" class="profile-notice"></p>
+      <h3>Excerpt preview</h3>
+      <ul id="knowledge-preview-list" class="excerpt-list" aria-label="Excerpt preview"></ul>
+      <h3>Published versions</h3>
+      <ul id="knowledge-version-list" class="published-list" aria-label="Knowledge versions"></ul>
     </section>
 
     <section id="panel-publish" role="tabpanel" aria-labelledby="tab-publish" data-panel="publish" hidden>

@@ -74,7 +74,7 @@ function harness(overrides = {}) {
 
 test('tabs are the approved set and default to runtime', () => {
   const {workspace} = harness();
-  assert.deepEqual([...PROFILE_TABS], ['runtime', 'profile', 'prompts', 'workers', 'publish']);
+  assert.deepEqual([...PROFILE_TABS], ['runtime', 'profile', 'prompts', 'workers', 'knowledge', 'publish']);
   assert.equal(workspace.snapshot().tab, 'runtime');
   workspace.selectTab('prompts');
   assert.equal(workspace.snapshot().tab, 'prompts');

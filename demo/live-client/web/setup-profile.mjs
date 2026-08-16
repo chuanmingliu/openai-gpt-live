@@ -1,6 +1,6 @@
 import {createDraftModel} from './profile-draft-state.mjs';
 
-export const PROFILE_TABS = Object.freeze(['runtime', 'profile', 'prompts', 'workers', 'publish']);
+export const PROFILE_TABS = Object.freeze(['runtime', 'profile', 'prompts', 'workers', 'knowledge', 'publish']);
 
 const NOTICES = Object.freeze({
   '': '',
@@ -11,6 +11,15 @@ const NOTICES = Object.freeze({
   template_deleted: 'Template deleted.',
   recipe_saved: 'Worker recipe saved.',
   recipe_deleted: 'Worker recipe removed.',
+  previewed_document: 'Document preview ready. Review the excerpts, then publish.',
+  published_document: 'Knowledge version published.',
+  tombstoned: 'Knowledge version retired from new selection.',
+  unsupported_content: 'Only UTF-8 text and Markdown are accepted. Convert other documents first.',
+  content_limit: 'The document exceeds a size limit.',
+  knowledge_invalid: 'The document could not be turned into citable excerpts.',
+  knowledge_not_found: 'That knowledge version no longer exists.',
+  knowledge_tombstoned: 'That knowledge version is retired.',
+  invalid_pack_id: 'Knowledge pack IDs use letters, digits, dot, hyphen, and underscore.',
   validated: 'Draft is valid and publishable.',
   previewed: 'Preview rendered.',
   published: 'Profile version published.',

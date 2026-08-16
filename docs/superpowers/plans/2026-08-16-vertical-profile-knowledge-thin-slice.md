@@ -46,7 +46,7 @@ Inherited unchanged from the worker/materials plan, plus the reductions below.
 
 The profile stack (publish → resolve → `live.profile.selected` → capture) has been exercised only against fakes; no run has touched real PostgreSQL. Stacking a new subsystem on an unverified one compounds untested surface.
 
-- [ ] **Step 0: Prove the existing profile path end-to-end against disposable PostgreSQL**
+- [x] **Step 0: Prove the existing profile path end-to-end against disposable PostgreSQL**
 
 Run: `make durable-demo-migrate && make durable-demo-up`
 
@@ -54,7 +54,11 @@ Run: `go test -race -tags=integration ./internal/store/postgres -run 'TestProfil
 
 Then, through `make demo-wizard` → Browser control panel with `LIVE_PROFILE_DATABASE_URL` exported: create a draft, publish and activate it, select it on the voice page, and confirm capture opens only after the exact `live.profile.selected` acknowledgement.
 
-Expected: PASS against real PostgreSQL. A skip is not acceptance. Do not begin Task 1 until this is green.
+Expected: PASS against real PostgreSQL. A skip is not acceptance.
+
+Done via `deploy/scripts/verify-durable-store.sh`, which shares one disposable
+container across the run. All four suites green at `d130f2c`: schema up/down/up,
+knowledge store, profile store, and knowledge+profile under `-race`.
 
 ---
 
@@ -93,7 +97,7 @@ Unchanged in substance from the original Task 4. This is the foundation and carr
 - Produces: immutable `knowledge.Pack`, `Version`, `Excerpt`, `Citation`, `Store`, and stable errors.
 - Consumed by Tasks 2, 3, 4, and 5.
 
-- [ ] **Step 1: Write RED domain and repository tests**
+- [x] **Step 1: Write RED domain and repository tests**
 
 ```go
 func TestKnowledgeVersionIsImmutableTenantScopedAndTombstoned(t *testing.T) {
@@ -165,7 +169,7 @@ Replaces the original Task 5. Same `Ingestor` contract; the extractor subpackage
 - Produces: `knowledge.Ingestor.Validate`, `Preview`, and `Publish`.
 - Produces: stable `ErrUnsupportedContent` and `ErrContentLimit`.
 
-- [ ] **Step 1: Write RED format-gate and boundary tests**
+- [x] **Step 1: Write RED format-gate and boundary tests**
 
 ```go
 func TestOnlyTextAndMarkdownAreAccepted(t *testing.T) {
@@ -231,7 +235,7 @@ New task with no counterpart in the original plan. This is the change that actua
 - Produces: `knowledge.NewReferenceValidator(Store) profile.KnowledgeReferenceValidator`.
 - Consumed by `profile.NewPublisher`'s fourth argument, currently `nil` in the demo composition.
 
-- [ ] **Step 1: Write RED validator and publication tests**
+- [x] **Step 1: Write RED validator and publication tests**
 
 ```go
 func TestPublicationRequiresEveryKnowledgeRefToResolveExactly(t *testing.T) {
@@ -305,7 +309,7 @@ Unchanged in substance from the original Task 6.
 - Produces: read-only tool `knowledge.search` with arguments `{query:string,max_results?:integer}` and bounded cited results.
 - Consumes: exact tenant and knowledge versions from `worker.ToolExecutionRequest.Authority`.
 
-- [ ] **Step 1: Write RED ranking and authority tests**
+- [x] **Step 1: Write RED ranking and authority tests**
 
 ```go
 func TestSearchUsesOnlyPinnedVersionsAndStableCJKRanking(t *testing.T) {
@@ -370,7 +374,7 @@ Fulfils Task 5 of the setup-experience plan, restricted to the formats Task 2 ac
 - Consumes: Task 2 ingestor and Task 1 store.
 - Produces: `POST .../knowledge` (upload+preview), `POST .../knowledge/{id}/publish`, `GET .../knowledge`, `POST .../knowledge/{id}/{version}/tombstone`, and a `'knowledge'` entry in `PROFILE_TABS`.
 
-- [ ] **Step 1: Write RED upload and privacy tests**
+- [x] **Step 1: Write RED upload and privacy tests**
 
 ```go
 func TestKnowledgeUploadRejectsOversizeWrongSignatureAndTrailingMultipart(t *testing.T) {

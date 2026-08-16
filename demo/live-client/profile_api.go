@@ -57,6 +57,10 @@ func (handler *demoHandler) serveProfileAPI(writer http.ResponseWriter, request 
 	defer cancel()
 	request = request.WithContext(ctx)
 
+	if segments[0] == "knowledge" {
+		handler.serveKnowledge(writer, request, segments)
+		return
+	}
 	if segments[0] != "profiles" {
 		writer.WriteHeader(http.StatusNotFound)
 		return

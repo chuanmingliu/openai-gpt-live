@@ -65,9 +65,9 @@ gateway connection.
 
 ## Vertical profiles in /setup
 
-`/setup` has five tabs. **Runtime** keeps the existing service controls.
-**Profile**, **Prompts**, **Workers**, and **Review & publish** appear when the
-BFF runs with loopback profile administration:
+`/setup` has six tabs. **Runtime** keeps the existing service controls.
+**Profile**, **Prompts**, **Workers**, **Knowledge**, and **Review & publish**
+appear when the BFF runs with loopback profile administration:
 
 ```bash
 go run ./demo/live-client \
@@ -97,7 +97,14 @@ Typical flow:
    the Prompts tab first, then set the recipe's timeouts and payload limits and
    **Save recipe**. The service links the objective itself; the browser never
    supplies a template reference, a command, or an adapter field.
-4. **Review & publish** — **Validate**, **Preview** the rendered fixtures, then
+4. **Knowledge** — upload reference material the background worker can cite.
+   **UTF-8 text and Markdown only**; convert other documents first. Markdown
+   headings become citation sections. **Preview excerpts** shows exactly what
+   would be stored and computes a content hash; **Publish version** re-sends the
+   same file and is refused unless it still hashes to what you reviewed.
+   Published versions are immutable — **Retire** removes one from new selection
+   without touching work already pinned to it.
+5. **Review & publish** — **Validate**, **Preview** the rendered fixtures, then
    **Publish and activate**. Published versions are immutable; use **Activate**
    and **Revoke** to control which version new sessions may select.
 

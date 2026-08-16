@@ -312,3 +312,22 @@ func TestQuickStartDocumentsVerticalProfileSetupWithoutSecretValues(t *testing.T
 	assert.NotContains(t, quickStart, "postgres://")
 	assert.False(t, hasCredentialLiteralAssignment(quickStart))
 }
+
+func TestQuickStartStatesTheAcceptedKnowledgeFormats(t *testing.T) {
+	quickStart := readQuickStart(t)
+	for _, exact := range []string{
+		"**Knowledge**",
+		"UTF-8 text and Markdown only",
+		"Preview excerpts",
+		"Publish version",
+		"Retire",
+	} {
+		assert.Contains(t, quickStart, exact)
+	}
+	// The restriction must be visible in the panel itself, not only discovered
+	// through a rejection.
+	markup, err := os.ReadFile("web/setup.html")
+	require.NoError(t, err)
+	assert.Contains(t, string(markup), "UTF-8 text and Markdown only")
+	assert.Contains(t, string(markup), `accept=".md,.markdown,.txt,.text"`)
+}

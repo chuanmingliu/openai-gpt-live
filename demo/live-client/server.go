@@ -238,6 +238,12 @@ func (handler *demoHandler) ServeHTTP(writer http.ResponseWriter, request *http.
 			return
 		}
 		handler.serveAsset(writer, "web/profile-api.mjs", "text/javascript; charset=utf-8")
+	case "/knowledge-editor.mjs":
+		if request.Method != http.MethodGet {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		handler.serveAsset(writer, "web/knowledge-editor.mjs", "text/javascript; charset=utf-8")
 	case "/profile-draft-state.mjs":
 		if request.Method != http.MethodGet {
 			writer.WriteHeader(http.StatusMethodNotAllowed)

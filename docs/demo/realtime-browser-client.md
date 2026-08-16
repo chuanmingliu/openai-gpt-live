@@ -427,6 +427,30 @@ an exact `live.profile.selected` event whose ID, version, and snapshot hash matc
 the selection. A mismatch stops the session with `profile-mismatch` instead of
 streaming audio, so stale or substituted profiles can never reach the microphone.
 
+### Knowledge
+
+Reference material is versioned and content addressed exactly like a profile.
+The browser may submit a pack ID and one document; tenant, actor, version
+number, and content hash are all server-owned.
+
+Ingestion accepts UTF-8 text and Markdown only. The format gate checks the
+extension *and* the bytes, so a PDF renamed to `.md` is rejected before any
+decode — every binary container fails either the encoding check or the control
+character check. Binary extraction is deliberately deferred; when it lands it
+belongs in a separate short-lived process rather than in the BFF.
+
+Preview and publish are two steps on purpose. Preview returns the exact excerpts
+and their content hash; publish re-sends the document and the service re-derives
+excerpts from those bytes, refusing unless they hash to the previewed value. An
+operator therefore cannot publish material nobody reviewed, and a file that
+changed between the two steps fails rather than slipping through.
+
+A profile pins knowledge by exact pack, version, and hash. Publication resolves
+every reference and refuses tombstoned, duplicate, or unresolvable ones, so a
+profile can never reference material the deployment cannot serve. Retiring a
+version removes it from new selection while work already pinned to it keeps
+reading exactly the bytes it was promised.
+
 ### Rollback
 
 Publishing a new version does not change connected sessions; each session keeps
