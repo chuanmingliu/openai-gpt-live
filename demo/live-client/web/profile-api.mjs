@@ -46,6 +46,19 @@ function decodeFileInfos(value) {
   });
 }
 
+function decodeKnowledgeRefs(value) {
+  if (!Array.isArray(value) || value.length > 32) fail('invalid_response');
+  return value.map((entry) => {
+    if (entry === null || typeof entry !== 'object'
+        || typeof entry.id !== 'string' || !ID_PATTERN.test(entry.id) || entry.id === 'builtin'
+        || typeof entry.version !== 'number' || !Number.isSafeInteger(entry.version) || entry.version < 1
+        || typeof entry.hash !== 'string' || !HASH_PATTERN.test(entry.hash)) {
+      fail('invalid_response');
+    }
+    return Object.freeze({id: entry.id, version: entry.version, hash: entry.hash});
+  });
+}
+
 const RECIPE_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
 function decodeRecipes(value) {
@@ -92,6 +105,7 @@ export function decodeDraft(value) {
     templates: Object.freeze(decodeFileInfos(value.templates)),
     fixtures: Object.freeze(decodeFileInfos(value.fixtures)),
     recipes: Object.freeze(decodeRecipes(value.recipes ?? [])),
+    knowledge: Object.freeze(decodeKnowledgeRefs(value.knowledge ?? [])),
   });
 }
 
@@ -260,6 +274,28 @@ export function createProfileAPI(fetchImpl) {
     async deleteRecipe(id, generation, recipeID, signal) {
       if (typeof recipeID !== 'string' || !RECIPE_ID_PATTERN.test(recipeID)) fail('invalid_recipe_id');
       const response = await request('DELETE', `/api/setup/v1/profiles/${encodeURIComponent(id)}/recipes/${recipeID}`, {
+        ifMatch: generation,
+        signal,
+      });
+      if (!response.ok) fail(decodeErrorCode(await jsonBody(response).catch(() => null), response.status));
+      return true;
+    },
+    // pinKnowledge names a pack and a version only. The service resolves the
+    // content hash, so the browser can never assert bytes it did not publish.
+    async pinKnowledge(id, generation, packID, version, signal) {
+      if (typeof packID !== 'string' || !ID_PATTERN.test(packID) || packID === 'builtin') fail('invalid_pack_id');
+      if (!Number.isSafeInteger(version) || version < 1) fail('invalid_response');
+      const response = await request('PUT', `/api/setup/v1/profiles/${encodeURIComponent(id)}/knowledge/${packID}`, {
+        body: JSON.stringify({version}),
+        contentType: 'application/json',
+        ifMatch: generation,
+        signal,
+      });
+      return expectJSON(response, decodeDraft);
+    },
+    async unpinKnowledge(id, generation, packID, signal) {
+      if (typeof packID !== 'string' || !ID_PATTERN.test(packID) || packID === 'builtin') fail('invalid_pack_id');
+      const response = await request('DELETE', `/api/setup/v1/profiles/${encodeURIComponent(id)}/knowledge/${packID}`, {
         ifMatch: generation,
         signal,
       });

@@ -20,6 +20,8 @@ const NOTICES = Object.freeze({
   knowledge_not_found: 'That knowledge version no longer exists.',
   knowledge_tombstoned: 'That knowledge version is retired.',
   invalid_pack_id: 'Knowledge pack IDs use letters, digits, dot, hyphen, and underscore.',
+  knowledge_pinned: 'Knowledge version pinned to this draft.',
+  knowledge_unpinned: 'Knowledge pack unpinned from this draft.',
   validated: 'Draft is valid and publishable.',
   previewed: 'Preview rendered.',
   published: 'Profile version published.',
@@ -76,6 +78,7 @@ export function createProfileWorkspace({api, dom}) {
       conflict: editor.conflict,
       preview: editor.preview,
       recipes: editor.draft === null ? Object.freeze([]) : editor.draft.recipes,
+      knowledge: editor.draft === null ? Object.freeze([]) : editor.draft.knowledge,
       published,
       notice,
       publishDisabled: editor.draft === null || editor.dirty || editor.conflict,
@@ -195,6 +198,23 @@ export function createProfileWorkspace({api, dom}) {
         const draft = await api.loadDraft(profileID, signal);
         model.loadDraft(draft);
       }, 'recipe_deleted');
+    },
+    // pinKnowledge attaches a published version to the draft. The generation
+    // advances, so a stale editor cannot pin against a draft that moved.
+    pinKnowledge(packID, version) {
+      return act(async (signal) => {
+        const current = model.snapshot().draft;
+        if (!current) throw Object.assign(new Error('profile_invalid'), {code: 'profile_invalid'});
+        model.applySaved(await api.pinKnowledge(profileID, current.generation, packID, version, signal));
+      }, 'knowledge_pinned');
+    },
+    unpinKnowledge(packID) {
+      return act(async (signal) => {
+        const current = model.snapshot().draft;
+        if (!current) throw Object.assign(new Error('profile_invalid'), {code: 'profile_invalid'});
+        await api.unpinKnowledge(profileID, current.generation, packID, signal);
+        model.loadDraft(await api.loadDraft(profileID, signal));
+      }, 'knowledge_unpinned');
     },
     reloadDraft() {
       return act(async (signal) => {

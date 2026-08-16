@@ -172,3 +172,36 @@ test('deleteRecipe surfaces the server error code', async () => {
   const api = createProfileAPI(async () => jsonResponse(409, {error: {code: 'stale_draft'}}));
   await assert.rejects(() => api.deleteRecipe('insurance', 2, 'lookup'), (error) => error.code === 'stale_draft');
 });
+
+test('pinKnowledge sends only a pack and version, and refuses hostile ids locally', async () => {
+  const requests = [];
+  const api = createProfileAPI(async (path, init) => {
+    requests.push({path, init});
+    return jsonResponse(200, draftBody({
+      generation: 3,
+      knowledge: [{id: 'policy', version: 1, hash: HASH}],
+    }));
+  });
+
+  const draft = await api.pinKnowledge('insurance', 2, 'policy', 1);
+  assert.equal(draft.knowledge[0].hash, HASH);
+  assert.equal(requests[0].path, '/api/setup/v1/profiles/insurance/knowledge/policy');
+  assert.equal(requests[0].init.method, 'PUT');
+  assert.equal(requests[0].init.headers['If-Match'], '"2"');
+  assert.deepEqual(JSON.parse(requests[0].init.body), {version: 1},
+    'the browser never sends a hash it did not receive');
+
+  for (const bad of ['builtin', '../escape', '', 'a/b']) {
+    await assert.rejects(() => api.pinKnowledge('insurance', 2, bad, 1), (error) => error.code === 'invalid_pack_id');
+    await assert.rejects(() => api.unpinKnowledge('insurance', 2, bad), (error) => error.code === 'invalid_pack_id');
+  }
+  await assert.rejects(() => api.pinKnowledge('insurance', 2, 'policy', 0), (error) => error.code === 'invalid_response');
+  assert.equal(requests.length, 1);
+});
+
+test('decodeDraft rejects a pinned reference without a real hash', () => {
+  assert.throws(() => decodeDraft(draftBody({knowledge: [{id: 'policy', version: 1, hash: 'short'}]})));
+  assert.throws(() => decodeDraft(draftBody({knowledge: [{id: 'builtin', version: 1, hash: HASH}]})));
+  assert.throws(() => decodeDraft(draftBody({knowledge: [{id: 'policy', version: 0, hash: HASH}]})));
+  assert.deepEqual([...decodeDraft(draftBody()).knowledge], []);
+});

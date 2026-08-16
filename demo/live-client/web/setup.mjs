@@ -329,6 +329,13 @@ export function createKnowledgeDOMPort(document) {
         const controls = document.createElement('span');
         controls.className = 'actions';
         if (!entry.tombstoned) {
+          const pin = document.createElement('button');
+          pin.type = 'button';
+          pin.dataset.pinPack = model.packID;
+          pin.dataset.pinVersion = String(entry.version);
+          pin.textContent = 'Pin to draft';
+          pin.disabled = model.busy;
+          controls.append(pin);
           const retire = document.createElement('button');
           retire.type = 'button';
           retire.dataset.knowledgeVersion = String(entry.version);
@@ -426,6 +433,31 @@ export function createProfileDOMPort(document) {
     }
   }
 
+  function renderPinnedKnowledge(model) {
+    const pinnedList = document.querySelector('#knowledge-pinned-list');
+    if (pinnedList === null) return;
+    pinnedList.replaceChildren();
+    for (const entry of model.knowledge) {
+      const row = document.createElement('li');
+      const label = document.createElement('span');
+      label.textContent = `${entry.id} v${entry.version}`;
+      const meta = document.createElement('span');
+      meta.className = 'version-meta';
+      // The short hash lets an operator confirm which bytes a profile loads.
+      meta.textContent = `content ${entry.hash.slice(0, 12)}`;
+      const controls = document.createElement('span');
+      controls.className = 'actions';
+      const unpin = document.createElement('button');
+      unpin.type = 'button';
+      unpin.dataset.unpinPack = entry.id;
+      unpin.textContent = 'Unpin';
+      unpin.disabled = model.busy;
+      controls.append(unpin);
+      row.append(label, meta, controls);
+      pinnedList.append(row);
+    }
+  }
+
   function renderPublished(model) {
     publishedList.replaceChildren();
     for (const entry of model.published) {
@@ -488,6 +520,7 @@ export function createProfileDOMPort(document) {
         : "Run Preview to render the profile's synthetic fixtures.";
       renderTemplates(model);
       renderRecipes(model);
+      renderPinnedKnowledge(model);
       renderPublished(model);
     },
   };
@@ -559,7 +592,17 @@ function bootProfileWorkspace(document, window) {
     document.querySelector('#knowledge-refresh').addEventListener('click', () => { void knowledge.refreshVersions(); });
     document.addEventListener('click', (event) => {
       const retire = event.target.closest('button[data-knowledge-version]');
-      if (retire && !retire.disabled) void knowledge.tombstoneVersion(Number(retire.dataset.knowledgeVersion));
+      if (retire && !retire.disabled) {
+        void knowledge.tombstoneVersion(Number(retire.dataset.knowledgeVersion));
+        return;
+      }
+      const pin = event.target.closest('button[data-pin-pack]');
+      if (pin && !pin.disabled) {
+        void workspace.pinKnowledge(pin.dataset.pinPack, Number(pin.dataset.pinVersion));
+        return;
+      }
+      const unpin = event.target.closest('button[data-unpin-pack]');
+      if (unpin && !unpin.disabled) void workspace.unpinKnowledge(unpin.dataset.unpinPack);
     });
   }
   document.querySelector('#profile-validate').addEventListener('click', () => { void workspace.validateDraft(); });

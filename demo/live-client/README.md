@@ -103,7 +103,10 @@ Typical flow:
    would be stored and computes a content hash; **Publish version** re-sends the
    same file and is refused unless it still hashes to what you reviewed.
    Published versions are immutable — **Retire** removes one from new selection
-   without touching work already pinned to it.
+   without touching work already pinned to it. **Pin to draft** attaches a
+   version to the open profile draft; the service resolves the content hash, so
+   the browser never asserts bytes it did not publish. Publication then refuses
+   any pin it cannot resolve, and a retired version cannot be pinned at all.
 5. **Review & publish** — **Validate**, **Preview** the rendered fixtures, then
    **Publish and activate**. Published versions are immutable; use **Activate**
    and **Revoke** to control which version new sessions may select.

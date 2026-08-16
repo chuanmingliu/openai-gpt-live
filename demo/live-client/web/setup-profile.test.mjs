@@ -30,6 +30,7 @@ function draftBody(generation, templates = ['system.j2'], recipes = []) {
     templates: Object.freeze(templates.map((path) => Object.freeze({path, hash: HASH, bytes: 10}))),
     fixtures: Object.freeze([]),
     recipes: Object.freeze(recipes),
+    knowledge: Object.freeze([]),
   });
 }
 
@@ -54,6 +55,8 @@ function fakeAPI(overrides = {}) {
     activate: async () => true,
     revoke: async () => true,
     saveRecipe: async () => draftBody(2, ['system.j2', 'workers/lookup.j2'], [recipeBody('lookup')]),
+    pinKnowledge: async () => draftBody(2),
+    unpinKnowledge: async () => true,
     deleteRecipe: async () => true,
     ...overrides,
   };
@@ -289,4 +292,57 @@ test('recipe actions refuse to run concurrently', async () => {
   assert.equal(announced.at(-1), 'Another profile action is still running.');
   release();
   assert.equal(await first, true);
+});
+
+test('pinning knowledge advances the generation and shows the resolved hash', async () => {
+  const calls = [];
+  const pinned = draftBody(2);
+  const withKnowledge = Object.freeze({
+    ...pinned,
+    knowledge: Object.freeze([Object.freeze({id: 'policy', version: 1, hash: 'd'.repeat(64)})]),
+  });
+  const {workspace, announced} = harness({
+    pinKnowledge: async (id, generation, packID, version) => {
+      calls.push({id, generation, packID, version});
+      return withKnowledge;
+    },
+  });
+  await workspace.openOrCreate('insurance');
+  assert.deepEqual([...workspace.snapshot().knowledge], []);
+
+  assert.equal(await workspace.pinKnowledge('policy', 1), true);
+  assert.deepEqual(calls, [{id: 'insurance', generation: 1, packID: 'policy', version: 1}]);
+  const snapshot = workspace.snapshot();
+  assert.equal(snapshot.draft.generation, 2);
+  assert.equal(snapshot.knowledge.length, 1);
+  assert.equal(snapshot.knowledge[0].hash.length, 64, 'the hash comes from the service, not the browser');
+  assert.equal(announced.at(-1), 'Knowledge version pinned to this draft.');
+});
+
+test('a pin refused by the service leaves the draft untouched', async () => {
+  const {workspace, announced} = harness({
+    pinKnowledge: async () => { throw apiError('knowledge_tombstoned'); },
+  });
+  await workspace.openOrCreate('insurance');
+  assert.equal(await workspace.pinKnowledge('policy', 1), false);
+  assert.equal(workspace.snapshot().draft.generation, 1);
+  assert.deepEqual([...workspace.snapshot().knowledge], []);
+  assert.equal(announced.at(-1), 'That knowledge version is retired.');
+});
+
+test('unpinning reloads the draft so the pinned list matches the store', async () => {
+  let loads = 0;
+  const {workspace} = harness({
+    loadDraft: async () => {
+      loads += 1;
+      const base = draftBody(loads === 1 ? 1 : 2);
+      return loads === 1
+        ? Object.freeze({...base, knowledge: Object.freeze([Object.freeze({id: 'policy', version: 1, hash: 'e'.repeat(64)})])})
+        : base;
+    },
+  });
+  await workspace.openOrCreate('insurance');
+  assert.equal(workspace.snapshot().knowledge.length, 1);
+  assert.equal(await workspace.unpinKnowledge('policy'), true);
+  assert.deepEqual([...workspace.snapshot().knowledge], []);
 });

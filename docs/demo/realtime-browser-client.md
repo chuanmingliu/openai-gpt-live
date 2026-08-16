@@ -445,6 +445,12 @@ excerpts from those bytes, refusing unless they hash to the previewed value. An
 operator therefore cannot publish material nobody reviewed, and a file that
 changed between the two steps fails rather than slipping through.
 
+Pinning is what connects the two halves. The browser names a pack and a version
+number; the service resolves the content hash from the store and writes the
+reference into the draft under the usual `If-Match` generation, so a stale
+editor cannot pin against a draft that moved. One version per pack: pinning
+again replaces rather than accumulates.
+
 A profile pins knowledge by exact pack, version, and hash. Publication resolves
 every reference and refuses tombstoned, duplicate, or unresolvable ones, so a
 profile can never reference material the deployment cannot serve. Retiring a

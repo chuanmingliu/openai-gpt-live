@@ -58,6 +58,14 @@ type profileRecipeInfo struct {
 	MaxFinalResultBytes int    `json:"max_final_result_bytes"`
 }
 
+// profileKnowledgeRef is the exact pinned reference. The hash is server
+// resolved and shown so an operator can confirm what a profile will load.
+type profileKnowledgeRef struct {
+	ID      string `json:"id"`
+	Version uint64 `json:"version"`
+	Hash    string `json:"hash"`
+}
+
 type profileDraftResponse struct {
 	ID          string                `json:"id"`
 	Generation  int64                 `json:"generation"`
@@ -65,6 +73,7 @@ type profileDraftResponse struct {
 	Templates   []profileTemplateInfo `json:"templates"`
 	Fixtures    []profileTemplateInfo `json:"fixtures"`
 	Recipes     []profileRecipeInfo   `json:"recipes"`
+	Knowledge   []profileKnowledgeRef `json:"knowledge"`
 	UpdatedAt   string                `json:"updated_at"`
 }
 
@@ -112,6 +121,7 @@ func draftResponse(draft profile.Draft) profileDraftResponse {
 		Templates:   sortedTemplateInfos(draft.Manifest.Bundle.Templates),
 		Fixtures:    sortedTemplateInfos(draft.Manifest.Bundle.Fixtures),
 		Recipes:     recipeInfos(draft.Manifest.Recipes),
+		Knowledge:   knowledgeRefs(draft.Manifest.Knowledge),
 		UpdatedAt:   draft.UpdatedAt.UTC().Format(time.RFC3339Nano),
 	}
 	return response
@@ -136,6 +146,15 @@ func recipeInfos(recipes []profile.WorkerRecipe) []profileRecipeInfo {
 	}
 	sort.Slice(infos, func(left, right int) bool { return infos[left].ID < infos[right].ID })
 	return infos
+}
+
+func knowledgeRefs(refs []profile.KnowledgeRef) []profileKnowledgeRef {
+	pinned := make([]profileKnowledgeRef, 0, len(refs))
+	for _, reference := range refs {
+		pinned = append(pinned, profileKnowledgeRef{ID: reference.ID, Version: reference.Version, Hash: reference.Hash})
+	}
+	sort.Slice(pinned, func(left, right int) bool { return pinned[left].ID < pinned[right].ID })
+	return pinned
 }
 
 // workerObjectiveName is the one logical template a recipe may reference.

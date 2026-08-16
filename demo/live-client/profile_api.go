@@ -12,6 +12,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/knowledge"
 	"github.com/chuanmingliu/openai-gpt-live/internal/profile"
 )
 
@@ -85,6 +86,8 @@ func (handler *demoHandler) serveProfileAPI(writer http.ResponseWriter, request 
 		handler.serveProfileTemplate(writer, request, profile.ID(id), strings.Join(segments[3:], "/"))
 	case len(segments) == 4 && segments[2] == "fixtures":
 		handler.serveProfileFixture(writer, request, profile.ID(id), segments[3])
+	case len(segments) == 4 && segments[2] == "knowledge":
+		handler.serveProfileKnowledgePin(writer, request, profile.ID(id), segments[3])
 	case len(segments) == 4 && segments[2] == "recipes":
 		handler.serveProfileRecipe(writer, request, profile.ID(id), segments[3])
 	case len(segments) == 3 && (segments[2] == "validate" || segments[2] == "preview" || segments[2] == "publish"):
@@ -529,6 +532,106 @@ func validProfileRecipeID(recipeID string) bool {
 
 // mutateProfileDraft applies one bounded manifest change under the exact draft
 // generation and persists it as the next generation.
+var knowledgePinFields = map[string]byte{"version": 'n'}
+
+// serveProfileKnowledgePin attaches one published knowledge version to the
+// draft, or removes it. The browser names a pack and a version number only: the
+// content hash is resolved from the store, so a profile can never pin material
+// whose bytes the operator asserted rather than published.
+func (handler *demoHandler) serveProfileKnowledgePin(writer http.ResponseWriter, request *http.Request, id profile.ID, packID string) {
+	service := handler.profiles
+	if service.knowledge == nil || !validKnowledgePackID(packID) {
+		writer.WriteHeader(http.StatusNotFound)
+		return
+	}
+	if request.Method != http.MethodPut && request.Method != http.MethodDelete {
+		writer.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	generation, present, err := parseIfMatchGeneration(request)
+	if err != nil {
+		writer.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if !present {
+		writer.WriteHeader(http.StatusPreconditionRequired)
+		return
+	}
+
+	if request.Method == http.MethodDelete {
+		handler.mutateProfileDraft(writer, request, id, generation, func(manifest *profile.Manifest) error {
+			kept := make([]profile.KnowledgeRef, 0, len(manifest.Knowledge))
+			for _, reference := range manifest.Knowledge {
+				if reference.ID != packID {
+					kept = append(kept, reference)
+				}
+			}
+			manifest.Knowledge = kept
+			return nil
+		}, http.StatusNoContent)
+		return
+	}
+
+	if !requireProfileJSON(writer, request) {
+		return
+	}
+	values, err := decodeProfileObject(writer, request, knowledgePinFields)
+	if err != nil {
+		writeProfileBodyError(writer, err)
+		return
+	}
+	raw, ok := values["version"]
+	if !ok {
+		writer.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	version, err := parseProfileVersion(raw)
+	if err != nil {
+		writer.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	// Resolution happens before the draft is touched, so a bad pin cannot
+	// advance the generation.
+	versions, err := service.knowledge.List(request.Context(), service.tenantID, packID, maximumKnowledgeListLimit)
+	if err != nil {
+		writeKnowledgeError(writer, err)
+		return
+	}
+	var resolved knowledge.Version
+	found := false
+	for _, candidate := range versions {
+		if candidate.Ref.Version == version {
+			resolved = candidate
+			found = true
+			break
+		}
+	}
+	if !found {
+		writeProfileErrorCode(writer, http.StatusUnprocessableEntity, "knowledge_not_found")
+		return
+	}
+	if !resolved.Bindable() {
+		writeProfileErrorCode(writer, http.StatusConflict, "knowledge_tombstoned")
+		return
+	}
+
+	handler.mutateProfileDraft(writer, request, id, generation, func(manifest *profile.Manifest) error {
+		pinned := make([]profile.KnowledgeRef, 0, len(manifest.Knowledge)+1)
+		for _, reference := range manifest.Knowledge {
+			if reference.ID != packID {
+				pinned = append(pinned, reference)
+			}
+		}
+		// One version per pack: pinning again replaces rather than accumulates,
+		// so a manifest cannot hold two versions of the same material.
+		manifest.Knowledge = append(pinned, profile.KnowledgeRef{
+			ID: packID, Version: resolved.Ref.Version, Hash: resolved.Ref.Hash,
+		})
+		return nil
+	})
+}
+
 func (handler *demoHandler) mutateProfileDraft(writer http.ResponseWriter, request *http.Request, id profile.ID, generation int64, mutate func(*profile.Manifest) error, successStatus ...int) {
 	service := handler.profiles
 	draft, ok, err := service.store.LoadDraft(request.Context(), service.tenantID, id)

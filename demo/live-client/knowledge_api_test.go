@@ -7,11 +7,13 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/knowledge"
+	"github.com/chuanmingliu/openai-gpt-live/internal/profile"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -320,4 +322,131 @@ func newKnowledgeTestHandler(t *testing.T) (http.Handler, *fakeKnowledgeStore, d
 	handler, err := newHandlerWithToolSearch(cfg, []byte("knowledge-test-bearer"), nil, &recordingToolSearch{})
 	require.NoError(t, err)
 	return handler, knowledgeStore, cfg
+}
+
+// Pinning is the link between a published pack and a profile: without it the
+// publisher's knowledge validator would never have anything to validate.
+func TestProfileKnowledgePinResolvesTheHashServerSide(t *testing.T) {
+	handler, knowledgeStore, profileStore, cfg := newPinningTestHandler(t)
+	pinned := knowledgeStore.seed(t, "policy", "waiting period is thirty days")
+
+	draft := seedPinningDraft(t, handler, cfg)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, pinRequest(cfg, http.MethodPut,
+		"/api/setup/v1/profiles/insurance/knowledge/policy", draft, `{"version":1}`))
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+
+	var body struct {
+		Generation int64 `json:"generation"`
+		Knowledge  []struct {
+			ID      string `json:"id"`
+			Version uint64 `json:"version"`
+			Hash    string `json:"hash"`
+		} `json:"knowledge"`
+	}
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &body))
+	require.Len(t, body.Knowledge, 1)
+	assert.Equal(t, "policy", body.Knowledge[0].ID)
+	assert.Equal(t, uint64(1), body.Knowledge[0].Version)
+	assert.Equal(t, pinned.Hash, body.Knowledge[0].Hash,
+		"the browser names a version; the hash is resolved from the store")
+
+	stored, ok, err := profileStore.LoadDraft(t.Context(), "local", profile.ID("insurance"))
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Len(t, stored.Manifest.Knowledge, 1)
+	assert.Equal(t, pinned.Hash, stored.Manifest.Knowledge[0].Hash)
+
+	// Unpinning removes it and advances the generation again.
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, pinRequest(cfg, http.MethodDelete,
+		"/api/setup/v1/profiles/insurance/knowledge/policy", body.Generation, ""))
+	require.Equal(t, http.StatusNoContent, response.Code)
+	stored, _, err = profileStore.LoadDraft(t.Context(), "local", profile.ID("insurance"))
+	require.NoError(t, err)
+	assert.Empty(t, stored.Manifest.Knowledge)
+}
+
+func TestProfileKnowledgePinRefusesUnresolvableAndRetiredVersions(t *testing.T) {
+	handler, knowledgeStore, _, cfg := newPinningTestHandler(t)
+	knowledgeStore.seed(t, "policy", "waiting period is thirty days")
+	draft := seedPinningDraft(t, handler, cfg)
+
+	for name, test := range map[string]struct {
+		path string
+		body string
+		want int
+	}{
+		"unknown version": {"/api/setup/v1/profiles/insurance/knowledge/policy", `{"version":9}`, http.StatusUnprocessableEntity},
+		"unknown pack":    {"/api/setup/v1/profiles/insurance/knowledge/absent", `{"version":1}`, http.StatusUnprocessableEntity},
+		"zero version":    {"/api/setup/v1/profiles/insurance/knowledge/policy", `{"version":0}`, http.StatusBadRequest},
+		"hostile field":   {"/api/setup/v1/profiles/insurance/knowledge/policy", `{"version":1,"hash":"x"}`, http.StatusBadRequest},
+		"reserved pack":   {"/api/setup/v1/profiles/insurance/knowledge/builtin", `{"version":1}`, http.StatusNotFound},
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, pinRequest(cfg, http.MethodPut, test.path, draft, test.body))
+			assert.Equal(t, test.want, response.Code, response.Body.String())
+		})
+	}
+
+	// A retired version may not be pinned by a new publication.
+	require.NoError(t, knowledgeStore.Tombstone(t.Context(), "local",
+		knowledge.VersionRef{PackID: "policy", Version: 1, Hash: knowledgeStore.versions["policy"][0].Ref.Hash},
+		"operator", knowledgeTestTime()))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, pinRequest(cfg, http.MethodPut,
+		"/api/setup/v1/profiles/insurance/knowledge/policy", draft, `{"version":1}`))
+	assert.Equal(t, http.StatusConflict, response.Code)
+
+	// Without If-Match the write is refused entirely.
+	request := httptest.NewRequest(http.MethodPut,
+		"/api/setup/v1/profiles/insurance/knowledge/policy", strings.NewReader(`{"version":1}`))
+	request.Header.Set("Origin", cfg.Origin)
+	request.Header.Set("Content-Type", "application/json")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	assert.Equal(t, http.StatusPreconditionRequired, response.Code)
+}
+
+func pinRequest(cfg demoConfig, method, path string, generation int64, body string) *http.Request {
+	request := httptest.NewRequest(method, path, strings.NewReader(body))
+	request.Header.Set("Origin", cfg.Origin)
+	if body != "" {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	request.Header.Set("If-Match", `"`+strconv.FormatInt(generation, 10)+`"`)
+	return request
+}
+
+func seedPinningDraft(t *testing.T, handler http.Handler, cfg demoConfig) int64 {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodPost, "/api/setup/v1/profiles",
+		strings.NewReader(`{"id":"insurance","description":"Insurance"}`))
+	request.Header.Set("Origin", cfg.Origin)
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	require.Equal(t, http.StatusCreated, response.Code, response.Body.String())
+	var body struct {
+		Generation int64 `json:"generation"`
+	}
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &body))
+	return body.Generation
+}
+
+func newPinningTestHandler(t *testing.T) (http.Handler, *fakeKnowledgeStore, *fakeProfileStore, demoConfig) {
+	t.Helper()
+	cfg := parseTestConfig(t)
+	cfg.Profiles.Enabled = true
+	cfg.Profiles.TenantID = "local"
+	cfg.Profiles.Actor = "operator"
+	knowledgeStore := newFakeKnowledgeStore()
+	profileStore := newFakeProfileStore()
+	service, err := newProfileAdminService(cfg.Profiles, profileStore, knowledgeStore, nil)
+	require.NoError(t, err)
+	cfg.Profiles.service = service
+	handler, err := newHandlerWithToolSearch(cfg, []byte("knowledge-test-bearer"), nil, &recordingToolSearch{})
+	require.NoError(t, err)
+	return handler, knowledgeStore, profileStore, cfg
 }
