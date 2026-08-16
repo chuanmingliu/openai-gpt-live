@@ -312,7 +312,7 @@ func newProfileTestHandler(t *testing.T) (http.Handler, *fakeProfileStore, demoC
 	cfg.Profiles.TenantID = "local"
 	cfg.Profiles.Actor = "operator"
 	store := newFakeProfileStore()
-	service, err := newProfileAdminService(cfg.Profiles, store, nil)
+	service, err := newProfileAdminService(cfg.Profiles, store, nil, nil)
 	require.NoError(t, err)
 	cfg.Profiles.service = service
 	handler, err := newHandlerWithToolSearch(cfg, []byte("profile-test-bearer"), nil, &recordingToolSearch{})
@@ -641,4 +641,36 @@ func TestWorkerRecipeRejectsHostileFieldsAndBounds(t *testing.T) {
 
 	noIfMatch := serveProfile(handler, profileRequest(cfg, http.MethodPut, "/api/setup/v1/profiles/insurance/recipes/research", "application/json", `{}`, nil))
 	assert.Equal(t, http.StatusPreconditionRequired, noIfMatch.Code)
+}
+
+// A deployment with no knowledge store must still fail closed on a manifest
+// that pins knowledge, rather than publishing material it could never resolve.
+func TestPublicationWithoutAKnowledgeStoreRejectsPinnedKnowledge(t *testing.T) {
+	cfg := parseTestConfig(t)
+	cfg.Profiles.Enabled = true
+	cfg.Profiles.TenantID = "local"
+	cfg.Profiles.Actor = "operator"
+	store := newFakeProfileStore()
+	service, err := newProfileAdminService(cfg.Profiles, store, nil, nil)
+	require.NoError(t, err)
+
+	draft, err := service.seedDraft(t.Context(), profile.ID("insurance"), "Insurance")
+	require.NoError(t, err)
+
+	pinned := draft.Manifest.Clone()
+	pinned.Knowledge = []profile.KnowledgeRef{{ID: "policy", Version: 1, Hash: strings.Repeat("a", 64)}}
+	pinned.Description = "pins knowledge"
+	updated := draft.Clone()
+	updated.Manifest = pinned
+	updated.UpdatedAt = service.now()
+	saved, err := store.SaveDraft(t.Context(), updated, draft.Generation)
+	require.NoError(t, err)
+
+	_, err = service.publisher.Publish(t.Context(), profile.PublishCommand{
+		TenantID: "local", ProfileID: profile.ID("insurance"),
+		ExpectedGeneration: saved.Generation, Actor: "operator",
+	})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, profile.ErrProfileIncompatible,
+		"without a validator the publisher accepts only an empty knowledge list")
 }

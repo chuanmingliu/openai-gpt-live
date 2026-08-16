@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
+	"github.com/chuanmingliu/openai-gpt-live/internal/knowledge"
 	"github.com/chuanmingliu/openai-gpt-live/internal/profile"
 	"github.com/chuanmingliu/openai-gpt-live/internal/prompttmpl"
 	"github.com/chuanmingliu/openai-gpt-live/internal/store/postgres"
@@ -37,20 +38,30 @@ type profileAdminService struct {
 	tenantID  string
 	actor     string
 	store     profile.Store
+	knowledge knowledge.Store
 	publisher *profile.Publisher
 	closeFn   func()
 }
 
-func newProfileAdminService(cfg profileAdminConfig, store profile.Store, closeFn func()) (*profileAdminService, error) {
+// newProfileAdminService composes the publisher. The knowledge validator may be
+// nil: the publisher then accepts only manifests that pin no knowledge, so a
+// deployment without a knowledge store cannot publish a profile whose material
+// it could never resolve.
+func newProfileAdminService(cfg profileAdminConfig, store profile.Store, knowledgeStore knowledge.Store, closeFn func()) (*profileAdminService, error) {
 	if !cfg.Enabled || store == nil {
 		return nil, errors.New("demo profile administration is unavailable")
 	}
 	engine := prompttmpl.NewMiniJinja()
+	var validator profile.KnowledgeReferenceValidator
+	if knowledgeStore != nil {
+		validator = knowledge.NewReferenceValidator(knowledgeStore)
+	}
 	return &profileAdminService{
 		tenantID:  cfg.TenantID,
 		actor:     cfg.Actor,
 		store:     store,
-		publisher: profile.NewPublisher(store, engine, demoAdapterCatalog{}, nil),
+		knowledge: knowledgeStore,
+		publisher: profile.NewPublisher(store, engine, demoAdapterCatalog{}, validator),
 		closeFn:   closeFn,
 	}, nil
 }
@@ -80,7 +91,7 @@ func openProfileAdminService(ctx context.Context, cfg profileAdminConfig, lookup
 		pool.Close()
 		return nil, errors.New("demo profile database is unavailable")
 	}
-	service, err := newProfileAdminService(cfg, repository, pool.Close)
+	service, err := newProfileAdminService(cfg, repository, repository.KnowledgeStore(), pool.Close)
 	if err != nil {
 		pool.Close()
 		return nil, err
