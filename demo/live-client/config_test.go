@@ -112,3 +112,43 @@ func TestParseConfigAcceptsSeparateFixedSpeechTrustRoot(t *testing.T) {
 	assert.Equal(t, speechRoot, cfg.Operator.SpeechRoot)
 	assert.Equal(t, "http://127.0.0.1:8766/v1/pool", cfg.Operator.Readiness[componentSpeech])
 }
+
+func TestVerticalProfileConfigurationIsPrivateAndValidated(t *testing.T) {
+	cfg, err := parseConfig(nil)
+	require.NoError(t, err)
+	assert.False(t, cfg.Profiles.Enabled)
+
+	cfg, err = parseConfig([]string{
+		"-vertical-profiles",
+		"-profile-tenant", "local",
+		"-profile-actor", "operator",
+		"-profile-database-url-env", "LIVE_PROFILE_DATABASE_URL",
+	})
+	require.NoError(t, err)
+	assert.True(t, cfg.Profiles.Enabled)
+	assert.Equal(t, "local", cfg.Profiles.TenantID)
+	assert.Equal(t, "operator", cfg.Profiles.Actor)
+	assert.Equal(t, "LIVE_PROFILE_DATABASE_URL", cfg.Profiles.DatabaseURLEnv)
+
+	for name, args := range map[string][]string{
+		"missing identity": {"-vertical-profiles"},
+		"missing actor":    {"-vertical-profiles", "-profile-tenant", "local"},
+		"spaced tenant":    {"-vertical-profiles", "-profile-tenant", "local tenant", "-profile-actor", "operator"},
+		"database value":   {"-vertical-profiles", "-profile-tenant", "local", "-profile-actor", "operator", "-profile-database-url-env", "postgres://user:pass@localhost/db"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := parseConfig(args)
+			assert.Error(t, err)
+		})
+	}
+}
+
+func TestProfileConfigurationNeverCarriesDatabaseValues(t *testing.T) {
+	cfg, err := parseConfig([]string{
+		"-vertical-profiles", "-profile-tenant", "local", "-profile-actor", "operator",
+	})
+	require.NoError(t, err)
+	rendered := fmt.Sprintf("%+v", cfg)
+	assert.NotContains(t, rendered, "postgres://")
+	assert.NotContains(t, rendered, "password")
+}

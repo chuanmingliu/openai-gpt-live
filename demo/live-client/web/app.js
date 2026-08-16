@@ -1,5 +1,6 @@
 import {createBrowserRuntime} from './browser-runtime.mjs';
 import {ClientPresentation} from './client-state.mjs';
+import {createVoiceProfileState} from './voice-profile-state.mjs';
 
 const terminalStatuses = new Set(['idle', 'stopped', 'error']);
 
@@ -32,6 +33,8 @@ const errorLabels = {
   'session-updated-timeout': 'The gateway did not confirm voice configuration in time. Select Start listening to reconnect.',
   'socket-open-timeout': 'The local voice connection did not open in time. Select Start listening to reconnect.',
   'transport-closed': 'The local voice connection closed. Select Start listening to reconnect.',
+  'profile-mismatch': 'The gateway confirmed a different profile version. Select Start listening to reconnect.',
+  'profile-unavailable': 'The selected profile is unavailable. Choose another profile, then select Start listening.',
 };
 
 const toolSaveLabels = {
@@ -114,9 +117,12 @@ if (typeof document !== 'undefined') {
     toolTest: document.querySelector('#tool-test'),
     toolTimeout: document.querySelector('#tool-timeout'),
     transcript: document.querySelector('#transcript'),
+    voiceProfile: document.querySelector('#voice-profile'),
+    voiceProfileNote: document.querySelector('#voice-profile-note'),
   };
 
   const presentation = new ClientPresentation();
+  const profileState = createVoiceProfileState();
   presentation.endSession('idle');
   let noticeCode = '';
   let renderFrame = null;
@@ -215,7 +221,37 @@ if (typeof document !== 'undefined') {
 
   function setNotice(code = '') {
     noticeCode = code;
+    // A failed or stopped session releases the selection so a different
+    // published profile can be chosen before reconnecting.
+    if (elements.voiceProfile) elements.voiceProfile.disabled = false;
     scheduleRender();
+  }
+
+  // Published options are loaded once before the first session; a failure
+  // leaves only the built-in profile selectable.
+  async function loadVoiceProfiles() {
+    if (!elements.voiceProfile) return;
+    try {
+      const response = await fetch('/api/setup/v1/profiles?state=published', {
+        cache: 'no-store',
+        credentials: 'same-origin',
+      });
+      if (!response.ok) return;
+      const options = profileState.loadPublished(await response.json());
+      elements.voiceProfile.replaceChildren();
+      for (const option of options) {
+        const item = document.createElement('option');
+        item.value = `${option.id}/${option.version}`;
+        item.textContent = option.id === 'builtin'
+          ? 'Built-in voice assistant'
+          : `${option.id} v${option.version}${option.active ? ' (active)' : ''}`;
+        elements.voiceProfile.append(item);
+      }
+      const selection = profileState.selection();
+      elements.voiceProfile.value = `${selection.id}/${selection.version}`;
+    } catch {
+      // The built-in profile remains selectable.
+    }
   }
 
   const runtime = createBrowserRuntime({
@@ -227,10 +263,30 @@ if (typeof document !== 'undefined') {
     onSnapshot: scheduleRender,
     onNotice: setNotice,
     fetch: window.fetch.bind(window),
+    profileState,
   });
 
-  elements.start.addEventListener('click', () => { void runtime.start(); });
-  elements.stop.addEventListener('click', () => { void runtime.stop(); });
+  if (elements.voiceProfile) {
+    elements.voiceProfile.addEventListener('change', () => {
+      const [id, version] = elements.voiceProfile.value.split('/');
+      try {
+        profileState.select({id, version: Number(version)});
+      } catch {
+        const selection = profileState.selection();
+        elements.voiceProfile.value = `${selection.id}/${selection.version}`;
+      }
+    });
+  }
+
+  elements.start.addEventListener('click', () => {
+    if (elements.voiceProfile) elements.voiceProfile.disabled = true;
+    void runtime.start();
+  });
+  elements.stop.addEventListener('click', () => {
+    void runtime.stop().finally(() => {
+      if (elements.voiceProfile) elements.voiceProfile.disabled = false;
+    });
+  });
   elements.mute.addEventListener('click', () => { runtime.mute(!presentation.isMuted()); });
   elements.resumeAudio.addEventListener('click', () => { void runtime.resumeAudio(); });
   elements.toolForm.addEventListener('input', () => { toolFormDirty = true; });
@@ -252,4 +308,5 @@ if (typeof document !== 'undefined') {
   window.addEventListener('beforeunload', () => { void runtime.stop(); });
 
   scheduleRender();
+  void loadVoiceProfiles();
 }

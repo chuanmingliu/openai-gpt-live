@@ -1,0 +1,584 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"io"
+	"mime"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/chuanmingliu/openai-gpt-live/internal/profile"
+)
+
+const (
+	profileAPIPrefix      = "/api/setup/v1/"
+	profileRequestTimeout = 10 * time.Second
+)
+
+// serveProfileAPI is the single strict boundary for /api/setup/v1/*.
+func (handler *demoHandler) serveProfileAPI(writer http.ResponseWriter, request *http.Request) {
+	if handler.profiles == nil {
+		writer.WriteHeader(http.StatusNotFound)
+		return
+	}
+	if request.URL.RawPath != "" && request.URL.RawPath != request.URL.Path {
+		writer.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if request.Method != http.MethodGet {
+		origins := request.Header.Values("Origin")
+		if len(origins) != 1 || origins[0] != handler.cfg.Origin {
+			writer.WriteHeader(http.StatusForbidden)
+			return
+		}
+	}
+	rest, ok := strings.CutPrefix(request.URL.Path, profileAPIPrefix)
+	if !ok || rest == "" {
+		writer.WriteHeader(http.StatusNotFound)
+		return
+	}
+	segments := strings.Split(rest, "/")
+	for _, segment := range segments {
+		if segment == "" || segment == "." || segment == ".." {
+			writer.WriteHeader(http.StatusNotFound)
+			return
+		}
+	}
+	ctx, cancel := context.WithTimeout(request.Context(), profileRequestTimeout)
+	defer cancel()
+	request = request.WithContext(ctx)
+
+	if segments[0] != "profiles" {
+		writer.WriteHeader(http.StatusNotFound)
+		return
+	}
+	if len(segments) == 1 {
+		handler.serveProfileCollection(writer, request)
+		return
+	}
+	id := segments[1]
+	if !validProfilePathID(id) {
+		writer.WriteHeader(http.StatusNotFound)
+		return
+	}
+	if request.URL.RawQuery != "" {
+		writer.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	switch {
+	case len(segments) == 3 && segments[2] == "draft":
+		handler.serveProfileDraft(writer, request, profile.ID(id))
+	case len(segments) >= 4 && segments[2] == "templates":
+		handler.serveProfileTemplate(writer, request, profile.ID(id), strings.Join(segments[3:], "/"))
+	case len(segments) == 4 && segments[2] == "fixtures":
+		handler.serveProfileFixture(writer, request, profile.ID(id), segments[3])
+	case len(segments) == 3 && (segments[2] == "validate" || segments[2] == "preview" || segments[2] == "publish"):
+		handler.serveProfilePublication(writer, request, profile.ID(id), segments[2])
+	case len(segments) == 3 && (segments[2] == "activate" || segments[2] == "revoke"):
+		handler.serveProfileLifecycle(writer, request, profile.ID(id), segments[2])
+	default:
+		writer.WriteHeader(http.StatusNotFound)
+	}
+}
+
+func requireProfileJSON(writer http.ResponseWriter, request *http.Request) bool {
+	mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		writer.WriteHeader(http.StatusUnsupportedMediaType)
+		return false
+	}
+	return true
+}
+
+func (handler *demoHandler) serveProfileCollection(writer http.ResponseWriter, request *http.Request) {
+	service := handler.profiles
+	switch request.Method {
+	case http.MethodGet:
+		query, err := url.ParseQuery(request.URL.RawQuery)
+		if err != nil {
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		limit := defaultProfileListLimit
+		cursor := ""
+		for key, values := range query {
+			if len(values) != 1 {
+				writer.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			switch key {
+			case "state":
+				if values[0] != "published" {
+					writer.WriteHeader(http.StatusBadRequest)
+					return
+				}
+			case "limit":
+				parsed, parseErr := parseProfileGeneration(values[0])
+				if parseErr != nil || parsed > maximumProfileListLimit {
+					writer.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				limit = int(parsed)
+			case "cursor":
+				if len(values[0]) == 0 || len(values[0]) > 512 {
+					writer.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				cursor = values[0]
+			default:
+				writer.WriteHeader(http.StatusBadRequest)
+				return
+			}
+		}
+		summaries, nextCursor, err := service.store.ListPublished(request.Context(), service.tenantID, limit, cursor)
+		if err != nil {
+			writeProfileDomainError(writer, err)
+			return
+		}
+		response := publishedProfileList{Profiles: make([]publishedProfileSummary, 0, len(summaries)), Cursor: nextCursor}
+		for _, summary := range summaries {
+			response.Profiles = append(response.Profiles, publishedSummary(summary))
+		}
+		writeProfileJSON(writer, http.StatusOK, response)
+	case http.MethodPost:
+		if request.URL.RawQuery != "" {
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if !requireProfileJSON(writer, request) {
+			return
+		}
+		values, err := decodeProfileObject(writer, request, map[string]byte{"id": 's', "description": 's'})
+		if err != nil {
+			writeProfileBodyError(writer, err)
+			return
+		}
+		id, ok := values["id"]
+		if !ok || !validProfilePathID(id) || !validProfileDescription(values["description"]) {
+			writeProfileErrorCode(writer, http.StatusUnprocessableEntity, "profile_invalid")
+			return
+		}
+		draft, err := service.seedDraft(request.Context(), profile.ID(id), values["description"])
+		if err != nil {
+			writeProfileDomainError(writer, err)
+			return
+		}
+		writer.Header().Set("ETag", draftETag(draft.Generation))
+		writeProfileJSON(writer, http.StatusCreated, draftResponse(draft))
+	default:
+		writer.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (handler *demoHandler) serveProfileDraft(writer http.ResponseWriter, request *http.Request, id profile.ID) {
+	service := handler.profiles
+	switch request.Method {
+	case http.MethodGet:
+		draft, ok, err := service.store.LoadDraft(request.Context(), service.tenantID, id)
+		if err != nil {
+			writeProfileDomainError(writer, err)
+			return
+		}
+		if !ok {
+			writer.WriteHeader(http.StatusNotFound)
+			return
+		}
+		writer.Header().Set("ETag", draftETag(draft.Generation))
+		writeProfileJSON(writer, http.StatusOK, draftResponse(draft))
+	case http.MethodPut:
+		if !requireProfileJSON(writer, request) {
+			return
+		}
+		generation, present, err := parseIfMatchGeneration(request)
+		if !present {
+			writer.WriteHeader(http.StatusPreconditionRequired)
+			return
+		}
+		if err != nil {
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		values, err := decodeProfileObject(writer, request, map[string]byte{"description": 's'})
+		if err != nil {
+			writeProfileBodyError(writer, err)
+			return
+		}
+		description, ok := values["description"]
+		if !ok || !validProfileDescription(description) {
+			writeProfileErrorCode(writer, http.StatusUnprocessableEntity, "profile_invalid")
+			return
+		}
+		draft, ok, err := service.store.LoadDraft(request.Context(), service.tenantID, id)
+		if err != nil {
+			writeProfileDomainError(writer, err)
+			return
+		}
+		if !ok {
+			writer.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if draft.Generation != generation {
+			writeProfileErrorCode(writer, http.StatusConflict, "stale_draft")
+			return
+		}
+		draft.Manifest = draft.Manifest.Clone()
+		draft.Manifest.Description = description
+		draft.UpdatedAt = service.now()
+		draft.UpdatedBy = service.actor
+		saved, err := service.store.SaveDraft(request.Context(), draft, generation)
+		if err != nil {
+			writeProfileDomainError(writer, err)
+			return
+		}
+		writer.Header().Set("ETag", draftETag(saved.Generation))
+		writeProfileJSON(writer, http.StatusOK, draftResponse(saved))
+	default:
+		writer.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (handler *demoHandler) serveProfileTemplate(writer http.ResponseWriter, request *http.Request, id profile.ID, path string) {
+	service := handler.profiles
+	if profile.ValidateTemplateName(path) != nil {
+		writer.WriteHeader(http.StatusNotFound)
+		return
+	}
+	switch request.Method {
+	case http.MethodGet:
+		handler.serveProfileBlob(writer, request, id, path, false)
+	case http.MethodPut:
+		mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
+		if err != nil || mediaType != "text/plain" {
+			writer.WriteHeader(http.StatusUnsupportedMediaType)
+			return
+		}
+		generation, present, err := parseIfMatchGeneration(request)
+		if !present {
+			writer.WriteHeader(http.StatusPreconditionRequired)
+			return
+		}
+		if err != nil {
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		source, ok := readProfileBody(writer, request, maximumProfileTemplateBytes)
+		if !ok {
+			return
+		}
+		if !utf8.Valid(source) {
+			writeProfileErrorCode(writer, http.StatusUnprocessableEntity, "profile_invalid")
+			return
+		}
+		draft, err := service.store.SaveTemplate(request.Context(), service.tenantID, id, path, source, generation, service.actor)
+		if err != nil {
+			writeProfileDomainError(writer, err)
+			return
+		}
+		writer.Header().Set("ETag", draftETag(draft.Generation))
+		writeProfileJSON(writer, http.StatusOK, draftResponse(draft))
+	case http.MethodDelete:
+		generation, present, err := parseIfMatchGeneration(request)
+		if !present {
+			writer.WriteHeader(http.StatusPreconditionRequired)
+			return
+		}
+		if err != nil {
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		draft, err := service.store.DeleteTemplate(request.Context(), service.tenantID, id, path, generation, service.actor)
+		if err != nil {
+			writeProfileDomainError(writer, err)
+			return
+		}
+		writer.Header().Set("ETag", draftETag(draft.Generation))
+		writer.WriteHeader(http.StatusNoContent)
+	default:
+		writer.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (handler *demoHandler) serveProfileFixture(writer http.ResponseWriter, request *http.Request, id profile.ID, name string) {
+	service := handler.profiles
+	if !validProfileFixtureName(name) {
+		writer.WriteHeader(http.StatusNotFound)
+		return
+	}
+	switch request.Method {
+	case http.MethodGet:
+		handler.serveProfileBlob(writer, request, id, name, true)
+	case http.MethodPut:
+		if !requireProfileJSON(writer, request) {
+			return
+		}
+		generation, present, err := parseIfMatchGeneration(request)
+		if !present {
+			writer.WriteHeader(http.StatusPreconditionRequired)
+			return
+		}
+		if err != nil {
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		content, ok := readProfileBody(writer, request, maximumProfileTemplateBytes)
+		if !ok {
+			return
+		}
+		handler.mutateProfileFixture(writer, request, id, generation, func(manifest *profile.Manifest) error {
+			blob, err := (profile.Blob{MediaType: "application/json", Content: content}).Canonical()
+			if err != nil {
+				return profile.ErrInvalidProfile
+			}
+			if err := service.store.PutBlob(request.Context(), service.tenantID, blob); err != nil {
+				return err
+			}
+			if manifest.Bundle.Fixtures == nil {
+				manifest.Bundle.Fixtures = make(map[string]profile.TemplateRef)
+			}
+			manifest.Bundle.Fixtures[name] = profile.TemplateRef{Hash: blob.Hash, MediaType: blob.MediaType, Bytes: blob.ContentBytes}
+			return nil
+		})
+	case http.MethodDelete:
+		generation, present, err := parseIfMatchGeneration(request)
+		if !present {
+			writer.WriteHeader(http.StatusPreconditionRequired)
+			return
+		}
+		if err != nil {
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		handler.mutateProfileFixture(writer, request, id, generation, func(manifest *profile.Manifest) error {
+			if _, ok := manifest.Bundle.Fixtures[name]; !ok {
+				return profile.ErrInvalidProfile
+			}
+			delete(manifest.Bundle.Fixtures, name)
+			return nil
+		})
+	default:
+		writer.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (handler *demoHandler) mutateProfileFixture(writer http.ResponseWriter, request *http.Request, id profile.ID, generation int64, mutate func(*profile.Manifest) error) {
+	service := handler.profiles
+	draft, ok, err := service.store.LoadDraft(request.Context(), service.tenantID, id)
+	if err != nil {
+		writeProfileDomainError(writer, err)
+		return
+	}
+	if !ok {
+		writer.WriteHeader(http.StatusNotFound)
+		return
+	}
+	if draft.Generation != generation {
+		writeProfileErrorCode(writer, http.StatusConflict, "stale_draft")
+		return
+	}
+	draft.Manifest = draft.Manifest.Clone()
+	if err := mutate(&draft.Manifest); err != nil {
+		writeProfileDomainError(writer, err)
+		return
+	}
+	draft.UpdatedAt = service.now()
+	draft.UpdatedBy = service.actor
+	saved, err := service.store.SaveDraft(request.Context(), draft, generation)
+	if err != nil {
+		writeProfileDomainError(writer, err)
+		return
+	}
+	writer.Header().Set("ETag", draftETag(saved.Generation))
+	writeProfileJSON(writer, http.StatusOK, draftResponse(saved))
+}
+
+func (handler *demoHandler) serveProfileBlob(writer http.ResponseWriter, request *http.Request, id profile.ID, path string, fixture bool) {
+	service := handler.profiles
+	draft, ok, err := service.store.LoadDraft(request.Context(), service.tenantID, id)
+	if err != nil {
+		writeProfileDomainError(writer, err)
+		return
+	}
+	if !ok {
+		writer.WriteHeader(http.StatusNotFound)
+		return
+	}
+	refs := draft.Manifest.Bundle.Templates
+	if fixture {
+		refs = draft.Manifest.Bundle.Fixtures
+	}
+	ref, ok := refs[path]
+	if !ok {
+		writer.WriteHeader(http.StatusNotFound)
+		return
+	}
+	blob, ok, err := service.store.LoadBlob(request.Context(), service.tenantID, ref.Hash)
+	if err != nil {
+		writeProfileDomainError(writer, err)
+		return
+	}
+	if !ok {
+		writer.WriteHeader(http.StatusNotFound)
+		return
+	}
+	writer.Header().Set("Content-Type", blob.MediaType)
+	writer.Header().Set("ETag", draftETag(draft.Generation))
+	writer.WriteHeader(http.StatusOK)
+	_, _ = writer.Write(blob.Content)
+}
+
+func (handler *demoHandler) serveProfilePublication(writer http.ResponseWriter, request *http.Request, id profile.ID, action string) {
+	service := handler.profiles
+	if request.Method != http.MethodPost {
+		writer.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !requireProfileJSON(writer, request) {
+		return
+	}
+	allowed := map[string]byte{"expected_generation": 'n'}
+	if action == "publish" {
+		allowed["activate"] = 'b'
+	}
+	values, err := decodeProfileObject(writer, request, allowed)
+	if err != nil {
+		writeProfileBodyError(writer, err)
+		return
+	}
+	rawGeneration, ok := values["expected_generation"]
+	if !ok {
+		writer.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	generation, err := parseProfileGeneration(rawGeneration)
+	if err != nil {
+		writer.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	command := profile.PublishCommand{
+		TenantID:           service.tenantID,
+		ProfileID:          id,
+		ExpectedGeneration: generation,
+		Actor:              service.actor,
+		Activate:           values["activate"] == "true",
+	}
+	switch action {
+	case "validate":
+		if err := service.publisher.Validate(request.Context(), command); err != nil {
+			writeProfileDomainError(writer, err)
+			return
+		}
+		writer.WriteHeader(http.StatusNoContent)
+	case "preview":
+		preview, err := service.publisher.Preview(request.Context(), command)
+		if err != nil {
+			writeProfileDomainError(writer, err)
+			return
+		}
+		outputs := preview.Outputs
+		if outputs == nil {
+			outputs = map[string]string{}
+		}
+		writeProfileJSON(writer, http.StatusOK, profilePreviewResponse{
+			BundleHash: preview.BundleHash, SnapshotHash: preview.SnapshotHash, Outputs: outputs,
+		})
+	case "publish":
+		published, err := service.publisher.Publish(request.Context(), command)
+		if err != nil {
+			writeProfileDomainError(writer, err)
+			return
+		}
+		writeProfileJSON(writer, http.StatusCreated, profilePublishResponse{
+			ID:           string(published.Ref.ID),
+			Version:      published.Ref.Version,
+			SnapshotHash: published.Snapshot.SnapshotHash,
+			Active:       published.Active,
+		})
+	}
+}
+
+func (handler *demoHandler) serveProfileLifecycle(writer http.ResponseWriter, request *http.Request, id profile.ID, action string) {
+	service := handler.profiles
+	if request.Method != http.MethodPost {
+		writer.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !requireProfileJSON(writer, request) {
+		return
+	}
+	values, err := decodeProfileObject(writer, request, map[string]byte{"version": 'n'})
+	if err != nil {
+		writeProfileBodyError(writer, err)
+		return
+	}
+	rawVersion, ok := values["version"]
+	if !ok {
+		writer.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	version, err := parseProfileVersion(rawVersion)
+	if err != nil {
+		writer.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	ref := profile.VersionRef{ID: id, Version: version}
+	if action == "activate" {
+		err = service.publisher.Activate(request.Context(), service.tenantID, ref, service.actor)
+	} else {
+		err = service.publisher.Revoke(request.Context(), service.tenantID, ref, service.actor)
+	}
+	if err != nil {
+		writeProfileDomainError(writer, err)
+		return
+	}
+	writer.WriteHeader(http.StatusNoContent)
+}
+
+// readProfileBody reads at most maximum bytes and reports oversize as 413.
+func readProfileBody(writer http.ResponseWriter, request *http.Request, maximum int64) ([]byte, bool) {
+	content, err := io.ReadAll(http.MaxBytesReader(writer, request.Body, maximum))
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writer.WriteHeader(http.StatusRequestEntityTooLarge)
+		} else {
+			writer.WriteHeader(http.StatusBadRequest)
+		}
+		return nil, false
+	}
+	return content, true
+}
+
+func writeProfileBodyError(writer http.ResponseWriter, err error) {
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		writer.WriteHeader(http.StatusRequestEntityTooLarge)
+		return
+	}
+	writer.WriteHeader(http.StatusBadRequest)
+}
+
+func validProfileDescription(value string) bool {
+	return len(value) <= 4096 && utf8.ValidString(value) && !strings.ContainsRune(value, 0)
+}
+
+// validProfileFixtureName mirrors the profile package's fixture rules for one
+// path segment: lowercase alphanumeric start, .json suffix, bounded charset.
+func validProfileFixtureName(name string) bool {
+	if len(name) < len("a.json") || len(name) > 256 || !strings.HasSuffix(name, ".json") {
+		return false
+	}
+	first := name[0]
+	if !(first >= 'a' && first <= 'z' || first >= '0' && first <= '9') {
+		return false
+	}
+	for _, value := range []byte(name) {
+		if !(value >= 'a' && value <= 'z' || value >= '0' && value <= '9' || value == '_' || value == '.' || value == '-') {
+			return false
+		}
+	}
+	return true
+}

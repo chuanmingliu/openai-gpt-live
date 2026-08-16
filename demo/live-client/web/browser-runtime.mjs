@@ -18,6 +18,8 @@ const NOTICE_CODES = new Set([
   'microphone-backpressure',
   'microphone-ended',
   'microphone-suspended',
+  'profile-mismatch',
+  'profile-unavailable',
   'session-created-timeout',
   'session-updated-timeout',
   'socket-open-timeout',
@@ -35,6 +37,10 @@ export function createBrowserRuntime(dependencies) {
     presentation,
     onSnapshot,
     onNotice,
+    // profileState is optional. When present it owns the immutable selection
+    // and the second capture acknowledgement gate; the builtin default keeps
+    // existing single-ack behavior for voice-only gateways.
+    profileState = null,
   } = dependencies;
 
   let generation = 0;
@@ -56,6 +62,7 @@ export function createBrowserRuntime(dependencies) {
   let nextPolicyEventID = 1;
   let policySaveQueue = Promise.resolve();
   let startPromise = null;
+  let policyAccepted = false;
   let playbackRevision = 0;
   let captureResumePending = false;
   const playbackPacer = new PCMPlaybackPacer(120);
@@ -65,6 +72,25 @@ export function createBrowserRuntime(dependencies) {
 
   function publishSnapshot() {
     onSnapshot(presentation.snapshot());
+  }
+
+  // captureGateOpen requires the tool-policy acknowledgement plus, when a
+  // custom profile is selected, the exact live.profile.selected acknowledgement
+  // and the provider session.updated acknowledgement. Any mismatch fails closed.
+  function captureGateOpen() {
+    if (!policyAccepted) return false;
+    if (profileState === null) return true;
+    return profileState.captureReady();
+  }
+
+  // openCaptureIfReady promotes a pending session to listening once the last
+  // outstanding acknowledgement arrives, in whichever order they land.
+  function openCaptureIfReady(currentGeneration) {
+    if (generation !== currentGeneration || streamReady || !captureGateOpen()) return;
+    establishmentTimer.clear();
+    streamReady = true;
+    presentation.apply({type: 'status', value: 'listening'});
+    publishSnapshot();
   }
 
   async function boundedFetch(path, options) {
@@ -142,9 +168,12 @@ export function createBrowserRuntime(dependencies) {
     if (generation !== currentGeneration) return;
     if (effect.type === 'tool-policy-accepted') {
       if (presentation.tools.acceptPolicy(effect.event_id, effect.policy, effect.model)) {
-        establishmentTimer.clear();
-        streamReady = true;
-        presentation.apply({type: 'status', value: 'listening'});
+        policyAccepted = true;
+        if (captureGateOpen()) {
+          establishmentTimer.clear();
+          streamReady = true;
+          presentation.apply({type: 'status', value: 'listening'});
+        }
       }
       publishSnapshot();
       return;
@@ -227,11 +256,18 @@ export function createBrowserRuntime(dependencies) {
       }
       if (!sessionConfigured) {
         sessionConfigured = true;
+        profileState?.onProviderUpdated();
         armEstablishmentDeadline('session-updated-timeout', currentGeneration, ownedSocket);
         void (policyLoadPromise ?? Promise.resolve()).then(() => {
           sendCurrentPolicy(currentGeneration, ownedSocket, true);
         });
       }
+    } else if (event?.type === 'live.profile.selected') {
+      if (profileState !== null && !profileState.onProfileSelected(event.profile)) {
+        void failSession('profile-mismatch', currentGeneration);
+        return;
+      }
+      openCaptureIfReady(currentGeneration);
     }
     for (const effect of protocol.consume(event)) applyEffect(effect, currentGeneration);
   }
@@ -357,7 +393,8 @@ export function createBrowserRuntime(dependencies) {
 
     try {
       const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const ownedSocket = new WebSocket(`${scheme}//${location.host}/ws`);
+      const profileQuery = profileState?.query() ?? '';
+      const ownedSocket = new WebSocket(`${scheme}//${location.host}/ws${profileQuery === '' ? '' : `?${profileQuery}`}`);
       socket = ownedSocket;
       ownedSocket.addEventListener('open', () => {
         handleSocketOpen(currentGeneration, ownedSocket);
@@ -387,7 +424,9 @@ export function createBrowserRuntime(dependencies) {
     if (mediaStream || socket) return Promise.resolve();
 
     const currentGeneration = ++generation;
+    profileState?.onConnected();
     streamReady = false;
+    policyAccepted = false;
     sessionConfigured = false;
     sessionUpdateSent = false;
     socketOpenObserved = false;
@@ -407,7 +446,9 @@ export function createBrowserRuntime(dependencies) {
   }
 
   async function releaseResources(closeSocket) {
+    profileState?.onDisconnected();
     streamReady = false;
+    policyAccepted = false;
     sessionConfigured = false;
     sessionUpdateSent = false;
     socketOpenObserved = false;

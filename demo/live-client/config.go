@@ -27,6 +27,35 @@ type demoConfig struct {
 	BearerEnv     string
 	MaxFrameBytes int64
 	Operator      operatorConfig
+	Profiles      profileAdminConfig
+}
+
+// profileAdminConfig is the private vertical-profile administration
+// configuration. Identity and database access are operator-supplied and are
+// never returned to or accepted from the browser.
+type profileAdminConfig struct {
+	Enabled        bool
+	DatabaseURLEnv string
+	TenantID       string
+	Actor          string
+
+	// service is a test seam; production composition opens PostgreSQL.
+	service *profileAdminService
+}
+
+var profileIdentifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+
+func (cfg profileAdminConfig) validate() error {
+	if !cfg.Enabled {
+		return nil
+	}
+	if !environmentPattern.MatchString(cfg.DatabaseURLEnv) {
+		return errors.New("demo profile database environment name is invalid")
+	}
+	if !profileIdentifierPattern.MatchString(cfg.TenantID) || !profileIdentifierPattern.MatchString(cfg.Actor) {
+		return errors.New("demo profile identity is required")
+	}
+	return nil
 }
 
 func parseConfig(args []string) (demoConfig, error) {
@@ -55,6 +84,10 @@ func parseConfig(args []string) (demoConfig, error) {
 	flags.StringVar(&cfg.Model, "model", cfg.Model, "advertised gateway model")
 	flags.StringVar(&cfg.Origin, "origin", cfg.Origin, "exact browser origin")
 	flags.StringVar(&cfg.BearerEnv, "bearer-env", cfg.BearerEnv, "environment variable containing the bearer")
+	flags.BoolVar(&cfg.Profiles.Enabled, "vertical-profiles", false, "enable loopback vertical profile administration")
+	flags.StringVar(&cfg.Profiles.DatabaseURLEnv, "profile-database-url-env", "LIVE_PROFILE_DATABASE_URL", "environment variable containing the private profile database URL")
+	flags.StringVar(&cfg.Profiles.TenantID, "profile-tenant", "", "exact profile tenant identifier")
+	flags.StringVar(&cfg.Profiles.Actor, "profile-actor", "", "exact profile operator actor identifier")
 	flags.BoolVar(&cfg.Operator.Enabled, "operator", false, "enable fixed local demo operator controls")
 	flags.StringVar(&cfg.Operator.StateDir, "operator-state-dir", "", "private operator state directory")
 	flags.StringVar(&cfg.Operator.RepositoryRoot, "operator-repository-root", "", "fixed repository root")
@@ -120,6 +153,9 @@ func (cfg demoConfig) validate() error {
 		if err := cfg.Operator.validate(); err != nil {
 			return errors.New("demo configuration is invalid")
 		}
+	}
+	if err := cfg.Profiles.validate(); err != nil {
+		return err
 	}
 	return nil
 }

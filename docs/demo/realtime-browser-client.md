@@ -352,6 +352,61 @@ Run the content-free automated browser gate separately:
 make test-demo-live-client
 ```
 
+## Vertical profiles
+
+`/setup` exposes profile administration only when the browser BFF runs with the
+loopback profile flags:
+
+```bash
+go run ./demo/live-client \
+  -operator \
+  -vertical-profiles \
+  -profile-tenant local \
+  -profile-actor operator \
+  -profile-database-url-env LIVE_PROFILE_DATABASE_URL
+```
+
+The database URL is resolved from that environment variable name inside the
+process. It is never a flag value, never returned by an endpoint, and never
+rendered in the browser. Without the flags every `/api/setup/v1/*` route answers
+`404` and the demo keeps using the built-in voice profile.
+
+### Trust boundary
+
+The browser may submit only a profile ID, a description, logical `.j2` template
+paths and their plain-text source, synthetic fixtures, an exact draft
+generation, and a published version number. Tenant, actor, engine version,
+adapter registry version, snapshot hashes, and publication timestamps are
+server-owned. Adapter bindings fail closed because the loopback demo installs no
+adapters, and raw `mcpServers` JSON is intentionally rejected here as well.
+
+### Draft generations
+
+Draft and template writes carry `If-Match: "<generation>"`. A missing header is
+`428`; a losing write is `409 stale_draft`, leaves the stored draft untouched,
+and keeps unsaved source in the editor until an explicit **Reload draft**.
+Publication names one exact generation and can succeed only once.
+
+### Selecting a profile for a session
+
+The voice page lists the built-in profile plus every non-revoked published
+version. The selection is locked from connect until disconnect. The browser
+opens `/ws?profile=<id>&profile_version=<n>`; the BFF accepts only that exact
+pair, adds its own fixed model, and forwards no other browser query key.
+
+Microphone capture requires three acknowledgements: the provider
+`session.updated`, the tool-policy acknowledgement, and — for a custom profile —
+an exact `live.profile.selected` event whose ID, version, and snapshot hash match
+the selection. A mismatch stops the session with `profile-mismatch` instead of
+streaming audio, so stale or substituted profiles can never reach the microphone.
+
+### Rollback
+
+Publishing a new version does not change connected sessions; each session keeps
+its immutable snapshot until it disconnects. **Activate** chooses the version
+offered to new sessions, and **Revoke** removes a version from selection and
+reconnect. Neither changes the immutable published content.
+
 ## Production roadmap
 
 Production requires reviewed OIDC/BFF authentication, `wss://`, PostgreSQL TLS,

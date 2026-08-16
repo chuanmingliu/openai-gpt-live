@@ -1,3 +1,6 @@
+import {createProfileAPI} from './profile-api.mjs';
+import {createProfileWorkspace, profileNoticeText, PROFILE_TABS} from './setup-profile.mjs';
+
 export const COMPONENTS = Object.freeze(['speech', 'postgres', 'gateway', 'worker', 'client']);
 
 const STATES = new Set(['ready', 'stopped', 'starting', 'stopping', 'failed']);
@@ -274,17 +277,199 @@ export function createSetupDOMPort(document) {
   };
 }
 
+// createProfileDOMPort renders the Profile, Prompts, and Review & publish tabs
+// using text nodes and form values only. No template source, preview output, or
+// notice text is ever injected as HTML.
+export function createProfileDOMPort(document) {
+  const announcement = document.querySelector('#profile-announcement');
+  const notice = document.querySelector('#profile-notice');
+  const current = document.querySelector('#profile-current');
+  const generation = document.querySelector('#profile-generation');
+  const descriptionInput = document.querySelector('#profile-description');
+  const templateList = document.querySelector('#template-list');
+  const templateSource = document.querySelector('#template-source');
+  const publishedList = document.querySelector('#published-list');
+  const previewOutput = document.querySelector('#profile-preview-output');
+  const buttons = {
+    saveDescription: document.querySelector('#profile-save-description'),
+    reload: document.querySelector('#profile-reload'),
+    templateSave: document.querySelector('#template-save'),
+    templateDelete: document.querySelector('#template-delete'),
+    templateAdd: document.querySelector('#template-add'),
+    validate: document.querySelector('#profile-validate'),
+    preview: document.querySelector('#profile-preview'),
+    publish: document.querySelector('#profile-publish'),
+  };
+  const tabs = new Map(PROFILE_TABS.map((name) => [name, document.querySelector(`#tab-${name}`)]));
+  const panels = new Map(PROFILE_TABS.map((name) => [name, document.querySelector(`#panel-${name}`)]));
+  let sourceDirtyByUser = false;
+
+  function renderTabs(active) {
+    for (const [name, tab] of tabs) {
+      if (!tab) continue;
+      const selected = name === active;
+      tab.setAttribute('aria-selected', String(selected));
+      tab.tabIndex = selected ? 0 : -1;
+      const panel = panels.get(name);
+      if (panel) panel.hidden = !selected;
+    }
+  }
+
+  function renderTemplates(model) {
+    templateList.replaceChildren();
+    const templates = model.draft ? model.draft.templates : [];
+    for (const entry of templates) {
+      const row = document.createElement('li');
+      row.setAttribute('aria-current', String(entry.path === model.selectedPath));
+      const label = document.createElement('span');
+      label.textContent = entry.path;
+      const open = document.createElement('button');
+      open.type = 'button';
+      open.dataset.templatePath = entry.path;
+      open.textContent = entry.path === model.selectedPath ? 'Selected' : 'Open';
+      open.disabled = model.busy;
+      row.append(label, open);
+      templateList.append(row);
+    }
+  }
+
+  function renderPublished(model) {
+    publishedList.replaceChildren();
+    for (const entry of model.published) {
+      const row = document.createElement('li');
+      row.dataset.active = String(entry.active);
+      row.dataset.revoked = String(entry.revoked);
+      const label = document.createElement('span');
+      label.textContent = `${entry.id} v${entry.version}`;
+      const meta = document.createElement('span');
+      meta.className = 'version-meta';
+      meta.textContent = entry.revoked ? 'Revoked' : entry.active ? 'Active for new sessions' : 'Published';
+      const controls = document.createElement('span');
+      controls.className = 'actions';
+      if (!entry.revoked) {
+        const activate = document.createElement('button');
+        activate.type = 'button';
+        activate.dataset.versionAction = 'activate';
+        activate.dataset.versionId = entry.id;
+        activate.dataset.version = String(entry.version);
+        activate.textContent = 'Activate';
+        activate.disabled = model.busy || entry.active;
+        const revoke = document.createElement('button');
+        revoke.type = 'button';
+        revoke.dataset.versionAction = 'revoke';
+        revoke.dataset.versionId = entry.id;
+        revoke.dataset.version = String(entry.version);
+        revoke.textContent = 'Revoke';
+        revoke.disabled = model.busy;
+        controls.append(activate, revoke);
+      }
+      row.append(label, meta, controls);
+      publishedList.append(row);
+    }
+  }
+
+  return {
+    announce(message) { announcement.textContent = message; },
+    markSourceDirty() { sourceDirtyByUser = true; },
+    render(model) {
+      renderTabs(model.tab);
+      notice.textContent = profileNoticeText(model.notice);
+      current.textContent = model.draft ? model.draft.id : 'No draft loaded.';
+      generation.textContent = model.draft ? String(model.draft.generation) : '—';
+      if (model.draft && !sourceDirtyByUser) descriptionInput.value = model.draft.description;
+      const hasDraft = model.draft !== null;
+      const hasTemplate = model.selectedPath !== '';
+      buttons.saveDescription.disabled = !hasDraft || model.busy;
+      buttons.reload.disabled = !hasDraft || model.busy;
+      buttons.templateSave.disabled = !hasTemplate || model.busy || !model.dirty;
+      buttons.templateDelete.disabled = !hasTemplate || model.busy || model.selectedPath === 'system.j2';
+      buttons.templateAdd.disabled = !hasDraft || model.busy;
+      buttons.validate.disabled = !hasDraft || model.busy;
+      buttons.preview.disabled = !hasDraft || model.busy;
+      buttons.publish.disabled = model.publishDisabled || model.busy;
+      templateSource.disabled = !hasTemplate || model.busy;
+      if (templateSource.value !== model.source) templateSource.value = model.source;
+      previewOutput.textContent = model.preview
+        ? Object.entries(model.preview.outputs).map(([name, output]) => `${name}\n${output}`).join('\n\n')
+        : "Run Preview to render the profile's synthetic fixtures.";
+      renderTemplates(model);
+      renderPublished(model);
+    },
+  };
+}
+
+function bootProfileWorkspace(document, window) {
+  if (!document.querySelector('#panel-profile')) return null;
+  const dom = createProfileDOMPort(document);
+  const workspace = createProfileWorkspace({api: createProfileAPI(window.fetch.bind(window)), dom});
+  const idInput = document.querySelector('#profile-id');
+  const descriptionInput = document.querySelector('#profile-description');
+  const templateSource = document.querySelector('#template-source');
+  const newPathInput = document.querySelector('#template-new-path');
+
+  document.querySelector('#profile-open-form').addEventListener('submit', (event) => {
+    event.preventDefault();
+    void workspace.openOrCreate(idInput.value.trim(), descriptionInput.value);
+  });
+  document.querySelector('#profile-save-description').addEventListener('click', () => {
+    void workspace.saveDescription(descriptionInput.value);
+  });
+  document.querySelector('#profile-reload').addEventListener('click', () => { void workspace.reloadDraft(); });
+  descriptionInput.addEventListener('input', () => dom.markSourceDirty());
+  templateSource.addEventListener('input', () => workspace.editSource(templateSource.value));
+  document.querySelector('#template-save').addEventListener('click', () => {
+    void workspace.saveTemplate(workspace.snapshot().selectedPath, templateSource.value);
+  });
+  document.querySelector('#template-delete').addEventListener('click', () => {
+    void workspace.deleteTemplate(workspace.snapshot().selectedPath);
+  });
+  document.querySelector('#template-add-form').addEventListener('submit', (event) => {
+    event.preventDefault();
+    const path = newPathInput.value.trim();
+    if (path !== '') void workspace.saveTemplate(path, '');
+  });
+  document.querySelector('#profile-validate').addEventListener('click', () => { void workspace.validateDraft(); });
+  document.querySelector('#profile-preview').addEventListener('click', () => { void workspace.previewDraft(); });
+  document.querySelector('#profile-publish').addEventListener('click', () => { void workspace.publishDraft(true); });
+  document.querySelector('#profile-refresh').addEventListener('click', () => { void workspace.refreshPublished(); });
+  document.addEventListener('click', (event) => {
+    const tab = event.target.closest('[role="tab"][data-tab]');
+    if (tab) {
+      workspace.selectTab(tab.dataset.tab);
+      return;
+    }
+    const template = event.target.closest('button[data-template-path]');
+    if (template && !template.disabled) {
+      void workspace.selectTemplate(template.dataset.templatePath);
+      return;
+    }
+    const version = event.target.closest('button[data-version-action]');
+    if (version && !version.disabled) {
+      const id = version.dataset.versionId;
+      const number = Number(version.dataset.version);
+      if (version.dataset.versionAction === 'activate') void workspace.activateVersion(id, number);
+      else void workspace.revokeVersion(id, number);
+    }
+  });
+  return workspace;
+}
+
 function boot(document, window) {
   const dom = createSetupDOMPort(document);
   const controller = createSetupController({fetch: window.fetch.bind(window), timers: window, dom});
+  const workspace = bootProfileWorkspace(document, window);
   document.addEventListener('click', (event) => {
     const button = event.target.closest('button[data-action]');
     if (!button || button.disabled) return;
     const card = button.closest('[data-component]');
     if (card) void controller.act(card.dataset.component, button.dataset.action);
   });
-  window.addEventListener('pagehide', () => controller.destroy(), {once: true});
+  window.addEventListener('pagehide', () => {
+    controller.destroy();
+    workspace?.destroy();
+  }, {once: true});
   controller.start();
+  void workspace?.refreshPublished();
 }
 
 if (typeof document !== 'undefined' && typeof window !== 'undefined') boot(document, window);

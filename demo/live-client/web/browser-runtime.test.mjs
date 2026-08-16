@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {createBrowserRuntime} from './browser-runtime.mjs';
 import {ClientPresentation} from './client-state.mjs';
+import {createVoiceProfileState} from './voice-profile-state.mjs';
 
 const SCHEDULED_PCM_BASE64 = Buffer.alloc(16000).toString('base64');
 const FRAME_PCM_BASE64 = Buffer.alloc(960).toString('base64');
@@ -207,7 +208,14 @@ class BrowserHarness {
     };
   }
 
-  dependencies() {
+  dependencies(overrides = {}) {
+    return {
+      ...this.baseDependencies(),
+      ...overrides,
+    };
+  }
+
+  baseDependencies() {
     return {
       mediaDevices: this.mediaDevices,
       AudioContext: this.AudioContext,
@@ -1235,4 +1243,100 @@ test('audio worklet initialization failure is not mislabeled as a microphone fai
   assert.equal(harness.captureContext.closed, true);
   assert.equal(harness.playbackContext.closed, true);
   assert.equal(harness.sockets.length, 0);
+});
+
+const PROFILE_HASH = 'e'.repeat(64);
+
+function customProfileState(selection = {id: 'insurance', version: 3}) {
+  const state = createVoiceProfileState();
+  state.loadPublished({profiles: [
+    {id: selection.id, version: selection.version, active: true, revoked: false, snapshot_hash: PROFILE_HASH},
+  ]});
+  state.select(selection);
+  return state;
+}
+
+async function acceptPolicy(harness) {
+  harness.server({type: 'session.created'});
+  harness.server({type: 'session.updated'});
+  await new Promise((resolve) => setImmediate(resolve));
+  const update = harness.sent.filter(({type}) => type === 'live.tool_policy.update').at(-1);
+  harness.server({
+    type: 'live.tool_policy.updated', event_id: update.event_id,
+    tools: update.tools, model: 'deepseek-v4-flash',
+  });
+}
+
+test('builtin selection sends no profile query and keeps single-ack capture', async (t) => {
+  const harness = new BrowserHarness();
+  harness.installFakeTimers();
+  t.after(() => harness.restoreTimers());
+  const runtime = createBrowserRuntime(harness.dependencies({profileState: createVoiceProfileState()}));
+  await runtime.start();
+  assert.equal(harness.socket.url, 'ws://127.0.0.1:3000/ws');
+  await acceptPolicy(harness);
+  harness.capture({type: 'frame', pcm: new ArrayBuffer(960)});
+  assert.equal(harness.sent.filter(({type}) => type === 'input_audio_buffer.append').length, 1);
+});
+
+test('custom profile sends the exact query and holds capture until both acks', async (t) => {
+  const harness = new BrowserHarness();
+  harness.installFakeTimers();
+  t.after(() => harness.restoreTimers());
+  const runtime = createBrowserRuntime(harness.dependencies({profileState: customProfileState()}));
+  await runtime.start();
+  assert.equal(harness.socket.url, 'ws://127.0.0.1:3000/ws?profile=insurance&profile_version=3');
+
+  await acceptPolicy(harness);
+  harness.capture({type: 'frame', pcm: new ArrayBuffer(960)});
+  assert.equal(harness.sent.filter(({type}) => type === 'input_audio_buffer.append').length, 0);
+
+  harness.server({
+    type: 'live.profile.selected', event_id: 'profile-1',
+    profile: {id: 'insurance', version: 3, snapshot_hash: PROFILE_HASH},
+  });
+  harness.capture({type: 'frame', pcm: new ArrayBuffer(960)});
+  assert.equal(harness.sent.filter(({type}) => type === 'input_audio_buffer.append').length, 1);
+});
+
+test('profile acknowledgement before the policy ack still opens capture exactly once', async (t) => {
+  const harness = new BrowserHarness();
+  harness.installFakeTimers();
+  t.after(() => harness.restoreTimers());
+  const runtime = createBrowserRuntime(harness.dependencies({profileState: customProfileState()}));
+  await runtime.start();
+  harness.server({type: 'session.created'});
+  harness.server({type: 'session.updated'});
+  harness.server({
+    type: 'live.profile.selected', event_id: 'profile-1',
+    profile: {id: 'insurance', version: 3, snapshot_hash: PROFILE_HASH},
+  });
+  harness.capture({type: 'frame', pcm: new ArrayBuffer(960)});
+  assert.equal(harness.sent.filter(({type}) => type === 'input_audio_buffer.append').length, 0);
+
+  await new Promise((resolve) => setImmediate(resolve));
+  const update = harness.sent.filter(({type}) => type === 'live.tool_policy.update').at(-1);
+  harness.server({
+    type: 'live.tool_policy.updated', event_id: update.event_id,
+    tools: update.tools, model: 'deepseek-v4-flash',
+  });
+  harness.capture({type: 'frame', pcm: new ArrayBuffer(960)});
+  assert.equal(harness.sent.filter(({type}) => type === 'input_audio_buffer.append').length, 1);
+});
+
+test('mismatched profile acknowledgement fails closed before any microphone frame', async (t) => {
+  const harness = new BrowserHarness();
+  harness.installFakeTimers();
+  t.after(() => harness.restoreTimers());
+  const runtime = createBrowserRuntime(harness.dependencies({profileState: customProfileState()}));
+  await runtime.start();
+  await acceptPolicy(harness);
+  harness.server({
+    type: 'live.profile.selected', event_id: 'profile-1',
+    profile: {id: 'insurance', version: 4, snapshot_hash: PROFILE_HASH},
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.notices.at(-1), 'profile-mismatch');
+  assert.equal(harness.sent.filter(({type}) => type === 'input_audio_buffer.append').length, 0);
+  assert.ok(harness.mediaStreams.every((stream) => stream.getTracks().every((track) => track.stopped)));
 });

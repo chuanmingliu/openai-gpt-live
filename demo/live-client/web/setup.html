@@ -13,32 +13,99 @@
     <header>
       <p class="eyebrow">LOCAL DEMO SETUP</p>
       <h1>Bring the voice demo online</h1>
-      <p class="lede">Start the local services in order. This page only controls the reviewed local operator.</p>
+      <p class="lede">Start the local services in order, then edit and publish the vertical profile this demo speaks with.</p>
     </header>
     <p id="setup-announcement" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
-    <ol class="setup-grid" aria-label="Local demo components">
-      <li class="setup-card" data-component="speech" data-state="unknown" aria-busy="false">
-        <h2>Speech</h2><p data-state-label>State: Unavailable</p><p data-status>Status unavailable.</p>
-        <div class="actions"><button type="button" data-action="start" disabled>Start</button><button type="button" data-action="stop" disabled>Stop</button></div>
-      </li>
-      <li class="setup-card" data-component="postgres" data-state="unknown" aria-busy="false">
-        <h2>PostgreSQL</h2><p data-state-label>State: Unavailable</p><p data-status>Status unavailable.</p>
-        <div class="actions"><button type="button" data-action="start" disabled>Start</button><button type="button" data-action="migrate" disabled>Migrate</button><button type="button" data-action="stop" disabled>Stop</button></div>
-      </li>
-      <li class="setup-card" data-component="gateway" data-state="unknown" aria-busy="false">
-        <h2>Gateway</h2><p data-state-label>State: Unavailable</p><p data-status>Status unavailable.</p>
-        <div class="actions"><button type="button" data-action="start" disabled>Start</button><button type="button" data-action="stop" disabled>Stop</button></div>
-      </li>
-      <li class="setup-card" data-component="worker" data-state="unknown" aria-busy="false">
-        <h2>Worker <span>(optional)</span></h2><p data-state-label>State: Unavailable</p><p data-status>Status unavailable.</p>
-        <div class="actions"><button type="button" data-action="start" disabled>Start</button><button type="button" data-action="stop" disabled>Stop</button></div>
-      </li>
-      <li class="setup-card" data-component="client" data-state="unknown" aria-busy="false">
-        <h2>Client</h2><p data-state-label>State: Unavailable</p><p data-status>Status unavailable.</p>
-        <div class="actions"><button type="button" data-action="start" disabled>Start</button><button type="button" data-action="stop" disabled>Stop</button></div>
-      </li>
-    </ol>
-    <p class="voice-link"><a id="open-voice-demo" aria-disabled="true" tabindex="-1">Open voice demo</a></p>
+    <p id="profile-announcement" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
+
+    <div class="tabs" role="tablist" aria-label="Setup sections">
+      <button type="button" role="tab" id="tab-runtime" data-tab="runtime" aria-controls="panel-runtime" aria-selected="true">Runtime</button>
+      <button type="button" role="tab" id="tab-profile" data-tab="profile" aria-controls="panel-profile" aria-selected="false" tabindex="-1">Profile</button>
+      <button type="button" role="tab" id="tab-prompts" data-tab="prompts" aria-controls="panel-prompts" aria-selected="false" tabindex="-1">Prompts</button>
+      <button type="button" role="tab" id="tab-publish" data-tab="publish" aria-controls="panel-publish" aria-selected="false" tabindex="-1">Review &amp; publish</button>
+    </div>
+
+    <section id="panel-runtime" role="tabpanel" aria-labelledby="tab-runtime" data-panel="runtime">
+      <ol class="setup-grid" aria-label="Local demo components">
+        <li class="setup-card" data-component="speech" data-state="unknown" aria-busy="false">
+          <h2>Speech</h2><p data-state-label>State: Unavailable</p><p data-status>Status unavailable.</p>
+          <div class="actions"><button type="button" data-action="start" disabled>Start</button><button type="button" data-action="stop" disabled>Stop</button></div>
+        </li>
+        <li class="setup-card" data-component="postgres" data-state="unknown" aria-busy="false">
+          <h2>PostgreSQL</h2><p data-state-label>State: Unavailable</p><p data-status>Status unavailable.</p>
+          <div class="actions"><button type="button" data-action="start" disabled>Start</button><button type="button" data-action="migrate" disabled>Migrate</button><button type="button" data-action="stop" disabled>Stop</button></div>
+        </li>
+        <li class="setup-card" data-component="gateway" data-state="unknown" aria-busy="false">
+          <h2>Gateway</h2><p data-state-label>State: Unavailable</p><p data-status>Status unavailable.</p>
+          <div class="actions"><button type="button" data-action="start" disabled>Start</button><button type="button" data-action="stop" disabled>Stop</button></div>
+        </li>
+        <li class="setup-card" data-component="worker" data-state="unknown" aria-busy="false">
+          <h2>Worker <span>(optional)</span></h2><p data-state-label>State: Unavailable</p><p data-status>Status unavailable.</p>
+          <div class="actions"><button type="button" data-action="start" disabled>Start</button><button type="button" data-action="stop" disabled>Stop</button></div>
+        </li>
+        <li class="setup-card" data-component="client" data-state="unknown" aria-busy="false">
+          <h2>Client</h2><p data-state-label>State: Unavailable</p><p data-status>Status unavailable.</p>
+          <div class="actions"><button type="button" data-action="start" disabled>Start</button><button type="button" data-action="stop" disabled>Stop</button></div>
+        </li>
+      </ol>
+      <p class="voice-link"><a id="open-voice-demo" aria-disabled="true" tabindex="-1">Open voice demo</a></p>
+    </section>
+
+    <section id="panel-profile" role="tabpanel" aria-labelledby="tab-profile" data-panel="profile" hidden>
+      <h2>Vertical profile</h2>
+      <p class="panel-note">Profiles are stored by the local operator service. Prompts, identity, and versions never leave this machine through this page.</p>
+      <form id="profile-open-form" class="profile-form">
+        <label for="profile-id">Profile ID</label>
+        <input id="profile-id" name="profile-id" type="text" autocomplete="off" spellcheck="false" placeholder="insurance-sales" maxlength="64" required>
+        <label for="profile-description">Description</label>
+        <input id="profile-description" name="profile-description" type="text" autocomplete="off" maxlength="200" placeholder="Insurance renewal sales">
+        <div class="actions">
+          <button type="submit" id="profile-open">Open or create draft</button>
+          <button type="button" id="profile-save-description" disabled>Save description</button>
+          <button type="button" id="profile-reload" disabled>Reload draft</button>
+        </div>
+      </form>
+      <dl class="profile-facts">
+        <dt>Draft</dt><dd id="profile-current">No draft loaded.</dd>
+        <dt>Generation</dt><dd id="profile-generation">—</dd>
+      </dl>
+      <p id="profile-notice" class="profile-notice"></p>
+    </section>
+
+    <section id="panel-prompts" role="tabpanel" aria-labelledby="tab-prompts" data-panel="prompts" hidden>
+      <h2>Prompt templates</h2>
+      <p class="panel-note">Logical bundle names only. <code>system.j2</code> is required; <code>opening_message.j2</code> and <code>turn_instruction.j2</code> are optional.</p>
+      <div class="prompt-layout">
+        <ul id="template-list" class="template-list" aria-label="Template files"></ul>
+        <div class="template-editor">
+          <label for="template-source">Template source</label>
+          <textarea id="template-source" rows="14" spellcheck="false" disabled></textarea>
+          <div class="actions">
+            <button type="button" id="template-save" disabled>Save template</button>
+            <button type="button" id="template-delete" disabled>Delete template</button>
+          </div>
+          <form id="template-add-form" class="profile-form">
+            <label for="template-new-path">New logical path</label>
+            <input id="template-new-path" type="text" autocomplete="off" spellcheck="false" placeholder="opening_message.j2" maxlength="255">
+            <button type="submit" id="template-add" disabled>Add template</button>
+          </form>
+        </div>
+      </div>
+    </section>
+
+    <section id="panel-publish" role="tabpanel" aria-labelledby="tab-publish" data-panel="publish" hidden>
+      <h2>Review &amp; publish</h2>
+      <div class="actions">
+        <button type="button" id="profile-validate" disabled>Validate</button>
+        <button type="button" id="profile-preview" disabled>Preview</button>
+        <button type="button" id="profile-publish" disabled>Publish and activate</button>
+        <button type="button" id="profile-refresh" >Refresh versions</button>
+      </div>
+      <h3>Rendered fixture preview</h3>
+      <pre id="profile-preview-output" class="preview-output">Run Preview to render the profile's synthetic fixtures.</pre>
+      <h3>Published versions</h3>
+      <ul id="published-list" class="published-list" aria-label="Published profile versions"></ul>
+    </section>
   </main>
 </body>
 </html>

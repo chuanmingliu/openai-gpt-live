@@ -7,6 +7,9 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,6 +32,7 @@ type demoHandler struct {
 	operator        *operatorSupervisor
 	operatorContext context.Context
 	clientSessions  *clientSessionSet
+	profiles        *profileAdminService
 }
 
 type clientSessionSet struct {
@@ -137,6 +141,13 @@ func newHandlerWithToolSearchContext(operatorContext context.Context, cfg demoCo
 	if err != nil {
 		return nil, errors.New("demo operator is unavailable")
 	}
+	profiles := cfg.Profiles.service
+	if profiles == nil && cfg.Profiles.Enabled {
+		profiles, err = openProfileAdminService(operatorContext, cfg.Profiles, osLookupEnv)
+		if err != nil {
+			return nil, errors.New("demo profile administration is unavailable")
+		}
+	}
 	sessions := cfg.Operator.clientSessions
 	if sessions == nil {
 		sessions = newClientSessionSet()
@@ -151,11 +162,19 @@ func newHandlerWithToolSearchContext(operatorContext context.Context, cfg demoCo
 		operator:        operator,
 		operatorContext: operatorContext,
 		clientSessions:  sessions,
+		profiles:        profiles,
 	}, nil
 }
 
+// osLookupEnv is indirected so tests never depend on process environment.
+var osLookupEnv = os.LookupEnv
+
 func (handler *demoHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	setBrowserHeaders(writer.Header(), handler.websocketOrigin)
+	if strings.HasPrefix(request.URL.Path, profileAPIPrefix) {
+		handler.serveProfileAPI(writer, request)
+		return
+	}
 	switch request.URL.Path {
 	case "/api/operator/status":
 		handler.serveOperatorStatus(writer, request)
@@ -207,6 +226,30 @@ func (handler *demoHandler) ServeHTTP(writer http.ResponseWriter, request *http.
 			return
 		}
 		handler.serveAsset(writer, "web/setup.mjs", "text/javascript; charset=utf-8")
+	case "/setup-profile.mjs":
+		if request.Method != http.MethodGet {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		handler.serveAsset(writer, "web/setup-profile.mjs", "text/javascript; charset=utf-8")
+	case "/profile-api.mjs":
+		if request.Method != http.MethodGet {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		handler.serveAsset(writer, "web/profile-api.mjs", "text/javascript; charset=utf-8")
+	case "/profile-draft-state.mjs":
+		if request.Method != http.MethodGet {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		handler.serveAsset(writer, "web/profile-draft-state.mjs", "text/javascript; charset=utf-8")
+	case "/voice-profile-state.mjs":
+		if request.Method != http.MethodGet {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		handler.serveClientAsset(writer, request, "web/voice-profile-state.mjs", "text/javascript; charset=utf-8")
 	case "/audio-core.mjs":
 		if request.Method != http.MethodGet {
 			writer.WriteHeader(http.StatusMethodNotAllowed)
@@ -306,6 +349,13 @@ func (handler *demoHandler) serveWebSocket(writer http.ResponseWriter, request *
 		writer.WriteHeader(http.StatusForbidden)
 		return
 	}
+	// The browser may select exactly one published profile. Every other query
+	// key is rejected here so no browser value reaches the gateway untrusted.
+	upstreamURL, err := handler.upstreamWithProfile(request.URL.RawQuery)
+	if err != nil {
+		writer.WriteHeader(http.StatusBadRequest)
+		return
+	}
 	browser, err := websocket.Accept(writer, request, &websocket.AcceptOptions{InsecureSkipVerify: true})
 	if err != nil {
 		return
@@ -320,13 +370,45 @@ func (handler *demoHandler) serveWebSocket(writer http.ResponseWriter, request *
 	header := http.Header{}
 	header.Set("Authorization", "Bearer "+string(handler.bearer))
 	header.Set("Origin", handler.cfg.Origin)
-	upstream, err := handler.dial(request.Context(), handler.upstream, header)
+	upstream, err := handler.dial(request.Context(), upstreamURL, header)
 	if err != nil {
 		_ = browser.Close(websocket.StatusInternalError, "upstream unavailable")
 		return
 	}
 	defer upstream.CloseNow()
 	_ = proxyWebSocket(request.Context(), browser, upstream, handler.cfg.MaxFrameBytes)
+}
+
+// upstreamWithProfile forwards only an exact profile/profile_version pair from
+// the browser. Unknown, duplicate, or malformed keys fail closed, and the
+// gateway always receives this BFF's fixed model value.
+func (handler *demoHandler) upstreamWithProfile(rawQuery string) (*url.URL, error) {
+	upstream := *handler.upstream
+	if rawQuery == "" {
+		return &upstream, nil
+	}
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return nil, errors.New("demo websocket query is invalid")
+	}
+	id, hasID := values["profile"]
+	version, hasVersion := values["profile_version"]
+	if len(values) != 2 || !hasID || !hasVersion || len(id) != 1 || len(version) != 1 {
+		return nil, errors.New("demo websocket query is invalid")
+	}
+	if !profileIdentifierPattern.MatchString(id[0]) || id[0] == "builtin" {
+		return nil, errors.New("demo websocket profile is invalid")
+	}
+	parsed, err := strconv.ParseUint(version[0], 10, 64)
+	if err != nil || parsed == 0 || strconv.FormatUint(parsed, 10) != version[0] {
+		return nil, errors.New("demo websocket profile version is invalid")
+	}
+	query := url.Values{}
+	query.Set("model", handler.cfg.Model)
+	query.Set("profile", id[0])
+	query.Set("profile_version", version[0])
+	upstream.RawQuery = query.Encode()
+	return &upstream, nil
 }
 
 func setBrowserHeaders(header http.Header, websocketOrigin string) {
@@ -379,6 +461,7 @@ func run(ctx context.Context, cfg demoConfig, bearer []byte) error {
 		return errors.New("demo handler unavailable")
 	}
 	defer closeOperatorRunner(demo.operator)
+	defer demo.profiles.close()
 	listener, err := net.Listen("tcp", cfg.ListenAddr)
 	if err != nil {
 		return errors.New("listen demo server")

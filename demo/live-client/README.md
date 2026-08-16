@@ -63,6 +63,50 @@ gpt-live-simulator
 The browser never receives the bearer; the loopback BFF injects it into the
 gateway connection.
 
+## Vertical profiles in /setup
+
+`/setup` has four tabs. **Runtime** keeps the existing service controls.
+**Profile**, **Prompts**, and **Review & publish** appear when the BFF runs with
+loopback profile administration:
+
+```bash
+go run ./demo/live-client \
+  -operator \
+  -vertical-profiles \
+  -profile-tenant local \
+  -profile-actor operator \
+  -profile-database-url-env LIVE_PROFILE_DATABASE_URL
+```
+
+`-profile-database-url-env` names an environment variable; the URL value itself
+is never accepted on the command line, returned by any endpoint, or rendered in
+the browser. Without these flags every `/api/setup/v1/*` route answers `404` and
+the demo keeps using the built-in voice profile.
+
+Typical flow:
+
+1. **Profile** — enter a profile ID and select **Open or create draft**. A new
+   draft is seeded with a valid `system.j2` and one synthetic fixture, so it is
+   publishable immediately.
+2. **Prompts** — open `system.j2`, edit the source, and **Save template**. Add
+   `opening_message.j2` or `turn_instruction.j2` with **Add template**. Paths are
+   logical bundle names, never operator filesystem paths.
+3. **Review & publish** — **Validate**, **Preview** the rendered fixtures, then
+   **Publish and activate**. Published versions are immutable; use **Activate**
+   and **Revoke** to control which version new sessions may select.
+
+Draft writes carry the exact `If-Match` generation. A concurrent change returns
+`409 stale_draft`, keeps your unsaved source in the editor, and requires an
+explicit **Reload draft** before saving again.
+
+On the voice page, **Vertical profile** lists the built-in profile plus every
+non-revoked published version. The choice is locked once a session starts. The
+browser sends only `profile` and `profile_version`; the BFF validates that exact
+pair, adds its own model, and forwards nothing else. Microphone capture waits for
+the gateway's exact `live.profile.selected` acknowledgement in addition to the
+existing provider and tool-policy acknowledgements, and a mismatched
+acknowledgement stops the session instead of streaming audio.
+
 ## Requirements and help
 
 Full mode requires Go, Docker Compose, `curl`, `jq`, `openssl`, a reviewed

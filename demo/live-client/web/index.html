@@ -31,6 +31,14 @@
         </div>
       </div>
 
+      <div class="profile-picker">
+        <label for="voice-profile">Vertical profile</label>
+        <select id="voice-profile" name="voice-profile">
+          <option value="builtin/1" selected>Built-in voice assistant</option>
+        </select>
+        <p id="voice-profile-note" class="profile-picker-note">Selection is locked for the duration of a session.</p>
+      </div>
+
       <div class="controls" aria-label="Voice session controls">
         <button id="start" class="button button-primary" type="button">
           <span class="button-icon" aria-hidden="true">●</span> Start listening

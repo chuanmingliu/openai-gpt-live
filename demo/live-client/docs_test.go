@@ -286,3 +286,29 @@ func isSymbolicEnvironmentReference(value string) bool {
 	}
 	return true
 }
+
+func TestQuickStartDocumentsVerticalProfileSetupWithoutSecretValues(t *testing.T) {
+	quickStart := readQuickStart(t)
+	for _, exact := range []string{
+		"## Vertical profiles in /setup",
+		"-vertical-profiles",
+		"-profile-tenant local",
+		"-profile-actor operator",
+		"-profile-database-url-env LIVE_PROFILE_DATABASE_URL",
+		"names an environment variable",
+		"Open or create draft",
+		"system.j2",
+		"opening_message.j2",
+		"turn_instruction.j2",
+		"Publish and activate",
+		"409 stale_draft",
+		"Reload draft",
+		"live.profile.selected",
+		"profile_version",
+	} {
+		assert.Contains(t, quickStart, exact)
+	}
+	assert.Contains(t, quickStart, "locked once a session starts")
+	assert.NotContains(t, quickStart, "postgres://")
+	assert.False(t, hasCredentialLiteralAssignment(quickStart))
+}
