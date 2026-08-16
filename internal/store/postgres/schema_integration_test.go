@@ -38,6 +38,17 @@ var requiredColumns = map[string]map[string]string{
 		"published_at": "timestamp with time zone", "published_by": "text",
 		"activated_at": "timestamp with time zone", "activated_by": "text",
 	},
+	"knowledge_versions": {
+		"tenant_id": "text", "pack_id": "text", "version": "bigint", "content_hash": "text",
+		"title": "text", "media_type": "text", "excerpt_count": "integer", "content_bytes": "bigint",
+		"published_at": "timestamp with time zone", "published_by": "text",
+		"tombstoned_at": "timestamp with time zone", "tombstoned_by": "text",
+	},
+	"knowledge_excerpts": {
+		"tenant_id": "text", "pack_id": "text", "version": "bigint", "ordinal": "integer",
+		"body": "text", "body_bytes": "integer", "excerpt_hash": "text", "tokens": "ARRAY",
+		"source_title": "text", "section": "text", "page": "integer",
+	},
 	"conversations": {
 		"tenant_id": "text", "id": "text", "user_id": "text", "status": "text",
 		"retention_until": "timestamp with time zone", "deletion_actor": "text", "deletion_reason_code": "text",
@@ -322,7 +333,7 @@ func TestSchemaMigrationLifecycle(t *testing.T) {
 	assert.False(t, dirty)
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
 	assert.False(t, journalPresent)
-	require.NoError(t, migrations.Steps(t.Context(), pool, 8))
+	require.NoError(t, migrations.Steps(t.Context(), pool, 9))
 	require.NoError(t, migrations.Steps(t.Context(), pool, 0))
 	require.NoError(t, migrations.Check(t.Context(), pool))
 }
@@ -1950,4 +1961,62 @@ func nulPrefixedToolNamesJSON(count, nulBytes int) string {
 	}
 	document.WriteByte(']')
 	return document.String()
+}
+
+func TestSchemaKnowledgeV10UpDownUpCatalogAndConstraints(t *testing.T) {
+	pool := testkit.Postgres(t)
+	require.NoError(t, migrations.Up(t.Context(), pool))
+
+	for _, table := range []string{"knowledge_versions", "knowledge_excerpts"} {
+		var present bool
+		require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass($1) IS NOT NULL`, table).Scan(&present))
+		assert.True(t, present, table)
+	}
+
+	insertVersion := func(hash string, count int, bytes int) error {
+		_, err := pool.Exec(t.Context(), `INSERT INTO knowledge_versions
+			(tenant_id,pack_id,version,content_hash,title,media_type,excerpt_count,content_bytes,published_at,published_by)
+			VALUES ('tenant-a','policy',1,$1,'policy.md','text/markdown',$2,$3,now(),'operator')`, hash, count, bytes)
+		return err
+	}
+	require.NoError(t, insertVersion(strings.Repeat("a", 64), 1, 10))
+
+	// A tenant or pack identity carrying whitespace never reaches a key.
+	_, err := pool.Exec(t.Context(), `INSERT INTO knowledge_versions
+		(tenant_id,pack_id,version,content_hash,title,media_type,excerpt_count,content_bytes,published_at,published_by)
+		VALUES ('tenant a','policy',9,$1,'policy.md','text/markdown',1,10,now(),'operator')`, strings.Repeat("b", 64))
+	assertConstraint(t, err, "knowledge_versions_identity_check")
+
+	// Aggregate bounds are enforced in SQL, not only in Go.
+	_, err = pool.Exec(t.Context(), `INSERT INTO knowledge_versions
+		(tenant_id,pack_id,version,content_hash,title,media_type,excerpt_count,content_bytes,published_at,published_by)
+		VALUES ('tenant-a','policy',2,$1,'policy.md','text/markdown',2049,10,now(),'operator')`, strings.Repeat("c", 64))
+	assertConstraint(t, err, "knowledge_versions_aggregate_check")
+
+	// A tombstone must carry both a time and an actor.
+	_, err = pool.Exec(t.Context(), `UPDATE knowledge_versions SET tombstoned_at=now() WHERE tenant_id='tenant-a'`)
+	assertConstraint(t, err, "knowledge_versions_tombstone_check")
+
+	// Excerpts cannot outlive the version they cite.
+	_, err = pool.Exec(t.Context(), `INSERT INTO knowledge_excerpts
+		(tenant_id,pack_id,version,ordinal,body,body_bytes,excerpt_hash,tokens,source_title,section,page)
+		VALUES ('tenant-a','absent',1,0,'body',4,$1,ARRAY['body'],'policy.md','',0)`, strings.Repeat("d", 64))
+	assertConstraint(t, err, "knowledge_excerpts_version_fkey")
+
+	_, err = pool.Exec(t.Context(), `INSERT INTO knowledge_excerpts
+		(tenant_id,pack_id,version,ordinal,body,body_bytes,excerpt_hash,tokens,source_title,section,page)
+		VALUES ('tenant-a','policy',1,0,'body',5,$1,ARRAY['body'],'policy.md','',0)`, strings.Repeat("d", 64))
+	assertConstraint(t, err, "knowledge_excerpts_body_check")
+
+	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
+	version, dirty, err := migrations.Version(t.Context(), pool)
+	require.NoError(t, err)
+	assert.Equal(t, uint(9), version)
+	assert.False(t, dirty)
+	var present bool
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('knowledge_versions') IS NOT NULL`).Scan(&present))
+	assert.False(t, present)
+
+	require.NoError(t, migrations.Up(t.Context(), pool))
+	require.NoError(t, migrations.Check(t.Context(), pool))
 }

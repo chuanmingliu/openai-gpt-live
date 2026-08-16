@@ -125,7 +125,7 @@ ALTER TABLE handoffs DROP COLUMN tool_policy;
 }
 
 func TestEmbeddedVerticalProfileMigrationCatalogIsExact(t *testing.T) {
-	assert.Equal(t, uint(9), latestVersion)
+	assert.Equal(t, uint(10), latestVersion)
 	wantNames := []string{
 		"000001_durable_handoffs.down.sql", "000001_durable_handoffs.up.sql",
 		"000002_task11_coordinator_replay.down.sql", "000002_task11_coordinator_replay.up.sql",
@@ -136,6 +136,7 @@ func TestEmbeddedVerticalProfileMigrationCatalogIsExact(t *testing.T) {
 		"000007_coordinator_delivery_shards.down.sql", "000007_coordinator_delivery_shards.up.sql",
 		"000008_handoff_tool_policy.down.sql", "000008_handoff_tool_policy.up.sql",
 		"000009_vertical_profiles.down.sql", "000009_vertical_profiles.up.sql",
+		"000010_knowledge_packs.down.sql", "000010_knowledge_packs.up.sql",
 	}
 	entries, err := files.ReadDir(".")
 	require.NoError(t, err)
@@ -174,4 +175,17 @@ func TestToolInvocationScopeRefusalClassificationIsExact(t *testing.T) {
 	assert.True(t, isToolInvocationScopeRefusal(&pgconn.PgError{Code: "55000", Message: ErrToolInvocationScopeConflict.Error()}))
 	assert.False(t, isToolInvocationScopeRefusal(&pgconn.PgError{Code: "57014", Message: ErrToolInvocationScopeConflict.Error()}))
 	assert.False(t, isToolInvocationScopeRefusal(&pgconn.PgError{Code: "55000", Message: "arbitrary prerequisite failure"}))
+}
+
+func TestKnowledgePackMigrationEmbeddedChecksums(t *testing.T) {
+	want := map[string]string{
+		"000010_knowledge_packs.up.sql":   "dcf2324e6d973f6c011e7b5bda19651368432d3763caa40097cf06fee2292b13",
+		"000010_knowledge_packs.down.sql": "4be578f7067f55842e24c41df4b05e165de3ad4a5c470c977a06e4b529cd40ec",
+	}
+	for name, checksum := range want {
+		contents, err := files.ReadFile(name)
+		require.NoError(t, err)
+		digest := sha256.Sum256(contents)
+		assert.Equal(t, checksum, hex.EncodeToString(digest[:]), name)
+	}
 }
