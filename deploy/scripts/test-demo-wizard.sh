@@ -57,6 +57,11 @@ if [[ "$*" == *'-operator'* ]]; then
     [[ -n "${!required:-}" ]] || exit 95
   done
   printf '%s\n' 'operator diagnostic sentinel' >&2
+  if [[ "$*" == *'-vertical-profiles'* ]]; then
+    [[ "$*" != *'postgres://'* ]] || exit 96
+    [[ -n "${LIVE_PROFILE_DATABASE_URL:-}" ]] || exit 97
+    printf '%s\n' 'profile database sentinel' >&2
+  fi
 fi
 trap 'exit 0' TERM INT
 while :; do sleep 1; done
@@ -149,6 +154,7 @@ run_wizard() {
   DEMO_OPERATOR_SPEECH_PROFILE="$operator_speech_profile" \
   DEMO_OPERATOR_SPEECH_ENV="$operator_speech_env" \
   DEMO_OPERATOR_SPEECH_EXECUTABLE="$operator_speech_executable" \
+  LIVE_PROFILE_DATABASE_URL="${LIVE_PROFILE_DATABASE_URL:-}" \
   PATH="$scratch/bin:/usr/bin:/bin" \
   "$root/deploy/scripts/demo-wizard.sh" \
     >"$scratch/$name.out" 2>"$scratch/$name.err" <<<"$input"
@@ -201,6 +207,29 @@ fi
 for secret in postgres-password-sentinel local-bearer-sentinel speech-key-sentinel deepseek-key-sentinel; do
   if grep -F "$secret" "$scratch/state-control/live-client.calls" "$scratch/control.out" "$scratch/control.err"; then
     fail "control-panel mode placed a secret in argv or output"
+  fi
+done
+
+if grep -F -- '-vertical-profiles' "$scratch/state-control/live-client.calls" >/dev/null; then
+  fail "control-panel mode enabled vertical profiles without a profile database"
+fi
+grep -F 'Vertical profiles: off' "$scratch/control.out" >/dev/null || fail "control-panel mode did not report that profiles are off"
+
+# With a profile database URL exported, the wizard enables the profile tabs and
+# passes the variable name only. The URL must reach the child environment and
+# never appear in argv, stdout, or any state file.
+LIVE_PROFILE_DATABASE_URL='postgres://live:profile-url-sentinel@127.0.0.1:5432/live?sslmode=disable' \
+  run_wizard profiles "$control_input"
+grep -F -- '-vertical-profiles -profile-tenant development -profile-actor operator -profile-database-url-env LIVE_PROFILE_DATABASE_URL' \
+  "$scratch/state-profiles/live-client.calls" >/dev/null || {
+  sed 's/^/call: /' "$scratch/state-profiles/live-client.calls" >&2
+  fail "profile mode did not pass the profile flags by environment-variable name"
+}
+grep -F 'Vertical profiles: on' "$scratch/profiles.out" >/dev/null || fail "profile mode did not report that profiles are on"
+grep -Fx 'profile database sentinel' "$scratch/profiles.err" >/dev/null || fail "profile mode did not forward the profile database URL to the child"
+for location in "$scratch/state-profiles/live-client.calls" "$scratch/profiles.out" "$scratch/profiles.err" "$scratch/profiles.calls"; do
+  if grep -F 'profile-url-sentinel' "$location" >/dev/null; then
+    fail "profile mode leaked the profile database URL"
   fi
 done
 

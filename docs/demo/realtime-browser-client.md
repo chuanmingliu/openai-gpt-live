@@ -403,6 +403,17 @@ Draft and template writes carry `If-Match: "<generation>"`. A missing header is
 and keeps unsaved source in the editor until an explicit **Reload draft**.
 Publication names one exact generation and can succeed only once.
 
+### Enabling the feature
+
+Two independent switches must agree. The gateway needs
+`features.vertical_profiles.enabled: true` with bounded render workers and
+queue, and it fails closed at startup if that is set without durable profile
+storage. The loopback BFF needs `-vertical-profiles` plus the name of an
+environment variable holding the profile database URL. The demo wizard's browser
+control panel supplies the BFF half automatically when
+`LIVE_PROFILE_DATABASE_URL` is exported before it runs, forwarding the value
+through the child environment only. Neither half accepts a URL as a flag value.
+
 ### Selecting a profile for a session
 
 The voice page lists the built-in profile plus every non-revoked published

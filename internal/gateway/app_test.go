@@ -21,6 +21,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/health"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/presentation"
+	"github.com/chuanmingliu/openai-gpt-live/internal/profile"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
 	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
@@ -1057,4 +1058,87 @@ func TestGatewayDropsLateAudioFromInterruptedEpoch(t *testing.T) {
 		"input_audio_buffer.speech_stopped": true,
 		"response.done":                     true,
 	}, seen)
+}
+
+type gatewayProfileResolverFake struct{}
+
+func (gatewayProfileResolverFake) Resolve(context.Context, string, profile.VersionRef, profile.ResolvePurpose) (profile.Resolved, error) {
+	return profile.Builtin(), nil
+}
+
+func verticalProfileConfig() config.Config {
+	cfg := validConfig()
+	cfg.Mode = "development_durable"
+	cfg.Features.Handoffs = true
+	cfg.Features.VerticalProfiles = config.VerticalProfileConfig{Enabled: true, RenderWorkers: 2, RenderQueue: 8}
+	cfg.Auth = config.AuthConfig{
+		StaticBearerEnv: "LIVE_STATIC_BEARER_TOKEN", StaticTenantID: "development",
+		StaticUserID: "profile-test", StaticScopes: []string{"realtime"},
+	}
+	cfg.Store = config.StoreConfig{
+		DatabaseURLEnv: "DATABASE_URL",
+		Retention: config.RetentionConfig{
+			HMACKeyEnv: "LIVE_RETENTION_HMAC_KEY", HMACKeyID: "profile-test-retention-v1",
+		},
+	}
+	cfg.Gateway.Reconnect.HMACKeyEnv = "LIVE_RECONNECT_HMAC_KEY"
+	cfg.Gateway.Reconnect.HMACKeyID = "profile-test-reconnect-v1"
+	cfg.Tools.WebSearch.Enabled = true
+	cfg.Features.ToolEncryptionKeyEnv = "LIVE_TOOL_ENCRYPTION_KEY"
+	cfg.Features.ToolEncryptionKeyID = "profile-test-tools-v1"
+	return cfg
+}
+
+func verticalProfileAdmission() Option {
+	return WithAdmission(transportws.AdmissionFunc(func(context.Context, *http.Request) (session.Subject, func(), error) {
+		return session.Subject{TenantID: "development", UserID: "profile-test", Scopes: map[string]struct{}{"realtime": {}}}, func() {}, nil
+	}))
+}
+
+func verticalProfileDependencies() DurableDependencies {
+	return DurableDependencies{
+		Service:            &handoffServiceFake{creates: make(chan handoff.CreateRequest, 1)},
+		ConversationWriter: &transcriptWriterFake{}, RecoveryStore: &gatewayRecoveryStore{},
+		ConversationProvisioner: gatewayConversationProvisioner{}, ConversationTTL: 24 * time.Hour,
+		Journal: newCoordinatorJournalFake(), DeliveryAffinity: "profile-affinity", JournalOwner: "profile-owner",
+		JournalClaimLease: time.Minute, HandoffQueueCapacity: 1, TranscriptQueueCapacity: 1,
+		Snapshot: validHandoffWork().Snapshot,
+	}
+}
+
+func TestNewEnablesVerticalProfilesOnlyWithAnExactResolver(t *testing.T) {
+	resolver := gatewayProfileResolverFake{}
+	app, err := New(verticalProfileConfig(), testkit.NewFakeConnector(2), WithIDGenerator(deterministicIDs{}),
+		WithDurableHandoffs(verticalProfileDependencies()), testHandoffPresentationOption(), verticalProfileAdmission(), WithVerticalProfiles(resolver))
+	require.NoError(t, err)
+	require.True(t, app.wsOptions.VerticalProfiles)
+	require.Equal(t, resolver, app.wsOptions.ProfileResolver)
+}
+
+func TestNewFailsClosedWhenVerticalProfileWiringDisagreesWithConfig(t *testing.T) {
+	_, err := New(verticalProfileConfig(), testkit.NewFakeConnector(2), WithIDGenerator(deterministicIDs{}),
+		WithDurableHandoffs(verticalProfileDependencies()), testHandoffPresentationOption(), verticalProfileAdmission())
+	require.ErrorContains(t, err, "vertical profile")
+
+	_, err = New(verticalProfileConfig(), testkit.NewFakeConnector(2), WithIDGenerator(deterministicIDs{}),
+		WithDurableHandoffs(verticalProfileDependencies()), testHandoffPresentationOption(), verticalProfileAdmission(),
+		WithVerticalProfiles(profile.Resolver(nil)))
+	require.ErrorContains(t, err, "vertical profile")
+
+	disabled := verticalProfileConfig()
+	disabled.Features.VerticalProfiles = config.VerticalProfileConfig{}
+	_, err = New(disabled, testkit.NewFakeConnector(2), WithIDGenerator(deterministicIDs{}),
+		WithDurableHandoffs(verticalProfileDependencies()), testHandoffPresentationOption(), verticalProfileAdmission(),
+		WithVerticalProfiles(gatewayProfileResolverFake{}))
+	require.ErrorContains(t, err, "vertical profile")
+}
+
+func TestGatewayWithoutVerticalProfilesLeavesResolutionOff(t *testing.T) {
+	cfg := verticalProfileConfig()
+	cfg.Features.VerticalProfiles = config.VerticalProfileConfig{}
+	app, err := New(cfg, testkit.NewFakeConnector(2), WithIDGenerator(deterministicIDs{}),
+		WithDurableHandoffs(verticalProfileDependencies()), testHandoffPresentationOption(), verticalProfileAdmission())
+	require.NoError(t, err)
+	require.False(t, app.wsOptions.VerticalProfiles)
+	require.Nil(t, app.wsOptions.ProfileResolver)
 }

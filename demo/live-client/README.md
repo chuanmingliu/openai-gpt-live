@@ -105,6 +105,21 @@ Draft writes carry the exact `If-Match` generation. A concurrent change returns
 `409 stale_draft`, keeps your unsaved source in the editor, and requires an
 explicit **Reload draft** before saving again.
 
+### Starting from the demo wizard
+
+`make demo-wizard` → **Browser control panel** enables the profile tabs when
+`LIVE_PROFILE_DATABASE_URL` is already exported in that shell. The wizard passes
+the variable *name* to the BFF and forwards the value only through the child
+process environment; it never constructs, prints, or stores the URL. Without
+that variable the wizard starts the control panel with profiles off and says so.
+The durable PostgreSQL service is deliberately not published to the host, so
+point the variable at a database you can reach from this machine.
+
+The gateway must also have `features.vertical_profiles.enabled: true`, which
+`deploy/config/development-control-panel.yaml` now sets. A gateway configured
+for profiles without durable profile storage refuses to start, and a session may
+never select a profile the deployment did not authorize.
+
 On the voice page, **Vertical profile** lists the built-in profile plus every
 non-revoked published version. The choice is locked once a session starts. The
 browser sends only `profile` and `profile_version`; the BFF validates that exact

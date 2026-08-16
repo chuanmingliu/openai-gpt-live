@@ -23,6 +23,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/lifecycle"
 	"github.com/chuanmingliu/openai-gpt-live/internal/presentation"
+	"github.com/chuanmingliu/openai-gpt-live/internal/profile"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
 	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
 	"github.com/chuanmingliu/openai-gpt-live/internal/session"
@@ -210,6 +211,21 @@ func WithFeatureGates(gates interface{ Enabled(string) bool }) Option {
 	}
 }
 
+// WithVerticalProfiles supplies the exact published-profile resolver. The
+// resolver and the configuration must agree: a configured feature without a
+// resolver, or a resolver without the feature, fails closed in New so no
+// session can ever select a profile the deployment did not authorize.
+func WithVerticalProfiles(resolver profile.Resolver) Option {
+	return func(app *App) error {
+		if isNil(resolver) {
+			return errors.New("vertical profile resolver is required")
+		}
+		app.wsOptions.ProfileResolver = resolver
+		app.wsOptions.VerticalProfiles = true
+		return nil
+	}
+}
+
 func WithApprovalStore(store handoff.ApprovalStore) Option {
 	return func(app *App) error {
 		if isNil(store) {
@@ -307,6 +323,9 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 	}
 	managerConfig = app.managerConfig
 	wsOptions = app.wsOptions
+	if cfg.Features.VerticalProfiles.Enabled != wsOptions.VerticalProfiles {
+		return nil, errors.New("vertical profile resolution and configuration must be enabled together")
+	}
 	if cfg.Mode == "production" && (isNil(managerConfig.ReconnectCredentials) || isNil(managerConfig.ReconnectOwners)) {
 		return nil, errors.New("production reconnect authority must be explicitly configured")
 	}

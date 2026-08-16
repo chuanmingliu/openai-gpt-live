@@ -344,3 +344,24 @@ func TestGatewayExpectedHashMismatchIsContentFree(t *testing.T) {
 	})
 	require.EqualError(t, err, "config hash mismatch")
 }
+
+func TestComposeGatewayVerticalProfilesRequiresDurableStorage(t *testing.T) {
+	off := config.Config{Mode: "development_durable"}
+	option, err := composeGatewayVerticalProfiles(off, nil)
+	require.NoError(t, err)
+	assert.Nil(t, option, "a deployment without the feature must not resolve profiles")
+
+	on := off
+	on.Features.VerticalProfiles = config.VerticalProfileConfig{Enabled: true, RenderWorkers: 2, RenderQueue: 8}
+	option, err = composeGatewayVerticalProfiles(on, nil)
+	assert.Nil(t, option)
+	assert.ErrorContains(t, err, "durable profile storage")
+
+	option, err = composeGatewayVerticalProfiles(on, &gatewayFeatureRuntime{})
+	assert.Nil(t, option)
+	assert.ErrorContains(t, err, "durable profile storage")
+
+	option, err = composeGatewayVerticalProfiles(on, &gatewayFeatureRuntime{repo: &postgres.Repository{}})
+	require.NoError(t, err)
+	require.NotNil(t, option)
+}

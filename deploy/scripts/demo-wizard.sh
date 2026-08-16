@@ -162,8 +162,25 @@ start_bff() {
   wait_ready browser-bff http://127.0.0.1:3000/health/ready
 }
 
+# profile_arguments emits the vertical-profile flags only when the operator has
+# already exported a reachable profile database URL under the fixed variable
+# name. The wizard never constructs, prints, or persists that URL, and the
+# durable PostgreSQL service is deliberately not published to the host.
+profile_arguments=()
+set_profile_arguments() {
+  profile_arguments=()
+  [[ -n "${LIVE_PROFILE_DATABASE_URL:-}" ]] || return 0
+  profile_arguments=(
+    -vertical-profiles
+    -profile-tenant "${DEMO_PROFILE_TENANT:-development}"
+    -profile-actor "${DEMO_PROFILE_ACTOR:-operator}"
+    -profile-database-url-env LIVE_PROFILE_DATABASE_URL
+  )
+}
+
 start_operator_bff() {
   local speech_root="$1" speech_profile="$2"
+  set_profile_arguments
   stop_current_bff
   rm -f "$state_dir/live-client.calls"
   go build -o "$state_dir/live-client" ./demo/live-client
@@ -179,6 +196,7 @@ start_operator_bff() {
     LIVE_RECONNECT_HMAC_KEY="$LIVE_RECONNECT_HMAC_KEY" \
     LIVE_TOOL_ENCRYPTION_KEY="$LIVE_TOOL_ENCRYPTION_KEY" \
     LIVE_EXPECTED_CONFIG_HASH="$LIVE_EXPECTED_CONFIG_HASH" \
+    LIVE_PROFILE_DATABASE_URL="${LIVE_PROFILE_DATABASE_URL:-}" \
     "$state_dir/live-client" \
     -gateway-url ws://127.0.0.1:18080/v1/realtime \
     -model gpt-live-simulator \
@@ -189,6 +207,7 @@ start_operator_bff() {
     -operator-speech-command "$root/deploy/scripts/operator-speech-launcher.py" \
     -operator-speech-profile "$speech_profile" \
     -operator-speech-ready-url http://127.0.0.1:8766/v1/pool \
+    ${profile_arguments[@]+"${profile_arguments[@]}"} \
     &
   bff_pid=$!
   printf '%s\n' "$bff_pid" >"$state_dir/bff.pid"
@@ -326,7 +345,9 @@ run_control_panel() {
     printf 'fixed speech executable/environment is unavailable\n' >&2
     exit 1
   }
-  permissions=$(stat -f '%Lp' "$speech_environment" 2>/dev/null || stat -c '%a' "$speech_environment" 2>/dev/null || true)
+  # GNU stat accepts -f as --file-system and would answer a filesystem field
+  # for -f '%Lp', so probe the GNU form first and fall back to the BSD form.
+  permissions=$(stat -c '%a' "$speech_environment" 2>/dev/null || stat -f '%Lp' "$speech_environment" 2>/dev/null || true)
   [[ "$permissions" == 600 ]] || {
     printf 'fixed speech environment must be private mode 600\n' >&2
     exit 1
@@ -349,6 +370,12 @@ run_control_panel() {
   trap - EXIT HUP INT TERM
   printf '\n%s%s✓ Browser control panel ready%s\n' "$BOLD" "$GREEN" "$RESET"
   printf '  Open: http://127.0.0.1:3000/setup\n'
+  if [[ -n "${LIVE_PROFILE_DATABASE_URL:-}" ]]; then
+    printf '  Vertical profiles: on. Use the Profile, Prompts, and Workers tabs to publish a profile.\n'
+  else
+    printf '  Vertical profiles: off. Export LIVE_PROFILE_DATABASE_URL with a reachable\n'
+    printf '  profile database URL before starting the wizard to enable the profile tabs.\n'
+  fi
   printf '  Worker is optional for voice-only; use it for durable asynchronous tools.\n'
   printf '  Stop dependencies in this order: Client, Worker, Gateway, PostgreSQL, then Speech.\n'
   printf '  Stops preserve the PostgreSQL volume. This surface is for local development only.\n\n'

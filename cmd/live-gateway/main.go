@@ -34,6 +34,8 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/lifecycle"
 	"github.com/chuanmingliu/openai-gpt-live/internal/presentation"
+	"github.com/chuanmingliu/openai-gpt-live/internal/profile"
+	"github.com/chuanmingliu/openai-gpt-live/internal/prompttmpl"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime/s2sws"
 	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
 	"github.com/chuanmingliu/openai-gpt-live/internal/secretbuf"
@@ -250,6 +252,13 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 	if featureRuntime != nil {
 		appOptions = append(appOptions, gateway.WithFeatureGates(featureRuntime.gates))
 		appOptions = append(appOptions, gateway.WithApprovalStore(featureRuntime.repo))
+	}
+	profileOption, err := composeGatewayVerticalProfiles(cfg, featureRuntime)
+	if err != nil {
+		return err
+	}
+	if profileOption != nil {
+		appOptions = append(appOptions, profileOption)
 	}
 	durableOptions, err := composeGatewayDurability(cfg, featureRuntime, configHash, instance, region)
 	if err != nil {
@@ -664,6 +673,20 @@ func validateComposition(cfg config.Config) error {
 		return errors.New("handoff delivery requires durable PostgreSQL composition")
 	}
 	return nil
+}
+
+// composeGatewayVerticalProfiles builds the exact published-profile resolver
+// from the durable repository. It fails closed when the configuration enables
+// profiles without a durable repository, so no session can select a profile the
+// deployment cannot resolve.
+func composeGatewayVerticalProfiles(cfg config.Config, runtime *gatewayFeatureRuntime) (gateway.Option, error) {
+	if !cfg.Features.VerticalProfiles.Enabled {
+		return nil, nil
+	}
+	if runtime == nil || runtime.repo == nil {
+		return nil, errors.New("vertical profiles require durable profile storage")
+	}
+	return gateway.WithVerticalProfiles(profile.NewResolver(runtime.repo, prompttmpl.NewMiniJinja())), nil
 }
 
 func requiresRuntimeRepository(cfg config.Config) bool { return cfg.IsDurable() }
