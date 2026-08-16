@@ -5,6 +5,7 @@ import {createBrowserRuntime} from './browser-runtime.mjs';
 import {ClientPresentation} from './client-state.mjs';
 
 const SCHEDULED_PCM_BASE64 = Buffer.alloc(16000).toString('base64');
+const FRAME_PCM_BASE64 = Buffer.alloc(960).toString('base64');
 const DEFAULT_TOOL_POLICY = {
 	web_search: {enabled: true, safe_search: 'strict', region: 'wt-wt', max_results: 5, timeout_ms: 8000},
 };
@@ -1023,7 +1024,33 @@ test('playback acknowledgements are fenced by generation and newest queue revisi
   await runtime.stop();
 });
 
-test('current idle acknowledgement keeps buffering and repumps a delayed reservoir', async (t) => {
+test('playback waits for five 20 ms frames before startup and after an underrun', async () => {
+  const harness = new BrowserHarness();
+  const runtime = createBrowserRuntime(harness.dependencies());
+  await runtime.start();
+  harness.server({type: 'session.created'});
+  harness.server({type: 'session.updated'});
+
+  for (let index = 0; index < 4; index += 1) {
+    harness.server({type: 'response.output_audio.delta', delta: FRAME_PCM_BASE64});
+  }
+  assert.equal(harness.playbackNode.port.messages.filter(({type}) => type === 'append').length, 0);
+
+  harness.server({type: 'response.output_audio.delta', delta: FRAME_PCM_BASE64});
+  const first = harness.playbackNode.port.messages.filter(({type}) => type === 'append').at(-1);
+  assert.equal(new Int16Array(first.pcm).length, 2400);
+
+  harness.playback({type: 'idle', generation: first.generation, revision: first.revision});
+  harness.server({type: 'response.output_audio.delta', delta: FRAME_PCM_BASE64});
+  assert.equal(harness.playbackNode.port.messages.filter(({type}) => type === 'append').length, 1);
+
+  harness.server({type: 'response.output_audio.done'});
+  const final = harness.playbackNode.port.messages.filter(({type}) => type === 'append').at(-1);
+  assert.equal(new Int16Array(final.pcm).length, 480);
+  await runtime.stop();
+});
+
+test('current idle acknowledgement re-buffers until the delayed reservoir is primed', async (t) => {
   const harness = new BrowserHarness();
   harness.installFakeTimers();
   t.after(() => harness.restoreTimers());
@@ -1045,14 +1072,17 @@ test('current idle acknowledgement keeps buffering and repumps a delayed reservo
 
   harness.playback({type: 'idle', generation: first.generation, revision: first.revision});
 
-  const appends = harness.playbackNode.port.messages.filter(({type}) => type === 'append');
   assert.equal(harness.presentation.snapshot().status, 'assistant-buffering');
   assert.equal(delayedRefill.cleared, true);
+  assert.equal(harness.playbackNode.port.messages.filter(({type}) => type === 'append').length, 1);
+  assert.equal(harness.activeTimers.length, 0);
+
+  harness.server({type: 'response.output_audio.delta', delta: FRAME_PCM_BASE64});
+  const appends = harness.playbackNode.port.messages.filter(({type}) => type === 'append');
   assert.equal(appends.length, 2);
   assert.equal(appends[1].generation, first.generation);
   assert.ok(appends[1].revision > first.revision);
-  assert.equal(harness.activeTimers.length, 1);
-  assert.notEqual(harness.activeTimers[0], delayedRefill);
+  assert.equal(harness.activeTimers.length, 0);
   await runtime.stop();
 });
 

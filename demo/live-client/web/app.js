@@ -9,7 +9,7 @@ const statusLabels = {
   configuring: 'Configuring server VAD…',
   listening: 'Listening',
   'user-speaking': 'You are speaking',
-  'assistant-thinking': 'Assistant is thinking',
+  'assistant-thinking': 'Response pending',
   'assistant-buffering': 'Assistant audio is buffered. Select Stop to end this session.',
   'assistant-speaking': 'Assistant is speaking',
   'audio-suspended': 'Audio is paused. Select Enable audio to resume playback.',

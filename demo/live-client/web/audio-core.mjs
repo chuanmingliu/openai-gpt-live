@@ -222,6 +222,8 @@ export class PCMPlaybackPacer {
     this.bufferedUntil = 0;
     this.targetSeconds = 0.25;
     this.lowWaterSeconds = 0.1;
+    this.minimumStartSamples = 2400;
+    this.primed = false;
   }
 
   get queuedSamples() {
@@ -232,10 +234,15 @@ export class PCMPlaybackPacer {
     return this.buffer.append(samples);
   }
 
-  refill(currentTime, consume) {
+  refill(currentTime, consume, force = false) {
     if (!Number.isFinite(currentTime) || currentTime < 0) throw new RangeError('invalid playback time');
     if (typeof consume !== 'function') throw new TypeError('consume must be a function');
+    if (typeof force !== 'boolean') throw new TypeError('force must be boolean');
     this.bufferedUntil = Math.max(this.bufferedUntil, currentTime);
+    if (!this.primed) {
+      if (this.buffer.queuedSamples === 0 || (!force && this.buffer.queuedSamples < this.minimumStartSamples)) return null;
+      this.primed = true;
+    }
     while (this.buffer.queuedSamples > 0) {
       const aheadSeconds = this.bufferedUntil - currentTime;
       if (aheadSeconds >= this.targetSeconds) break;
@@ -249,10 +256,16 @@ export class PCMPlaybackPacer {
     return delaySeconds;
   }
 
+  rebuffer(currentTime = 0) {
+    if (!Number.isFinite(currentTime) || currentTime < 0) throw new RangeError('invalid playback time');
+    this.bufferedUntil = currentTime;
+    this.primed = false;
+  }
+
   clear(currentTime = 0) {
     if (!Number.isFinite(currentTime) || currentTime < 0) throw new RangeError('invalid playback time');
     this.buffer.clear();
-    this.bufferedUntil = currentTime;
+    this.rebuffer(currentTime);
   }
 }
 

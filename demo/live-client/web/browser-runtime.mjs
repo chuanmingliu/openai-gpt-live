@@ -119,7 +119,7 @@ export function createBrowserRuntime(dependencies) {
     playbackNode?.port.postMessage({type: 'clear', generation: playbackGeneration, revision: playbackRevision});
   }
 
-  function pumpPlayback(currentGeneration) {
+  function pumpPlayback(currentGeneration, force = false) {
     if (generation !== currentGeneration || !playbackContext || !playbackNode) return;
     const delaySeconds = playbackPacer.refill(playbackContext.currentTime, (samples) => {
       playbackRevision += 1;
@@ -129,7 +129,7 @@ export function createBrowserRuntime(dependencies) {
         revision: playbackRevision,
         pcm: samples.buffer,
       }, [samples.buffer]);
-    });
+    }, force);
     if (delaySeconds !== null) {
       playbackFeedTimer.request(
         () => pumpPlayback(currentGeneration),
@@ -172,6 +172,10 @@ export function createBrowserRuntime(dependencies) {
         }
         break;
       }
+      case 'audio-end':
+        playbackFeedTimer.clear();
+        pumpPlayback(currentGeneration, true);
+        break;
       case 'error':
         void failSession(NOTICE_CODES.has(effect.code) ? effect.code : 'gateway-error', currentGeneration);
         break;
@@ -331,6 +335,7 @@ export function createBrowserRuntime(dependencies) {
         if (data?.type === 'overflow') void failSession('audio-overflow', currentGeneration);
         if (data?.type === 'playing') presentation.apply({type: 'audio-playing'});
         if (data?.type === 'idle') {
+          playbackPacer.rebuffer(playbackContext.currentTime);
           if (playbackPacer.queuedSamples > 0) {
             presentation.apply({type: 'audio-idle'});
             presentation.apply({type: 'audio-buffered'});

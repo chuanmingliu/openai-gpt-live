@@ -89,6 +89,16 @@ test('truthful presentation states name controls that remain enabled', () => {
   assert.equal(ui.startDisabled, false);
 });
 
+test('pending response status never announces model thinking or reasoning', () => {
+  const state = new ClientPresentation();
+  state.beginSession();
+  state.apply({type: 'status', value: 'assistant-thinking'});
+
+  const status = presentationUI(state.snapshot()).statusText;
+  assert.equal(status, 'Response pending');
+  assert.doesNotMatch(status, /thinking|reasoning/i);
+});
+
 test('mute can be read as content-free scalar state', () => {
   const state = new ClientPresentation();
   state.apply({type: 'user-done', item_id: 'item-retained', text: 'a retained transcript turn'});
