@@ -20,19 +20,19 @@ import (
 // fakeProfileStore is an in-memory profile.Store with the same generation,
 // idempotency, and lifecycle semantics the API depends on.
 type fakeProfileStore struct {
-	mu        sync.Mutex
-	calls     int
-	blobs     map[string]profile.Blob
-	drafts    map[string]profile.Draft
-	published map[string]profile.Published
+	mu                   sync.Mutex
+	calls                int
+	blobs                map[string]profile.Blob
+	drafts               map[string]profile.Draft
+	published            map[string]profile.Published
 	publishedGenerations map[string]bool
 }
 
 func newFakeProfileStore() *fakeProfileStore {
 	return &fakeProfileStore{
-		blobs:     make(map[string]profile.Blob),
-		drafts:    make(map[string]profile.Draft),
-		published: make(map[string]profile.Published),
+		blobs:                make(map[string]profile.Blob),
+		drafts:               make(map[string]profile.Draft),
+		published:            make(map[string]profile.Published),
 		publishedGenerations: make(map[string]bool),
 	}
 }
