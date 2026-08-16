@@ -12,3 +12,6 @@ coverage.txt
 .env.*
 !*.example.env
 configs/*.local.yaml
+
+# Local verification logs.
+durable-store-verification.log
