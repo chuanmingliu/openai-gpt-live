@@ -19,6 +19,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/presentation"
+	"github.com/chuanmingliu/openai-gpt-live/internal/profile"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime/s2sws"
@@ -26,6 +27,134 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 	"github.com/stretchr/testify/require"
 )
+
+func TestManagerPublishesOwnedSafeProfileSelection(t *testing.T) {
+	connector := testkit.NewFakeConnector(2)
+	manager := NewManager(Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second}, connector,
+		managerIDs{session: "profile-session", conversation: "profile-conversation"})
+	client := newChannelClient(4)
+	selected := profile.Builtin()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.Run(ctx, OpenRequest{Subject: Subject{TenantID: "tenant", UserID: "user", ExpiresAt: time.Now().Add(time.Hour)}, Profile: selected}, client)
+	}()
+	_, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	select {
+	case event := <-client.writes:
+		require.IsType(t, protocol.SessionCreatedEvent{}, event)
+	case runErr := <-done:
+		t.Fatalf("manager failed before profile publication: %v", runErr)
+	}
+	selectedEvent := (<-client.writes).(protocol.LiveProfileSelectedEvent)
+	require.Equal(t, "builtin", selectedEvent.Profile.ID)
+	require.Equal(t, uint64(1), selectedEvent.Profile.Version)
+	require.Equal(t, selected.Snapshot.SnapshotHash, selectedEvent.Profile.SnapshotHash)
+	selected.Snapshot.Ref.ID = "mutated"
+	manager.activeMu.RLock()
+	retained := manager.logical["profile-session"].profile.Clone()
+	manager.activeMu.RUnlock()
+	require.Equal(t, profile.ID("builtin"), retained.Snapshot.Ref.ID)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestManagerWithoutExplicitProfileDoesNotPublishSelection(t *testing.T) {
+	connector := testkit.NewFakeConnector(2)
+	manager := NewManager(Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second}, connector,
+		managerIDs{session: "profile-disabled", conversation: "profile-disabled"})
+	client := newChannelClient(4)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.Run(ctx, OpenRequest{Subject: Subject{TenantID: "tenant", UserID: "user", ExpiresAt: time.Now().Add(time.Hour)}}, client)
+	}()
+	_, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	require.IsType(t, protocol.SessionCreatedEvent{}, <-client.writes)
+	_ = waitForActiveRuntime(t, manager, "profile-disabled", 1)
+	select {
+	case event := <-client.writes:
+		t.Fatalf("disabled profile mode published unexpected event %T", event)
+	default:
+	}
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestManagerReconnectAuthorityPublishesCustomProfileSelection(t *testing.T) {
+	manual := clock.NewManual(time.Now().UTC())
+	credentials, err := NewReconnectCredentials([]byte(strings.Repeat("z", 32)), manual)
+	require.NoError(t, err)
+	connector := testkit.NewFakeConnector(2)
+	owners := NewMemoryReconnectOwners(manual)
+	manager := NewManager(Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		ReconnectCredentials: credentials, ReconnectOwners: owners, ReconnectOwnerID: "profile-owner",
+		ReconnectCredentialTTL: time.Minute, Clock: manual}, connector,
+		managerIDs{session: "custom-profile-session", conversation: "custom-profile-conversation"})
+	selected := profile.Builtin()
+	selected.Snapshot.TenantID = "tenant"
+	selected.Snapshot.Ref = profile.VersionRef{ID: "insurance", Version: 3}
+	selected.Snapshot.SnapshotHash = ""
+	selected.Snapshot.SnapshotHash, err = selected.Snapshot.Hash()
+	require.NoError(t, err)
+	client := newChannelClient(4)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.Run(ctx, OpenRequest{Subject: Subject{TenantID: "tenant", UserID: "user", ExpiresAt: manual.Now().Add(time.Hour)},
+			RequestedModel: "provider-model", Profile: selected}, client)
+	}()
+	_, err = connector.NextSession(t.Context())
+	require.NoError(t, err)
+	select {
+	case event := <-client.writes:
+		require.IsType(t, protocol.SessionCreatedEvent{}, event)
+	case runErr := <-done:
+		t.Fatalf("manager failed before custom profile publication: %v", runErr)
+	}
+	require.IsType(t, protocol.LiveProfileSelectedEvent{}, <-client.writes)
+	_ = waitForActiveRuntime(t, manager, "custom-profile-session", 1)
+	require.Eventually(t, func() bool {
+		owner, ok := owners.Read("custom-profile-session")
+		return ok && owner.State == ReconnectOwnerActive
+	}, time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestManagerReconnectRequiresExactRetainedProfileSnapshot(t *testing.T) {
+	manager := NewManager(Config{}, testkit.NewFakeConnector(1), managerIDs{})
+	selected := profile.Builtin()
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "conversation"}
+	logical := &logicalSession{scope: scope, highWater: 1, turnBoundary: true, state: logicalTombstoned, profile: selected.Clone()}
+	request := ReconnectRequest{Scope: scope, SessionID: "session", LastIncarnation: 1, Profile: selected.Clone()}
+	require.NoError(t, manager.checkReconnectLocked(request, logical))
+
+	different := selected.Clone()
+	different.Snapshot.AdapterRegistryVersion = "builtin-v2"
+	different.Snapshot.SnapshotHash = ""
+	hash, err := different.Snapshot.Hash()
+	require.NoError(t, err)
+	different.Snapshot.SnapshotHash = hash
+	request.Profile = different
+	require.ErrorIs(t, manager.checkReconnectLocked(request, logical), ErrInvalidReconnectCredential)
+}
+
+func TestManagerRejectsProfileBundleWithoutImmutableSnapshot(t *testing.T) {
+	_, _, err := normalizeBoundProfile(Subject{TenantID: "tenant"}, profile.Resolved{Bundle: profile.Builtin().Bundle})
+	require.ErrorIs(t, err, profile.ErrInvalidProfile)
+	_, _, err = normalizeBoundProfile(Subject{TenantID: "tenant"}, profile.Resolved{Definition: profile.Builtin().Definition})
+	require.ErrorIs(t, err, profile.ErrInvalidProfile)
+}
+
+func TestManagerRejectsProfileSourceThatDoesNotMatchImmutableSnapshot(t *testing.T) {
+	selected := profile.Builtin()
+	selected.Bundle.Templates["system.j2"] = "mutated prompt outside snapshot authority"
+	_, _, err := normalizeBoundProfile(Subject{TenantID: "tenant"}, selected)
+	require.ErrorIs(t, err, profile.ErrInvalidProfile)
+}
 
 func withInitialManualInputTurn(cfg Config) Config {
 	cfg.InitialSession.TurnDetection = json.RawMessage(`null`)

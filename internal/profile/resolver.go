@@ -87,7 +87,7 @@ func (resolver *exactResolver) resolveBuiltin(ctx context.Context) (Resolved, er
 	if compiledVersion != engineVersion || engineVersionAfter != engineVersion {
 		return Resolved{}, ErrProfileIncompatible
 	}
-	if resolved.Snapshot.Validate() != nil {
+	if resolved.Validate() != nil {
 		return Resolved{}, ErrInvalidProfile
 	}
 	return resolved.Clone(), nil
@@ -157,7 +157,7 @@ func (resolver *exactResolver) resolveCustom(ctx context.Context, tenantID strin
 	if published.Snapshot.Validate() != nil || published.Manifest.ValidateSnapshot(published.Snapshot) != nil {
 		return Resolved{}, ErrInvalidProfile
 	}
-	return Resolved{Snapshot: published.Snapshot.Clone(), Bundle: cloneRenderBundle(bundle)}.Clone(), nil
+	return Resolved{Snapshot: published.Snapshot.Clone(), Definition: published.Manifest.Bundle.Clone(), Bundle: cloneRenderBundle(bundle)}.Clone(), nil
 }
 
 func validResolvePurpose(purpose ResolvePurpose) bool {

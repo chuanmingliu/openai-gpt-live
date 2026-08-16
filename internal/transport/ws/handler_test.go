@@ -156,11 +156,11 @@ func TestHandlerCapabilitiesAreExactAndDoNotUpgrade(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, recorder.Code)
 	require.Equal(t, "application/json", recorder.Header().Get("Content-Type"))
-	want, err := json.Marshal(protocol.Capabilities(protocol.Limits{
+	want, err := json.Marshal(protocol.CapabilitiesForFeatures(protocol.Limits{
 		MaxFrameBytes: 4096,
 		MaxJSONDepth:  7,
 		MaxAudioBytes: 2048,
-	}))
+	}, protocol.CapabilityFeatures{Handoffs: true}))
 	require.NoError(t, err)
 	require.JSONEq(t, string(want), recorder.Body.String())
 	require.Empty(t, recorder.Header().Get("Sec-WebSocket-Accept"))
@@ -631,6 +631,69 @@ func TestProfileResolutionRunsAfterAdmissionAndBeforeProviderOpen(t *testing.T) 
 		t.Fatalf("provider opened before profile resolution completed: %#v", request)
 	default:
 	}
+}
+
+func TestReconnectRevokedProfileFailsBeforeUpgradeAndProviderOpen(t *testing.T) {
+	requests := make(chan realtime.OpenRequest, 1)
+	connector := &recordingConnector{delegate: testkit.NewFakeConnector(2), requests: requests}
+	resolver := &recordingProfileResolver{err: profile.ErrProfileRevoked}
+	server := httptest.NewServer(NewHandler(Options{MaxFrameBytes: 4096, VerticalProfiles: true, ProfileResolver: resolver},
+		validManager(connector), AdmissionFunc(func(context.Context, *http.Request) (session.Subject, func(), error) {
+			return session.Subject{TenantID: "tenant-a", UserID: "user", ExpiresAt: time.Now().Add(time.Minute)}, func() {}, nil
+		})))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+	defer cancel()
+	conn, response, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+
+		"/v1/realtime?reconnect=1&profile=insurance&profile_version=3", nil)
+	require.Error(t, err)
+	require.Nil(t, conn)
+	require.NotNil(t, response)
+	require.Equal(t, http.StatusForbidden, response.StatusCode)
+	if response.Body != nil {
+		response.Body.Close()
+	}
+	require.Equal(t, []profileResolveCall{{tenant: "tenant-a", ref: profile.VersionRef{ID: "insurance", Version: 3}, purpose: profile.ResolveReconnect}}, resolver.calls)
+	select {
+	case request := <-requests:
+		t.Fatalf("provider opened for revoked reconnect profile: %#v", request)
+	default:
+	}
+}
+
+func TestEnabledVerticalProfilePublishesCapabilityAndSafeSelection(t *testing.T) {
+	resolved := resolvedProfile(t, "tenant-a", "insurance", 3)
+	resolver := &recordingProfileResolver{resolved: resolved}
+	handler := NewHandler(Options{MaxFrameBytes: 4096, VerticalProfiles: true, ProfileResolver: resolver},
+		validManager(testkit.NewFakeConnector(2)), AdmissionFunc(func(context.Context, *http.Request) (session.Subject, func(), error) {
+			return session.Subject{TenantID: "tenant-a", UserID: "user", ExpiresAt: time.Now().Add(time.Minute)}, func() {}, nil
+		}))
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/realtime/capabilities", nil))
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var capabilities protocol.CapabilityDocument
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &capabilities))
+	require.Contains(t, capabilities.Extensions, "live.profile.selected")
+
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+	defer cancel()
+	conn, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/v1/realtime?profile=insurance&profile_version=3", nil)
+	require.NoError(t, err)
+	require.Equal(t, "session.created", readServerType(t, conn))
+	typ, raw, err := conn.Read(ctx)
+	require.NoError(t, err)
+	require.Equal(t, websocket.MessageText, typ)
+	event, err := protocol.DecodeServer(raw, protocol.Limits{MaxFrameBytes: 4096, MaxJSONDepth: 32, MaxAudioBytes: 1})
+	require.NoError(t, err)
+	selected := event.(protocol.LiveProfileSelectedEvent)
+	require.Equal(t, "insurance", selected.Profile.ID)
+	require.Equal(t, uint64(3), selected.Profile.Version)
+	require.Equal(t, resolved.Snapshot.SnapshotHash, selected.Profile.SnapshotHash)
+	require.NotContains(t, string(raw), "engine")
+	require.NotContains(t, string(raw), "system.j2")
+	require.NoError(t, conn.Close(websocket.StatusNormalClosure, "done"))
 }
 
 func TestHandlerRejectsUnadvertisedOrAmbiguousPublicModelBeforeProviderOpen(t *testing.T) {

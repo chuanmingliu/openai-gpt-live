@@ -84,7 +84,7 @@ func mustBuildBuiltin() Resolved {
 	if snapshot.Validate() != nil || manifest.ValidateSnapshot(snapshot) != nil {
 		panic("profile: inconsistent built-in snapshot")
 	}
-	return Resolved{Snapshot: snapshot.Clone(), Bundle: cloneRenderBundle(bundle)}
+	return Resolved{Snapshot: snapshot.Clone(), Definition: manifest.Bundle.Clone(), Bundle: cloneRenderBundle(bundle)}
 }
 
 func decodeBuiltinSchema(raw []byte) prompttmpl.ContextSchema {

@@ -69,6 +69,41 @@ func TestLiveToolPolicyUpdatedRoundTripsCanonicalAcknowledgement(t *testing.T) {
 	}
 }
 
+func TestLiveProfileSelectedRoundTripContainsSafeIdentityOnly(t *testing.T) {
+	event := LiveProfileSelectedEvent{
+		Type: "live.profile.selected", EventID: "profile-1",
+		Profile: SelectedProfile{ID: "insurance", Version: 3, SnapshotHash: strings.Repeat("a", 64)},
+	}
+	raw, err := Encode(event)
+	require.NoError(t, err)
+	decoded, err := DecodeServer(raw, testLimits)
+	require.NoError(t, err)
+	assert.Equal(t, event, decoded)
+	assert.NotContains(t, string(raw), "system.j2")
+	assert.NotContains(t, string(raw), "prompt")
+	assert.NotContains(t, string(raw), "engine")
+
+	for _, invalid := range []string{
+		`{"type":"live.profile.selected","event_id":"profile-1","profile":{"id":"","version":3,"snapshot_hash":"` + strings.Repeat("a", 64) + `"}}`,
+		`{"type":"live.profile.selected","event_id":"profile-1","profile":{"id":"insurance","version":0,"snapshot_hash":"` + strings.Repeat("a", 64) + `"}}`,
+		`{"type":"live.profile.selected","event_id":"profile-1","profile":{"id":"insurance","version":3,"snapshot_hash":"ABC"}}`,
+		`{"type":"live.profile.selected","event_id":"profile-1","profile":{"id":"insurance","version":3,"snapshot_hash":"` + strings.Repeat("a", 64) + `","instructions":"secret"}}`,
+	} {
+		_, err := DecodeServer([]byte(invalid), testLimits)
+		require.Error(t, err)
+	}
+}
+
+func TestLiveProfileSelectedAcceptsProfileDomainUnicodeAndUint64Version(t *testing.T) {
+	event := LiveProfileSelectedEvent{Type: "live.profile.selected", EventID: "profile-domain",
+		Profile: SelectedProfile{ID: "保险销售", Version: ^uint64(0), SnapshotHash: strings.Repeat("f", 64)}}
+	raw, err := Encode(event)
+	require.NoError(t, err)
+	decoded, err := DecodeServer(raw, testLimits)
+	require.NoError(t, err)
+	require.Equal(t, event, decoded)
+}
+
 func TestDecodeClientDispatchesEverySupportedType(t *testing.T) {
 	tests := []struct {
 		name string

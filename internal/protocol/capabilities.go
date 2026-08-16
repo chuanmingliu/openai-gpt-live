@@ -66,18 +66,26 @@ var extensionEventTypes = [...]string{
 	"live.tool_policy.updated",
 }
 
+var verticalProfileExtensionEventTypes = [...]string{
+	"live.profile.selected",
+}
+
 type CapabilityFeatures struct {
-	Handoffs bool
+	Handoffs         bool
+	VerticalProfiles bool
 }
 
 func Capabilities(limits Limits) CapabilityDocument {
-	return CapabilitiesForFeatures(limits, CapabilityFeatures{Handoffs: true})
+	return CapabilitiesForFeatures(limits, CapabilityFeatures{Handoffs: true, VerticalProfiles: true})
 }
 
 func CapabilitiesForFeatures(limits Limits, features CapabilityFeatures) CapabilityDocument {
 	extensions := make([]string, 0, len(handoffExtensionEventTypes)+len(extensionEventTypes))
 	if features.Handoffs {
 		extensions = append(extensions, handoffExtensionEventTypes[:]...)
+	}
+	if features.VerticalProfiles {
+		extensions = append(extensions, verticalProfileExtensionEventTypes[:]...)
 	}
 	extensions = append(extensions, extensionEventTypes[:]...)
 	return CapabilityDocument{

@@ -1,6 +1,10 @@
 package session
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +22,8 @@ func TestReconnectCredentialIsBoundedIntegrityProtectedScopedAndExpiring(t *test
 	claims := ReconnectClaims{
 		Scope:     handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "conversation"},
 		SessionID: "session", Incarnation: 7, Cursor: 19, Model: "provider-model", ExpiresAt: manual.Now().Add(time.Minute),
+		ProfileID: "insurance", ProfileVersion: 3, ProfileSnapshotHash: strings.Repeat("a", 64),
+		ProfileEngineVersion: "jinja-go-v1/minijinja-go/v2.24.0",
 	}
 	issued, err := authority.Issue(claims)
 	require.NoError(t, err)
@@ -37,6 +43,49 @@ func TestReconnectCredentialIsBoundedIntegrityProtectedScopedAndExpiring(t *test
 	manual.Advance(time.Minute)
 	_, err = authority.Verify(issued.Credential)
 	require.ErrorIs(t, err, ErrExpiredReconnectCredential)
+}
+
+func TestReconnectCredentialRejectsMissingOrMalformedProfileClaims(t *testing.T) {
+	manual := clock.NewManual(time.Unix(11_000, 0))
+	authority, err := NewReconnectCredentials([]byte(strings.Repeat("k", 32)), manual)
+	require.NoError(t, err)
+	valid := ReconnectClaims{
+		Scope:     handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "conversation"},
+		SessionID: "session", Incarnation: 1, Model: "provider", ExpiresAt: manual.Now().Add(time.Minute),
+		ProfileID: "insurance", ProfileVersion: 3, ProfileSnapshotHash: strings.Repeat("a", 64),
+		ProfileEngineVersion: "jinja-go-v1/minijinja-go/v2.24.0",
+	}
+	mutations := []func(*ReconnectClaims){
+		func(value *ReconnectClaims) { value.ProfileID = "" },
+		func(value *ReconnectClaims) { value.ProfileVersion = 0 },
+		func(value *ReconnectClaims) { value.ProfileSnapshotHash = "bad" },
+		func(value *ReconnectClaims) { value.ProfileEngineVersion = "jinja-go-v1" },
+	}
+	for _, mutate := range mutations {
+		candidate := valid
+		mutate(&candidate)
+		_, err := authority.Issue(candidate)
+		require.ErrorIs(t, err, ErrInvalidReconnectCredential)
+	}
+}
+
+func TestReconnectCredentialVerifyRejectsIntegrityValidPayloadWithoutProfileClaims(t *testing.T) {
+	manual := clock.NewManual(time.Unix(12_000, 0))
+	key := []byte(strings.Repeat("s", 32))
+	authority, err := NewReconnectCredentials(key, manual)
+	require.NoError(t, err)
+	payload, err := json.Marshal(map[string]any{
+		"tenant_id": "tenant", "user_id": "user", "conversation_id": "conversation", "session_id": "session",
+		"incarnation": 1, "cursor": 0, "model": "provider", "expires_unix_ms": manual.Now().Add(time.Minute).UnixMilli(),
+		"credential_id": "credential",
+	})
+	require.NoError(t, err)
+	unsigned := "lrt1." + base64.RawURLEncoding.EncodeToString(payload)
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write([]byte(unsigned))
+	credential := unsigned + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	_, err = authority.Verify(credential)
+	require.ErrorIs(t, err, ErrInvalidReconnectCredential)
 }
 
 func TestReconnectOwnerCASIsCrossOwnerSafeAndConsumesCredentialExactlyOnce(t *testing.T) {

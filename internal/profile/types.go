@@ -471,14 +471,55 @@ func (published Published) Validate() error {
 // Resolved is the owned, exact prompt source bundle paired with its immutable
 // snapshot. No caller needs to reopen or choose another blob.
 type Resolved struct {
-	Snapshot Snapshot          `json:"snapshot"`
-	Bundle   prompttmpl.Bundle `json:"bundle"`
+	Snapshot   Snapshot          `json:"snapshot"`
+	Definition PromptBundle      `json:"definition"`
+	Bundle     prompttmpl.Bundle `json:"bundle"`
+}
+
+// IsZero distinguishes the legacy/default profile selection from every
+// partially populated value. Non-nil empty maps are intentionally nonzero so
+// malformed boundary input cannot silently downgrade to builtin.
+func (resolved Resolved) IsZero() bool {
+	return reflect.DeepEqual(resolved, Resolved{})
 }
 
 func (resolved Resolved) Clone() Resolved {
 	resolved.Snapshot = resolved.Snapshot.Clone()
+	resolved.Definition = resolved.Definition.Clone()
 	resolved.Bundle = clonePromptBundle(resolved.Bundle)
 	return resolved
+}
+
+// Validate proves that every retained runtime template and schema is the exact
+// source bundle committed by Snapshot. Resolved values cross a long-lived
+// session/reconnect boundary, so validating the snapshot alone is insufficient:
+// a caller could otherwise pair signed metadata with different prompt source.
+func (resolved Resolved) Validate() error {
+	if resolved.Snapshot.Validate() != nil || resolved.Definition.Validate() != nil ||
+		len(resolved.Definition.Templates) != len(resolved.Bundle.Templates) ||
+		!reflect.DeepEqual(resolved.Definition.Schema, resolved.Bundle.Schema) {
+		return ErrInvalidProfile
+	}
+	bundleHash, err := resolved.Definition.Hash()
+	if err != nil || bundleHash != resolved.Snapshot.BundleHash {
+		return ErrInvalidProfile
+	}
+	manifest := Manifest{Bundle: resolved.Definition.Clone(), Recipes: cloneRecipes(resolved.Snapshot.Recipes),
+		Bindings: cloneBindings(resolved.Snapshot.Bindings), Knowledge: append([]KnowledgeRef(nil), resolved.Snapshot.Knowledge...)}
+	if manifest.ValidateSnapshot(resolved.Snapshot) != nil {
+		return ErrInvalidProfile
+	}
+	for name, ref := range resolved.Definition.Templates {
+		source, ok := resolved.Bundle.Templates[name]
+		if !ok || len(source) != ref.Bytes {
+			return ErrInvalidProfile
+		}
+		digest := sha256.Sum256([]byte(source))
+		if hex.EncodeToString(digest[:]) != ref.Hash {
+			return ErrInvalidProfile
+		}
+	}
+	return nil
 }
 
 func validHash(value string) bool {

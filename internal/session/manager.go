@@ -276,6 +276,8 @@ type logicalSession struct {
 	turnBoundary  bool
 	tombstonedAt  time.Time
 	state         logicalSessionState
+	profile       profile.Resolved
+	profilePublic bool
 }
 
 type logicalSessionState uint8
@@ -323,6 +325,44 @@ type sessionRuntime struct {
 	reconnect             *IssuedReconnectCredential
 	reconnectDelivered    bool
 	reconnectLossDeadline time.Time
+	profile               profile.Resolved
+	profilePublic         bool
+}
+
+func normalizeBoundProfile(subject Subject, candidate profile.Resolved) (profile.Resolved, bool, error) {
+	provided := !candidate.IsZero()
+	if !provided {
+		return profile.Builtin(), false, nil
+	}
+	owned := candidate.Clone()
+	if owned.Validate() != nil {
+		return profile.Resolved{}, false, profile.ErrInvalidProfile
+	}
+	if owned.Snapshot.Ref.ID == "builtin" {
+		builtin := profile.Builtin()
+		if !sameProfileIdentity(owned, builtin) {
+			return profile.Resolved{}, false, profile.ErrInvalidProfile
+		}
+		owned = builtin
+	} else if owned.Snapshot.TenantID != subject.TenantID {
+		return profile.Resolved{}, false, profile.ErrInvalidProfile
+	}
+	return owned, true, nil
+}
+
+func sameProfileIdentity(left, right profile.Resolved) bool {
+	return left.Snapshot.TenantID == right.Snapshot.TenantID && left.Snapshot.Ref == right.Snapshot.Ref &&
+		left.Snapshot.SnapshotHash == right.Snapshot.SnapshotHash && left.Snapshot.EngineVersion == right.Snapshot.EngineVersion
+}
+
+func profileSelection(resolved profile.Resolved) *protocol.SelectedProfile {
+	return &protocol.SelectedProfile{ID: string(resolved.Snapshot.Ref.ID), Version: resolved.Snapshot.Ref.Version,
+		SnapshotHash: resolved.Snapshot.SnapshotHash}
+}
+
+func profileClaimsMatchResolved(claims ReconnectClaims, resolved profile.Resolved) bool {
+	return claims.ProfileID == string(resolved.Snapshot.Ref.ID) && claims.ProfileVersion == resolved.Snapshot.Ref.Version &&
+		claims.ProfileSnapshotHash == resolved.Snapshot.SnapshotHash && claims.ProfileEngineVersion == resolved.Snapshot.EngineVersion
 }
 
 func (r *sessionRuntime) commitPublication() {
@@ -1057,6 +1097,10 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 		return err
 	}
 	subject := cloneSubject(request.Subject)
+	selectedProfile, profilePublic, err := normalizeBoundProfile(subject, request.Profile)
+	if err != nil {
+		return err
+	}
 
 	sessionID := m.ids.NewSessionID()
 	if sessionID == "" {
@@ -1086,7 +1130,7 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	}
 	logical := &logicalSession{
 		scope: scope, subject: cloneSubject(subject), model: request.RequestedModel, highWater: ids.Incarnation, turnBoundary: false,
-		state: logicalEstablishing,
+		state: logicalEstablishing, profile: selectedProfile.Clone(), profilePublic: profilePublic,
 	}
 	m.logical[sessionID] = logical
 	m.activeMu.Unlock()
@@ -1125,7 +1169,7 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	reconnectAdvertisementAttempted := false
 	var reconnectOwnerLossDeadline time.Time
 	if m.ReconnectEnabled() {
-		issued, owner, issueErr := m.issueReconnectCredential(subject, scope, sessionID, ids.Incarnation, 0, request.RequestedModel, ReconnectOwnerEstablishing)
+		issued, owner, issueErr := m.issueReconnectCredentialForProfile(subject, scope, sessionID, ids.Incarnation, 0, request.RequestedModel, selectedProfile, ReconnectOwnerEstablishing)
 		if issueErr != nil {
 			closeCtx, closeCancel := context.WithTimeout(context.Background(), internalCloseTimeout)
 			_ = voice.Close(closeCtx)
@@ -1178,6 +1222,8 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 		accepting:             true,
 		inboxSlots:            state.inboxSlots,
 		reconnectLossDeadline: reconnectOwnerLossDeadline,
+		profile:               selectedProfile.Clone(),
+		profilePublic:         profilePublic,
 	}
 	if reconnectIssued != nil {
 		copy := *reconnectIssued
@@ -1226,7 +1272,11 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	// This prevents the durable pump from overtaking session establishment.
 	reconnectAdvertisementAttempted = reconnectMetadata != nil
 	<-state.inboxSlots
-	connected := reactorMessage{input: ConnectedInput{ProviderSession: json.RawMessage(`{}`), Reconnect: reconnectMetadata}, done: make(chan error, 1), requireClientWrites: true}
+	connectedInput := ConnectedInput{ProviderSession: json.RawMessage(`{}`), Reconnect: reconnectMetadata}
+	if profilePublic {
+		connectedInput.Profile = profileSelection(selectedProfile)
+	}
+	connected := reactorMessage{input: connectedInput, done: make(chan error, 1), requireClientWrites: true}
 	state.acceptControl(&connected)
 	state.inbox <- connected
 	select {
@@ -1335,6 +1385,10 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 	if err := validateReconnectRequest(request); err != nil {
 		return err
 	}
+	selectedProfile, profilePublic, err := normalizeBoundProfile(request.Subject, request.Profile)
+	if err != nil {
+		return ErrInvalidReconnectCredential
+	}
 	if uint64(request.LastIncarnation) == math.MaxUint64 {
 		return ErrStaleReconnect
 	}
@@ -1344,6 +1398,9 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 			request.Credential.SessionID != request.SessionID || request.Credential.Incarnation != request.LastIncarnation ||
 			request.Credential.Cursor != request.LastEventSeq || validateReconnectClaims(request.Credential, m.now(), true) != nil {
 			return ErrStaleReconnect
+		}
+		if !profileClaimsMatchResolved(request.Credential, selectedProfile) {
+			return ErrInvalidReconnectCredential
 		}
 	}
 	m.activeMu.Lock()
@@ -1410,6 +1467,8 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 		logical.reconnecting = true
 		subject = cloneSubject(logical.subject)
 		model = logical.model
+		selectedProfile, _, _ = normalizeBoundProfile(logical.subject, logical.profile)
+		profilePublic = logical.profilePublic
 	} else {
 		if !authoritativeOwners {
 			m.activeMu.Unlock()
@@ -1470,8 +1529,8 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 	var reconnectMetadata *protocol.ReconnectMetadata
 	var reconnectIssued *IssuedReconnectCredential
 	if authoritativeOwners {
-		issued, nextOwner, issueErr := m.issueReconnectCredential(subject, request.Scope, request.SessionID, newIncarnation,
-			request.LastEventSeq, model, ReconnectOwnerClaiming)
+		issued, nextOwner, issueErr := m.issueReconnectCredentialForProfile(subject, request.Scope, request.SessionID, newIncarnation,
+			request.LastEventSeq, model, selectedProfile, ReconnectOwnerClaiming)
 		if issueErr != nil {
 			return ErrRecoveryUnavailable
 		}
@@ -1494,9 +1553,12 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 			return ErrRecoveryUnavailable
 		}
 		restagedExisting := (claimedOwner.State == ReconnectOwnerClaiming || claimedOwner.State == ReconnectOwnerActive) && claimedOwner.Incarnation == newIncarnation &&
-			reconnectPreviousClaims(claimedOwner) == request.Credential
+			sameReconnectCore(reconnectPreviousClaims(claimedOwner), request.Credential)
 		if restagedExisting {
-			issued, issueErr = m.cfg.ReconnectCredentials.Issue(claimedOwner.Claims())
+			restagedClaims := claimedOwner.Claims()
+			restagedClaims.ProfileID, restagedClaims.ProfileVersion = request.Credential.ProfileID, request.Credential.ProfileVersion
+			restagedClaims.ProfileSnapshotHash, restagedClaims.ProfileEngineVersion = request.Credential.ProfileSnapshotHash, request.Credential.ProfileEngineVersion
+			issued, issueErr = m.cfg.ReconnectCredentials.Issue(restagedClaims)
 			if issueErr != nil {
 				return ErrRecoveryUnavailable
 			}
@@ -1517,7 +1579,8 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 		if logical == nil {
 			logical = &logicalSession{scope: request.Scope, subject: minimalReconnectSubject(subject), model: model,
 				highWater: request.LastIncarnation, responseEpoch: claimedOwner.ResponseEpoch, reconnecting: true,
-				turnBoundary: true, tombstonedAt: m.now(), state: logicalTombstoned}
+				turnBoundary: true, tombstonedAt: m.now(), state: logicalTombstoned,
+				profile: selectedProfile.Clone(), profilePublic: profilePublic}
 			m.activeMu.Lock()
 			if m.logical[request.SessionID] != nil {
 				m.activeMu.Unlock()
@@ -1630,7 +1693,7 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 	ids := IDs{SessionID: request.SessionID, ConversationID: request.Scope.ConversationID, Incarnation: newIncarnation}
 	err = m.runReplacement(sessionCtx, cancel, subject, ids, client, voice, initialEpoch, logical, request.LastIncarnation,
 		request.LastEventSeq, reconnectIssued, reconnectMetadata, activeEvents, snapshot.PendingApprovals,
-		claimedLossDeadline, advertisementAttempted.Store, durablyPublished.Store)
+		claimedLossDeadline, selectedProfile, profilePublic, advertisementAttempted.Store, durablyPublished.Store)
 	result := "ok"
 	if err != nil {
 		result = "error"
@@ -1652,6 +1715,12 @@ func (m *Manager) sendInitialSession(ctx context.Context, voice realtime.Session
 func (m *Manager) issueReconnectCredential(subject Subject, scope handoff.Scope, sessionID identity.SessionID, incarnation identity.Incarnation,
 	cursor int64, model string, state ReconnectOwnerState,
 ) (IssuedReconnectCredential, ReconnectOwner, error) {
+	return m.issueReconnectCredentialForProfile(subject, scope, sessionID, incarnation, cursor, model, profile.Builtin(), state)
+}
+
+func (m *Manager) issueReconnectCredentialForProfile(subject Subject, scope handoff.Scope, sessionID identity.SessionID, incarnation identity.Incarnation,
+	cursor int64, model string, selected profile.Resolved, state ReconnectOwnerState,
+) (IssuedReconnectCredential, ReconnectOwner, error) {
 	if !m.ReconnectEnabled() {
 		return IssuedReconnectCredential{}, ReconnectOwner{}, ErrRecoveryUnavailable
 	}
@@ -1660,7 +1729,9 @@ func (m *Manager) issueReconnectCredential(subject Subject, scope handoff.Scope,
 		expiresAt = subject.ExpiresAt
 	}
 	issued, err := m.cfg.ReconnectCredentials.Issue(ReconnectClaims{Scope: scope, SessionID: sessionID, Incarnation: incarnation,
-		Cursor: cursor, Model: model, ExpiresAt: expiresAt})
+		Cursor: cursor, Model: model, ExpiresAt: expiresAt, ProfileID: string(selected.Snapshot.Ref.ID),
+		ProfileVersion: selected.Snapshot.Ref.Version, ProfileSnapshotHash: selected.Snapshot.SnapshotHash,
+		ProfileEngineVersion: selected.Snapshot.EngineVersion})
 	if err != nil {
 		return IssuedReconnectCredential{}, ReconnectOwner{}, err
 	}
@@ -1897,8 +1968,12 @@ func (m *Manager) rotateReconnectCredential(ctx context.Context, runtime *sessio
 	if force || cursor != current.Claims.Cursor {
 		scope := runtime.handoffScope()
 		var err error
-		issued, _, err = m.issueReconnectCredential(runtime.subject, scope, runtime.key.sessionID, runtime.key.incarnation,
-			cursor, current.Claims.Model, ReconnectOwnerActive)
+		selected, _, profileErr := normalizeBoundProfile(runtime.subject, runtime.profile)
+		if profileErr != nil {
+			return ErrRecoveryUnavailable
+		}
+		issued, _, err = m.issueReconnectCredentialForProfile(runtime.subject, scope, runtime.key.sessionID, runtime.key.incarnation,
+			cursor, current.Claims.Model, selected, ReconnectOwnerActive)
 		if err != nil {
 			return ErrRecoveryUnavailable
 		}
@@ -2039,6 +2114,14 @@ func (m *Manager) checkReconnectLocked(request ReconnectRequest, logical *logica
 	if logical.runtime != nil && !logical.runtime.atTurnBoundary() || logical.runtime == nil && !logical.turnBoundary {
 		return ErrReconnectNotAtBoundary
 	}
+	selected, _, err := normalizeBoundProfile(request.Subject, request.Profile)
+	retained, _, retainedErr := normalizeBoundProfile(logical.subject, logical.profile)
+	if err != nil || retainedErr != nil || !sameProfileIdentity(selected, retained) {
+		return ErrInvalidReconnectCredential
+	}
+	if m.ReconnectEnabled() && !profileClaimsMatchResolved(request.Credential, retained) {
+		return ErrInvalidReconnectCredential
+	}
 	return nil
 }
 
@@ -2082,7 +2165,8 @@ func (m *Manager) connectReplacement(ctx context.Context, request realtime.OpenR
 func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.CancelFunc, subject Subject, ids IDs, client ClientConn,
 	voice realtime.Session, initialEpoch identity.ResponseEpoch, logical *logicalSession, expected identity.Incarnation, replayAfter int64,
 	reconnectIssued *IssuedReconnectCredential, reconnectMetadata *protocol.ReconnectMetadata, activeHandoffs []protocol.ServerEvent,
-	pendingApprovals []RecoveryApproval, ownerLossDeadline time.Time, markAdvertisement func(bool), markPublished func(bool),
+	pendingApprovals []RecoveryApproval, ownerLossDeadline time.Time, selectedProfile profile.Resolved, profilePublic bool,
+	markAdvertisement func(bool), markPublished func(bool),
 ) (runErr error) {
 	group, groupCtx := errgroup.WithContext(sessionCtx)
 	quiesced := make(chan struct{})
@@ -2097,6 +2181,7 @@ func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.Canc
 		key: runtimeKey{sessionID: ids.SessionID, incarnation: ids.Incarnation}, subject: subject,
 		inbox: state.inbox, done: groupCtx.Done(), quiesced: quiesced, state: state,
 		accepting: true, inboxSlots: state.inboxSlots, reconnectLossDeadline: ownerLossDeadline,
+		profile: selectedProfile.Clone(), profilePublic: profilePublic,
 	}
 	if reconnectIssued != nil {
 		copy := *reconnectIssued
@@ -2142,7 +2227,11 @@ func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.Canc
 		markAdvertisement(true)
 	}
 	<-state.inboxSlots
-	connected := reactorMessage{input: ConnectedInput{ProviderSession: json.RawMessage(`{}`), Reconnect: reconnectMetadata}, done: make(chan error, 1), requireClientWrites: true}
+	connectedInput := ConnectedInput{ProviderSession: json.RawMessage(`{}`), Reconnect: reconnectMetadata}
+	if profilePublic {
+		connectedInput.Profile = profileSelection(selectedProfile)
+	}
+	connected := reactorMessage{input: connectedInput, done: make(chan error, 1), requireClientWrites: true}
 	state.acceptControl(&connected)
 	state.inbox <- connected
 	select {

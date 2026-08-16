@@ -12,6 +12,24 @@ type ServerEvent interface {
 	isServerEvent()
 }
 
+// SelectedProfile is the safe public identity of the immutable profile bound
+// to a live session. Prompt sources, rendered content, tools, and engine
+// implementation details are intentionally excluded from the wire contract.
+type SelectedProfile struct {
+	ID           string `json:"id"`
+	Version      uint64 `json:"version"`
+	SnapshotHash string `json:"snapshot_hash"`
+}
+
+type LiveProfileSelectedEvent struct {
+	Type    string          `json:"type"`
+	EventID string          `json:"event_id"`
+	Profile SelectedProfile `json:"profile"`
+}
+
+func (e LiveProfileSelectedEvent) EventType() string { return e.Type }
+func (LiveProfileSelectedEvent) isServerEvent()      {}
+
 type LiveToolPolicyUpdatedEvent struct {
 	Type    string            `json:"type"`
 	EventID string            `json:"event_id"`

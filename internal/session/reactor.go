@@ -1348,6 +1348,12 @@ func (r *Reactor) applyConnected(input ConnectedInput) ([]Effect, error) {
 		Reconnect: cloneReconnectMetadata(input.Reconnect),
 	}
 	effects = append(effects, Effect{ClientEvent: created})
+	if input.Profile != nil {
+		selected := *input.Profile
+		effects = append(effects, Effect{ClientEvent: protocol.LiveProfileSelectedEvent{
+			Type: "live.profile.selected", EventID: r.providerOrSynthEventID(""), Profile: selected,
+		}})
+	}
 	if terminalizedPending {
 		acceptance, err := r.emitNextReadyHandoffAcceptance()
 		if err != nil {
@@ -2624,7 +2630,7 @@ func (r *Reactor) providerOrSynthEventID(providerID string) string {
 		return providerID
 	}
 	r.synthEventSequence++
-	return fmt.Sprintf("session-%s-%06d", r.ids.SessionID, r.synthEventSequence)
+	return fmt.Sprintf("session-%s-%06d-%06d", r.ids.SessionID, r.ids.Incarnation, r.synthEventSequence)
 }
 
 func defaultString(value, fallback string) string {

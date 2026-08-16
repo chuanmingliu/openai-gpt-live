@@ -66,6 +66,70 @@ func readSessionCreated(t *testing.T, conn *websocket.Conn) protocol.SessionCrea
 	return created
 }
 
+func readProfileSelected(t *testing.T, conn *websocket.Conn) protocol.LiveProfileSelectedEvent {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+	defer cancel()
+	typ, raw, err := conn.Read(ctx)
+	require.NoError(t, err)
+	require.Equal(t, websocket.MessageText, typ)
+	event, err := protocol.DecodeServer(raw, protocol.Limits{MaxFrameBytes: 8 << 10, MaxJSONDepth: 32, MaxAudioBytes: 1})
+	require.NoError(t, err)
+	selected, ok := event.(protocol.LiveProfileSelectedEvent)
+	require.True(t, ok)
+	return selected
+}
+
+func TestCustomProfileReconnectRetainsExactSnapshotAndPublishesEachIncarnation(t *testing.T) {
+	manual := clock.NewManual(time.Now().UTC())
+	credentials, err := session.NewReconnectCredentials([]byte(strings.Repeat("v", 32)), manual)
+	require.NoError(t, err)
+	owners := session.NewMemoryReconnectOwners(manual)
+	connector := testkit.NewFakeConnector(4)
+	managerFor := func(ownerID string) *session.Manager {
+		return session.NewManager(session.Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+			RecoveryStore: reconnectRecoveryStore{snapshot: session.RecoverySnapshot{}}, ReconnectCredentials: credentials,
+			ReconnectOwners: owners, ReconnectOwnerID: ownerID, ReconnectCredentialTTL: time.Minute}, connector, fixedIDs{})
+	}
+	subject := session.Subject{TenantID: "tenant-profile", UserID: "user-profile", ExpiresAt: manual.Now().Add(time.Hour)}
+	resolver := &recordingProfileResolver{resolved: resolvedProfile(t, subject.TenantID, "insurance", 3)}
+	require.NoError(t, resolver.resolved.Validate())
+	admit := AdmissionFunc(func(context.Context, *http.Request) (session.Subject, func(), error) { return subject, func() {}, nil })
+	opts := Options{MaxFrameBytes: 8 << 10, ProviderModel: "provider-model", ReconnectCredentials: credentials,
+		VerticalProfiles: true, ProfileResolver: resolver}
+	serverA := httptest.NewServer(NewHandler(opts, managerFor("profile-a"), admit))
+	defer serverA.Close()
+	serverB := httptest.NewServer(NewHandler(opts, managerFor("profile-b"), admit))
+	defer serverB.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+	defer cancel()
+	query := "?profile=insurance&profile_version=3"
+	first, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(serverA.URL, "http")+"/v1/realtime"+query, nil)
+	require.NoError(t, err)
+	created := readSessionCreated(t, first)
+	initialSelection := readProfileSelected(t, first)
+	require.Equal(t, resolver.resolved.Snapshot.SnapshotHash, initialSelection.Profile.SnapshotHash)
+	require.NoError(t, first.Close(websocket.StatusNormalClosure, "reconnect"))
+	require.Eventually(t, func() bool {
+		owner, ok := owners.Read(identity.SessionID(created.Reconnect.SessionID))
+		return ok && owner.State == session.ReconnectOwnerTombstoned
+	}, testTimeout, time.Millisecond)
+
+	second, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(serverB.URL, "http")+"/v1/realtime?reconnect=1&profile=insurance&profile_version=3", nil)
+	require.NoError(t, err)
+	writeReconnectControl(t, second, created.Reconnect.Credential)
+	reconnected := readSessionCreated(t, second)
+	reconnectSelection := readProfileSelected(t, second)
+	require.Equal(t, initialSelection.Profile, reconnectSelection.Profile)
+	require.NotEqual(t, initialSelection.EventID, reconnectSelection.EventID, "different incarnations need distinct replay identities")
+	verified, err := credentials.Verify(reconnected.Reconnect.Credential)
+	require.NoError(t, err)
+	require.Equal(t, reconnectSelection.Profile.ID, verified.ProfileID)
+	require.Equal(t, reconnectSelection.Profile.Version, verified.ProfileVersion)
+	require.Equal(t, reconnectSelection.Profile.SnapshotHash, verified.ProfileSnapshotHash)
+	require.NoError(t, second.Close(websocket.StatusNormalClosure, "done"))
+}
+
 func writeReconnectControl(t *testing.T, conn *websocket.Conn, credential string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)

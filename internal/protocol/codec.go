@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
@@ -124,6 +125,8 @@ func DecodeServer(raw []byte, limits Limits) (ServerEvent, error) {
 		target = &LiveToolApprovalRequiredEvent{}
 	case "live.tool_policy.updated":
 		target = &LiveToolPolicyUpdatedEvent{}
+	case "live.profile.selected":
+		target = &LiveProfileSelectedEvent{}
 	default:
 		return nil, fmt.Errorf("unsupported server event type %q", eventType)
 	}
@@ -549,9 +552,45 @@ func validateServer(event ServerEvent, raw []byte, limits Limits) error {
 		}
 		_, err := decodeCanonicalToolPolicy(fields, toolpolicy.DefaultCatalog())
 		return err
+	case LiveProfileSelectedEvent:
+		if err := exactFields(fields, "type", "event_id", "profile"); err != nil {
+			return err
+		}
+		if err := requirePrintableASCIIString(fields, "event_id", 128); err != nil {
+			return err
+		}
+		selected, err := requiredObject(fields, "profile")
+		if err != nil {
+			return err
+		}
+		if err := exactFields(selected, "id", "version", "snapshot_hash"); err != nil {
+			return err
+		}
+		if err := requireProfileIdentifier(selected, "id", 256); err != nil {
+			return err
+		}
+		if err := requirePositiveUint64(selected, "version"); err != nil || typed.Profile.Version == 0 {
+			return errors.New("profile version is invalid")
+		}
+		if err := requireString(selected, "snapshot_hash", true); err != nil || !isLowerHexHash(typed.Profile.SnapshotHash) {
+			return errors.New("profile snapshot hash is invalid")
+		}
+		return nil
 	default:
 		return fmt.Errorf("unsupported server event %T", event)
 	}
+}
+
+func isLowerHexHash(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, character := range value {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func rawObject(raw []byte) (map[string]json.RawMessage, error) {
@@ -618,6 +657,20 @@ func requirePrintableASCIIString(fields map[string]json.RawMessage, name string,
 	return nil
 }
 
+func requireProfileIdentifier(fields map[string]json.RawMessage, name string, limit int) error {
+	if err := requireBoundedString(fields, name, limit, true); err != nil {
+		return err
+	}
+	var value string
+	_ = json.Unmarshal(fields[name], &value)
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return fmt.Errorf("%s contains a control character", name)
+		}
+	}
+	return nil
+}
+
 func decodeCanonicalToolPolicy(fields map[string]json.RawMessage, catalog toolpolicy.Catalog) (toolpolicy.Policy, error) {
 	raw, ok := fields["tools"]
 	if !ok {
@@ -653,6 +706,18 @@ func requireNonNegativeInt(fields map[string]json.RawMessage, name string) error
 	}
 	if value < 0 {
 		return fmt.Errorf("%s must not be negative", name)
+	}
+	return nil
+}
+
+func requirePositiveUint64(fields map[string]json.RawMessage, name string) error {
+	raw, ok := fields[name]
+	if !ok {
+		return fmt.Errorf("%s is required", name)
+	}
+	var value uint64
+	if err := json.Unmarshal(raw, &value); err != nil || value == 0 {
+		return fmt.Errorf("%s must be a positive uint64", name)
 	}
 	return nil
 }

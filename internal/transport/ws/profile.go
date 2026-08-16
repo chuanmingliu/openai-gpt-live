@@ -20,6 +20,10 @@ var (
 )
 
 func resolveProfile(ctx context.Context, rawQuery, tenantID string, enabled bool, resolver profile.Resolver) (profile.Resolved, error) {
+	return resolveProfileForPurpose(ctx, rawQuery, tenantID, enabled, resolver, profile.ResolveNewSession)
+}
+
+func resolveProfileForPurpose(ctx context.Context, rawQuery, tenantID string, enabled bool, resolver profile.Resolver, purpose profile.ResolvePurpose) (profile.Resolved, error) {
 	ref, custom, err := parseProfileQuery(rawQuery)
 	if err != nil {
 		return profile.Resolved{}, errProfileQuery
@@ -36,7 +40,7 @@ func resolveProfile(ctx context.Context, rawQuery, tenantID string, enabled bool
 	if nilProfileResolver(resolver) {
 		return profile.Resolved{}, errProfileUnavailable
 	}
-	resolved, resolveErr := resolver.Resolve(nonNilProfileContext(ctx), tenantID, ref, profile.ResolveNewSession)
+	resolved, resolveErr := resolver.Resolve(nonNilProfileContext(ctx), tenantID, ref, purpose)
 	if resolveErr != nil {
 		if errors.Is(resolveErr, profile.ErrProfileRevoked) {
 			return profile.Resolved{}, errProfileForbidden

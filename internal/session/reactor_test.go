@@ -1518,6 +1518,25 @@ func TestConnectedInputSynthesizesSessionCreatedAndOnlyReconnectAdvances(t *test
 	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventSessionCreated, ProviderEventID: "upstream-created"})))
 }
 
+func TestConnectedInputEmitsSafeProfileSelectionAfterSessionCreated(t *testing.T) {
+	reactor, _ := testReactor(1)
+	selected := protocol.SelectedProfile{ID: "insurance", Version: 3, SnapshotHash: strings.Repeat("a", 64)}
+	effects := applyOK(t, reactor, ConnectedInput{ProviderSession: json.RawMessage(`{"id":"provider"}`), Profile: &selected})
+	require.Len(t, effects, 2)
+	assert.IsType(t, protocol.SessionCreatedEvent{}, effects[0].ClientEvent)
+	profileEvent, ok := effects[1].ClientEvent.(protocol.LiveProfileSelectedEvent)
+	require.True(t, ok)
+	assert.Equal(t, selected, profileEvent.Profile)
+	assert.NotEmpty(t, profileEvent.EventID)
+	restaged, _ := testReactor(1)
+	restagedEffects := applyOK(t, restaged, ConnectedInput{ProviderSession: json.RawMessage(`{"id":"provider-retry"}`), Profile: &selected})
+	restagedEvent := restagedEffects[1].ClientEvent.(protocol.LiveProfileSelectedEvent)
+	assert.Equal(t, profileEvent.EventID, restagedEvent.EventID, "the same incarnation and attempt order must replay a stable identity")
+
+	selected.ID = "mutated"
+	assert.Equal(t, "insurance", profileEvent.Profile.ID)
+}
+
 func TestSessionUpdatedRequiresActualProviderAcknowledgement(t *testing.T) {
 	reactor, fence := unconfiguredTestReactor(1)
 	toolParams := json.RawMessage(`{"type":"object","properties":{"q":{"type":"string"}}}`)

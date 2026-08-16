@@ -107,7 +107,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(protocol.CapabilitiesForFeatures(h.limits, protocol.CapabilityFeatures{Handoffs: h.handoffsEnabled}))
+		_ = json.NewEncoder(w).Encode(protocol.CapabilitiesForFeatures(h.limits, protocol.CapabilityFeatures{
+			Handoffs: h.handoffsEnabled, VerticalProfiles: h.opts.VerticalProfiles,
+		}))
 	case "/v1/realtime":
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)
@@ -162,13 +164,18 @@ func (h *handler) serveRealtime(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 		return
 	}
-	selectedProfile := profile.Resolved{}
-	if !reconnecting {
-		selectedProfile, err = resolveProfile(r.Context(), r.URL.RawQuery, subject.TenantID, h.opts.VerticalProfiles, h.opts.ProfileResolver)
-		if err != nil {
-			writeProfileError(w, err)
-			return
-		}
+	purpose := profile.ResolveNewSession
+	if reconnecting {
+		purpose = profile.ResolveReconnect
+	}
+	selectedProfile, err := resolveProfileForPurpose(r.Context(), r.URL.RawQuery, subject.TenantID, h.opts.VerticalProfiles, h.opts.ProfileResolver, purpose)
+	if err != nil {
+		writeProfileError(w, err)
+		return
+	}
+	runtimeProfile := selectedProfile
+	if !h.opts.VerticalProfiles {
+		runtimeProfile = profile.Resolved{}
 	}
 
 	sessionCtx, cancel := context.WithCancel(r.Context())
@@ -214,17 +221,18 @@ func (h *handler) serveRealtime(w http.ResponseWriter, r *http.Request) {
 			runErr = session.ErrInvalidReconnectCredential
 			_ = client.closeNow(websocket.StatusPolicyViolation, "invalid reconnect control")
 		} else {
-			claims, verifyErr := h.verifyReconnectCredential(credential, subject, providerModel)
+			claims, verifyErr := h.verifyReconnectCredential(credential, subject, providerModel, selectedProfile)
 			if verifyErr != nil {
 				runErr = verifyErr
 				_ = client.closeNow(websocket.StatusPolicyViolation, "invalid reconnect control")
 			} else {
 				runErr = h.manager.Reconnect(sessionCtx, session.ReconnectRequest{Scope: claims.Scope, SessionID: claims.SessionID,
-					LastIncarnation: claims.Incarnation, LastEventSeq: claims.Cursor, Subject: subject, Credential: claims}, client)
+					LastIncarnation: claims.Incarnation, LastEventSeq: claims.Cursor, Subject: subject, Credential: claims,
+					Profile: runtimeProfile}, client)
 			}
 		}
 	} else {
-		runErr = h.manager.Run(sessionCtx, session.OpenRequest{Subject: subject, RequestedModel: providerModel, Profile: selectedProfile}, client)
+		runErr = h.manager.Run(sessionCtx, session.OpenRequest{Subject: subject, RequestedModel: providerModel, Profile: runtimeProfile}, client)
 	}
 	cancel()
 	if leaseMonitorDone != nil {
@@ -248,7 +256,7 @@ func reconnectMode(rawQuery string) (bool, error) {
 	return true, nil
 }
 
-func (h *handler) verifyReconnectCredential(credential string, subject session.Subject, providerModel string) (session.ReconnectClaims, error) {
+func (h *handler) verifyReconnectCredential(credential string, subject session.Subject, providerModel string, selected profile.Resolved) (session.ReconnectClaims, error) {
 	if isNilReconnectCredentials(h.opts.ReconnectCredentials) {
 		return session.ReconnectClaims{}, session.ErrInvalidReconnectCredential
 	}
@@ -260,6 +268,10 @@ func (h *handler) verifyReconnectCredential(credential string, subject session.S
 		return session.ReconnectClaims{}, admission.ErrForbidden
 	}
 	if claims.Model != providerModel {
+		return session.ReconnectClaims{}, session.ErrInvalidReconnectCredential
+	}
+	if claims.ProfileID != string(selected.Snapshot.Ref.ID) || claims.ProfileVersion != selected.Snapshot.Ref.Version ||
+		claims.ProfileSnapshotHash != selected.Snapshot.SnapshotHash || claims.ProfileEngineVersion != selected.Snapshot.EngineVersion {
 		return session.ReconnectClaims{}, session.ErrInvalidReconnectCredential
 	}
 	return claims, nil

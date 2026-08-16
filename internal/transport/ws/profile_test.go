@@ -5,8 +5,12 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
+	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/profile"
+	"github.com/chuanmingliu/openai-gpt-live/internal/session"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -35,6 +39,48 @@ func TestProfileQueryResolvesExactCustomVersionForNewSession(t *testing.T) {
 	require.Equal(t, []profileResolveCall{{tenant: "tenant-a", ref: profile.VersionRef{ID: "insurance", Version: 3}, purpose: profile.ResolveNewSession}}, resolver.calls)
 	assert.Equal(t, profile.ID("insurance"), got.Snapshot.Ref.ID)
 	assert.Equal(t, uint64(3), got.Snapshot.Ref.Version)
+}
+
+func TestProfileQueryResolvesExactCustomVersionForReconnect(t *testing.T) {
+	resolver := &recordingProfileResolver{resolved: resolvedProfile(t, "tenant-a", "insurance", 3)}
+	got, err := resolveProfileForPurpose(t.Context(), "model=gpt-live&reconnect=1&profile=insurance&profile_version=3", "tenant-a", true, resolver, profile.ResolveReconnect)
+	require.NoError(t, err)
+	require.Equal(t, []profileResolveCall{{tenant: "tenant-a", ref: profile.VersionRef{ID: "insurance", Version: 3}, purpose: profile.ResolveReconnect}}, resolver.calls)
+	assert.Equal(t, profile.ID("insurance"), got.Snapshot.Ref.ID)
+}
+
+func TestReconnectCredentialRequiresExactResolvedProfile(t *testing.T) {
+	manual := clock.NewManual(time.Unix(20_000, 0))
+	authority, err := session.NewReconnectCredentials([]byte(strings.Repeat("p", 32)), manual)
+	require.NoError(t, err)
+	selected := resolvedProfile(t, "tenant-a", "insurance", 3)
+	claims := session.ReconnectClaims{
+		Scope:     handoff.Scope{TenantID: "tenant-a", UserID: "user-a", ConversationID: "conversation-a"},
+		SessionID: "session-a", Incarnation: 1, Model: "provider", ExpiresAt: manual.Now().Add(time.Minute),
+		ProfileID: string(selected.Snapshot.Ref.ID), ProfileVersion: selected.Snapshot.Ref.Version,
+		ProfileSnapshotHash: selected.Snapshot.SnapshotHash, ProfileEngineVersion: selected.Snapshot.EngineVersion,
+	}
+	issued, err := authority.Issue(claims)
+	require.NoError(t, err)
+	h := &handler{opts: Options{ReconnectCredentials: authority}}
+	subject := session.Subject{TenantID: "tenant-a", UserID: "user-a"}
+	_, err = h.verifyReconnectCredential(issued.Credential, subject, "provider", selected)
+	require.NoError(t, err)
+
+	different := selected.Clone()
+	different.Snapshot.AdapterRegistryVersion = "different-v1"
+	different.Snapshot.SnapshotHash = ""
+	different.Snapshot.SnapshotHash, err = different.Snapshot.Hash()
+	require.NoError(t, err)
+	_, err = h.verifyReconnectCredential(issued.Credential, subject, "provider", different)
+	require.ErrorIs(t, err, session.ErrInvalidReconnectCredential)
+}
+
+func TestReconnectProfileRevocationFailsAtResolutionBoundary(t *testing.T) {
+	resolver := &recordingProfileResolver{err: profile.ErrProfileRevoked}
+	_, err := resolveProfileForPurpose(t.Context(), "reconnect=1&profile=insurance&profile_version=3", "tenant-a", true, resolver, profile.ResolveReconnect)
+	require.ErrorIs(t, err, errProfileForbidden)
+	require.Equal(t, []profileResolveCall{{tenant: "tenant-a", ref: profile.VersionRef{ID: "insurance", Version: 3}, purpose: profile.ResolveReconnect}}, resolver.calls)
 }
 
 func TestProfileQueryDefaultsToOwnedBuiltinWithoutResolver(t *testing.T) {
