@@ -62,10 +62,6 @@ func (store *fakeKnowledgeStore) Tombstone(context.Context, string, knowledge.Ve
 	return errors.New("unused")
 }
 
-func (store *fakeKnowledgeStore) Search(context.Context, knowledge.SearchRequest) ([]knowledge.Excerpt, error) {
-	return nil, errors.New("unused")
-}
-
 func storedVersion(tenantID, packID string, number uint64, body string) knowledge.Version {
 	version := knowledge.Version{
 		TenantID:  tenantID,

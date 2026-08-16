@@ -52,7 +52,9 @@ type SearchRequest struct {
 	MaxResults int
 }
 
-// Store persists immutable knowledge versions for one deployment.
+// Store persists immutable knowledge versions for one deployment. It has no
+// search method on purpose: ranking happens in Go over versions the caller has
+// already resolved, so a result can always name the exact version behind it.
 //
 // Resolve reports (Version, false, nil) for a reference that does not exist for
 // this tenant - absence is not an error, so a caller cannot distinguish "wrong
@@ -63,5 +65,4 @@ type Store interface {
 	Resolve(context.Context, string, VersionRef) (Version, bool, error)
 	List(context.Context, string, string, int) ([]Version, error)
 	Tombstone(context.Context, string, VersionRef, string, time.Time) error
-	Search(context.Context, SearchRequest) ([]Excerpt, error)
 }

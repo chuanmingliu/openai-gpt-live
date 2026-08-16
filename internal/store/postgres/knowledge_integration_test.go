@@ -159,26 +159,36 @@ func TestKnowledgeSearchReadsOnlyPinnedVersionsAndFailsOnAMissingPin(t *testing.
 	pinned, err := store.Publish(t.Context(), knowledgeRecord("tenant-a", "policy",
 		knowledgeExcerpt(0, "waiting period is thirty days")))
 	require.NoError(t, err)
-	later, err := store.Publish(t.Context(), knowledgeRecord("tenant-a", "policy",
+	newer, err := store.Publish(t.Context(), knowledgeRecord("tenant-a", "policy",
 		knowledgeExcerpt(0, "waiting period is sixty days")))
 	require.NoError(t, err)
 
-	excerpts, err := store.Search(t.Context(), knowledge.SearchRequest{
-		TenantID: "tenant-a", Refs: []knowledge.VersionRef{pinned.Ref}, Query: "waiting", MaxResults: 5,
+	searcher := knowledge.NewSearcher(store)
+	results, err := searcher.Search(t.Context(), knowledge.SearchRequest{
+		TenantID: "tenant-a", Refs: []knowledge.VersionRef{pinned.Ref}, Query: "waiting period", MaxResults: 5,
 	})
 	require.NoError(t, err)
-	require.Len(t, excerpts, 1)
-	assert.Equal(t, "waiting period is thirty days", excerpts[0].Text,
+	require.Len(t, results, 1)
+	assert.Equal(t, "waiting period is thirty days", results[0].Text,
 		"publishing a newer version must not change what a pinned reader sees")
-	assert.NotEqual(t, pinned.Ref.Hash, later.Ref.Hash)
+	assert.Equal(t, pinned.Ref, results[0].Ref, "every result names the exact version behind it")
+	assert.NotEqual(t, newer.Ref.Hash, results[0].Ref.Hash)
 
 	absent := pinned.Ref
 	absent.Version = 99
-	_, err = store.Search(t.Context(), knowledge.SearchRequest{
-		TenantID: "tenant-a", Refs: []knowledge.VersionRef{absent}, Query: "waiting",
+	_, err = searcher.Search(t.Context(), knowledge.SearchRequest{
+		TenantID: "tenant-a", Refs: []knowledge.VersionRef{absent}, Query: "waiting period",
 	})
 	assert.ErrorIs(t, err, knowledge.ErrKnowledgeNotFound,
 		"answering from less material than the pin promised is worse than failing")
+
+	// Tokens must survive the database round-trip, or ranking silently
+	// degrades to phrase-only matching.
+	resolved, ok, err := store.Resolve(t.Context(), "tenant-a", pinned.Ref)
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.NotEmpty(t, resolved.Excerpts[0].Tokens)
+	assert.Equal(t, knowledge.Tokenize(resolved.Excerpts[0].Text), resolved.Excerpts[0].Tokens)
 }
 
 func TestKnowledgeListIsNewestFirstAndBounded(t *testing.T) {

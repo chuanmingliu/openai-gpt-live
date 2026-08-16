@@ -43,10 +43,6 @@ func (store knowledgeStore) Tombstone(ctx context.Context, tenantID string, ref 
 	return store.repository.tombstoneKnowledge(ctx, tenantID, ref, actor, at)
 }
 
-func (store knowledgeStore) Search(ctx context.Context, request knowledge.SearchRequest) ([]knowledge.Excerpt, error) {
-	return store.repository.searchKnowledge(ctx, request)
-}
-
 // CreateDraft validates and returns normalized draft material without
 // persisting it. Drafts are deliberately not durable: the operator previews the
 // exact content hash, then publishes that hash, so an unreviewed draft can
@@ -282,36 +278,6 @@ func (r *Repository) tombstoneKnowledge(ctx context.Context, tenantID string, re
 		return knowledge.ErrKnowledgeNotFound
 	}
 	return nil
-}
-
-// Search returns excerpts from the exact pinned versions only. Ranking is not
-// performed here: the caller ranks in Go so ordering is identical regardless of
-// database collation or planner choices.
-func (r *Repository) searchKnowledge(ctx context.Context, request knowledge.SearchRequest) ([]knowledge.Excerpt, error) {
-	if err := validateKnowledgeRepository(r, ctx); err != nil {
-		return nil, err
-	}
-	if !validProfileIdentifier(request.TenantID) || len(request.Refs) == 0 {
-		return nil, knowledge.ErrInvalidKnowledge
-	}
-	excerpts := make([]knowledge.Excerpt, 0, len(request.Refs)*8)
-	for _, ref := range request.Refs {
-		if ref.Validate() != nil {
-			return nil, knowledge.ErrInvalidKnowledge
-		}
-		version, ok, err := r.resolveKnowledge(ctx, request.TenantID, ref)
-		if err != nil {
-			return nil, err
-		}
-		if !ok {
-			// A pinned version that no longer resolves is a hard failure: the
-			// alternative is silently answering from less material than the
-			// publication promised.
-			return nil, knowledge.ErrKnowledgeNotFound
-		}
-		excerpts = append(excerpts, version.Excerpts...)
-	}
-	return excerpts, nil
 }
 
 func (r *Repository) loadKnowledgeExcerpts(ctx context.Context, tenantID string, ref knowledge.VersionRef) ([]knowledge.Excerpt, error) {
