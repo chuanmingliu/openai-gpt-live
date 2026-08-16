@@ -179,7 +179,7 @@ func TestToolInvocationScopeRefusalClassificationIsExact(t *testing.T) {
 
 func TestKnowledgePackMigrationEmbeddedChecksums(t *testing.T) {
 	want := map[string]string{
-		"000010_knowledge_packs.up.sql":   "dcf2324e6d973f6c011e7b5bda19651368432d3763caa40097cf06fee2292b13",
+		"000010_knowledge_packs.up.sql":   "451b5ae4e890249b5341feeb7bf48d62db00c6a331c90da1958c4a7dba279e36",
 		"000010_knowledge_packs.down.sql": "4be578f7067f55842e24c41df4b05e165de3ad4a5c470c977a06e4b529cd40ec",
 	}
 	for name, checksum := range want {

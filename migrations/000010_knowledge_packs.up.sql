@@ -70,9 +70,12 @@ CREATE TABLE knowledge_excerpts (
         AND octet_length(body) = body_bytes
     ),
     CONSTRAINT knowledge_excerpts_hash_check CHECK (excerpt_hash ~ '^[0-9a-f]{64}$'),
+    -- array_length and array_ndims return NULL for an empty array, and a NULL
+    -- CHECK is satisfied, so both are coalesced. Zero tokens is legal: a
+    -- paragraph of only punctuation has no lexical index but is still content.
     CONSTRAINT knowledge_excerpts_tokens_check CHECK (
-        array_ndims(tokens) = 1
-        AND array_length(tokens, 1) BETWEEN 1 AND 1024
+        COALESCE(array_ndims(tokens), 1) = 1
+        AND COALESCE(array_length(tokens, 1), 0) <= 1024
         AND array_position(tokens, NULL) IS NULL
     ),
     CONSTRAINT knowledge_excerpts_citation_check CHECK (

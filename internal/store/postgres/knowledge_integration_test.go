@@ -16,7 +16,7 @@ func knowledgeExcerpt(ordinal int, text string) knowledge.Excerpt {
 	return knowledge.Excerpt{
 		Ordinal: ordinal,
 		Text:    text,
-		Tokens:  []string{"coverage", "waiting"},
+		Tokens:  knowledge.Tokenize(text),
 		Citation: knowledge.Citation{
 			SourceTitle: "policy.md",
 			Section:     "Coverage",

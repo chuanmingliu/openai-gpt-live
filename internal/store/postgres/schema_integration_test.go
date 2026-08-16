@@ -306,7 +306,6 @@ func TestSchemaMigrationLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, uint(10), version)
 	assert.False(t, dirty)
-	stepDownTo(t, pool, 9)
 	var journalPresent bool
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
 	assert.True(t, journalPresent)
@@ -327,7 +326,7 @@ func TestSchemaMigrationLifecycle(t *testing.T) {
 	}
 	require.NoError(t, migrations.Down(t.Context(), pool))
 	require.NoError(t, migrations.Up(t.Context(), pool))
-	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
+	stepDownTo(t, pool, 8)
 	version, dirty, err = migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
 	assert.Equal(t, uint(8), version)
@@ -401,16 +400,6 @@ func TestSchemaProfileV9UpDownUpCatalogAndConstraints(t *testing.T) {
 		(tenant_id,content_hash,media_type,content,content_bytes,created_at)
 		VALUES ('tenant-v9',$1,'text/plain; charset=utf-8',''::bytea,0,$2)`, strings.Repeat("a", 64), profileTestCatalogTime())
 	require.NoError(t, err, "zero-byte deterministic templates are valid")
-	_, err = pool.Exec(t.Context(), `INSERT INTO knowledge_versions
-		(tenant_id,pack_id,version,content_hash,title,media_type,excerpt_count,content_bytes,published_at,published_by)
-		VALUES ('tenant-c','pack-c',1,$1,'policy.md','text/markdown',1,4,CURRENT_TIMESTAMP,'operator')`,
-		strings.Repeat("a", 64))
-	require.NoError(t, err)
-	_, err = pool.Exec(t.Context(), `INSERT INTO knowledge_excerpts
-		(tenant_id,pack_id,version,ordinal,body,body_bytes,excerpt_hash,tokens,source_title,section,page)
-		VALUES ('tenant-c','pack-c',1,0,'body',4,$1,ARRAY['body'],'policy.md','',0)`,
-		strings.Repeat("b", 64))
-	require.NoError(t, err)
 	_, err = pool.Exec(t.Context(), `INSERT INTO profile_blobs
 		(tenant_id,content_hash,media_type,content,content_bytes,created_at)
 		VALUES ('tenant-v9',$1,'text/plain; charset=utf-8',''::bytea,524289,$2)`, strings.Repeat("b", 64), profileTestCatalogTime())
@@ -1113,6 +1102,16 @@ func TestSchemaEveryNamedCheckRejectsInvalidMutation(t *testing.T) {
 		VALUES ('reconnect-c','tenant-c','user-c','conversation-c',1,0,'model-c',0,
 		'credential-c','owner-c','active',CURRENT_TIMESTAMP+interval '5 minutes',CURRENT_TIMESTAMP+interval '1 minute')`)
 	require.NoError(t, err)
+	_, err = pool.Exec(t.Context(), `INSERT INTO knowledge_versions
+		(tenant_id,pack_id,version,content_hash,title,media_type,excerpt_count,content_bytes,published_at,published_by)
+		VALUES ('tenant-c','pack-c',1,$1,'policy.md','text/markdown',1,4,CURRENT_TIMESTAMP,'operator')`,
+		strings.Repeat("a", 64))
+	require.NoError(t, err)
+	_, err = pool.Exec(t.Context(), `INSERT INTO knowledge_excerpts
+		(tenant_id,pack_id,version,ordinal,body,body_bytes,excerpt_hash,tokens,source_title,section,page)
+		VALUES ('tenant-c','pack-c',1,0,'body',4,$1,ARRAY['body'],'policy.md','',0)`,
+		strings.Repeat("b", 64))
+	require.NoError(t, err)
 	_, err = pool.Exec(t.Context(), `INSERT INTO profile_blobs
 		(tenant_id,content_hash,media_type,content,content_bytes,created_at)
 		VALUES ('tenant-c',$1,'text/plain; charset=utf-8','x'::bytea,1,CURRENT_TIMESTAMP)`, strings.Repeat("a", 64))
@@ -1158,7 +1157,7 @@ func TestSchemaEveryNamedCheckRejectsInvalidMutation(t *testing.T) {
 		"knowledge_excerpts_ordinal_check":                         `UPDATE knowledge_excerpts SET ordinal=2048 WHERE pack_id='pack-c'`,
 		"knowledge_excerpts_body_check":                            `UPDATE knowledge_excerpts SET body_bytes=5 WHERE pack_id='pack-c'`,
 		"knowledge_excerpts_hash_check":                            `UPDATE knowledge_excerpts SET excerpt_hash='short' WHERE pack_id='pack-c'`,
-		"knowledge_excerpts_tokens_check":                          `UPDATE knowledge_excerpts SET tokens=ARRAY[]::TEXT[] WHERE pack_id='pack-c'`,
+		"knowledge_excerpts_tokens_check":                          `UPDATE knowledge_excerpts SET tokens=array_fill('x'::text, ARRAY[1025]) WHERE pack_id='pack-c'`,
 		"knowledge_excerpts_citation_check":                        `UPDATE knowledge_excerpts SET source_title='' WHERE pack_id='pack-c'`,
 		"profile_versions_state_check":                             `UPDATE profile_versions SET active=true WHERE profile_id='profile-c'`,
 		"session_reconnect_owners_identifiers_check":               `UPDATE session_reconnect_owners SET owner_id='' WHERE session_id='reconnect-c'`,
