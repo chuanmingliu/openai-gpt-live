@@ -89,7 +89,7 @@ Provider credentials do not expose async delegation by themselves.
 2. Keep the PostgreSQL runtime `handoffs_enabled` authority enabled. Fresh migrations initialize it enabled; existing environments may not.
 3. Verify `/v1/realtime/capabilities` includes `live.handoff.*` and the gateway injects all three reserved tools.
 
-The checked-in production template leaves the static flag off. Enabling it requires a reviewed, synchronized edit to both `deploy/config/production.yaml` and `deploy/k8s/base/production.yaml`; static deployment verification rejects drift.
+The checked-in production template enables the static flag. Changing it requires a synchronized edit to both `deploy/config/production.yaml` and `deploy/k8s/base/production.yaml`; static deployment verification rejects drift.
 
 Optional side-effecting tools are separate:
 

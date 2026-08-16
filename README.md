@@ -174,7 +174,7 @@ Clients cannot define, replace, or remove those names. With static handoffs disa
 
 Local mode intentionally rejects `features.handoffs: true` because it lacks the production durable coordinator composition. Use the disposable production-like chaos topology for local end-to-end handoff testing, or deploy the validated production topology. Do not bypass this by weakening validation.
 
-The checked-in production template leaves static handoffs disabled. Enabling them is a reviewed source change: update both [deploy/config/production.yaml](deploy/config/production.yaml) and its synchronized [Kubernetes copy](deploy/k8s/base/production.yaml), then run `make verify-deploy-static`. Editing only one copy fails drift validation.
+The checked-in production template enables static handoffs (`features.handoffs: true`) so DeepSeek can take durable background work. Runtime authority remains a separate PostgreSQL flag. Changing only one of [deploy/config/production.yaml](deploy/config/production.yaml) or its synchronized [Kubernetes copy](deploy/k8s/base/production.yaml) fails drift validation; run `make verify-deploy-static` after editing either copy.
 
 Runtime enable/disable is an authenticated, audited operation on the loopback admin listener:
 

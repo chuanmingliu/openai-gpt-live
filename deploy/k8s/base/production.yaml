@@ -66,6 +66,7 @@ worker:
     model: deepseek-chat
     api_key_env: DEEPSEEK_API_KEY
 features:
+  handoffs: true
   side_effecting_tools: true
   tool_encryption_key_env: LIVE_TOOL_ENCRYPTION_KEY
   tool_encryption_key_id: production-tools-v1
