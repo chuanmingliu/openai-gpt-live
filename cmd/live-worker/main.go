@@ -446,7 +446,7 @@ func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecret
 		FeatureGates: gates,
 		Retry:        worker.RetryPolicy{Base: cfg.Worker.RetryBase, Maximum: cfg.Worker.RetryMax, MaxRetries: uint32(cfg.Worker.MaxRetries)}, WorkerID: workerIdentity(),
 		LeaseDuration: cfg.Worker.LeaseDuration, HeartbeatInterval: cfg.Worker.HeartbeatInterval, Concurrency: cfg.Worker.Concurrency,
-		PollInterval: cfg.Worker.PollInterval, MaxOutputBytes: cfg.Worker.MaxOutputBytes, MaxOutputTokens: cfg.Worker.MaxOutputTokens, MaxToolRounds: cfg.Worker.MaxToolRounds, MaxToolCalls: 64,
+		PollInterval: cfg.Worker.PollInterval, MaxOutputBytes: cfg.Worker.MaxOutputBytes, MaxOutputTokens: cfg.Worker.MaxOutputTokens, MaxToolRounds: cfg.Worker.MaxToolRounds, MaxToolCalls: 64, SpeakBy: cfg.Worker.SpeakBy,
 		MaxToolArgumentBytes: minInt(cfg.Worker.MaxOutputBytes, 256<<10), MaxToolOutputBytes: minInt(cfg.Worker.MaxOutputBytes, 256<<10),
 		ProviderSafetyID: func(tenant, user string) (string, error) { return safety.ProviderSafetyID(privacyKey, tenant, user) },
 		Metrics: worker.MetricsHooks{Queue: func(d time.Duration) { metrics.WorkerQueue.WithLabelValues("ok").Observe(d.Seconds()) }, FirstToken: func(d time.Duration) { metrics.ReasonerFirstToken.WithLabelValues("ok").Observe(d.Seconds()) }, Duration: func(d time.Duration, result string) {

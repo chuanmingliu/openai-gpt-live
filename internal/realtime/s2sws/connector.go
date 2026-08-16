@@ -37,6 +37,7 @@ var (
 	ErrImplicitAggregateFull = errors.New("implicit response aggregate buffer limit exceeded")
 	ErrImplicitResponseLimit = errors.New("implicit unbound response limit exceeded")
 	ErrPendingResponseLimit  = errors.New("pending explicit response limit exceeded")
+	ErrReceiveQueueFull      = errors.New("realtime receive queue is full")
 	ErrSessionClosed         = errors.New("realtime WebSocket session closed")
 )
 
@@ -197,6 +198,7 @@ type voiceSession struct {
 	implicitUnbound        int
 	implicitBufferedEvents int
 	implicitBufferedBytes  int
+	orphanMediaDropped     int
 
 	terminalOnce      sync.Once
 	terminalMu        sync.RWMutex
@@ -616,6 +618,10 @@ func (s *voiceSession) handleMapped(mapped mappedServerEvent) error {
 	}
 	correlation, exists := s.responses[mapped.event.ResponseID]
 	if !exists {
+		if orphanMediaEvent(mapped.event.Kind) {
+			s.orphanMediaDropped++
+			return nil
+		}
 		return fmt.Errorf("%w: %q", ErrUnknownResponseEpoch, mapped.event.ResponseID)
 	}
 	if correlation.bound {
@@ -835,6 +841,15 @@ func (s *voiceSession) trimResponseHistory() error {
 	return nil
 }
 
+func orphanMediaEvent(kind realtime.EventKind) bool {
+	switch kind {
+	case realtime.EventAudioDelta, realtime.EventAudioDone, realtime.EventTranscriptDelta, realtime.EventTranscriptDone:
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *voiceSession) deliver(ctx context.Context, event realtime.Event) error {
 	select {
 	case s.events <- cloneEvent(event):
@@ -843,6 +858,8 @@ func (s *voiceSession) deliver(ctx context.Context, event realtime.Event) error 
 		return ctx.Err()
 	case <-s.done:
 		return s.sessionError()
+	default:
+		return ErrReceiveQueueFull
 	}
 }
 

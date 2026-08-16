@@ -14,15 +14,22 @@ This process is a credential-injecting edge, not an OIDC login broker. Put it on
 2. Gateway advertised model matches `-model` (Compose default: `gpt-live-simulator`).
 3. The named bearer environment variable equals a credential the gateway will accept (local static bearer, or the production workload identity the gateway expects).
 4. DeepSeek key is in the worker environment (`DEEPSEEK_API_KEY`) if handoffs are enabled.
+5. End-to-end DeepSeek handoffs require production or chaos composition (local Compose still refuses `features.handoffs`). Background work appears in the browser as `live.handoff.*` status, not as automatic speech.
 
 ## Local
+
+1. From `deploy/`, start PostgreSQL, speech-to-speech, gateway, and worker (`docker compose up -d`) after exporting the Compose secrets listed in the root README. The gateway listens on `127.0.0.1:18080`.
+2. In the repo root, export the demo bearer from the same local static token the gateway accepts:
 
 ```sh
 export LIVE_DEMO_BEARER="$LIVE_STATIC_BEARER_TOKEN"
 make demo-live-client
 ```
 
-Open `http://127.0.0.1:3000`. Click Start, grant the microphone, speak, interrupt playback by speaking, then Stop.
+3. Open `http://127.0.0.1:3000`. The Setup widget on the page checks BFF readiness and whether the gateway host accepts TCP. Click Recheck after Compose finishes.
+4. Click Start, grant the microphone, speak, interrupt playback by speaking, then Stop.
+
+Focused processes instead of Compose: migrate, then `go run ./cmd/live-gateway` and `go run ./cmd/live-worker` as in the root README, then the same `make demo-live-client` step.
 
 ```sh
 curl --fail http://127.0.0.1:3000/health/live

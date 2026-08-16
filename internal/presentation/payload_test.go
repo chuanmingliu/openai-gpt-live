@@ -37,6 +37,18 @@ func TestSanitizeActualWorkerRecordsStripsInternalMetadata(t *testing.T) {
 	}
 }
 
+func TestSanitizeSpeakByProgressPublishesAllowlistedCodeOnly(t *testing.T) {
+	payload, err := json.Marshal(worker.ProgressRecord{
+		MutationID: "mutation-secret", ExpectedObjectiveRevision: 9, Sequence: 3,
+		Summary: "still working", Code: worker.ProgressSpeakByDeadline,
+	})
+	require.NoError(t, err)
+	public, err := SanitizeEvent(handoff.Event{Kind: "handoff.progress", State: handoff.StateRunning, Payload: payload})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"summary":"still working","code":"speak_by_deadline"}`, string(public.Details))
+	assert.NotContains(t, string(public.Details), "mutation-secret")
+}
+
 func TestSanitizeApprovalOutcomesAreContentFreeAndPresentationSafe(t *testing.T) {
 	tests := []struct {
 		kind, outcome, want string

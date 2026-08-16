@@ -246,6 +246,9 @@ func (r *Repository) AppendProgress(ctx context.Context, token worker.LeaseToken
 	if err := bounded("progress summary", record.Summary, 16*1024, true); err != nil {
 		return err
 	}
+	if record.Code != "" && record.Code != worker.ProgressSpeakByDeadline {
+		return fmt.Errorf("%w: progress code is not allowlisted", handoff.ErrInvalidRequest)
+	}
 	if record.Sequence > math.MaxInt64 {
 		return fmt.Errorf("%w: progress sequence out of range", handoff.ErrInvalidRequest)
 	}

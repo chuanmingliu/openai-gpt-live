@@ -625,6 +625,7 @@ type runState struct {
 	externalProgress *sequenceProgress
 	pendingVoice     atomic.Int64
 	handoffEpoch     atomic.Uint64
+	liveBarge        atomic.Bool
 }
 
 func NewManager(cfg Config, connector realtime.Connector, ids IDGenerator) *Manager {
@@ -2796,6 +2797,16 @@ func (s *runState) voiceReader(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		if event.Kind == realtime.EventSpeechStarted {
+			if s.liveBarge.CompareAndSwap(false, true) {
+				event.Epoch = s.fence.Advance()
+			} else {
+				event.Epoch = s.fence.Current()
+			}
+		}
+		if event.Kind == realtime.EventSpeechStopped {
+			s.liveBarge.Store(false)
+		}
 		if streamHasAudio && !s.fence.Accept(streamEpoch) {
 			framer.reset()
 			streamHasAudio = false
@@ -2803,12 +2814,18 @@ func (s *runState) voiceReader(ctx context.Context) error {
 		}
 		if event.Kind == realtime.EventAudioDelta {
 			if event.ResponseID == "" || event.ItemID == "" || event.Epoch == 0 {
-				return errors.New("provider audio requires response ID, item ID, and epoch")
+				s.metrics.StaleOutputRejected()
+				if len(event.Audio) > 0 {
+					s.metrics.audioDropped(len(event.Audio))
+				}
+				continue
 			}
 			if streamHasAudio && (streamResponse != event.ResponseID || streamItem != event.ItemID || streamEpoch != event.Epoch) {
 				return errors.New("provider audio response changed before audio.done")
 			}
 			if !s.fence.Accept(event.Epoch) {
+				s.metrics.audioDropped(len(event.Audio))
+				s.metrics.BargeinSuppression(20 * time.Millisecond)
 				continue
 			}
 			if s.shadowHandoffEpoch(event.Epoch) {
@@ -2864,9 +2881,18 @@ func (s *runState) voiceReader(ctx context.Context) error {
 		}
 
 		latest := s.latestEgressSequence()
-		if err := s.enqueueReactorSync(ctx, reactorMessage{
+		message := reactorMessage{
 			input: VoiceInput{Incarnation: s.ids.Incarnation, Event: event}, egressAfter: latest,
-		}); err != nil {
+		}
+		// Created must reach the client before later PCM for the same response.
+		// deliver() is fail-closed, so this wait cannot deadlock the mapping loop.
+		if event.Kind == realtime.EventResponseCreated {
+			if err := s.enqueueReactorSync(ctx, message); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := s.enqueueReactor(message); err != nil {
 			return err
 		}
 	}
@@ -2930,6 +2956,18 @@ func (s *runState) reactorLoop(ctx context.Context) error {
 					case <-gate:
 					}
 				}
+			}
+			if voice, ok := message.input.(VoiceInput); ok &&
+				voice.Event.Kind == realtime.EventResponseCreated &&
+				voice.Event.NeedsEpochBinding &&
+				s.liveBarge.Load() {
+				s.metrics.StaleOutputRejected()
+				s.controlApplied.Store(message.controlSequence)
+				s.inboxSlots <- struct{}{}
+				if message.done != nil {
+					message.done <- nil
+				}
+				continue
 			}
 			dispatchCtx, finishDispatch := offerDispatchContext(ctx, message.offerCtx)
 			effects, err := reactor.ApplyContext(dispatchCtx, message.input)

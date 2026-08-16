@@ -17,7 +17,7 @@ import (
 
 func TestStaticAssetsCarryStrictHeaders(t *testing.T) {
 	handler := mustTestHandler(t, nil)
-	for _, path := range []string{"/", "/styles.css", "/app.js", "/audio-core.mjs", "/capture-worklet.js", "/playback-worklet.js", "/session-controller.mjs"} {
+	for _, path := range []string{"/", "/styles.css", "/app.js", "/audio-core.mjs", "/capture-worklet.js", "/playback-worklet.js", "/session-controller.mjs", "/setup-panel.mjs"} {
 		request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:3000"+path, nil)
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, request)
@@ -28,9 +28,24 @@ func TestStaticAssetsCarryStrictHeaders(t *testing.T) {
 		assert.Equal(t, "DENY", response.Header().Get("X-Frame-Options"))
 		assert.Equal(t, "same-origin", response.Header().Get("Cross-Origin-Resource-Policy"))
 		assert.Empty(t, response.Header().Get("Strict-Transport-Security"))
-		assert.NotContains(t, response.Body.String(), "LIVE_DEMO_BEARER")
 		assert.NotContains(t, response.Body.String(), "Authorization")
+		assert.NotContains(t, response.Body.String(), "sentinel")
 	}
+}
+
+func TestSetupStatusIsContentFreeAndReportsMode(t *testing.T) {
+	handler := mustTestHandler(t, nil)
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:3000/setup", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	assert.Equal(t, http.StatusOK, response.Code)
+	assert.Equal(t, "application/json; charset=utf-8", response.Header().Get("Content-Type"))
+	assert.NotContains(t, response.Body.String(), "sentinel")
+	assert.NotContains(t, response.Body.String(), "Authorization")
+	assert.NotContains(t, response.Body.String(), "LIVE_DEMO_BEARER=")
+	assert.Contains(t, response.Body.String(), `"mode":"local"`)
+	assert.Contains(t, response.Body.String(), `"gateway_host":"127.0.0.1:18080"`)
+	assert.Contains(t, response.Body.String(), `"model":"gpt-live-simulator"`)
 }
 
 func TestHealthReadyIsContentFree(t *testing.T) {

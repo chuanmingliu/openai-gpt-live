@@ -534,6 +534,70 @@ func TestSpeechEdgesAndExplicitCancelFenceInOrder(t *testing.T) {
 	})
 }
 
+func TestBackchannelTranscriptIsNotDurableWork(t *testing.T) {
+	reactor, _ := testReactor(1)
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventSpeechStarted, ItemID: "ack-turn",
+	}))
+	effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "ack-turn", Text: "mm-hmm",
+	}))
+	require.Len(t, effects, 1)
+	assert.Nil(t, effects[0].Transcript)
+	assert.Equal(t, "conversation.item.input_audio_transcription.completed", effects[0].ClientEvent.EventType())
+}
+
+func TestSpeechStartedUsesPreAdvancedFenceWithoutSecondBump(t *testing.T) {
+	reactor, fence := testReactor(1)
+	startStreaming(t, reactor, "response-1")
+	before := fence.Current()
+	advanced := fence.Advance()
+	effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventSpeechStarted, ItemID: "user-turn", Epoch: advanced,
+	}))
+	assert.Equal(t, advanced, fence.Current())
+	assert.NotEqual(t, before, fence.Current())
+	require.NotEmpty(t, effects)
+	assert.Equal(t, advanced, effects[0].FlushBefore)
+}
+
+func TestLateInputTranscriptionForSupersededTurnIsDropped(t *testing.T) {
+	reactor, _ := testReactor(1)
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventSpeechStarted, ItemID: "turn-a",
+	}))
+	first := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-a", Text: "hello",
+	}))
+	require.NotNil(t, first[0].Transcript)
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventSpeechStarted, ItemID: "turn-b",
+	}))
+	require.Equal(t, identity.TurnKey{ID: "turn-b", Revision: 2}, reactor.activeTurn.key)
+
+	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionDelta, ItemID: "turn-a", Text: " late",
+	})))
+	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-a", Text: "hello late",
+	})))
+	require.Equal(t, identity.TurnKey{ID: "turn-b", Revision: 2}, reactor.activeTurn.key)
+	assert.Empty(t, reactor.activeTurn.transcript)
+}
+
+func TestImplicitCreatedWhileUserSpeakingDoesNotBind(t *testing.T) {
+	reactor, fence := testReactor(1)
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventSpeechStarted, ItemID: "user-turn",
+	}))
+	before := reactor.Snapshot()
+	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventResponseCreated, ResponseID: "implicit", Status: "in_progress", NeedsEpochBinding: true,
+	})))
+	assertSnapshotAndEpochUnchanged(t, before, fence.Current(), reactor)
+	assert.Equal(t, ResponseIdle, reactor.Snapshot().Response)
+}
+
 func TestDifferentSpeechItemWhileSpeakingSupersedesCommittedEligibility(t *testing.T) {
 	reactor, _ := testReactor(1)
 	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
@@ -2403,6 +2467,11 @@ func TestTurnRevisionOverflowRejectsInputBoundariesWithoutMutation(t *testing.T)
 				Kind:     DurableKindTurnProvisional,
 				Payload:  committedTurnPayload(identity.TurnKey{ID: "last", Revision: ^uint32(0)}),
 			})
+			if test.name == "transcription" {
+				applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+					Kind: realtime.EventTranscriptionCompleted, ItemID: "last", Text: "done",
+				}))
+			}
 			before := mutationView(reactor)
 			effects, err := reactor.Apply(test.input(reactor))
 			require.EqualError(t, err, "session turn revision exhausted")

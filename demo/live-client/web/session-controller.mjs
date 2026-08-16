@@ -1,10 +1,12 @@
 const MAX_TURNS = 50;
+const MAX_HANDOFFS = 16;
 const MAX_AUDIO_B64 = 64 * 1024;
 
 export class SessionController {
   constructor() {
     this.generation = 1;
     this.turns = [];
+    this.handoffs = [];
     this.userOpen = null;
     this.assistantOpen = null;
     this.status = "idle";
@@ -13,11 +15,12 @@ export class SessionController {
 
   start() {
     this.turns = [];
+    this.handoffs = [];
     this.userOpen = null;
     this.assistantOpen = null;
     this.status = "connecting";
     this.generation += 1;
-    return [{ type: "status", value: "connecting" }, { type: "clear-transcript" }, { type: "clear-playback", generation: this.generation }];
+    return [{ type: "status", value: "connecting" }, { type: "clear-transcript" }, { type: "clear-handoffs" }, { type: "clear-playback", generation: this.generation }];
   }
 
   apply(effect) {
@@ -45,6 +48,8 @@ export class SessionController {
       case "assistant-delta":
       case "assistant-done":
         return this.record("assistant", effect.text, effect.type.endsWith("done"));
+      case "handoff":
+        return this.recordHandoff(effect);
       case "error":
         return [effect];
       default:
@@ -70,6 +75,26 @@ export class SessionController {
       out.push({ type: "announce", role, text });
     }
     return out;
+  }
+
+  recordHandoff(effect) {
+    if (!effect.id || typeof effect.id !== "string") {
+      return [];
+    }
+    let item = this.handoffs.find((handoff) => handoff.id === effect.id);
+    if (!item) {
+      item = { id: effect.id, status: effect.status, summary: effect.summary || "" };
+      this.handoffs.push(item);
+      while (this.handoffs.length > MAX_HANDOFFS) {
+        this.handoffs.shift();
+      }
+    } else {
+      item.status = effect.status;
+      if (effect.summary) {
+        item.summary = effect.summary;
+      }
+    }
+    return [{ type: "render-handoff", id: item.id, status: item.status, summary: item.summary }];
   }
 
   setMuted(next) {

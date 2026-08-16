@@ -63,3 +63,10 @@ func TestPolicyDoesNotInventImportantBlockerSchema(t *testing.T) {
 	assert.Equal(t, presentation.Decision{EmitVisual: true}, policy.Decide(presentation.Context{}, important))
 	assert.Equal(t, presentation.Decision{EmitVisual: true}, policy.Decide(presentation.Context{}, ordinary))
 }
+
+func TestPolicySpeaksAllowlistedSpeakByDeadlineOnly(t *testing.T) {
+	policy := presentation.NewPolicy(presentation.Config{MaxSpokenPayloadBytes: 1024})
+	speak := handoff.Event{Kind: "handoff.progress", State: handoff.StateRunning, Payload: json.RawMessage(`{"summary":"still working","code":"speak_by_deadline"}`)}
+	assert.Equal(t, presentation.Decision{EmitVisual: true, SpeakNow: true}, policy.Decide(presentation.Context{}, speak))
+	assert.Equal(t, presentation.Decision{EmitVisual: true, DeferSpeech: true}, policy.Decide(presentation.Context{UserSpeaking: true}, speak))
+}

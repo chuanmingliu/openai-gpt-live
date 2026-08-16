@@ -48,6 +48,13 @@ export class ProtocolState {
         return typeof event.delta === "string" ? [{ type: "audio", encoded: event.delta }] : [{ type: "error", code: "invalid-audio" }];
       case "error":
         return [{ type: "error", code: boundedCode(event.error && event.error.code) }];
+      case "live.handoff.created":
+      case "live.handoff.progress":
+      case "live.handoff.needs_input":
+      case "live.handoff.completed":
+      case "live.handoff.failed":
+      case "live.handoff.cancelled":
+        return this.handoff(event);
       default:
         return [];
     }
@@ -95,6 +102,24 @@ export class ProtocolState {
     return [{ type: "assistant-delta", text: next }];
   }
 
+  handoff(event) {
+    const id = typeof event.handoff_id === "string" ? event.handoff_id : "";
+    if (!validID(id)) {
+      return [{ type: "error", code: "invalid-event" }];
+    }
+    const details = event.details && typeof event.details === "object" ? event.details : {};
+    const summary = typeof details.summary === "string" ? details.summary : (typeof details.message === "string" ? details.message : "");
+    if (summary && !validText(summary)) {
+      return [{ type: "error", code: "invalid-event" }];
+    }
+    return [{
+      type: "handoff",
+      id,
+      status: handoffStatus(event.type, details.code),
+      summary,
+    }];
+  }
+
   assistantDone(id, text) {
     if (!validID(id) || !validText(text)) {
       return [{ type: "error", code: "invalid-transcript" }];
@@ -129,6 +154,25 @@ function rememberSet(set, key) {
   while (set.size > MAX_IDS) {
     const first = set.values().next().value;
     set.delete(first);
+  }
+}
+
+function handoffStatus(type, code) {
+  switch (type) {
+    case "live.handoff.created":
+      return "queued";
+    case "live.handoff.progress":
+      return code === "speak_by_deadline" ? "still-working" : "running";
+    case "live.handoff.needs_input":
+      return "needs-input";
+    case "live.handoff.completed":
+      return "completed";
+    case "live.handoff.failed":
+      return "failed";
+    case "live.handoff.cancelled":
+      return "cancelled";
+    default:
+      return "running";
   }
 }
 

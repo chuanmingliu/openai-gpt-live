@@ -23,6 +23,7 @@ type CreateRequest struct {
 	Objective        string
 	ContextRef       string
 	ContextHash      string
+	ContextPrefix    json.RawMessage
 	Deadline         time.Time
 	TokenBudget      int
 	Priority         int16
@@ -173,6 +174,7 @@ func cloneRequest(in CreateRequest) CreateRequest {
 		out.ToolAllowlist = append([]string{}, in.ToolAllowlist...)
 	}
 	out.ApprovalPolicy = cloneBytes(in.ApprovalPolicy)
+	out.ContextPrefix = cloneBytes(in.ContextPrefix)
 	return out
 }
 

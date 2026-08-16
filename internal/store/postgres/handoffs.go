@@ -19,7 +19,7 @@ import (
 
 const handoffColumns = `
 	id, tenant_id, conversation_id, user_id, session_id, source_turn_id, source_turn_revision,
-	user_request, objective, context_ref, context_hash, deadline, token_budget, priority,
+	user_request, objective, context_ref, context_hash, context_prefix::text, deadline, token_budget, priority,
 	tool_allowlist::text, approval_policy::text, model_version, prompt_version, tool_registry_version,
 	config_version, presentation_hint, idempotency_key, request_hash, state, objective_revision,
 	input_revision, consumed_input_revision, input::text, attempt, retry_count, terminal_mutation_id,
@@ -168,11 +168,11 @@ func (r *Repository) CreateHandoff(ctx context.Context, record handoff.CreateRec
 	err = tx.QueryRow(ctx, `
 		INSERT INTO handoffs (
 			tenant_id, conversation_id, id, user_id, session_id, source_turn_id, source_turn_revision,
-			user_request, objective, context_ref, context_hash, deadline, token_budget, priority,
+			user_request, objective, context_ref, context_hash, context_prefix, deadline, token_budget, priority,
 			tool_allowlist, approval_policy, model_version, prompt_version, tool_registry_version, config_version,
 			presentation_hint, idempotency_key, request_hash, ready_at, created_at, updated_at
 		)
-		SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::json,$16::json,$17,$18,$19,$20,$21,$22,$23,$24,$24,$24
+		SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::json,$13,$14,$15,$16::json,$17::json,$18,$19,$20,$21,$22,$23,$24,$25,$25,$25
 		FROM conversations c WHERE c.tenant_id=$1 AND c.id=$2 AND c.user_id=$4 AND c.status <> 'deleted'
 		  AND EXISTS (SELECT 1 FROM conversation_items i
 		    WHERE i.tenant_id=c.tenant_id AND i.conversation_id=c.id AND i.session_id=$5
@@ -182,7 +182,7 @@ func (r *Repository) CreateHandoff(ctx context.Context, record handoff.CreateRec
 		record.Request.Scope.TenantID, record.Request.Scope.ConversationID, record.HandoffID, record.Request.Scope.UserID,
 		record.Request.SessionID, record.Request.SourceTurn.ID, record.Request.SourceTurn.Revision,
 		record.Request.UserRequest, record.Request.Objective, record.Request.ContextRef, record.Request.ContextHash,
-		record.Request.Deadline, record.Request.TokenBudget, record.Request.Priority, allowlist, record.Request.ApprovalPolicy,
+		nullableJSON(record.Request.ContextPrefix), record.Request.Deadline, record.Request.TokenBudget, record.Request.Priority, allowlist, record.Request.ApprovalPolicy,
 		record.Request.Versions.Model, record.Request.Versions.Prompt, record.Request.Versions.ToolRegistry,
 		record.Request.Versions.Config, record.Request.PresentationHint, record.Request.IdempotencyKey,
 		record.RequestHash, record.CreatedAt).Scan(&insertedID)
@@ -616,16 +616,23 @@ func terminalHandoffState(state handoff.State) bool {
 	}
 }
 
+func nullableJSON(value json.RawMessage) any {
+	if len(value) == 0 {
+		return nil
+	}
+	return append(json.RawMessage(nil), value...)
+}
+
 func loadHandoffRow(row pgx.Row) (handoff.Snapshot, error) {
 	var out handoff.Snapshot
 	var tenant, conversation, user, session, sourceTurn string
 	var sourceRevision, objectiveRevision, inputRevision, consumedInput, attempt, retryCount int64
 	var state string
-	var allowlistRaw, approvalRaw, inputRaw []byte
+	var allowlistRaw, approvalRaw, inputRaw, prefixRaw []byte
 	var mutationID, resultSummary, structured, safetyDecision, usage, failureCode, failureMessage sql.NullString
 	var failureRetryable sql.NullBool
 	err := row.Scan(&out.ID, &tenant, &conversation, &user, &session, &sourceTurn, &sourceRevision,
-		&out.Request.UserRequest, &out.Request.Objective, &out.Request.ContextRef, &out.Request.ContextHash,
+		&out.Request.UserRequest, &out.Request.Objective, &out.Request.ContextRef, &out.Request.ContextHash, &prefixRaw,
 		&out.Request.Deadline, &out.Request.TokenBudget, &out.Request.Priority, &allowlistRaw, &approvalRaw,
 		&out.Request.Versions.Model, &out.Request.Versions.Prompt, &out.Request.Versions.ToolRegistry,
 		&out.Request.Versions.Config, &out.Request.PresentationHint, &out.Request.IdempotencyKey, &out.RequestHash,
@@ -646,6 +653,7 @@ func loadHandoffRow(row pgx.Row) (handoff.Snapshot, error) {
 		return handoff.Snapshot{}, err
 	}
 	out.Request.ApprovalPolicy = append(json.RawMessage(nil), approvalRaw...)
+	out.Request.ContextPrefix = append(json.RawMessage(nil), prefixRaw...)
 	out.State = handoff.State(state)
 	out.ObjectiveRevision, out.InputRevision, out.ConsumedInput = uint32(objectiveRevision), uint32(inputRevision), uint32(consumedInput)
 	out.Input = append(json.RawMessage(nil), inputRaw...)

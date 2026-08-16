@@ -259,7 +259,7 @@ export LIVE_DEMO_BEARER="$LIVE_STATIC_BEARER_TOKEN"
 make demo-live-client
 ```
 
-Open `http://127.0.0.1:3000`. The default upstream is `ws://127.0.0.1:18080/v1/realtime?model=gpt-live-simulator`. See [demo/live-client/README.md](demo/live-client/README.md).
+Open `http://127.0.0.1:3000`. The Setup widget at the top of the page lists the start commands and rechecks BFF readiness plus whether the gateway host accepts TCP. The default upstream is `ws://127.0.0.1:18080/v1/realtime?model=gpt-live-simulator`. See [demo/live-client/README.md](demo/live-client/README.md).
 
 ```sh
 LIVE_DEMO_BEARER=test-only-bearer make test-demo-live-client
@@ -428,7 +428,7 @@ go run ./cmd/live-migrate -direction up
 go run ./cmd/live-migrate -check
 ```
 
-The embedded latest schema is version 7: core handoffs, coordinator journal, tool-scope constraints, runtime feature authority, deletion provenance, reconnect owners, and generation-fenced coordinator delivery shards.
+The embedded latest schema is version 8: core handoffs, coordinator journal, tool-scope constraints, runtime feature authority, deletion provenance, reconnect owners, generation-fenced coordinator delivery shards, and persisted handoff context prefix.
 
 PostgreSQL stores committed text, conversations, handoffs/events, approvals, leases, idempotency, outbox, cursors, reconnect ownership (including response-epoch high water), retention, and runtime authority. It does not store PCM, partial transcripts, VAD/playback state, sockets, or raw DeepSeek deltas. `LISTEN/NOTIFY` is only an optimization; durable polling/cursors repair missed notifications.
 

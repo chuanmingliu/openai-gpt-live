@@ -414,6 +414,9 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 				return nil, err
 			}
 		}
+		if store := app.durable.RecoveryStore; !isNil(store) {
+			app.handoffs.SetContextStore(store)
+		}
 		app.handoffs.tracer = app.tracer
 		app.handoffs.metricsClock = app.presentation.Clock
 		app.handoffs.ackMetric = app.handoffMetrics.Acknowledgement

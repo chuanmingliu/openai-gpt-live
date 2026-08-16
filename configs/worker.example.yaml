@@ -3,6 +3,7 @@
 mode: local
 worker:
   concurrency: 1
+  speak_by: 8s
   reasoner:
     role: async_gpt_5_5
     provider: deepseek

@@ -27,6 +27,7 @@ type PublicEvent struct {
 
 type publicSummary struct {
 	Summary string `json:"summary,omitempty"`
+	Code    string `json:"code,omitempty"`
 }
 
 type publicNeedsInput struct {
@@ -116,7 +117,7 @@ func SanitizeEvent(event handoff.Event) (PublicEvent, error) {
 			return PublicEvent{}, malformed(event, err)
 		}
 		out.Summary = record.Summary
-		details = publicSummary{Summary: record.Summary}
+		details = publicSummary{Summary: record.Summary, Code: publicProgressCode(record.Code)}
 	case "tool.approval_approved":
 		if event.State != handoff.StatePending {
 			return PublicEvent{}, unsupported(event)
@@ -224,6 +225,13 @@ func publicJSON(value json.RawMessage) bool {
 }
 
 func cloneJSON(value json.RawMessage) json.RawMessage { return append(json.RawMessage(nil), value...) }
+
+func publicProgressCode(code string) string {
+	if code == worker.ProgressSpeakByDeadline {
+		return code
+	}
+	return ""
+}
 
 func unsupported(event handoff.Event) error {
 	return fmt.Errorf("%w: %s/%s", ErrUnsupportedEvent, event.Kind, event.State)

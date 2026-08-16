@@ -17,19 +17,20 @@ import (
 )
 
 const (
-	maxUserRequestBytes  = 16 * 1024
-	maxObjectiveBytes    = 8 * 1024
-	maxContextRefBytes   = 2 * 1024
-	maxJSONBytes         = 64 * 1024
-	maxToolNames         = 64
-	maxToolNameBytes     = 256
-	maxIdentityBytes     = 256
-	maxContextHashBytes  = 512
-	maxPresentationBytes = 2 * 1024
-	maxReasonBytes       = 2 * 1024
-	maxSummaryBytes      = 16 * 1024
-	maxJSONDepth         = 64
-	maxPriority          = 1000
+	maxUserRequestBytes   = 16 * 1024
+	maxObjectiveBytes     = 8 * 1024
+	maxContextRefBytes    = 2 * 1024
+	maxJSONBytes          = 64 * 1024
+	maxToolNames          = 64
+	maxToolNameBytes      = 256
+	maxIdentityBytes      = 256
+	maxContextHashBytes   = 512
+	maxContextPrefixBytes = 64 << 10
+	maxPresentationBytes  = 2 * 1024
+	maxReasonBytes        = 2 * 1024
+	maxSummaryBytes       = 16 * 1024
+	maxJSONDepth          = 64
+	maxPriority           = 1000
 )
 
 func ValidateTransition(from, to State) error {
@@ -106,6 +107,13 @@ func normalizeCreateRequest(request CreateRequest, now time.Time, checkFuture bo
 	if err := boundedRequired("context hash", request.ContextHash, maxContextHashBytes); err != nil {
 		return CreateRequest{}, err
 	}
+	if len(request.ContextPrefix) > 0 {
+		prefix, err := canonicalJSON(request.ContextPrefix, maxContextPrefixBytes, maxJSONDepth)
+		if err != nil || len(prefix) == 0 || prefix[0] != '[' {
+			return CreateRequest{}, invalid("context prefix", err)
+		}
+		request.ContextPrefix = prefix
+	}
 	if request.Deadline.IsZero() || (checkFuture && !request.Deadline.After(now)) {
 		return CreateRequest{}, invalid("deadline must be in the future", nil)
 	}
@@ -169,6 +177,7 @@ func CanonicalRequestHash(request CreateRequest) (string, error) {
 		Objective        string          `json:"objective"`
 		ContextRef       string          `json:"context_ref"`
 		ContextHash      string          `json:"context_hash"`
+		ContextPrefix    json.RawMessage `json:"context_prefix,omitempty"`
 		Deadline         string          `json:"deadline"`
 		TokenBudget      int             `json:"token_budget"`
 		Priority         int16           `json:"priority"`
@@ -179,7 +188,8 @@ func CanonicalRequestHash(request CreateRequest) (string, error) {
 	}{
 		Scope: normalized.Scope, SessionID: string(normalized.SessionID), SourceTurnID: normalized.SourceTurn.ID,
 		SourceRevision: normalized.SourceTurn.Revision, UserRequest: normalized.UserRequest, Objective: normalized.Objective,
-		ContextRef: normalized.ContextRef, ContextHash: normalized.ContextHash, Deadline: normalized.Deadline.Format(time.RFC3339Nano),
+		ContextRef: normalized.ContextRef, ContextHash: normalized.ContextHash, ContextPrefix: normalized.ContextPrefix,
+		Deadline:    normalized.Deadline.Format(time.RFC3339Nano),
 		TokenBudget: normalized.TokenBudget, Priority: normalized.Priority, ToolAllowlist: normalized.ToolAllowlist,
 		ApprovalPolicy: normalized.ApprovalPolicy, Versions: normalized.Versions, PresentationHint: normalized.PresentationHint,
 	}

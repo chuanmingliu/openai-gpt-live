@@ -70,12 +70,15 @@ type NeedsInputRecord struct {
 	Schema                    json.RawMessage
 }
 
+const ProgressSpeakByDeadline = "speak_by_deadline"
+
 type ProgressRecord struct {
 	MutationID                string
 	ExpectedObjectiveRevision uint32
 	InputRevision             uint32
 	Sequence                  uint64
 	Summary                   string
+	Code                      string `json:"code,omitempty"`
 }
 
 type CancelledRecord struct {

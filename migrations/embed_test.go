@@ -88,6 +88,19 @@ func TestCoordinatorDeliveryShardMigrationEmbeddedChecksums(t *testing.T) {
 	}
 }
 
+func TestHandoffContextPrefixMigrationEmbeddedChecksums(t *testing.T) {
+	want := map[string]string{
+		"000008_handoff_context_prefix.up.sql":   "d73daafc4ada0e253050cd40b3be58c0afe14fff0170a66e4a8c3c0f68ae11c6",
+		"000008_handoff_context_prefix.down.sql": "828e5e82322a0f03c5a598573ee7b5315cbe8087b1b39f940516f1590defed50",
+	}
+	for name, checksum := range want {
+		contents, err := files.ReadFile(name)
+		require.NoError(t, err)
+		digest := sha256.Sum256(contents)
+		assert.Equal(t, checksum, hex.EncodeToString(digest[:]), name)
+	}
+}
+
 func TestCoordinatorPendingRefusalClassificationIsExact(t *testing.T) {
 	assert.True(t, isCoordinatorPendingRefusal(&pgconn.PgError{Code: "55000", Message: ErrCoordinatorPendingWork.Error()}))
 	assert.False(t, isCoordinatorPendingRefusal(&pgconn.PgError{Code: "57014", Message: ErrCoordinatorPendingWork.Error()}))

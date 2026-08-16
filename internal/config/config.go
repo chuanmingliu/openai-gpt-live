@@ -124,6 +124,7 @@ type WorkerConfig struct {
 	MaxOutputBytes    int            `yaml:"max_output_bytes"`
 	MaxOutputTokens   int            `yaml:"max_output_tokens"`
 	MaxToolRounds     int            `yaml:"max_tool_rounds"`
+	SpeakBy           time.Duration  `yaml:"speak_by"`
 	Reasoner          ReasonerConfig `yaml:"reasoner"`
 }
 
@@ -403,6 +404,9 @@ func (c *Config) applyDefaults() {
 	if c.Worker.MaxToolRounds == 0 {
 		c.Worker.MaxToolRounds = 8
 	}
+	if c.Worker.SpeakBy == 0 {
+		c.Worker.SpeakBy = 8 * time.Second
+	}
 	if c.Safety.PolicyVersion == "" {
 		c.Safety.PolicyVersion = "static-v1"
 	}
@@ -563,6 +567,9 @@ func (c Config) Validate() error {
 	}
 	if c.Worker.MaxOutputBytes <= 0 || c.Worker.MaxOutputTokens <= 0 || c.Worker.MaxToolRounds <= 0 {
 		return errors.New("worker output limits must be positive")
+	}
+	if c.Worker.SpeakBy < 0 || c.Worker.SpeakBy > 2*time.Minute {
+		return errors.New("worker.speak_by is out of bounds")
 	}
 	if safetyPolicyVersion != "static-v1" || safetyMode != "enforce" && safetyMode != "redact" ||
 		c.Safety.MaxInputBytes < 0 || c.Safety.MaxInputBytes > 1<<20 || safetyMaxSummary <= 0 || safetyMaxSummary > 16<<10 ||

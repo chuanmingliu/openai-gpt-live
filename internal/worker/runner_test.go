@@ -1957,6 +1957,104 @@ func TestCanonicalToolArgumentsNormalizesObjectOrderAndNumbers(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestRunnerIncludesCommittedPrefixBeforeUntrustedJobPayload(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	lease := workerLease()
+	prefix, err := reasoner.BuildPrefix("conversation", "", []reasoner.PrefixLine{{Role: "user", Text: "prior turn"}})
+	require.NoError(t, err)
+	lease.Job.Request.ContextPrefix = prefix.Raw
+	lease.Job.Request.ContextHash = prefix.Hash
+	store := &memoryStore{leases: []Lease{lease}, onComplete: cancel}
+	registry, err := NewToolRegistry(map[string][]RegisteredTool{"tools-v1": {}})
+	require.NoError(t, err)
+	stream := streamerFunc(func(_ context.Context, request reasoner.Request, onChunk func(reasoner.Chunk) error) (reasoner.Result, error) {
+		require.Len(t, request.Messages, 3)
+		assert.Contains(t, request.Messages[1].Content, "prior turn")
+		assert.Contains(t, request.Messages[2].Content, "objective sentinel")
+		require.NoError(t, onChunk(reasoner.Chunk{Text: "done"}))
+		return reasoner.Result{Text: "done", FinishReason: "stop"}, nil
+	})
+	runner := testRunner(store, stream, allowPolicy(), clock.Real{}, fixedJitter(0), registry)
+	require.NoError(t, runner.Run(ctx))
+}
+
+func TestRunnerSpeakBySkipsAfterFirstToken(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	store := &memoryStore{leases: []Lease{workerLease()}}
+	registry, err := NewToolRegistry(map[string][]RegisteredTool{"tools-v1": {}})
+	require.NoError(t, err)
+	stream := streamerFunc(func(ctx context.Context, _ reasoner.Request, onChunk func(reasoner.Chunk) error) (reasoner.Result, error) {
+		require.NoError(t, onChunk(reasoner.Chunk{Text: "partial"}))
+		close(started)
+		select {
+		case <-release:
+			return reasoner.Result{Text: "partial done", FinishReason: "stop"}, nil
+		case <-ctx.Done():
+			return reasoner.Result{}, ctx.Err()
+		}
+	})
+	manual := clock.NewManual(time.Now().UTC())
+	runner := testRunner(store, stream, allowPolicy(), manual, fixedJitter(0), registry)
+	runner.SpeakBy = time.Second
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("reasoner did not start")
+	}
+	manual.Advance(time.Second)
+	time.Sleep(20 * time.Millisecond)
+	store.mu.Lock()
+	for _, record := range store.progress {
+		assert.NotEqual(t, ProgressSpeakByDeadline, record.Code)
+	}
+	store.mu.Unlock()
+	cancel()
+	close(release)
+	<-done
+}
+
+func TestRunnerSpeakByEmitsProgressWithoutCompleting(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	store := &memoryStore{leases: []Lease{workerLease()}}
+	registry, err := NewToolRegistry(map[string][]RegisteredTool{"tools-v1": {}})
+	require.NoError(t, err)
+	stream := streamerFunc(func(ctx context.Context, _ reasoner.Request, _ func(reasoner.Chunk) error) (reasoner.Result, error) {
+		close(started)
+		select {
+		case <-release:
+			return reasoner.Result{Text: "late", FinishReason: "stop"}, nil
+		case <-ctx.Done():
+			return reasoner.Result{}, ctx.Err()
+		}
+	})
+	manual := clock.NewManual(time.Now().UTC())
+	runner := testRunner(store, stream, allowPolicy(), manual, fixedJitter(0), registry)
+	runner.SpeakBy = time.Second
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- runner.Run(ctx) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("reasoner did not start")
+	}
+	manual.Advance(time.Second)
+	require.Eventually(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return len(store.progress) > 0 && store.progress[len(store.progress)-1].Code == ProgressSpeakByDeadline
+	}, time.Second, 5*time.Millisecond)
+	assert.Empty(t, store.completed)
+	cancel()
+	close(release)
+	<-done
+}
+
 type repeatingReader struct{ block []byte }
 
 func (r repeatingReader) Read(target []byte) (int, error) { return copy(target, r.block), nil }

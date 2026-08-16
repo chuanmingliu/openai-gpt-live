@@ -17,6 +17,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/feature"
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
+	"github.com/chuanmingliu/openai-gpt-live/internal/reasoner"
 	"github.com/chuanmingliu/openai-gpt-live/internal/session"
 	"github.com/chuanmingliu/openai-gpt-live/internal/store/postgres"
 	"go.opentelemetry.io/otel/attribute"
@@ -71,6 +72,7 @@ type HandoffCoordinator struct {
 	metricsClock    clock.Clock
 	ackMetric       func(time.Duration, string)
 	gates           interface{ Enabled(string) bool }
+	context         session.RecoveryStore
 }
 
 func (c *HandoffCoordinator) configureOutage(grace time.Duration, source clock.Clock) error {
@@ -163,8 +165,43 @@ func NewHandoffCoordinator(service handoff.Service, submit SessionSubmitter, cap
 	}
 }
 
+func (c *HandoffCoordinator) SetContextStore(store session.RecoveryStore) {
+	if c != nil && !isNil(store) {
+		c.context = store
+	}
+}
+
+func (c *HandoffCoordinator) warmPrefix(ctx context.Context, work HandoffWork) (reasoner.Prefix, error) {
+	if c == nil || isNil(c.context) {
+		return reasoner.Prefix{}, nil
+	}
+	snapshot, err := c.context.LoadRecovery(ctx, work.Scope, reasoner.MaxPrefixItems, reasoner.MaxPrefixBytes)
+	if err != nil {
+		return reasoner.Prefix{}, err
+	}
+	lines := make([]reasoner.PrefixLine, 0, len(snapshot.CommittedItems)+1)
+	for _, item := range snapshot.CommittedItems {
+		if reasoner.IsBackchannel(item.Content) {
+			continue
+		}
+		lines = append(lines, reasoner.PrefixLine{Role: item.Role, Text: item.Content})
+	}
+	if work.Transcript != "" && !reasoner.IsBackchannel(work.Transcript) {
+		lines = append(lines, reasoner.PrefixLine{Role: "user", Text: work.Transcript})
+	}
+	if len(lines) == 0 {
+		return reasoner.Prefix{}, nil
+	}
+	prefix, err := reasoner.BuildPrefix(string(work.Scope.ConversationID), "", lines)
+	if err != nil || prefix.Hash == "" {
+		return reasoner.Prefix{}, err
+	}
+	return prefix, nil
+}
+
 // SetFeatureGates installs the process-local immutable authority view. New
 // creation is checked after queueing/replay, immediately before durable Create.
+
 func (c *HandoffCoordinator) SetFeatureGates(gates interface{ Enabled(string) bool }) error {
 	if c == nil || isNil(gates) {
 		return errors.New("handoff feature gates are required")
@@ -478,6 +515,16 @@ func (c *HandoffCoordinator) process(appCtx context.Context, work HandoffWork) (
 			ApprovalPolicy: append(json.RawMessage(nil), work.Snapshot.ApprovalPolicy...),
 			Versions:       work.Snapshot.Versions, PresentationHint: work.Snapshot.PresentationHint,
 			IdempotencyKey: handoffIdempotencyKey(work, canonical),
+		}
+		prefix, prefixErr := c.warmPrefix(appCtx, work)
+		if prefixErr != nil {
+			completion.Reason = "context_unavailable"
+			return completion, nil
+		}
+		if prefix.Hash != "" {
+			request.ContextRef = prefix.Ref
+			request.ContextHash = prefix.Hash
+			request.ContextPrefix = append(json.RawMessage(nil), prefix.Raw...)
 		}
 		snapshot, err = c.service.Create(appCtx, request)
 	case handoff.SteerBackgroundTaskArgs:

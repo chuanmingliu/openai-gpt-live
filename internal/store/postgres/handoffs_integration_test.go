@@ -97,6 +97,28 @@ func TestCreateHandoffRoundTripIsAtomicAndIdempotent(t *testing.T) {
 	assert.Equal(t, []string{"handoff.dispatch", "handoff.event"}, seen)
 }
 
+func TestCreateHandoffPersistsContextPrefix(t *testing.T) {
+	repo, pool, _ := repositoryHarness(t)
+	scope := testScope("tenant-a", "conversation-prefix")
+	insertConversation(t, pool, scope)
+	record := prepareCreate(t, repo, scope, "prefix")
+	prefix, err := json.Marshal([]map[string]string{{"role": "user", "text": "look this up"}})
+	require.NoError(t, err)
+	record.Request.ContextPrefix = prefix
+	record.RequestHash, err = handoff.CanonicalRequestHash(record.Request)
+	require.NoError(t, err)
+
+	got, created, err := repo.CreateHandoff(t.Context(), record)
+	require.NoError(t, err)
+	assert.True(t, created)
+	assert.JSONEq(t, string(prefix), string(got.Request.ContextPrefix))
+
+	loaded, err := repo.GetHandoff(t.Context(), scope, record.HandoffID)
+	require.NoError(t, err)
+	assert.JSONEq(t, string(prefix), string(loaded.Request.ContextPrefix))
+	assert.Equal(t, record.RequestHash, loaded.RequestHash)
+}
+
 func TestCreateHandoffReplayPrecedesDeadlineAndCandidateValidation(t *testing.T) {
 	repo, pool, _ := repositoryHarness(t)
 	scope := testScope("tenant-a", "conversation-replay-precedence")

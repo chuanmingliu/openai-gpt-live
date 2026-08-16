@@ -13,6 +13,11 @@
       <h1>Speech-to-speech + DeepSeek</h1>
       <p class="lede">Trusted-edge voice client. The browser never sees the gateway credential. Audio is 24 kHz PCM through this BFF to speech-to-speech; DeepSeek stays on the worker.</p>
     </header>
+    <details class="setup-widget" open>
+      <summary>Setup</summary>
+      <div id="setup-panel"></div>
+      <button id="setup-recheck" type="button">Recheck</button>
+    </details>
     <section class="controls" aria-label="Session controls">
       <button id="start" type="button">Start</button>
       <button id="stop" type="button" disabled>Stop</button>
@@ -24,6 +29,10 @@
     <section class="transcript-wrap">
       <h2>Transcript</h2>
       <ol id="transcript"></ol>
+    </section>
+    <section class="handoff-wrap">
+      <h2>Background work</h2>
+      <ol id="handoffs"></ol>
     </section>
   </main>
   <script type="module" src="/app.js"></script>

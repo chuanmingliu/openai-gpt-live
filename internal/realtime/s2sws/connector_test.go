@@ -1051,14 +1051,6 @@ func TestResponseSpecificEventsRequireCreated(t *testing.T) {
 		wire map[string]any
 	}{
 		{
-			name: "audio",
-			wire: map[string]any{"type": "response.output_audio.delta", "response_id": "missing", "item_id": "item", "delta": "AAE="},
-		},
-		{
-			name: "transcript",
-			wire: map[string]any{"type": "response.output_audio_transcript.delta", "response_id": "missing", "item_id": "item", "delta": "x"},
-		},
-		{
 			name: "tool",
 			wire: map[string]any{"type": "response.function_call_arguments.done", "response_id": "missing", "item_id": "item", "call_id": "call", "name": "tool", "arguments": `{}`},
 		},
@@ -1076,6 +1068,17 @@ func TestResponseSpecificEventsRequireCreated(t *testing.T) {
 			require.ErrorIs(t, err, s2sws.ErrUnknownResponseEpoch)
 		})
 	}
+}
+
+func TestOrphanMediaBeforeResponseCreatedIsDropped(t *testing.T) {
+	server := newTestVoiceServer(t)
+	session := connectTestSession(t, server.URL, nil, realtime.OpenRequest{Model: "model"})
+	server.sendEvent(t, map[string]any{"type": "response.output_audio.delta", "response_id": "missing", "item_id": "item", "delta": "AAE="})
+	server.sendEvent(t, map[string]any{"type": "response.output_audio_transcript.delta", "response_id": "missing", "item_id": "item", "delta": "x"})
+	server.sendEvent(t, map[string]any{"type": "input_audio_buffer.speech_started", "event_id": "after-orphan", "item_id": "user"})
+	event := receiveEvent(t, session)
+	assert.Equal(t, realtime.EventSpeechStarted, event.Kind)
+	assert.Equal(t, "after-orphan", event.ProviderEventID)
 }
 
 // TestExplicitResponseRequiresMatchingStringEpoch catches implicit fallback

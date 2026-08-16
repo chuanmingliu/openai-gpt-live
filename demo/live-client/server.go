@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"embed"
+	"encoding/json"
 	"errors"
 	"io/fs"
 	"log/slog"
@@ -102,6 +103,8 @@ func (rt *runtime) serve(writer http.ResponseWriter, request *http.Request) {
 			return
 		}
 		rt.writePlain(writer, request, http.StatusOK, "ready\n")
+	case "/setup":
+		rt.serveSetup(writer, request)
 	case "/ws":
 		if request.Method != http.MethodGet {
 			writer.Header().Set("Allow", http.MethodGet)
@@ -123,6 +126,67 @@ func (rt *runtime) serve(writer http.ResponseWriter, request *http.Request) {
 			http.NotFound(writer, request)
 		}
 	}
+}
+
+type setupStatus struct {
+	Mode             string `json:"mode"`
+	Ready            bool   `json:"ready"`
+	Origin           string `json:"origin"`
+	Model            string `json:"model"`
+	GatewayHost      string `json:"gateway_host"`
+	GatewayReachable bool   `json:"gateway_reachable"`
+	BearerEnv        string `json:"bearer_env"`
+	ListenAddr       string `json:"listen"`
+	SecureOrigin     bool   `json:"https_origin"`
+}
+
+func (rt *runtime) serveSetup(writer http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodGet && request.Method != http.MethodHead {
+		writer.Header().Set("Allow", "GET, HEAD")
+		writer.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	status := setupStatus{
+		Mode:         rt.cfg.Mode,
+		Ready:        rt.sessions.Ready(),
+		Origin:       rt.cfg.Origin,
+		Model:        rt.cfg.Model,
+		GatewayHost:  gatewayHost(rt.cfg.GatewayURL),
+		BearerEnv:    rt.cfg.BearerEnv,
+		ListenAddr:   rt.cfg.ListenAddr,
+		SecureOrigin: strings.HasPrefix(rt.cfg.Origin, "https://"),
+	}
+	status.GatewayReachable = probeTCP(status.GatewayHost, 300*time.Millisecond)
+	body, err := json.Marshal(status)
+	if err != nil {
+		writer.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+	writer.WriteHeader(http.StatusOK)
+	if request.Method != http.MethodHead {
+		_, _ = writer.Write(append(body, '\n'))
+	}
+}
+
+func gatewayHost(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" {
+		return ""
+	}
+	return parsed.Host
+}
+
+func probeTCP(host string, timeout time.Duration) bool {
+	if host == "" || timeout <= 0 {
+		return false
+	}
+	conn, err := net.DialTimeout("tcp", host, timeout)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }
 
 func (rt *runtime) writePlain(writer http.ResponseWriter, request *http.Request, status int, body string) {

@@ -18,6 +18,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/presentation"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
+	"github.com/chuanmingliu/openai-gpt-live/internal/reasoner"
 	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
 )
 
@@ -1433,7 +1434,11 @@ func (r *Reactor) applySpeechStarted(event realtime.Event) ([]Effect, error) {
 		return nil, err
 	}
 	r.clearPresentationResponse()
-	epoch := r.fence.Advance()
+	// voiceReader may have already advanced so late PCM is dropped before this apply.
+	epoch := r.fence.Current()
+	if event.Epoch == 0 || event.Epoch != epoch {
+		epoch = r.fence.Advance()
+	}
 	r.state.UserSpeaking = true
 	effects := []Effect{{FlushBefore: epoch}}
 	if r.state.Response == ResponsePending || r.state.Response == ResponseStreaming {
@@ -1505,6 +1510,10 @@ func (r *Reactor) applyExplicitResponseCreated(event realtime.Event) ([]Effect, 
 }
 
 func (r *Reactor) applyImplicitResponseCreated(event realtime.Event) ([]Effect, error) {
+	if r.state.UserSpeaking {
+		// A barge-in has the floor. Binding would let simulator audio talk over the user.
+		return nil, nil
+	}
 	if r.state.Response != ResponseIdle && r.state.Response != ResponseTerminal {
 		return nil, fmt.Errorf("%w: implicit response.created from state %d", ErrInvalidTransition, r.state.Response)
 	}
@@ -1553,6 +1562,9 @@ func (r *Reactor) applyTranscriptDelta(event realtime.Event) ([]Effect, error) {
 }
 
 func (r *Reactor) applyInputTranscriptionDelta(event realtime.Event) ([]Effect, error) {
+	if !r.acceptInputTranscription(event.ItemID) {
+		return nil, nil
+	}
 	if err := r.observeTranscription(event.ItemID, false); err != nil {
 		return nil, err
 	}
@@ -1579,6 +1591,9 @@ func (r *Reactor) applyInputTranscriptionCompleted(event realtime.Event) ([]Effe
 		}
 		return []Effect{{ClientEvent: mapped}}, nil
 	}
+	if !r.acceptInputTranscription(event.ItemID) {
+		return nil, nil
+	}
 	if err := r.observeTranscription(event.ItemID, true); err != nil {
 		return nil, err
 	}
@@ -1587,6 +1602,9 @@ func (r *Reactor) applyInputTranscriptionCompleted(event realtime.Event) ([]Effe
 		EventID:    r.providerOrSynthEventID(event.ProviderEventID),
 		ItemID:     event.ItemID,
 		Transcript: event.Text,
+	}
+	if reasoner.IsBackchannel(event.Text) {
+		return []Effect{{ClientEvent: mapped}}, nil
 	}
 	if r.activeTurn == nil {
 		return []Effect{{ClientEvent: mapped}}, nil
@@ -2382,6 +2400,15 @@ func (r *Reactor) nextInputTurnRevision() (uint32, error) {
 	}
 	r.inputTurnRevision++
 	return r.inputTurnRevision, nil
+}
+
+func (r *Reactor) acceptInputTranscription(id string) bool {
+	if r.activeTurn == nil || r.activeTurn.key.ID == id {
+		return true
+	}
+	// A different item may open a new turn only after the current one finished.
+	// An open barge-in turn drops late STT for the superseded item.
+	return r.activeTurn.committed || r.activeTurn.transcriptComplete
 }
 
 func (r *Reactor) beginInputTurn(id string) error {

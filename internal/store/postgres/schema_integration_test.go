@@ -47,7 +47,7 @@ var requiredColumns = map[string]map[string]string{
 	"handoffs": {
 		"tenant_id": "text", "conversation_id": "text", "id": "text", "user_id": "text", "session_id": "text",
 		"source_turn_id": "text", "source_turn_revision": "bigint", "user_request": "text", "objective": "text",
-		"context_ref": "text", "context_hash": "text", "deadline": "timestamp with time zone", "token_budget": "integer",
+		"context_ref": "text", "context_hash": "text", "context_prefix": "json", "deadline": "timestamp with time zone", "token_budget": "integer",
 		"priority": "smallint", "tool_allowlist": "json", "approval_policy": "json", "model_version": "text",
 		"prompt_version": "text", "tool_registry_version": "text", "config_version": "text", "presentation_hint": "text",
 		"idempotency_key": "text", "request_hash": "text", "state": "text", "objective_revision": "bigint",
@@ -174,7 +174,7 @@ var requiredNamedConstraintNames = strings.Fields(`
 	handoffs_tenant_idempotency_uniq handoffs_tenant_id_size_check handoffs_conversation_id_size_check
 	handoffs_id_size_check handoffs_user_id_size_check handoffs_session_id_size_check
 	handoffs_source_turn_id_size_check handoffs_source_turn_revision_check handoffs_user_request_size_check
-	handoffs_objective_size_check handoffs_context_ref_size_check handoffs_context_hash_size_check
+	handoffs_objective_size_check handoffs_context_ref_size_check handoffs_context_hash_size_check handoffs_context_prefix_check
 	handoffs_deadline_check handoffs_token_budget_check handoffs_priority_check handoffs_tool_allowlist_check
 	handoffs_approval_policy_check handoffs_model_version_size_check handoffs_prompt_version_size_check
 	handoffs_tool_registry_version_size_check handoffs_config_version_size_check handoffs_presentation_hint_size_check
@@ -219,7 +219,7 @@ func TestSchemaMigrationLifecycle(t *testing.T) {
 
 	version, dirty, err := migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
-	assert.Equal(t, uint(7), version)
+	assert.Equal(t, uint(8), version)
 	assert.False(t, dirty)
 	var journalPresent bool
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
@@ -241,6 +241,13 @@ func TestSchemaMigrationLifecycle(t *testing.T) {
 	}
 	require.NoError(t, migrations.Down(t.Context(), pool))
 	require.NoError(t, migrations.Up(t.Context(), pool))
+	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
+	version, dirty, err = migrations.Version(t.Context(), pool)
+	require.NoError(t, err)
+	assert.Equal(t, uint(7), version)
+	assert.False(t, dirty)
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
+	assert.True(t, journalPresent)
 	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
 	version, dirty, err = migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
@@ -283,7 +290,7 @@ func TestSchemaMigrationLifecycle(t *testing.T) {
 	assert.False(t, dirty)
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
 	assert.False(t, journalPresent)
-	require.NoError(t, migrations.Steps(t.Context(), pool, 6))
+	require.NoError(t, migrations.Steps(t.Context(), pool, 7))
 	require.NoError(t, migrations.Steps(t.Context(), pool, 0))
 	require.NoError(t, migrations.Check(t.Context(), pool))
 }

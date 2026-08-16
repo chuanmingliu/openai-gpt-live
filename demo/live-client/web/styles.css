@@ -39,6 +39,33 @@ body {
 
 h1, h2 { font-weight: 560; margin: 0 0 12px; }
 .lede, .status { color: var(--muted); line-height: 1.5; }
+.setup-widget {
+  margin: 20px 0 8px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 12px 16px 16px;
+}
+
+.setup-widget summary {
+  cursor: pointer;
+  font-weight: 560;
+}
+
+.setup-summary { color: var(--muted); }
+.setup-checks, .setup-steps { padding-left: 20px; }
+.setup-checks .ok { color: var(--accent); }
+.setup-checks .wait { color: var(--assistant); }
+.setup-steps pre {
+  overflow-x: auto;
+  background: #10141c;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+.setup-hint { color: var(--muted); font-size: 14px; }
+#setup-recheck { margin-top: 8px; }
+
 .controls { display: flex; gap: 10px; flex-wrap: wrap; margin: 24px 0 16px; }
 
 button {
@@ -85,6 +112,35 @@ button:disabled { opacity: 0.45; cursor: not-allowed; }
 #transcript li:first-child { border-top: 0; }
 .user { color: var(--user); }
 .assistant { color: var(--assistant); }
+
+.handoff-wrap {
+  margin-top: 20px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 16px 18px 8px;
+}
+
+#handoffs {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+#handoffs li {
+  padding: 10px 0;
+  border-top: 1px solid var(--line);
+}
+
+#handoffs li:first-child { border-top: 0; }
+.handoff-status {
+  display: inline-block;
+  margin-right: 8px;
+  color: var(--accent);
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
 
 .visually-hidden {
   position: absolute;

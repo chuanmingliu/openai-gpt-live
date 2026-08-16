@@ -352,7 +352,7 @@ func TestCoordinatorJournalPayloadDepth64PassesAnd65Fails(t *testing.T) {
 
 func TestCoordinatorDeliveryShardMigrationRequeuesLegacyClaims(t *testing.T) {
 	_, pool, _ := repositoryHarness(t)
-	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
+	require.NoError(t, migrations.Steps(t.Context(), pool, -2))
 	scope := testScope("tenant-journal", "conversation-shard-upgrade")
 	insertConversation(t, pool, scope)
 	record := coordinatorRecord(scope, CoordinatorKindHandoff, "shard-upgrade", 1)
@@ -384,6 +384,7 @@ func TestCoordinatorDeliveryShardDownRefusesPendingAndPermitsDelivered(t *testin
 	_, err := repo.AdmitCoordinatorWork(t.Context(), record)
 	require.NoError(t, err)
 
+	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
 	err = migrations.Steps(t.Context(), pool, -1)
 	require.ErrorIs(t, err, migrations.ErrCoordinatorPendingWork)
 	version, dirty, versionErr := migrations.Version(t.Context(), pool)
@@ -509,7 +510,7 @@ func TestCoordinatorJournalDownWaitsForConcurrentAdmissionThenRefuses(t *testing
 
 func requireCoordinatorMigrationVersion2(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
-	require.NoError(t, migrations.Steps(t.Context(), pool, -5))
+	require.NoError(t, migrations.Steps(t.Context(), pool, -6))
 	version, dirty, err := migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
 	assert.Equal(t, uint(2), version)

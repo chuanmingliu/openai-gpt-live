@@ -60,7 +60,7 @@ Voice continues independently of background work. Barge-in does not cancel a dur
 
 ## PostgreSQL durability
 
-Embedded schema currently ends at version 7:
+Embedded schema currently ends at version 8:
 
 1. Core conversations, items, handoffs, approvals, tools, leases, outbox, cursors, admission, deletion.
 2. Coordinator journal.
@@ -69,6 +69,7 @@ Embedded schema currently ends at version 7:
 5. Deletion provenance.
 6. Reconnect owner lifecycle.
 7. Stable coordinator delivery shards with generation fencing.
+8. Persisted handoff context prefix for the worker reasoner.
 
 Coordinator claims are fenced by a stable region-derived shard plus a pod-specific lease owner and monotonically increasing generation. Replacement pods take over only after authority expiry and replay unacknowledged durable work.
 

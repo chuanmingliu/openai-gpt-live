@@ -24,6 +24,20 @@ test("accumulated transcript drafts fail closed", () => {
   assert.deepEqual(overflow, [{ type: "error", code: "invalid-transcript" }]);
 });
 
+test("handoff events become bounded visual status", () => {
+  const state = new ProtocolState();
+  assert.deepEqual(state.consume({ type: "live.handoff.created", handoff_id: "h1", details: {} }), [
+    { type: "handoff", id: "h1", status: "queued", summary: "" },
+  ]);
+  assert.deepEqual(state.consume({
+    type: "live.handoff.progress",
+    handoff_id: "h1",
+    details: { summary: "still working", code: "speak_by_deadline" },
+  }), [
+    { type: "handoff", id: "h1", status: "still-working", summary: "still working" },
+  ]);
+});
+
 test("audio and assistant transcript events are classified without retaining raw envelopes", () => {
   const state = new ProtocolState();
   assert.deepEqual(state.consume({ type: "response.output_audio.delta", delta: "AAA=" }), [{ type: "audio", encoded: "AAA=" }]);

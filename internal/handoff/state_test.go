@@ -92,6 +92,7 @@ func TestValidateCreateRequest_RequiredFieldsAndBounds(t *testing.T) {
 		{"deep policy", func(r *CreateRequest) {
 			r.ApprovalPolicy = json.RawMessage(strings.Repeat("[", 65) + strings.Repeat("]", 65))
 		}},
+		{"context prefix object", func(r *CreateRequest) { r.ContextPrefix = json.RawMessage(`{"role":"user"}`) }},
 	}
 
 	for _, tc := range tests {
@@ -237,6 +238,7 @@ func TestCanonicalRequestHash_IsSemanticAndCoversRequestExceptIdempotency(t *tes
 		func(r *CreateRequest) { r.Objective += "x" },
 		func(r *CreateRequest) { r.ContextRef += "x" },
 		func(r *CreateRequest) { r.ContextHash += "x" },
+		func(r *CreateRequest) { r.ContextPrefix = json.RawMessage(`[{"role":"user","text":"prior"}]`) },
 		func(r *CreateRequest) { r.Deadline = r.Deadline.Add(time.Second) },
 		func(r *CreateRequest) { r.TokenBudget++ },
 		func(r *CreateRequest) { r.Priority++ },

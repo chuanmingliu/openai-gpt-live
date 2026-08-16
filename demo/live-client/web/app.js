@@ -1,14 +1,18 @@
 import { ProtocolState } from "./protocol-state.mjs";
 import { SessionController } from "./session-controller.mjs";
 import { decodePCM16Base64, encodePCM16Base64 } from "./audio-core.mjs";
+import { renderSetupPanel } from "./setup-panel.mjs";
 
 const statusNode = document.getElementById("status");
 const errorNode = document.getElementById("error");
 const transcriptNode = document.getElementById("transcript");
+const handoffNode = document.getElementById("handoffs");
 const liveRegion = document.getElementById("live-announce");
 const startButton = document.getElementById("start");
 const stopButton = document.getElementById("stop");
 const muteButton = document.getElementById("mute");
+const setupPanel = document.getElementById("setup-panel");
+const setupRecheck = document.getElementById("setup-recheck");
 const MAX_VISIBLE_TURNS = 50;
 
 const SESSION_UPDATE = {
@@ -51,6 +55,29 @@ startButton.addEventListener("click", () => {
 stopButton.addEventListener("click", () => stopSession());
 muteButton.addEventListener("click", () => applyAll(session.setMuted(!session.muted)));
 window.addEventListener("pagehide", () => stopSession());
+if (setupRecheck) {
+  setupRecheck.addEventListener("click", () => refreshSetup());
+}
+refreshSetup();
+
+async function refreshSetup() {
+  if (!setupPanel) {
+    return;
+  }
+  let status = null;
+  try {
+    const response = await fetch("/setup", { headers: { Accept: "application/json" } });
+    if (response.ok) {
+      status = await response.json();
+    }
+  } catch {
+    status = null;
+  }
+  renderSetupPanel(setupPanel, status, {
+    secureContext: window.isSecureContext,
+    mediaDevices: Boolean(navigator.mediaDevices && navigator.mediaDevices.getUserMedia),
+  });
+}
 
 async function startSession() {
   if (!stopped) {
@@ -152,6 +179,14 @@ function applyEffect(effect) {
       transcriptNode.replaceChildren();
       renderers = new Map();
       break;
+    case "clear-handoffs":
+      if (handoffNode) {
+        handoffNode.replaceChildren();
+      }
+      break;
+    case "render-handoff":
+      writeHandoff(effect.id, effect.status, effect.summary);
+      break;
     case "clear-playback":
       if (playbackNode) {
         playbackNode.port.postMessage({ type: "clear", generation: effect.generation });
@@ -190,6 +225,27 @@ function applyEffect(effect) {
       break;
     default:
       break;
+  }
+}
+
+function writeHandoff(id, status, summary) {
+  if (!handoffNode) {
+    return;
+  }
+  let item = handoffNode.querySelector(`[data-handoff-id="${CSS.escape(id)}"]`);
+  if (!item) {
+    item = document.createElement("li");
+    item.dataset.handoffId = id;
+    const badge = document.createElement("span");
+    badge.className = "handoff-status";
+    const text = document.createElement("span");
+    item.append(badge, text);
+    handoffNode.appendChild(item);
+  }
+  item.firstChild.textContent = status;
+  item.lastChild.textContent = summary || id;
+  while (handoffNode.children.length > 16) {
+    handoffNode.removeChild(handoffNode.firstElementChild);
   }
 }
 

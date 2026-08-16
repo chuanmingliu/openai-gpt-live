@@ -20,6 +20,19 @@ test("transcript history is bounded", () => {
   assert.equal(session.turns.length, 50);
 });
 
+test("handoff list is upserted and bounded", () => {
+  const session = new SessionController();
+  session.start();
+  session.apply({ type: "handoff", id: "h1", status: "queued", summary: "" });
+  session.apply({ type: "handoff", id: "h1", status: "completed", summary: "done" });
+  assert.equal(session.handoffs.length, 1);
+  assert.equal(session.handoffs[0].status, "completed");
+  for (let i = 0; i < 20; i += 1) {
+    session.apply({ type: "handoff", id: `h-${i}`, status: "running", summary: "x" });
+  }
+  assert.equal(session.handoffs.length, 16);
+});
+
 test("oversized audio fails closed", () => {
   const session = new SessionController();
   const effects = session.apply({ type: "audio", encoded: "a".repeat(64 * 1024 + 1) });

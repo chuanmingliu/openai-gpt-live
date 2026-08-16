@@ -156,6 +156,61 @@ func TestHandoffCoordinatorUsesTrustedWorkAndSnapshotThenSubmitsAcceptance(t *te
 	require.NoError(t, <-done)
 }
 
+type recoveryStoreFake struct {
+	snapshot session.RecoverySnapshot
+	err      error
+}
+
+func (s *recoveryStoreFake) LoadRecovery(context.Context, handoff.Scope, int, int) (session.RecoverySnapshot, error) {
+	if s.err != nil {
+		return session.RecoverySnapshot{}, s.err
+	}
+	return s.snapshot, nil
+}
+
+func TestHandoffCoordinatorStampsCommittedPrefixOnCreate(t *testing.T) {
+	service := &handoffServiceFake{creates: make(chan handoff.CreateRequest, 1), result: handoff.Snapshot{ID: "handoff-prefix"}}
+	submit := &submitterFake{inputs: make(chan session.Input, 1)}
+	coordinator := NewHandoffCoordinator(service, submit, 1)
+	coordinator.SetContextStore(&recoveryStoreFake{snapshot: session.RecoverySnapshot{
+		CommittedItems: []session.CommittedItem{{Role: "user", Content: "look this up"}, {Role: "assistant", Content: "on it"}},
+	}})
+	require.NoError(t, coordinator.SetFeatureGates(staticFeatureGates{feature.HandoffsEnabled: true}))
+	require.NoError(t, coordinator.Enqueue(validHandoffWork()))
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- coordinator.Run(ctx) }()
+	request := <-service.creates
+	assert.Equal(t, "conversation:conversation-trusted", request.ContextRef)
+	assert.NotEqual(t, "hash-trusted", request.ContextHash)
+	assert.NotEmpty(t, request.ContextPrefix)
+	assert.Contains(t, string(request.ContextPrefix), "look this up")
+	cancel()
+	require.NoError(t, <-done)
+}
+
+func TestHandoffCoordinatorRejectsCreateWhenContextStoreFails(t *testing.T) {
+	service := &handoffServiceFake{creates: make(chan handoff.CreateRequest, 1)}
+	submit := &submitterFake{inputs: make(chan session.Input, 1)}
+	coordinator := NewHandoffCoordinator(service, submit, 1)
+	coordinator.SetContextStore(&recoveryStoreFake{err: errors.New("recovery down")})
+	require.NoError(t, coordinator.SetFeatureGates(staticFeatureGates{feature.HandoffsEnabled: true}))
+	require.NoError(t, coordinator.Enqueue(validHandoffWork()))
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- coordinator.Run(ctx) }()
+	rejected := (<-submit.inputs).(session.HandoffAcceptedInput)
+	assert.False(t, rejected.Accepted)
+	assert.Equal(t, "context_unavailable", rejected.Reason)
+	select {
+	case request := <-service.creates:
+		t.Fatalf("failed recovery reached create: %#v", request)
+	default:
+	}
+	cancel()
+	require.NoError(t, <-done)
+}
+
 func TestHandoffCoordinatorRejectsAdversarialArgumentsAndOverflow(t *testing.T) {
 	service := &handoffServiceFake{creates: make(chan handoff.CreateRequest, 1)}
 	submit := &submitterFake{inputs: make(chan session.Input, 1)}

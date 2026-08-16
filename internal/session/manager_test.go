@@ -3404,6 +3404,9 @@ func TestManagerDiscardsInvalidatedProviderTailBeforeNextResponse(t *testing.T) 
 	cancelCommand, err := voice.NextCommand(commandCtx)
 	require.NoError(t, err)
 	require.Equal(t, realtime.CommandCancelResponse, cancelCommand.Kind)
+	require.NoError(t, voice.Emit(commandCtx, realtime.Event{
+		Kind: realtime.EventSpeechStopped, ProviderEventID: "barge-stop", ItemID: "input-item",
+	}))
 
 	require.NoError(t, voice.Emit(commandCtx, realtime.Event{
 		Kind: realtime.EventResponseCreated, NeedsEpochBinding: true,
@@ -3441,6 +3444,103 @@ func TestManagerDiscardsInvalidatedProviderTailBeforeNextResponse(t *testing.T) 
 			t.Fatal("timed out waiting for new response audio")
 		}
 	}
+}
+
+func TestManagerSpeechStartedFencesAudioBeforeReactorApplies(t *testing.T) {
+	applyGate := make(chan struct{})
+	dropped := make(chan int, 8)
+	connector := testkit.NewFakeConnector(32)
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second,
+		EgressBlockTimeout:  time.Second,
+		reactorApplyGate: func(input Input) <-chan struct{} {
+			if voice, ok := input.(VoiceInput); ok && voice.Event.Kind == realtime.EventSpeechStarted {
+				return applyGate
+			}
+			return nil
+		},
+	}, connector, managerIDs{session: "session-early-fence", conversation: "conversation-early-fence"})
+	manager.SetMetricsHooks(MetricsHooks{AudioDropped: func(bytes int) { dropped <- bytes }})
+	client := newChannelClient(32)
+	ctx, cancel := context.WithCancel(context.Background())
+	runResult := make(chan error, 1)
+	go func() {
+		runResult <- manager.Run(ctx, OpenRequest{Subject: Subject{
+			TenantID: "tenant", UserID: "user", ExpiresAt: time.Now().Add(time.Hour),
+		}}, client)
+	}()
+	voice, err := connector.NextSession(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, "session.created", (<-client.writes).EventType())
+	commandCtx, stop := context.WithTimeout(context.Background(), time.Second)
+	defer stop()
+	client.reads <- protocol.ResponseCreateEvent{Type: "response.create"}
+	create, err := voice.NextCommand(commandCtx)
+	require.NoError(t, err)
+	require.NoError(t, voice.Emit(commandCtx, realtime.Event{
+		Kind: realtime.EventResponseCreated, Epoch: create.Epoch,
+		ResponseID: "live", ProviderEventID: "created", Status: "in_progress",
+	}))
+	require.NoError(t, voice.Emit(commandCtx, realtime.Event{
+		Kind: realtime.EventSpeechStarted, ProviderEventID: "barge", ItemID: "user-item",
+	}))
+	require.Eventually(t, func() bool {
+		runtime := waitForActiveRuntime(t, manager, "session-early-fence", 1)
+		return runtime.state.controlAccepted.Load() > runtime.state.controlApplied.Load()
+	}, time.Second, time.Millisecond)
+	stale := []byte{0xaa, 0xbb}
+	require.NoError(t, voice.Emit(commandCtx, realtime.Event{
+		Kind: realtime.EventAudioDelta, Epoch: create.Epoch,
+		ResponseID: "live", ItemID: "assistant", Audio: stale,
+	}))
+	select {
+	case n := <-dropped:
+		require.Equal(t, len(stale), n)
+	case <-commandCtx.Done():
+		t.Fatal("stale audio was not dropped before reactor applied speech_started")
+	}
+	close(applyGate)
+	cancel()
+	require.ErrorIs(t, <-runResult, context.Canceled)
+}
+
+func TestManagerDropsImplicitCreatedThatRacesBargeIn(t *testing.T) {
+	connector := testkit.NewFakeConnector(32)
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+	}, connector, managerIDs{session: "session-implicit-barge", conversation: "conversation-implicit-barge"})
+	client := newChannelClient(32)
+	ctx, cancel := context.WithCancel(context.Background())
+	runResult := make(chan error, 1)
+	go func() {
+		runResult <- manager.Run(ctx, OpenRequest{Subject: Subject{
+			TenantID: "tenant", UserID: "user", ExpiresAt: time.Now().Add(time.Hour),
+		}}, client)
+	}()
+	voice, err := connector.NextSession(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, "session.created", (<-client.writes).EventType())
+	commandCtx, stop := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer stop()
+	require.NoError(t, voice.Emit(commandCtx, realtime.Event{
+		Kind: realtime.EventSpeechStarted, ProviderEventID: "barge", ItemID: "user-item",
+	}))
+	require.NoError(t, voice.Emit(commandCtx, realtime.Event{
+		Kind: realtime.EventResponseCreated, NeedsEpochBinding: true,
+		ProviderEventID: "implicit-over-user", ResponseID: "implicit", Status: "in_progress",
+	}))
+	for {
+		command, err := voice.NextCommand(commandCtx)
+		if err != nil {
+			require.ErrorIs(t, err, context.DeadlineExceeded)
+			break
+		}
+		if command.Kind == realtime.CommandBindResponseEpoch {
+			t.Fatalf("implicit response bound during barge-in: %+v", command)
+		}
+	}
+	cancel()
+	require.ErrorIs(t, <-runResult, context.Canceled)
 }
 
 func TestManagerSubjectExpiryCancelsAllLoopsAndClosesTransports(t *testing.T) {

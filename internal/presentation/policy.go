@@ -3,7 +3,10 @@
 package presentation
 
 import (
+	"encoding/json"
+
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
+	"github.com/chuanmingliu/openai-gpt-live/internal/worker"
 )
 
 const defaultMaxSpokenPayloadBytes = 4 << 10
@@ -53,6 +56,15 @@ func (p policy) Decide(context Context, event handoff.Event) Decision {
 }
 
 func speechCandidate(event handoff.Event) bool {
-	return (event.Kind == "handoff.needs-input" && event.State == handoff.StateNeedsInput) ||
-		(event.Kind == "handoff.complete" && event.State == handoff.StateSucceeded)
+	if event.Kind == "handoff.needs-input" && event.State == handoff.StateNeedsInput {
+		return true
+	}
+	if event.Kind == "handoff.complete" && event.State == handoff.StateSucceeded {
+		return true
+	}
+	if event.Kind == "handoff.progress" && event.State == handoff.StateRunning {
+		var record worker.ProgressRecord
+		return json.Unmarshal(event.Payload, &record) == nil && record.Code == worker.ProgressSpeakByDeadline
+	}
+	return false
 }
