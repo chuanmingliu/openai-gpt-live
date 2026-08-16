@@ -241,7 +241,56 @@ var requiredNamedConstraintNames = strings.Fields(`
 	runtime_feature_flags_name_check runtime_feature_flags_version_check
 	runtime_feature_audit_name_check runtime_feature_audit_actor_size_check
 	runtime_feature_audit_reason_size_check runtime_feature_audit_version_check
+	knowledge_versions_content_uniq knowledge_versions_identity_check knowledge_versions_version_check
+	knowledge_versions_hash_check knowledge_versions_title_check knowledge_versions_aggregate_check
+	knowledge_versions_publication_check knowledge_versions_tombstone_check
+	knowledge_excerpts_ordinal_check knowledge_excerpts_body_check knowledge_excerpts_hash_check
+	knowledge_excerpts_tokens_check knowledge_excerpts_citation_check
 `)
+
+// stepDownTo walks the schema down to an exact version. Tests use it instead of
+// a literal step count so adding a migration cannot silently retarget them.
+func stepDownTo(t *testing.T, pool *pgxpool.Pool, target uint) {
+	t.Helper()
+	current, dirty, err := migrations.Version(t.Context(), pool)
+	require.NoError(t, err)
+	require.False(t, dirty)
+	require.GreaterOrEqual(t, current, target, "schema is already below the requested version")
+	if current == target {
+		return
+	}
+	require.NoError(t, migrations.Steps(t.Context(), pool, -int(current-target)))
+	reached, dirty, err := migrations.Version(t.Context(), pool)
+	require.NoError(t, err)
+	require.False(t, dirty)
+	require.Equal(t, target, reached)
+}
+
+// stepUpTo walks the schema up to an exact version.
+func stepUpTo(t *testing.T, pool *pgxpool.Pool, target uint) {
+	t.Helper()
+	current, dirty, err := migrations.Version(t.Context(), pool)
+	require.NoError(t, err)
+	require.False(t, dirty)
+	require.LessOrEqual(t, current, target, "schema is already above the requested version")
+	if current == target {
+		return
+	}
+	require.NoError(t, migrations.Steps(t.Context(), pool, int(target-current)))
+	reached, dirty, err := migrations.Version(t.Context(), pool)
+	require.NoError(t, err)
+	require.False(t, dirty)
+	require.Equal(t, target, reached)
+}
+
+func latestSchemaVersion(t *testing.T, pool *pgxpool.Pool) uint {
+	t.Helper()
+	require.NoError(t, migrations.Up(t.Context(), pool))
+	version, dirty, err := migrations.Version(t.Context(), pool)
+	require.NoError(t, err)
+	require.False(t, dirty)
+	return version
+}
 
 // Removing the embedded migration, leaving it dirty, or reporting a stale
 // version must make this lifecycle contract fail.
@@ -255,8 +304,9 @@ func TestSchemaMigrationLifecycle(t *testing.T) {
 
 	version, dirty, err := migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
-	assert.Equal(t, uint(9), version)
+	assert.Equal(t, uint(10), version)
 	assert.False(t, dirty)
+	stepDownTo(t, pool, 9)
 	var journalPresent bool
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
 	assert.True(t, journalPresent)
@@ -333,7 +383,7 @@ func TestSchemaMigrationLifecycle(t *testing.T) {
 	assert.False(t, dirty)
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
 	assert.False(t, journalPresent)
-	require.NoError(t, migrations.Steps(t.Context(), pool, 9))
+	require.NoError(t, migrations.Up(t.Context(), pool))
 	require.NoError(t, migrations.Steps(t.Context(), pool, 0))
 	require.NoError(t, migrations.Check(t.Context(), pool))
 }
@@ -351,6 +401,16 @@ func TestSchemaProfileV9UpDownUpCatalogAndConstraints(t *testing.T) {
 		(tenant_id,content_hash,media_type,content,content_bytes,created_at)
 		VALUES ('tenant-v9',$1,'text/plain; charset=utf-8',''::bytea,0,$2)`, strings.Repeat("a", 64), profileTestCatalogTime())
 	require.NoError(t, err, "zero-byte deterministic templates are valid")
+	_, err = pool.Exec(t.Context(), `INSERT INTO knowledge_versions
+		(tenant_id,pack_id,version,content_hash,title,media_type,excerpt_count,content_bytes,published_at,published_by)
+		VALUES ('tenant-c','pack-c',1,$1,'policy.md','text/markdown',1,4,CURRENT_TIMESTAMP,'operator')`,
+		strings.Repeat("a", 64))
+	require.NoError(t, err)
+	_, err = pool.Exec(t.Context(), `INSERT INTO knowledge_excerpts
+		(tenant_id,pack_id,version,ordinal,body,body_bytes,excerpt_hash,tokens,source_title,section,page)
+		VALUES ('tenant-c','pack-c',1,0,'body',4,$1,ARRAY['body'],'policy.md','',0)`,
+		strings.Repeat("b", 64))
+	require.NoError(t, err)
 	_, err = pool.Exec(t.Context(), `INSERT INTO profile_blobs
 		(tenant_id,content_hash,media_type,content,content_bytes,created_at)
 		VALUES ('tenant-v9',$1,'text/plain; charset=utf-8',''::bytea,524289,$2)`, strings.Repeat("b", 64), profileTestCatalogTime())
@@ -459,7 +519,7 @@ func TestSchemaProfileV9UpDownUpCatalogAndConstraints(t *testing.T) {
 		profileTestCatalogTime().Add(time.Minute))
 	assertConstraint(t, err, "profile_versions_state_check")
 
-	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
+	stepDownTo(t, pool, 8)
 	version, dirty, err := migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
 	assert.Equal(t, uint(8), version)
@@ -526,7 +586,7 @@ func TestSchemaHandoffToolPolicyV8UpDownUpIsExactAndRefusesDataLoss(t *testing.T
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT tool_policy=$1::jsonb FROM handoffs WHERE id='handoff-v8'`, defaultPolicy).Scan(&exact))
 	assert.True(t, exact)
 
-	require.NoError(t, migrations.Steps(t.Context(), pool, -2))
+	stepDownTo(t, pool, 7)
 	var columnPresent bool
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT EXISTS (
 		SELECT 1 FROM information_schema.columns
@@ -577,12 +637,12 @@ func TestSchemaTask20RuntimeFlagsV4UpDownUpPreservesPriorDurableRowsAndTriggers(
 		assert.Equal(t, 2, triggers)
 	}
 	assertV4Objects(true)
-	require.NoError(t, migrations.Steps(t.Context(), pool, -6))
+	stepDownTo(t, pool, 3)
 	assertV4Objects(false)
 	var preserved int
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT count(*) FROM conversations WHERE tenant_id='tenant-v4-preserve' AND id='conversation-v4-preserve'`).Scan(&preserved))
 	assert.Equal(t, 1, preserved)
-	require.NoError(t, migrations.Steps(t.Context(), pool, 6))
+	require.NoError(t, migrations.Up(t.Context(), pool))
 	assertV4Objects(true)
 	var authorityVersion, flags int
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT version FROM runtime_feature_authority WHERE singleton=true`).Scan(&authorityVersion))
@@ -602,7 +662,7 @@ func TestSchemaTask21DeletionProvenanceV5DownUpPreservesPriorDurableRows(t *test
 		WHERE tenant_id='tenant-v5-preserve' AND id='conversation-v5-preserve'`)
 	require.NoError(t, err)
 
-	require.NoError(t, migrations.Steps(t.Context(), pool, -5))
+	stepDownTo(t, pool, 4)
 	version, dirty, err := migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
 	assert.Equal(t, uint(4), version)
@@ -618,7 +678,7 @@ func TestSchemaTask21DeletionProvenanceV5DownUpPreservesPriorDurableRows(t *test
 	)`).Scan(&provenanceColumnPresent))
 	assert.False(t, provenanceColumnPresent)
 
-	require.NoError(t, migrations.Steps(t.Context(), pool, 5))
+	require.NoError(t, migrations.Up(t.Context(), pool))
 	require.NoError(t, migrations.Check(t.Context(), pool))
 	var actor, reason *string
 	var requestedAt *time.Time
@@ -653,7 +713,7 @@ func TestSchemaTask12ToolInvocationScopeSafeDownAndUp(t *testing.T) {
 	require.NoError(t, insertHandoff(t, pool, "tenant-safe", "conversation-safe", "handoff-safe", "handoff-idem-safe"))
 	require.NoError(t, insertToolInvocation(t, pool, "invocation-safe", "tenant-safe", "conversation-safe", "handoff-safe", "tool-idem-safe"))
 
-	require.NoError(t, migrations.Steps(t.Context(), pool, -7))
+	stepDownTo(t, pool, 2)
 	version, dirty, err := migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
 	assert.Equal(t, uint(2), version)
@@ -682,7 +742,7 @@ func TestSchemaTask12ToolInvocationScopeConflictingDownRefusalPreservesV3(t *tes
 	require.NoError(t, insertToolInvocation(t, pool, "invocation-a", "tenant-conflict", "conversation-a", "same-handoff", "tool-idem-a"))
 	require.NoError(t, insertToolInvocation(t, pool, "invocation-b", "tenant-conflict", "conversation-b", "same-handoff", "tool-idem-b"))
 
-	require.NoError(t, migrations.Steps(t.Context(), pool, -6))
+	stepDownTo(t, pool, 3)
 	err := migrations.Steps(t.Context(), pool, -1)
 	require.ErrorIs(t, err, migrations.ErrToolInvocationScopeConflict)
 	version, dirty, versionErr := migrations.Version(t.Context(), pool)
@@ -772,7 +832,7 @@ func TestSchemaMigrationLockTimeoutLeavesNoOrphan(t *testing.T) {
 // backend, roll back the statement, and preserve a clean schema version.
 func TestSchemaMigrationCancellationWhileExecutingSQL(t *testing.T) {
 	pool := migratedPostgres(t)
-	require.NoError(t, migrations.Steps(t.Context(), pool, -7))
+	stepDownTo(t, pool, 2)
 	locker, err := pool.Acquire(t.Context())
 	require.NoError(t, err)
 	defer locker.Release()
@@ -1088,6 +1148,18 @@ func TestSchemaEveryNamedCheckRejectsInvalidMutation(t *testing.T) {
 		"profile_versions_revocation_check":                        `UPDATE profile_versions SET revoked_by='operator' WHERE profile_id='profile-c'`,
 		"profile_versions_chronology_check":                        `UPDATE profile_versions SET activated_at=published_at+interval '2 minutes',activated_by='operator',revoked_at=published_at+interval '1 minute',revoked_by='operator' WHERE profile_id='profile-c'`,
 		"profile_versions_snapshot_coherence_check":                `UPDATE profile_versions SET snapshot=json_build_object('tenant_id','tenant-other','ref',json_build_object('id','profile-c','version',1),'engine_version','jinja-go-v1/test-engine-v1','snapshot_hash',snapshot_hash) WHERE profile_id='profile-c'`,
+		"knowledge_versions_identity_check":                        `UPDATE knowledge_versions SET pack_id='pack c' WHERE pack_id='pack-c'`,
+		"knowledge_versions_version_check":                         `UPDATE knowledge_versions SET version=0 WHERE pack_id='pack-c'`,
+		"knowledge_versions_hash_check":                            `UPDATE knowledge_versions SET content_hash='short' WHERE pack_id='pack-c'`,
+		"knowledge_versions_title_check":                           `UPDATE knowledge_versions SET title='' WHERE pack_id='pack-c'`,
+		"knowledge_versions_aggregate_check":                       `UPDATE knowledge_versions SET excerpt_count=2049 WHERE pack_id='pack-c'`,
+		"knowledge_versions_publication_check":                     `UPDATE knowledge_versions SET published_by='' WHERE pack_id='pack-c'`,
+		"knowledge_versions_tombstone_check":                       `UPDATE knowledge_versions SET tombstoned_at=CURRENT_TIMESTAMP WHERE pack_id='pack-c'`,
+		"knowledge_excerpts_ordinal_check":                         `UPDATE knowledge_excerpts SET ordinal=2048 WHERE pack_id='pack-c'`,
+		"knowledge_excerpts_body_check":                            `UPDATE knowledge_excerpts SET body_bytes=5 WHERE pack_id='pack-c'`,
+		"knowledge_excerpts_hash_check":                            `UPDATE knowledge_excerpts SET excerpt_hash='short' WHERE pack_id='pack-c'`,
+		"knowledge_excerpts_tokens_check":                          `UPDATE knowledge_excerpts SET tokens=ARRAY[]::TEXT[] WHERE pack_id='pack-c'`,
+		"knowledge_excerpts_citation_check":                        `UPDATE knowledge_excerpts SET source_title='' WHERE pack_id='pack-c'`,
 		"profile_versions_state_check":                             `UPDATE profile_versions SET active=true WHERE profile_id='profile-c'`,
 		"session_reconnect_owners_identifiers_check":               `UPDATE session_reconnect_owners SET owner_id='' WHERE session_id='reconnect-c'`,
 		"session_reconnect_owners_counters_check":                  `UPDATE session_reconnect_owners SET incarnation=0 WHERE session_id='reconnect-c'`,
@@ -1916,6 +1988,7 @@ func allowedNullableColumn(table, column string) bool {
 		"coordinator_work_journal.storage_sequence": true, "coordinator_work_journal.claim_owner": true,
 		"coordinator_work_journal.claim_until": true, "coordinator_work_journal.claim_affinity_generation": true,
 		"coordinator_work_journal.delivered_at": true,
+		"knowledge_versions.tombstoned_at":      true, "knowledge_versions.tombstoned_by": true,
 	}
 	return allowed[key]
 }
