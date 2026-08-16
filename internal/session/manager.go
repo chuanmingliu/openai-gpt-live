@@ -21,6 +21,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/presentation"
+	"github.com/chuanmingliu/openai-gpt-live/internal/profile"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
 	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
@@ -237,6 +238,7 @@ type OpenRequest struct {
 	Subject        Subject
 	RequestedModel string
 	ConversationID identity.ConversationID
+	Profile        profile.Resolved
 }
 
 type IDGenerator interface {

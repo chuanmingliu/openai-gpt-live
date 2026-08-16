@@ -99,6 +99,40 @@ func TestRuntimeFeatureRefreshDefaultsAndIsBounded(t *testing.T) {
 	assert.ErrorContains(t, err, "runtime_refresh_interval")
 }
 
+func TestVerticalProfilesChangeConfigHashAndRequireDurability(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.Features.VerticalProfiles = VerticalProfileConfig{Enabled: true, RenderWorkers: 4, RenderQueue: 64}
+	require.ErrorContains(t, cfg.Validate(), "vertical profiles")
+
+	cfg.Mode = "development_durable"
+	require.NoError(t, cfg.Validate())
+
+	disabled := cfg
+	disabled.Features.VerticalProfiles = VerticalProfileConfig{}
+	assert.NotEqual(t, mustHash(t, disabled), mustHash(t, cfg))
+}
+
+func TestVerticalProfileRendererBoundsDefaultOnlyWhenEnabled(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.Mode = "development_durable"
+	cfg.Features.VerticalProfiles.Enabled = true
+	cfg.applyDefaults()
+	require.Equal(t, VerticalProfileConfig{Enabled: true, RenderWorkers: 4, RenderQueue: 64}, cfg.Features.VerticalProfiles)
+	require.NoError(t, cfg.Validate())
+
+	for _, invalid := range []VerticalProfileConfig{
+		{Enabled: true, RenderWorkers: 0, RenderQueue: 64},
+		{Enabled: true, RenderWorkers: 65, RenderQueue: 64},
+		{Enabled: true, RenderWorkers: 4, RenderQueue: 0},
+		{Enabled: true, RenderWorkers: 4, RenderQueue: 1_025},
+		{RenderWorkers: 4, RenderQueue: 64},
+	} {
+		candidate := cfg
+		candidate.Features.VerticalProfiles = invalid
+		assert.ErrorContains(t, candidate.Validate(), "vertical profiles")
+	}
+}
+
 func TestDevelopmentDurableSeparatesSecurityAndDurabilitySemantics(t *testing.T) {
 	cfg := validConfig(t)
 	cfg.Mode = "development_durable"

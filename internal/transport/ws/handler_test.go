@@ -17,6 +17,7 @@ import (
 	admissionpkg "github.com/chuanmingliu/openai-gpt-live/internal/admission"
 	"github.com/chuanmingliu/openai-gpt-live/internal/auth"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
+	"github.com/chuanmingliu/openai-gpt-live/internal/profile"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
 	"github.com/chuanmingliu/openai-gpt-live/internal/session"
@@ -568,7 +569,7 @@ func TestCapabilitySlicesCannotMutateFutureResponses(t *testing.T) {
 	require.Equal(t, "session.update", second.ClientEvents[0])
 }
 
-func TestHandlerDoesNotTrustClientIdentityParameters(t *testing.T) {
+func TestHandlerRejectsClientIdentityParametersBeforeProviderOpen(t *testing.T) {
 	var admitted session.Subject
 	requests := make(chan realtime.OpenRequest, 1)
 	connector := &recordingConnector{delegate: testkit.NewFakeConnector(4), requests: requests}
@@ -587,15 +588,48 @@ func TestHandlerDoesNotTrustClientIdentityParameters(t *testing.T) {
 	if response != nil && response.Body != nil {
 		defer response.Body.Close()
 	}
-	require.NoError(t, err)
-	defer conn.CloseNow()
+	require.Error(t, err)
+	require.Nil(t, conn)
+	require.NotNil(t, response)
+	require.Equal(t, http.StatusBadRequest, response.StatusCode)
 	require.Equal(t, "trusted", admitted.TenantID)
-	require.Equal(t, "session.created", readServerType(t, conn))
 	select {
 	case request := <-requests:
-		require.Equal(t, "provider-voice-model", request.Model)
-	case <-time.After(testTimeout):
-		t.Fatal("connector did not receive open request")
+		t.Fatalf("provider opened for rejected client identity parameters: %#v", request)
+	default:
+	}
+}
+
+func TestProfileResolutionRunsAfterAdmissionAndBeforeProviderOpen(t *testing.T) {
+	var admitted atomic.Bool
+	requests := make(chan realtime.OpenRequest, 1)
+	connector := &recordingConnector{delegate: testkit.NewFakeConnector(2), requests: requests}
+	resolver := &recordingProfileResolver{err: profile.ErrProfileRevoked}
+	admission := AdmissionFunc(func(context.Context, *http.Request) (session.Subject, func(), error) {
+		admitted.Store(true)
+		return session.Subject{TenantID: "tenant-a", UserID: "user", ExpiresAt: time.Now().Add(time.Minute)}, func() {}, nil
+	})
+	server := httptest.NewServer(NewHandler(Options{
+		MaxFrameBytes: 4096, VerticalProfiles: true, ProfileResolver: resolver,
+	}, validManager(connector), admission))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
+	defer cancel()
+	conn, response, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http")+"/v1/realtime?profile=insurance&profile_version=3", nil)
+	if response != nil && response.Body != nil {
+		defer response.Body.Close()
+	}
+	require.Error(t, err)
+	require.Nil(t, conn)
+	require.NotNil(t, response)
+	require.Equal(t, http.StatusForbidden, response.StatusCode)
+	require.True(t, admitted.Load())
+	require.Equal(t, []profileResolveCall{{tenant: "tenant-a", ref: profile.VersionRef{ID: "insurance", Version: 3}, purpose: profile.ResolveNewSession}}, resolver.calls)
+	select {
+	case request := <-requests:
+		t.Fatalf("provider opened before profile resolution completed: %#v", request)
+	default:
 	}
 }
 

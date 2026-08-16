@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/admission"
+	"github.com/chuanmingliu/openai-gpt-live/internal/profile"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
 	"github.com/chuanmingliu/openai-gpt-live/internal/session"
 	"github.com/coder/websocket"
@@ -38,6 +39,8 @@ type Options struct {
 	HandoffsEnabled       *bool
 	ReconnectCredentials  session.ReconnectCredentials
 	CanaryRuntimeIdentity RuntimeIdentity
+	ProfileResolver       profile.Resolver
+	VerticalProfiles      bool
 }
 
 type RuntimeIdentity struct {
@@ -79,6 +82,9 @@ func NewHandler(opts Options, manager *session.Manager, admission Admission) htt
 	}
 	if manager != nil && (isNilReconnectCredentials(normalized.ReconnectCredentials) != !manager.ReconnectEnabled()) {
 		err = errors.New("reconnect transport and manager authority must be configured together")
+	}
+	if normalized.VerticalProfiles && nilProfileResolver(normalized.ProfileResolver) {
+		err = errors.New("vertical profile resolver is required when vertical profiles are enabled")
 	}
 	handoffsEnabled := true
 	if normalized.HandoffsEnabled != nil {
@@ -156,6 +162,14 @@ func (h *handler) serveRealtime(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 		return
 	}
+	selectedProfile := profile.Resolved{}
+	if !reconnecting {
+		selectedProfile, err = resolveProfile(r.Context(), r.URL.RawQuery, subject.TenantID, h.opts.VerticalProfiles, h.opts.ProfileResolver)
+		if err != nil {
+			writeProfileError(w, err)
+			return
+		}
+	}
 
 	sessionCtx, cancel := context.WithCancel(r.Context())
 	defer cancel()
@@ -210,7 +224,7 @@ func (h *handler) serveRealtime(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else {
-		runErr = h.manager.Run(sessionCtx, session.OpenRequest{Subject: subject, RequestedModel: providerModel}, client)
+		runErr = h.manager.Run(sessionCtx, session.OpenRequest{Subject: subject, RequestedModel: providerModel, Profile: selectedProfile}, client)
 	}
 	cancel()
 	if leaseMonitorDone != nil {

@@ -74,6 +74,17 @@ func TestToolCatalogChangesConfigHash(t *testing.T) {
 	assert.NotEqual(t, mustHash(t, a), mustHash(t, b))
 }
 
+func TestVerticalProfileRendererSettingsChangeConfigHash(t *testing.T) {
+	a, b := validConfig(t), validConfig(t)
+	a.Mode, b.Mode = "development_durable", "development_durable"
+	a.Features.VerticalProfiles = VerticalProfileConfig{Enabled: true, RenderWorkers: 4, RenderQueue: 64}
+	b.Features.VerticalProfiles = VerticalProfileConfig{Enabled: true, RenderWorkers: 5, RenderQueue: 64}
+	assert.NotEqual(t, mustHash(t, a), mustHash(t, b))
+	b.Features.VerticalProfiles.RenderWorkers = 4
+	b.Features.VerticalProfiles.RenderQueue = 65
+	assert.NotEqual(t, mustHash(t, a), mustHash(t, b))
+}
+
 func TestValidateExpectedDoesNotDiscloseValue(t *testing.T) {
 	if err := ValidateExpected("v1:"+string(make([]byte, 64)), "secret"); err == nil || err.Error() == "secret" {
 		t.Fatalf("unexpected error %v", err)
@@ -108,7 +119,7 @@ func TestGatewayExampleConfigHashGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = "v1:94737ba565f3157a40f665bdaea0ea4feac95a9fa069cff68a7bf33c47be8ea3"
+	const want = "v1:dcb5c9bcd7a817fabf52f906cfc837a6436ccbabd02e6da63e31a2bda9049342"
 	if hash != want {
 		t.Fatalf("hash=%s want=%s", hash, want)
 	}

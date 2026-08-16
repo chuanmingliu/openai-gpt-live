@@ -220,11 +220,18 @@ type AdminConfig struct {
 }
 
 type FeatureConfig struct {
-	SideEffectingTools   bool          `yaml:"side_effecting_tools"`
-	ToolEncryptionKeyEnv string        `yaml:"tool_encryption_key_env"`
-	ToolEncryptionKeyID  string        `yaml:"tool_encryption_key_id"`
-	Handoffs             bool          `yaml:"handoffs"`
-	RefreshInterval      time.Duration `yaml:"runtime_refresh_interval"`
+	SideEffectingTools   bool                  `yaml:"side_effecting_tools"`
+	ToolEncryptionKeyEnv string                `yaml:"tool_encryption_key_env"`
+	ToolEncryptionKeyID  string                `yaml:"tool_encryption_key_id"`
+	Handoffs             bool                  `yaml:"handoffs"`
+	RefreshInterval      time.Duration         `yaml:"runtime_refresh_interval"`
+	VerticalProfiles     VerticalProfileConfig `yaml:"vertical_profiles"`
+}
+
+type VerticalProfileConfig struct {
+	Enabled       bool `yaml:"enabled"`
+	RenderWorkers int  `yaml:"render_workers"`
+	RenderQueue   int  `yaml:"render_queue"`
 }
 
 type ToolCatalogConfig struct {
@@ -488,6 +495,14 @@ func (c *Config) applyDefaults() {
 	if c.Features.RefreshInterval == 0 {
 		c.Features.RefreshInterval = time.Second
 	}
+	if c.Features.VerticalProfiles.Enabled {
+		if c.Features.VerticalProfiles.RenderWorkers == 0 {
+			c.Features.VerticalProfiles.RenderWorkers = 4
+		}
+		if c.Features.VerticalProfiles.RenderQueue == 0 {
+			c.Features.VerticalProfiles.RenderQueue = 64
+		}
+	}
 	if c.Store.Retention.ConversationTTL == 0 {
 		c.Store.Retention.ConversationTTL = 30 * 24 * time.Hour
 	}
@@ -675,6 +690,14 @@ func (c Config) Validate() error {
 	}
 	if featureRefreshInterval(c) < 10*time.Millisecond || featureRefreshInterval(c) > time.Minute {
 		return errors.New("features.runtime_refresh_interval must be bounded")
+	}
+	profiles := c.Features.VerticalProfiles
+	if profiles.Enabled {
+		if !c.IsDurable() || !c.Features.Handoffs || profiles.RenderWorkers < 1 || profiles.RenderWorkers > 64 || profiles.RenderQueue < 1 || profiles.RenderQueue > 1_024 {
+			return errors.New("vertical profiles require durable handoffs and bounded render workers and queue")
+		}
+	} else if profiles.RenderWorkers != 0 || profiles.RenderQueue != 0 {
+		return errors.New("vertical profiles renderer settings require vertical profiles to be enabled")
 	}
 	if err := validateToolCatalog(effectiveToolCatalog(c.Tools)); err != nil {
 		return err

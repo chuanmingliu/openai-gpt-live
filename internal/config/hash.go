@@ -113,10 +113,11 @@ type canonicalTelemetry struct {
 	ExportTimeout                       time.Duration
 }
 type canonicalFeatures struct {
-	SideEffectingTools  bool          `json:"side_effecting_tools"`
-	ToolEncryptionKeyID string        `json:"tool_encryption_key_id"`
-	Handoffs            bool          `json:"handoffs"`
-	RefreshInterval     time.Duration `json:"runtime_refresh_interval"`
+	SideEffectingTools  bool                  `json:"side_effecting_tools"`
+	ToolEncryptionKeyID string                `json:"tool_encryption_key_id"`
+	Handoffs            bool                  `json:"handoffs"`
+	RefreshInterval     time.Duration         `json:"runtime_refresh_interval"`
+	VerticalProfiles    VerticalProfileConfig `json:"vertical_profiles"`
 }
 type canonicalToolCatalog struct {
 	WebSearch canonicalWebSearchTool `json:"web_search"`
@@ -150,7 +151,7 @@ func Canonical(cfg Config) ([]byte, error) {
 		Admission: canonicalAdmission{MaxSessions: cfg.Admission.MaxSessions, MaxSessionsPerTenant: cfg.Admission.MaxSessionsPerTenant, MaxSessionsPerUser: cfg.Admission.MaxSessionsPerUser, LeaseDuration: cfg.Admission.LeaseDuration, HeartbeatInterval: cfg.Admission.HeartbeatInterval, GlobalRate: cfg.Admission.GlobalRate, GlobalBurst: cfg.Admission.GlobalBurst, IPRate: cfg.Admission.IPRate, IPBurst: cfg.Admission.IPBurst, IPKeyTTL: cfg.Admission.IPKeyTTL, MaxIPKeys: cfg.Admission.MaxIPKeys, InstanceID: cfg.Admission.InstanceID},
 		Safety:    canonicalSafety{PolicyVersion: cfg.Safety.PolicyVersion, Mode: cfg.Safety.Mode, MaxInputBytes: cfg.Safety.MaxInputBytes, MaxSummaryBytes: cfg.Safety.MaxSummaryBytes, MaxStructuredBytes: cfg.Safety.MaxStructuredBytes, RedactedSummary: cfg.Safety.RedactedSummary, ClarificationPrompt: cfg.Safety.ClarificationPrompt, RedactionDeniedKeys: sorted(cfg.Safety.RedactionDeniedKeys)},
 		Telemetry: canonicalTelemetry{OTLPEndpoint: safeURL(cfg.Telemetry.OTLPEndpoint), ServiceName: cfg.Telemetry.ServiceName, Protocol: cfg.Telemetry.Protocol, ExportTimeout: cfg.Telemetry.ExportTimeout}, Shutdown: cfg.Shutdown, Admin: cfg.Admin,
-		Features:  canonicalFeatures{SideEffectingTools: cfg.Features.SideEffectingTools, ToolEncryptionKeyID: cfg.Features.ToolEncryptionKeyID, Handoffs: cfg.Features.Handoffs, RefreshInterval: featureRefreshInterval(cfg)},
+		Features:  canonicalFeatures{SideEffectingTools: cfg.Features.SideEffectingTools, ToolEncryptionKeyID: cfg.Features.ToolEncryptionKeyID, Handoffs: cfg.Features.Handoffs, RefreshInterval: featureRefreshInterval(cfg), VerticalProfiles: cfg.Features.VerticalProfiles},
 		Tools:     canonicalToolCatalog{WebSearch: canonicalWebSearchTool{Enabled: tools.Enabled, ForceStrict: tools.ForceStrict, Regions: tools.Regions, MaximumResults: tools.MaxResults, MaximumTimeoutMS: int(tools.Timeout / time.Millisecond)}},
 		Retention: canonicalRetention{ConversationTTL: retention.ConversationTTL, SweepInterval: retention.SweepInterval, DeletionBatch: retention.DeletionBatch, ApprovalTTL: retention.ApprovalTTL, HMACKeyID: retention.HMACKeyID}, StoreURL: safeStoreURL(cfg.Store.URL),
 	}
