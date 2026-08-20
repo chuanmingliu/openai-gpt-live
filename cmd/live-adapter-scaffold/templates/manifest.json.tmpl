@@ -1,0 +1,22 @@
+{
+  "adapter_id": "{{.Name}}",
+  "adapter_version": "v1",
+  "registry_version": "review-required",
+  "tool": {
+    "Name": "{{.Name}}",
+    "Description": "Reviewed native {{.Name}} adapter.",
+    "Parameters": {"type":"object","additionalProperties":false}
+  },
+  "read_only": true,
+  "side_effecting": false,
+  "parallel_safe": true,
+  "stable_idempotency": true,
+  "approval": "none",
+  "timeout_ms": 5000,
+  "max_concurrency": 4,
+  "max_argument_bytes": 65536,
+  "max_result_bytes": 65536,
+  "destination_id": "review-required",
+  "transport_class": "native",
+  "health_class": "required"
+}
