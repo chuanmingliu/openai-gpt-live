@@ -24,6 +24,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/lifecycle"
 	"github.com/chuanmingliu/openai-gpt-live/internal/presentation"
 	"github.com/chuanmingliu/openai-gpt-live/internal/profile"
+	"github.com/chuanmingliu/openai-gpt-live/internal/prompttmpl"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
 	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
 	"github.com/chuanmingliu/openai-gpt-live/internal/session"
@@ -69,6 +70,8 @@ type App struct {
 	eventWakeups    chan handoff.EventWakeup
 	featureGates    interface{ Enabled(string) bool }
 	approvalStore   handoff.ApprovalStore
+	profileEngine   prompttmpl.Engine
+	profileRenderer *session.ProfileRenderDispatcher
 }
 
 type DurableDependencies struct {
@@ -215,13 +218,21 @@ func WithFeatureGates(gates interface{ Enabled(string) bool }) Option {
 // resolver and the configuration must agree: a configured feature without a
 // resolver, or a resolver without the feature, fails closed in New so no
 // session can ever select a profile the deployment did not authorize.
-func WithVerticalProfiles(resolver profile.Resolver) Option {
+func WithVerticalProfiles(resolver profile.Resolver, engines ...prompttmpl.Engine) Option {
 	return func(app *App) error {
-		if isNil(resolver) {
+		if isNil(resolver) || len(engines) > 1 {
 			return errors.New("vertical profile resolver is required")
+		}
+		engine := prompttmpl.Engine(prompttmpl.NewMiniJinja())
+		if len(engines) == 1 {
+			engine = engines[0]
+		}
+		if isNil(engine) || prompttmpl.ValidateEngineIdentity(engine.Version()) != nil {
+			return errors.New("vertical profile engine is required")
 		}
 		app.wsOptions.ProfileResolver = resolver
 		app.wsOptions.VerticalProfiles = true
+		app.profileEngine = engine
 		return nil
 	}
 }
@@ -325,6 +336,18 @@ func New(cfg config.Config, connector realtime.Connector, opts ...Option) (*App,
 	wsOptions = app.wsOptions
 	if cfg.Features.VerticalProfiles.Enabled != wsOptions.VerticalProfiles {
 		return nil, errors.New("vertical profile resolution and configuration must be enabled together")
+	}
+	if cfg.Features.VerticalProfiles.Enabled {
+		renderer, err := session.NewProfileRenderDispatcher(
+			app.profileEngine, cfg.Features.VerticalProfiles.RenderWorkers,
+			cfg.Features.VerticalProfiles.RenderQueue, prompttmpl.DefaultLimits(),
+		)
+		if err != nil {
+			return nil, errors.New("vertical profile renderer configuration is invalid")
+		}
+		app.profileRenderer = renderer
+		managerConfig.ProfileEngine = app.profileEngine
+		managerConfig.ProfileRenderer = renderer
 	}
 	if cfg.Mode == "production" && (isNil(managerConfig.ReconnectCredentials) || isNil(managerConfig.ReconnectOwners)) {
 		return nil, errors.New("production reconnect authority must be explicitly configured")
@@ -689,6 +712,11 @@ func (a *App) Run(ctx context.Context) (runErr error) {
 		case <-coordinatorDone:
 		case <-cleanupCtx.Done():
 			cleanupErrs = append(cleanupErrs, fmt.Errorf("wait for durable coordinators: %w", cleanupCtx.Err()))
+		}
+	}
+	if a.profileRenderer != nil {
+		if err := a.profileRenderer.Close(cleanupCtx); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("close vertical profile renderer: %w", err))
 		}
 	}
 

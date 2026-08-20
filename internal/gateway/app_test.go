@@ -22,6 +22,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/presentation"
 	"github.com/chuanmingliu/openai-gpt-live/internal/profile"
+	"github.com/chuanmingliu/openai-gpt-live/internal/prompttmpl"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
 	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
@@ -1126,6 +1127,9 @@ func TestNewEnablesVerticalProfilesOnlyWithAnExactResolver(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, app.wsOptions.VerticalProfiles)
 	require.Equal(t, resolver, app.wsOptions.ProfileResolver)
+	require.NotNil(t, app.profileRenderer)
+	require.Same(t, app.profileRenderer, app.managerConfig.ProfileRenderer)
+	require.Equal(t, prompttmpl.NewMiniJinja().Version(), app.managerConfig.ProfileEngine.Version())
 }
 
 func TestNewFailsClosedWhenVerticalProfileWiringDisagreesWithConfig(t *testing.T) {

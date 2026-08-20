@@ -115,11 +115,11 @@ func (resolver *exactResolver) resolveCustom(ctx context.Context, tenantID strin
 	if published.TenantID != tenantID || published.Ref != ref || published.Snapshot.TenantID != tenantID || published.Snapshot.Ref != ref || published.Validate() != nil || !validPublishedLifecycle(published) {
 		return Resolved{}, ErrInvalidProfile
 	}
-	if purpose != ResolveAcceptedWork {
+	if purpose == ResolveNewSession || purpose == ResolveReconnect {
 		if published.RevokedAt != nil {
 			return Resolved{}, ErrProfileRevoked
 		}
-		if !published.Active {
+		if purpose == ResolveNewSession && !published.Active {
 			return Resolved{}, ErrProfileIncompatible
 		}
 	}

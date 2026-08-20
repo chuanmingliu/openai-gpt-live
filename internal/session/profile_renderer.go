@@ -29,16 +29,18 @@ type profileRenderWork struct {
 // never waits for rendering or queue capacity, so provider speech fences remain
 // independent from prompt compilation and execution.
 type ProfileRenderDispatcher struct {
-	engine prompttmpl.Engine
-	limits prompttmpl.Limits
-	ctx    context.Context
-	cancel context.CancelFunc
-	queue  chan profileRenderWork
-	done   chan struct{}
+	engine  prompttmpl.Engine
+	limits  prompttmpl.Limits
+	ctx     context.Context
+	cancel  context.CancelFunc
+	queue   chan profileRenderWork
+	done    chan struct{}
+	workers int
 
-	mu     sync.RWMutex
-	closed bool
-	wg     sync.WaitGroup
+	mu      sync.RWMutex
+	closed  bool
+	started bool
+	wg      sync.WaitGroup
 }
 
 func NewProfileRenderDispatcher(engine prompttmpl.Engine, workers, capacity int, limits prompttmpl.Limits) (*ProfileRenderDispatcher, error) {
@@ -49,16 +51,8 @@ func NewProfileRenderDispatcher(engine prompttmpl.Engine, workers, capacity int,
 	ctx, cancel := context.WithCancel(context.Background())
 	dispatcher := &ProfileRenderDispatcher{
 		engine: engine, limits: validated, ctx: ctx, cancel: cancel,
-		queue: make(chan profileRenderWork, capacity), done: make(chan struct{}),
+		queue: make(chan profileRenderWork, capacity), done: make(chan struct{}), workers: workers,
 	}
-	dispatcher.wg.Add(workers)
-	for range workers {
-		go dispatcher.worker()
-	}
-	go func() {
-		dispatcher.wg.Wait()
-		close(dispatcher.done)
-	}()
 	return dispatcher, nil
 }
 
@@ -77,17 +71,33 @@ func (dispatcher *ProfileRenderDispatcher) Dispatch(ctx context.Context, runtime
 	owned.Transcript = strings.Clone(request.Transcript)
 	work := profileRenderWork{ctx: ctx, runtime: runtime, request: owned, complete: complete}
 
-	dispatcher.mu.RLock()
-	defer dispatcher.mu.RUnlock()
+	dispatcher.mu.Lock()
+	defer dispatcher.mu.Unlock()
 	if dispatcher.closed {
 		return ErrProfileRenderClosed
 	}
+	dispatcher.startLocked()
 	select {
 	case dispatcher.queue <- work:
 		return nil
 	default:
 		return ErrProfileRenderQueueFull
 	}
+}
+
+func (dispatcher *ProfileRenderDispatcher) startLocked() {
+	if dispatcher.started {
+		return
+	}
+	dispatcher.started = true
+	dispatcher.wg.Add(dispatcher.workers)
+	for range dispatcher.workers {
+		go dispatcher.worker()
+	}
+	go func() {
+		dispatcher.wg.Wait()
+		close(dispatcher.done)
+	}()
 }
 
 func (dispatcher *ProfileRenderDispatcher) worker() {
@@ -212,6 +222,10 @@ func (dispatcher *ProfileRenderDispatcher) Close(ctx context.Context) error {
 	if !dispatcher.closed {
 		dispatcher.closed = true
 		dispatcher.cancel()
+		if !dispatcher.started {
+			dispatcher.started = true
+			close(dispatcher.done)
+		}
 	}
 	dispatcher.mu.Unlock()
 	select {

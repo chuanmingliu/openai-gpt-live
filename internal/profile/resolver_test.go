@@ -55,7 +55,7 @@ func TestResolvePurposeMatrixEnforcesActiveRevokedAndAcceptedWorkRules(t *testin
 		{"active new session", ResolveNewSession, true, false, nil},
 		{"active reconnect", ResolveReconnect, true, false, nil},
 		{"inactive new session", ResolveNewSession, false, false, ErrProfileIncompatible},
-		{"inactive reconnect", ResolveReconnect, false, false, ErrProfileIncompatible},
+		{"inactive reconnect stays pinned", ResolveReconnect, false, false, nil},
 		{"revoked new session", ResolveNewSession, false, true, ErrProfileRevoked},
 		{"revoked reconnect", ResolveReconnect, false, true, ErrProfileRevoked},
 		{"inactive accepted work", ResolveAcceptedWork, false, false, nil},

@@ -686,7 +686,8 @@ func composeGatewayVerticalProfiles(cfg config.Config, runtime *gatewayFeatureRu
 	if runtime == nil || runtime.repo == nil {
 		return nil, errors.New("vertical profiles require durable profile storage")
 	}
-	return gateway.WithVerticalProfiles(profile.NewResolver(runtime.repo, prompttmpl.NewMiniJinja())), nil
+	engine := prompttmpl.NewMiniJinja()
+	return gateway.WithVerticalProfiles(profile.NewResolver(runtime.repo, engine), engine), nil
 }
 
 func requiresRuntimeRepository(cfg config.Config) bool { return cfg.IsDurable() }
