@@ -43,6 +43,19 @@ type ProfileBootstrapCompletedInput struct {
 	SnapshotHash string
 }
 
+// PromptRenderCompletedInput is produced only by the bounded profile render
+// dispatcher. Every authority field must still match the reactor's pending
+// request; prompt text alone never authorizes response creation.
+type PromptRenderCompletedInput struct {
+	Incarnation   identity.Incarnation
+	SnapshotHash  string
+	Epoch         identity.ResponseEpoch
+	InputRevision uint32
+	Turn          identity.TurnKey
+	Instructions  string
+	ErrClass      string
+}
+
 type DurableInput struct {
 	Sequence uint64
 	Kind     string
@@ -94,6 +107,7 @@ func (ClientInput) isSessionInput()                    {}
 func (VoiceInput) isSessionInput()                     {}
 func (VoiceCommandCompletedInput) isSessionInput()     {}
 func (ProfileBootstrapCompletedInput) isSessionInput() {}
+func (PromptRenderCompletedInput) isSessionInput()     {}
 func (DurableInput) isSessionInput()                   {}
 func (TurnCommittedInput) isSessionInput()             {}
 func (TranscriptPersistedInput) isSessionInput()       {}

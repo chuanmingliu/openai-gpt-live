@@ -20,12 +20,25 @@ type Effect struct {
 	Incarnation           identity.Incarnation
 	VoiceCommand          *realtime.Command
 	ProfileBootstrap      *ProfileBootstrapCompletedInput
+	PromptRender          *PromptRenderRequestedEffect
 	Async                 *AsyncEffect
 	Transcript            *TranscriptRequestedEffect
 	Handoff               *HandoffRequestedEffect
 	FlushBefore           identity.ResponseEpoch
 	Close                 *CloseEffect
 	HandoffPresentation   bool
+}
+
+// PromptRenderRequestedEffect is an immutable, bounded request for one
+// finalized input turn. The dispatcher owns a clone before returning from
+// admission.
+type PromptRenderRequestedEffect struct {
+	Incarnation   identity.Incarnation
+	SnapshotHash  string
+	Epoch         identity.ResponseEpoch
+	InputRevision uint32
+	Turn          identity.TurnKey
+	Transcript    string
 }
 
 type TranscriptRequestedEffect struct {

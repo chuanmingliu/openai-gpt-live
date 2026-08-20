@@ -17,6 +17,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/presentation"
+	"github.com/chuanmingliu/openai-gpt-live/internal/prompttmpl"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
 	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
@@ -175,6 +176,10 @@ type finalizedTranscript struct {
 	text string
 }
 
+type pendingPromptRender struct {
+	request PromptRenderRequestedEffect
+}
+
 type providerInputGeneration struct {
 	commandSequence        uint64
 	itemID                 string
@@ -243,6 +248,8 @@ type Reactor struct {
 	profileOpening            string
 	profileBootstrapQueued    bool
 	profileBootstrapComplete  bool
+	profileTurnEnabled        bool
+	pendingPromptRender       *pendingPromptRender
 }
 
 func NewReactor(ids IDs, fence *EpochFence) *Reactor {
@@ -301,6 +308,7 @@ func (r *Reactor) configureProfileBootstrap(runtime *ProfileRuntime, suppressOpe
 	}
 	r.profileOwned = true
 	r.profileSnapshotHash = strings.Clone(runtime.Profile.Snapshot.SnapshotHash)
+	_, r.profileTurnEnabled = runtime.Profile.Bundle.Templates["turn_instruction.j2"]
 	if !suppressOpening {
 		r.profileOpening = strings.Clone(runtime.Opening)
 	}
@@ -360,6 +368,8 @@ func (r *Reactor) ApplyContext(ctx context.Context, input Input) ([]Effect, erro
 		return r.applyVoiceCommandCompleted(typed)
 	case ProfileBootstrapCompletedInput:
 		return r.applyProfileBootstrapCompleted(typed)
+	case PromptRenderCompletedInput:
+		return r.applyPromptRenderCompleted(typed)
 	case ClientEffectCompletedInput:
 		if typed.Err != nil {
 			return nil, fmt.Errorf("client effect %d failed: %w", typed.Sequence, typed.Err)
@@ -1402,6 +1412,12 @@ func (r *Reactor) applySessionUpdate(event protocol.SessionUpdateEvent) ([]Effec
 	if err != nil {
 		return nil, err
 	}
+	if r.profileTurnEnabled && len(commandSession.TurnDetection) != 0 {
+		commandSession.TurnDetection, err = disableAutomaticResponse(commandSession.TurnDetection)
+		if err != nil {
+			return nil, err
+		}
+	}
 	requestedMode, modeSpecified, err := realtime.ParseInputTurnMode(commandSession.TurnDetection)
 	if err != nil {
 		return nil, err
@@ -1544,6 +1560,9 @@ func (r *Reactor) applyConversationItemCreate(event protocol.ConversationItemCre
 }
 
 func (r *Reactor) applyResponseCreate(event protocol.ResponseCreateEvent) ([]Effect, error) {
+	if r.profileTurnEnabled {
+		return nil, fmt.Errorf("%w: profile-owned response creation", ErrUnsupportedField)
+	}
 	if r.state.Response != ResponseIdle && r.state.Response != ResponseTerminal {
 		return nil, fmt.Errorf("%w: response.create from state %d", ErrInvalidTransition, r.state.Response)
 	}
@@ -1879,7 +1898,7 @@ func (r *Reactor) applyImplicitResponseCreated(event realtime.Event) ([]Effect, 
 		Epoch:      epoch,
 		ResponseID: event.ResponseID,
 	}
-	if r.state.UserSpeaking {
+	if r.state.UserSpeaking || r.profileTurnEnabled {
 		cancelEpoch := r.fence.Advance()
 		cancel := realtime.Command{
 			Kind:       realtime.CommandCancelResponse,
@@ -1988,8 +2007,70 @@ func (r *Reactor) applyInputTranscriptionCompleted(event realtime.Event) ([]Effe
 	transcript := TranscriptRequestedEffect{
 		Turn: providerGeneration.turn, Sequence: r.transcriptSequence, Role: "user", FinalText: event.Text,
 	}
+	var render *PromptRenderRequestedEffect
+	if r.profileTurnEnabled {
+		request := PromptRenderRequestedEffect{
+			Incarnation: r.ids.Incarnation, SnapshotHash: strings.Clone(r.profileSnapshotHash),
+			Epoch: r.fence.Current(), InputRevision: providerGeneration.turn.Revision,
+			Turn: providerGeneration.turn, Transcript: strings.Clone(event.Text),
+		}
+		r.pendingPromptRender = &pendingPromptRender{request: request}
+		render = &request
+	}
 	r.providerInput.removeGeneration(generation)
-	return []Effect{{ClientEvent: mapped, Transcript: &transcript}}, nil
+	return []Effect{{ClientEvent: mapped, Transcript: &transcript, PromptRender: render}}, nil
+}
+
+func (r *Reactor) applyPromptRenderCompleted(input PromptRenderCompletedInput) ([]Effect, error) {
+	pending := r.pendingPromptRender
+	if pending == nil {
+		return nil, nil
+	}
+	request := pending.request
+	if input.Incarnation != request.Incarnation || input.SnapshotHash != request.SnapshotHash ||
+		input.Epoch != request.Epoch || input.InputRevision != request.InputRevision || input.Turn != request.Turn ||
+		input.Incarnation != r.ids.Incarnation || input.SnapshotHash != r.profileSnapshotHash ||
+		input.Epoch != r.fence.Current() || r.activeTurn == nil || r.activeTurn.key != request.Turn {
+		return nil, nil
+	}
+	r.pendingPromptRender = nil
+	if input.ErrClass != "" {
+		return []Effect{{ClientEvent: r.promptRenderDegraded(input.ErrClass)}}, nil
+	}
+	if !utf8.ValidString(input.Instructions) || len(input.Instructions) == 0 || len(input.Instructions) > prompttmpl.MaxOutputBytes {
+		return []Effect{{ClientEvent: r.promptRenderDegraded("render_limit_exceeded")}}, nil
+	}
+	if r.state.Response != ResponseIdle && r.state.Response != ResponseTerminal {
+		return nil, nil
+	}
+	epoch := r.fence.Advance()
+	command := realtime.Command{
+		Kind: realtime.CommandCreateResponse, Sequence: r.allocateSequence(), Epoch: epoch,
+		Response: realtime.ResponseConfig{Instructions: strings.Clone(input.Instructions)},
+	}
+	r.state.Response = ResponsePending
+	r.activeResponseID = ""
+	r.activeResponseEpoch = epoch
+	r.suppressedImplicitID = ""
+	r.terminal = nil
+	r.pendingCancelSequence = 0
+	r.pendingCreateSequence = command.Sequence
+	return []Effect{{VoiceCommand: &command}}, nil
+}
+
+func (r *Reactor) promptRenderDegraded(code string) protocol.LiveSessionDegradedEvent {
+	switch code {
+	case "render_limit_exceeded", "render_timeout", "render_cancelled", "render_queue_full", "render_failed":
+	default:
+		code = "render_failed"
+	}
+	details, _ := json.Marshal(struct {
+		Code string `json:"code"`
+	}{Code: code})
+	return protocol.LiveSessionDegradedEvent{
+		Type: "live.session.degraded", EventID: r.providerOrSynthEventID(""),
+		SequenceID: int64(r.transcriptSequence), Status: "degraded", Details: details,
+	}
 }
 
 func (r *Reactor) applyInputAudioCommitted(event realtime.Event) ([]Effect, error) {

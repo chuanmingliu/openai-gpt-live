@@ -1,13 +1,40 @@
 package session
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/profile"
 	"github.com/chuanmingliu/openai-gpt-live/internal/prompttmpl"
 )
+
+func (runtime *ProfileRuntime) HasTurnTemplate() bool {
+	if runtime == nil {
+		return false
+	}
+	_, ok := runtime.Profile.Bundle.Templates["turn_instruction.j2"]
+	return ok
+}
+
+func disableAutomaticResponse(raw json.RawMessage) (json.RawMessage, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return append(json.RawMessage(nil), raw...), nil
+	}
+	var object map[string]json.RawMessage
+	if json.Unmarshal(trimmed, &object) != nil || object == nil {
+		return nil, profile.ErrProfileIncompatible
+	}
+	object["create_response"] = json.RawMessage("false")
+	encoded, err := json.Marshal(object)
+	if err != nil {
+		return nil, profile.ErrProfileIncompatible
+	}
+	return encoded, nil
+}
 
 // ProfileRuntime owns the exact compiled bundle and the render results that
 // are fixed for one immutable realtime profile snapshot. Prompt source never

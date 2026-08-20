@@ -106,6 +106,7 @@ type Config struct {
 	ReconnectCleanupBatch           int
 	InitialSession                  realtime.SessionConfig
 	ProfileEngine                   prompttmpl.Engine
+	ProfileRenderer                 *ProfileRenderDispatcher
 	ToolCatalog                     toolpolicy.Catalog
 	AsyncModel                      string
 	HandoffToolsEnabled             bool
@@ -1117,6 +1118,9 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 		if err != nil {
 			return err
 		}
+		if profileRuntime.HasTurnTemplate() && m.cfg.ProfileRenderer == nil {
+			return profile.ErrProfileIncompatible
+		}
 	}
 
 	sessionID := m.ids.NewSessionID()
@@ -1414,6 +1418,9 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 			if parent.Err() != nil {
 				return parent.Err()
 			}
+			return ErrRecoveryUnavailable
+		}
+		if profileRuntime.HasTurnTemplate() && m.cfg.ProfileRenderer == nil {
 			return ErrRecoveryUnavailable
 		}
 	}
@@ -1734,6 +1741,13 @@ func (m *Manager) sendInitialSession(ctx context.Context, voice realtime.Session
 	config := cloneRealtimeSessionConfig(m.cfg.InitialSession)
 	if runtime != nil {
 		config.Instructions = strings.Clone(runtime.System)
+		if runtime.HasTurnTemplate() {
+			var err error
+			config.TurnDetection, err = disableAutomaticResponse(config.TurnDetection)
+			if err != nil {
+				return err
+			}
+		}
 	}
 	if len(config.Tools) == 0 && len(config.ToolChoice) == 0 && config.Instructions == "" &&
 		config.InputFormat == (realtime.AudioFormat{}) && config.OutputFormat == (realtime.AudioFormat{}) &&
@@ -3654,6 +3668,31 @@ func (s *runState) dispatchEffectsQueued(ctx context.Context, effects []Effect, 
 			completed := *effect.ProfileBootstrap
 			if err := s.enqueueCompletion(ctx, completed); err != nil {
 				return 0, err
+			}
+		}
+		if effect.PromptRender != nil {
+			request := *effect.PromptRender
+			complete := func(completionCtx context.Context, completed PromptRenderCompletedInput) error {
+				return s.enqueueCompletion(completionCtx, completed)
+			}
+			var dispatchErr error
+			if s.cfg.ProfileRenderer == nil || s.profileRuntime == nil {
+				dispatchErr = ErrProfileRenderInvalid
+			} else {
+				dispatchErr = s.cfg.ProfileRenderer.Dispatch(ctx, s.profileRuntime, request, complete)
+			}
+			if dispatchErr != nil {
+				completed := PromptRenderCompletedInput{
+					Incarnation: request.Incarnation, SnapshotHash: strings.Clone(request.SnapshotHash),
+					Epoch: request.Epoch, InputRevision: request.InputRevision, Turn: request.Turn,
+					ErrClass: "render_failed",
+				}
+				if errors.Is(dispatchErr, ErrProfileRenderQueueFull) {
+					completed.ErrClass = "render_queue_full"
+				}
+				if err := s.enqueueCompletion(ctx, completed); err != nil {
+					return 0, err
+				}
 			}
 		}
 		if effect.ClientEvent != nil {
