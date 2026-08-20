@@ -810,6 +810,7 @@ func gatewayHandoffSnapshot(cfg config.Config, configHash string) (gateway.Sessi
 		Deadline:    time.Date(9999, time.December, 31, 23, 59, 59, 0, time.UTC),
 		TokenBudget: cfg.Worker.MaxOutputTokens, ToolAllowlist: toolAllowlist, ToolPolicy: policyRaw, ApprovalPolicy: json.RawMessage(`{"mode":"none"}`),
 		Versions:         handoff.Versions{Model: cfg.Worker.Reasoner.Model, Prompt: cfg.Safety.PolicyVersion, ToolRegistry: configHash, Config: configHash},
+		Profile:          handoff.LegacyProfileSnapshot(),
 		PresentationHint: "brief",
 	}, nil
 }

@@ -268,6 +268,14 @@ func TestDurableDispatcherBuildsScopeOnlyFromTrustedManagerContext(t *testing.T)
 	handoffs := NewHandoffCoordinator(&handoffServiceFake{creates: make(chan handoff.CreateRequest, 1)}, &submitterFake{}, 1)
 	transcripts := NewTranscriptCoordinator(&transcriptWriterFake{}, &submitterFake{}, 1)
 	dispatcher := &durableDispatcher{handoffs: handoffs, transcripts: transcripts, snapshot: snapshot}
+	profileSnapshot := handoff.ProfileSnapshot{
+		ProfileID: "insurance", ProfileVersion: 2, SnapshotHash: strings.Repeat("a", 64),
+		EngineVersion: "jinja-go-v1/minijinja-go/v2.24.0", RecipeID: "quote", RecipeVersion: 3,
+		RecipeHash: strings.Repeat("b", 64), RegistryVersion: "registry-2",
+		Knowledge: []handoff.KnowledgeVersion{{ID: "policies", Version: 4, Hash: strings.Repeat("c", 64)}},
+		Evidence:  json.RawMessage(`{"intent":"quote"}`),
+	}
+	wantProfile := cloneHandoffProfile(profileSnapshot)
 	trusted := session.TrustedSessionContext{
 		IDs:     session.IDs{SessionID: "trusted-session", ConversationID: "trusted-conversation", Incarnation: 7},
 		Subject: session.Subject{TenantID: "trusted-tenant", UserID: "trusted-user"},
@@ -277,7 +285,10 @@ func TestDurableDispatcherBuildsScopeOnlyFromTrustedManagerContext(t *testing.T)
 		ResponseID: "response", CallID: "call", ToolName: handoff.ToolCancelBackgroundTask,
 		Arguments:  json.RawMessage(`{"handoff_id":"h-1"}`),
 		ToolPolicy: toolpolicy.DefaultPolicy(),
+		Profile:    profileSnapshot,
 	}))
+	profileSnapshot.Knowledge[0].ID = "mutated"
+	profileSnapshot.Evidence[1] = 'X'
 	queued := <-handoffs.work
 	assert.Equal(t, "trusted-tenant", queued.Scope.TenantID)
 	assert.Equal(t, "trusted-user", queued.Scope.UserID)
@@ -285,7 +296,9 @@ func TestDurableDispatcherBuildsScopeOnlyFromTrustedManagerContext(t *testing.T)
 	assert.Equal(t, identity.SessionID("trusted-session"), queued.SessionID)
 	assert.Equal(t, identity.Incarnation(7), queued.Incarnation)
 	assert.Equal(t, mustGatewayToolPolicy(toolpolicy.DefaultPolicy()), queued.ToolPolicy)
-	assert.Equal(t, snapshot, queued.Snapshot)
+	wantSnapshot := snapshot
+	wantSnapshot.Profile = wantProfile
+	assert.Equal(t, wantSnapshot, queued.Snapshot)
 }
 
 func TestDurableDispatcherDropsPersistenceOnlyForEphemeralSyntheticIdentity(t *testing.T) {

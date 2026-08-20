@@ -7,6 +7,7 @@ import (
 	"errors"
 	"strings"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/profile"
 	"github.com/chuanmingliu/openai-gpt-live/internal/prompttmpl"
 )
@@ -17,6 +18,42 @@ func (runtime *ProfileRuntime) HasTurnTemplate() bool {
 	}
 	_, ok := runtime.Profile.Bundle.Templates["turn_instruction.j2"]
 	return ok
+}
+
+// HandoffProfileSnapshot pins one deterministic server-owned recipe from the
+// session's immutable profile. Model arguments cannot alter recipe, registry,
+// engine, or knowledge authority.
+func (runtime *ProfileRuntime) HandoffProfileSnapshot(transcript string) (handoff.ProfileSnapshot, bool) {
+	if runtime == nil || len(runtime.Profile.Snapshot.Recipes) == 0 {
+		return handoff.ProfileSnapshot{}, false
+	}
+	selected := runtime.Profile.Snapshot.Recipes[0]
+	for _, candidate := range runtime.Profile.Snapshot.Recipes[1:] {
+		if candidate.ID < selected.ID {
+			selected = candidate
+		}
+	}
+	recipeHash, err := selected.Hash()
+	if err != nil {
+		return handoff.ProfileSnapshot{}, false
+	}
+	evidence, err := json.Marshal(struct {
+		Transcript string `json:"transcript"`
+	}{Transcript: transcript})
+	if err != nil {
+		return handoff.ProfileSnapshot{}, false
+	}
+	knowledge := make([]handoff.KnowledgeVersion, len(runtime.Profile.Snapshot.Knowledge))
+	for index, reference := range runtime.Profile.Snapshot.Knowledge {
+		knowledge[index] = handoff.KnowledgeVersion{ID: strings.Clone(reference.ID), Version: reference.Version, Hash: strings.Clone(reference.Hash)}
+	}
+	return handoff.ProfileSnapshot{
+		ProfileID: string(runtime.Profile.Snapshot.Ref.ID), ProfileVersion: runtime.Profile.Snapshot.Ref.Version,
+		SnapshotHash: strings.Clone(runtime.Profile.Snapshot.SnapshotHash), EngineVersion: strings.Clone(runtime.Profile.Snapshot.EngineVersion),
+		RecipeID: strings.Clone(selected.ID), RecipeVersion: selected.Version, RecipeHash: recipeHash,
+		RegistryVersion: strings.Clone(runtime.Profile.Snapshot.AdapterRegistryVersion), Knowledge: knowledge,
+		Evidence: evidence,
+	}, true
 }
 
 func disableAutomaticResponse(raw json.RawMessage) (json.RawMessage, error) {

@@ -3,6 +3,7 @@ package session
 import (
 	"encoding/json"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
@@ -58,6 +59,7 @@ type HandoffRequestedEffect struct {
 	Transcript   string
 	RejectReason string
 	ToolPolicy   toolpolicy.Policy
+	Profile      handoff.ProfileSnapshot
 }
 
 type AsyncEffect struct {

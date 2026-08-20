@@ -125,7 +125,7 @@ ALTER TABLE handoffs DROP COLUMN tool_policy;
 }
 
 func TestEmbeddedVerticalProfileMigrationCatalogIsExact(t *testing.T) {
-	assert.Equal(t, uint(10), latestVersion)
+	assert.Equal(t, uint(11), latestVersion)
 	wantNames := []string{
 		"000001_durable_handoffs.down.sql", "000001_durable_handoffs.up.sql",
 		"000002_task11_coordinator_replay.down.sql", "000002_task11_coordinator_replay.up.sql",
@@ -137,6 +137,7 @@ func TestEmbeddedVerticalProfileMigrationCatalogIsExact(t *testing.T) {
 		"000008_handoff_tool_policy.down.sql", "000008_handoff_tool_policy.up.sql",
 		"000009_vertical_profiles.down.sql", "000009_vertical_profiles.up.sql",
 		"000010_knowledge_packs.down.sql", "000010_knowledge_packs.up.sql",
+		"000011_handoff_profile_snapshot.down.sql", "000011_handoff_profile_snapshot.up.sql",
 	}
 	entries, err := files.ReadDir(".")
 	require.NoError(t, err)
@@ -147,9 +148,17 @@ func TestEmbeddedVerticalProfileMigrationCatalogIsExact(t *testing.T) {
 		}
 	}
 	assert.Equal(t, wantNames, gotNames)
+	up, err := files.ReadFile("000011_handoff_profile_snapshot.up.sql")
+	require.NoError(t, err)
+	down, err := files.ReadFile("000011_handoff_profile_snapshot.down.sql")
+	require.NoError(t, err)
+	assert.Contains(t, string(up), "profile_snapshot_hash")
+	assert.Contains(t, string(down), "handoff profile snapshot downgrade would lose non-default data")
 	wantChecksums := map[string]string{
-		"000009_vertical_profiles.down.sql": "14ddeb515492515b2f23a0afe754c1ab31cfa534ec93bed974f46b87798dd39e",
-		"000009_vertical_profiles.up.sql":   "363d71258d0fecd30538eaf3bbeb323a1e9c87ac7004226a39ea32f9ca8d7729",
+		"000009_vertical_profiles.down.sql":        "14ddeb515492515b2f23a0afe754c1ab31cfa534ec93bed974f46b87798dd39e",
+		"000009_vertical_profiles.up.sql":          "363d71258d0fecd30538eaf3bbeb323a1e9c87ac7004226a39ea32f9ca8d7729",
+		"000011_handoff_profile_snapshot.up.sql":   "faab92097fa7a1583274f671859bf9da2ae08f03e04e772c3c4d465e482f41dd",
+		"000011_handoff_profile_snapshot.down.sql": "6edf23d03428848d18df269d4f653ac7929bfaf2c35ff13d2ba69e010b2cdfb7",
 	}
 	for name, checksum := range wantChecksums {
 		contents, readErr := files.ReadFile(name)
@@ -163,6 +172,12 @@ func TestHandoffToolPolicyDataLossRefusalClassificationIsExact(t *testing.T) {
 	assert.True(t, isHandoffToolPolicyDataLossRefusal(&pgconn.PgError{Code: "55000", Message: ErrHandoffToolPolicyDataLoss.Error()}))
 	assert.False(t, isHandoffToolPolicyDataLossRefusal(&pgconn.PgError{Code: "57014", Message: ErrHandoffToolPolicyDataLoss.Error()}))
 	assert.False(t, isHandoffToolPolicyDataLossRefusal(&pgconn.PgError{Code: "55000", Message: "arbitrary prerequisite failure"}))
+}
+
+func TestHandoffProfileSnapshotDataLossRefusalClassificationIsExact(t *testing.T) {
+	assert.True(t, isHandoffProfileSnapshotDataLossRefusal(&pgconn.PgError{Code: "55000", Message: ErrHandoffProfileSnapshotDataLoss.Error()}))
+	assert.False(t, isHandoffProfileSnapshotDataLossRefusal(&pgconn.PgError{Code: "57014", Message: ErrHandoffProfileSnapshotDataLoss.Error()}))
+	assert.False(t, isHandoffProfileSnapshotDataLossRefusal(&pgconn.PgError{Code: "55000", Message: "arbitrary prerequisite failure"}))
 }
 
 func TestCoordinatorPendingRefusalClassificationIsExact(t *testing.T) {

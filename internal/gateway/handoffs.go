@@ -51,6 +51,7 @@ type SessionHandoffSnapshot struct {
 	ToolPolicy       json.RawMessage
 	ApprovalPolicy   json.RawMessage
 	Versions         handoff.Versions
+	Profile          handoff.ProfileSnapshot
 	PresentationHint string
 }
 
@@ -489,8 +490,9 @@ func (c *HandoffCoordinator) process(appCtx context.Context, work HandoffWork) (
 			Priority: work.Snapshot.Priority, ToolAllowlist: toolAllowlistForPolicy(work.Snapshot.ToolAllowlist, policy),
 			ToolPolicy:     canonicalPolicy,
 			ApprovalPolicy: append(json.RawMessage(nil), work.Snapshot.ApprovalPolicy...),
-			Versions:       work.Snapshot.Versions, PresentationHint: work.Snapshot.PresentationHint,
-			IdempotencyKey: handoffIdempotencyKey(work, canonical),
+			Versions:       work.Snapshot.Versions, Profile: cloneHandoffProfile(work.Snapshot.Profile),
+			PresentationHint: work.Snapshot.PresentationHint,
+			IdempotencyKey:   handoffIdempotencyKey(work, canonical),
 		}
 		snapshot, err = c.service.Create(appCtx, request)
 	case handoff.SteerBackgroundTaskArgs:
@@ -573,6 +575,7 @@ func cloneHandoffWork(work HandoffWork) HandoffWork {
 	work.Snapshot.ToolAllowlist = cloneStringSlice(work.Snapshot.ToolAllowlist)
 	work.Snapshot.ToolPolicy = append(json.RawMessage(nil), work.Snapshot.ToolPolicy...)
 	work.Snapshot.ApprovalPolicy = append(json.RawMessage(nil), work.Snapshot.ApprovalPolicy...)
+	work.Snapshot.Profile = cloneHandoffProfile(work.Snapshot.Profile)
 	return work
 }
 
@@ -587,6 +590,13 @@ func cloneHandoffSnapshot(snapshot SessionHandoffSnapshot) SessionHandoffSnapsho
 	snapshot.ToolAllowlist = cloneStringSlice(snapshot.ToolAllowlist)
 	snapshot.ToolPolicy = append(json.RawMessage(nil), snapshot.ToolPolicy...)
 	snapshot.ApprovalPolicy = append(json.RawMessage(nil), snapshot.ApprovalPolicy...)
+	snapshot.Profile = cloneHandoffProfile(snapshot.Profile)
+	return snapshot
+}
+
+func cloneHandoffProfile(snapshot handoff.ProfileSnapshot) handoff.ProfileSnapshot {
+	snapshot.Knowledge = append([]handoff.KnowledgeVersion(nil), snapshot.Knowledge...)
+	snapshot.Evidence = append(json.RawMessage(nil), snapshot.Evidence...)
 	return snapshot
 }
 
@@ -624,7 +634,7 @@ func validateHandoffWorkBounds(work HandoffWork) (int, error) {
 		string(work.SessionID), work.Scope.TenantID, work.Scope.UserID, string(work.Scope.ConversationID),
 		work.CallID, work.ResponseID, work.ToolName,
 	}
-	retained := len(work.Arguments) + len(work.Transcript) + len(work.ToolPolicy) + len(work.Snapshot.ToolPolicy) + len(work.Snapshot.ApprovalPolicy)
+	retained := len(work.Arguments) + len(work.Transcript) + len(work.ToolPolicy) + len(work.Snapshot.ToolPolicy) + len(work.Snapshot.ApprovalPolicy) + len(work.Snapshot.Profile.Evidence)
 	for _, value := range stringsToCheck {
 		if strings.TrimSpace(value) == "" || !utf8.ValidString(value) || len(value) > session.DurableIdentifierBytes {
 			return 0, ErrCoordinatorWorkTooLarge
@@ -653,6 +663,20 @@ func validateHandoffWorkBounds(work HandoffWork) (int, error) {
 			return 0, ErrCoordinatorWorkTooLarge
 		}
 		retained += len(value)
+	}
+	for _, value := range []string{work.Snapshot.Profile.ProfileID, work.Snapshot.Profile.SnapshotHash,
+		work.Snapshot.Profile.EngineVersion, work.Snapshot.Profile.RecipeID, work.Snapshot.Profile.RecipeHash,
+		work.Snapshot.Profile.RegistryVersion} {
+		if !utf8.ValidString(value) || len(value) > session.DurableIdentifierBytes {
+			return 0, ErrCoordinatorWorkTooLarge
+		}
+		retained += len(value)
+	}
+	for _, reference := range work.Snapshot.Profile.Knowledge {
+		if !utf8.ValidString(reference.ID) || len(reference.ID) > session.DurableIdentifierBytes {
+			return 0, ErrCoordinatorWorkTooLarge
+		}
+		retained += len(reference.ID) + len(reference.Hash)
 	}
 	for _, tool := range work.Snapshot.ToolAllowlist {
 		if strings.TrimSpace(tool) == "" || !utf8.ValidString(tool) || len(tool) > session.DurableIdentifierBytes {

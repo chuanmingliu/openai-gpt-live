@@ -121,6 +121,7 @@ func validHandoffWork() HandoffWork {
 			ToolPolicy:       mustGatewayToolPolicy(toolpolicy.DefaultPolicy()),
 			ApprovalPolicy:   json.RawMessage(`{"mode":"strict"}`),
 			Versions:         handoff.Versions{Model: "m", Prompt: "p", ToolRegistry: "t", Config: "c"},
+			Profile:          handoff.LegacyProfileSnapshot(),
 			PresentationHint: "server-policy",
 		},
 	}
@@ -131,12 +132,17 @@ func TestHandoffCoordinatorUsesTrustedWorkAndSnapshotThenSubmitsAcceptance(t *te
 	submit := &submitterFake{inputs: make(chan session.Input, 1)}
 	coordinator := NewHandoffCoordinator(service, submit, 1)
 	work := validHandoffWork()
+	work.Snapshot.Profile.Knowledge = []handoff.KnowledgeVersion{{ID: "guide", Version: 2, Hash: strings.Repeat("d", 64)}}
+	work.Snapshot.Profile.Evidence = json.RawMessage(`{"intent":"quote"}`)
+	wantProfile := cloneHandoffProfile(work.Snapshot.Profile)
 	require.NoError(t, coordinator.Enqueue(work))
 	work.Arguments[14] = 'X'
 	work.ToolPolicy[0] = '['
 	work.Snapshot.ToolAllowlist[0] = "attacker"
 	work.Snapshot.ToolPolicy[0] = '['
 	work.Snapshot.ApprovalPolicy[9] = 'X'
+	work.Snapshot.Profile.Knowledge[0].ID = "attacker"
+	work.Snapshot.Profile.Evidence[1] = 'X'
 
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
@@ -152,6 +158,7 @@ func TestHandoffCoordinatorUsesTrustedWorkAndSnapshotThenSubmitsAcceptance(t *te
 	assert.Equal(t, mustGatewayToolPolicy(toolpolicy.DefaultPolicy()), request.ToolPolicy)
 	assert.JSONEq(t, `{"mode":"strict"}`, string(request.ApprovalPolicy))
 	assert.Equal(t, "server-policy", request.PresentationHint)
+	assert.Equal(t, wantProfile, request.Profile)
 	assert.NotEmpty(t, request.IdempotencyKey)
 
 	accepted := (<-submit.inputs).(session.HandoffAcceptedInput)

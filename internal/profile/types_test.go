@@ -338,6 +338,17 @@ func manifestWithResearchRecipe(resultSchema json.RawMessage) Manifest {
 	return manifest
 }
 
+func TestWorkerRecipeHashCoversImmutableExecutionAuthority(t *testing.T) {
+	recipe := manifestWithResearchRecipe(json.RawMessage(`{"type":"object"}`)).Recipes[0]
+	first, err := recipe.Hash()
+	require.NoError(t, err)
+	recipe.MaxFinalResultBytes = 1024
+	second, err := recipe.Hash()
+	require.NoError(t, err)
+	require.NotEqual(t, first, second)
+	require.Regexp(t, `^[0-9a-f]{64}$`, first)
+}
+
 func mustHash(t *testing.T, manifest Manifest) string {
 	t.Helper()
 	hash, err := manifest.Hash()

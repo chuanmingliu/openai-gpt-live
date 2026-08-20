@@ -197,6 +197,24 @@ func (recipe WorkerRecipe) Clone() WorkerRecipe {
 	return recipe
 }
 
+// Hash identifies every immutable execution authority in one worker recipe,
+// independently of its containing profile snapshot.
+func (recipe WorkerRecipe) Hash() (string, error) {
+	if !validRecipe(recipe) {
+		return "", ErrInvalidProfile
+	}
+	canonical := recipe.Clone()
+	sort.Strings(canonical.BindingIDs)
+	sort.Strings(canonical.RequiredEvidence)
+	sort.Strings(canonical.OptionalEvidence)
+	resultSchema, ok := canonicalJSON(canonical.ResultSchema)
+	if !ok {
+		return "", ErrInvalidProfile
+	}
+	canonical.ResultSchema = resultSchema
+	return hashCanonical(profileHashVersion+"/worker-recipe", canonical), nil
+}
+
 // AdapterBinding narrows one server-owned adapter catalog entry.
 type AdapterBinding struct {
 	AdapterID       string   `json:"adapter_id"`

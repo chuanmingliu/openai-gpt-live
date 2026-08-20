@@ -23,6 +23,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/session"
 	"github.com/chuanmingliu/openai-gpt-live/internal/store/postgres"
 	"github.com/chuanmingliu/openai-gpt-live/internal/testkit"
+	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 	"github.com/chuanmingliu/openai-gpt-live/internal/worker"
 	"github.com/chuanmingliu/openai-gpt-live/migrations"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -68,12 +69,17 @@ func (h recoveryHarness) create(t *testing.T, suffix string) (handoff.Service, h
 	require.NoError(t, err)
 	service, err := handoff.NewService(h.repo, h.now, sequenceHandoffIDs{suffix: suffix})
 	require.NoError(t, err)
+	policy := toolpolicy.DefaultPolicy()
+	policy.WebSearch.Enabled = false
+	policyRaw, err := toolpolicy.MarshalCanonical(policy)
+	require.NoError(t, err)
 	snapshot, err := service.Create(t.Context(), handoff.CreateRequest{
 		Scope: scope, SessionID: identity.SessionID("session-" + suffix), SourceTurn: identity.TurnKey{ID: "turn-" + suffix, Revision: 1},
 		UserRequest: text, Objective: "objective-" + suffix, ContextRef: "context://" + suffix, ContextHash: "sha256:context-" + suffix,
 		Deadline: h.now.Now().Add(time.Hour), TokenBudget: 4096, Priority: 12,
-		ToolAllowlist: []string{"fetch", "search"}, ApprovalPolicy: json.RawMessage(`{"mode":"ask"}`),
+		ToolAllowlist: []string{"fetch", "search"}, ToolPolicy: policyRaw, ApprovalPolicy: json.RawMessage(`{"mode":"ask"}`),
 		Versions:         handoff.Versions{Model: "model-v1", Prompt: "prompt-v2", ToolRegistry: "tools-v3", Config: "config-v4"},
+		Profile:          handoff.LegacyProfileSnapshot(),
 		PresentationHint: "compact", IdempotencyKey: "key-" + suffix,
 	})
 	require.NoError(t, err)

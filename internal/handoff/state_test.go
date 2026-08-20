@@ -1,6 +1,8 @@
 package handoff
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -12,6 +14,50 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestLegacyProfilePreservesPreProfileIdempotencyHash(t *testing.T) {
+	request := validCreateRequest(time.Date(2026, time.August, 20, 12, 0, 0, 0, time.UTC))
+	request.Profile = LegacyProfileSnapshot()
+	normalized, err := NormalizeCreateRequest(request)
+	require.NoError(t, err)
+	legacyDocument := struct {
+		Scope            Scope           `json:"scope"`
+		SessionID        string          `json:"session_id"`
+		SourceTurnID     string          `json:"source_turn_id"`
+		SourceRevision   uint32          `json:"source_turn_revision"`
+		UserRequest      string          `json:"user_request"`
+		Objective        string          `json:"objective"`
+		ContextRef       string          `json:"context_ref"`
+		ContextHash      string          `json:"context_hash"`
+		Deadline         string          `json:"deadline"`
+		TokenBudget      int             `json:"token_budget"`
+		Priority         int16           `json:"priority"`
+		ToolAllowlist    []string        `json:"tool_allowlist"`
+		ToolPolicy       json.RawMessage `json:"tool_policy"`
+		ApprovalPolicy   json.RawMessage `json:"approval_policy"`
+		Versions         Versions        `json:"versions"`
+		PresentationHint string          `json:"presentation_hint"`
+	}{
+		Scope: normalized.Scope, SessionID: string(normalized.SessionID), SourceTurnID: normalized.SourceTurn.ID,
+		SourceRevision: normalized.SourceTurn.Revision, UserRequest: normalized.UserRequest, Objective: normalized.Objective,
+		ContextRef: normalized.ContextRef, ContextHash: normalized.ContextHash, Deadline: normalized.Deadline.Format(time.RFC3339Nano),
+		TokenBudget: normalized.TokenBudget, Priority: normalized.Priority, ToolAllowlist: normalized.ToolAllowlist,
+		ToolPolicy: normalized.ToolPolicy, ApprovalPolicy: normalized.ApprovalPolicy, Versions: normalized.Versions,
+		PresentationHint: normalized.PresentationHint,
+	}
+	encoded, err := json.Marshal(legacyDocument)
+	require.NoError(t, err)
+	digest := sha256.Sum256(encoded)
+	want := hex.EncodeToString(digest[:])
+	got, err := CanonicalRequestHash(request)
+	require.NoError(t, err)
+	require.Equal(t, want, got)
+
+	request.Profile = validProfileSnapshot()
+	custom, err := CanonicalRequestHash(request)
+	require.NoError(t, err)
+	require.NotEqual(t, want, custom)
+}
 
 func TestNormalizeCreateRequestCanonicalizesToolPolicy(t *testing.T) {
 	request := validCreateRequest(time.Now().UTC())
@@ -62,6 +108,47 @@ func TestCloneSnapshotDeepCopiesToolPolicy(t *testing.T) {
 	cloned := CloneSnapshot(original)
 	cloned.Request.ToolPolicy[0] = '['
 	assert.Equal(t, byte('{'), original.Request.ToolPolicy[0])
+}
+
+func TestProfileSnapshotIsHashedAndDeepCopiedWithCreateRequest(t *testing.T) {
+	request := validCreateRequest(time.Now().UTC())
+	first, err := CanonicalRequestHash(request)
+	require.NoError(t, err)
+	request.Profile.Knowledge[0].Hash = strings.Repeat("e", 64)
+	second, err := CanonicalRequestHash(request)
+	require.NoError(t, err)
+	require.NotEqual(t, first, second)
+
+	original := Snapshot{Request: request}
+	cloned := CloneSnapshot(original)
+	cloned.Request.Profile.Knowledge[0].ID = "mutated"
+	cloned.Request.Profile.Evidence[0] = '['
+	require.Equal(t, "policy", original.Request.Profile.Knowledge[0].ID)
+	require.Equal(t, byte('{'), original.Request.Profile.Evidence[0])
+}
+
+func TestProfileSnapshotBoundsKnowledgeAndEvidence(t *testing.T) {
+	now := time.Now().UTC()
+	atLimit := validCreateRequest(now)
+	atLimit.Profile.Knowledge = make([]KnowledgeVersion, 32)
+	for index := range atLimit.Profile.Knowledge {
+		atLimit.Profile.Knowledge[index] = KnowledgeVersion{
+			ID: "pack-" + string(rune('a'+index)), Version: 1, Hash: strings.Repeat("a", 64),
+		}
+	}
+	atLimit.Profile.Evidence = json.RawMessage(`{"value":"` + strings.Repeat("x", 256*1024-len(`{"value":""}`)) + `"}`)
+	_, err := NormalizeCreateRequest(atLimit)
+	require.NoError(t, err)
+
+	overKnowledge := validCreateRequest(now)
+	overKnowledge.Profile.Knowledge = append(overKnowledge.Profile.Knowledge, make([]KnowledgeVersion, 32)...)
+	_, err = NormalizeCreateRequest(overKnowledge)
+	require.ErrorIs(t, err, ErrInvalidRequest)
+
+	overEvidence := validCreateRequest(now)
+	overEvidence.Profile.Evidence = json.RawMessage(`"` + strings.Repeat("x", 256*1024) + `"`)
+	_, err = NormalizeCreateRequest(overEvidence)
+	require.ErrorIs(t, err, ErrInvalidRequest)
 }
 
 func TestValidateTransition_AllOrderedPairs(t *testing.T) {
@@ -537,7 +624,18 @@ func validCreateRequest(now time.Time) CreateRequest {
 		ToolPolicy:       mustPolicyJSONWithoutTest(disabledPolicy),
 		ApprovalPolicy:   json.RawMessage(`{"mode":"ask"}`),
 		Versions:         Versions{Model: "model-1", Prompt: "prompt-1", ToolRegistry: "tools-1", Config: "config-1"},
+		Profile:          validProfileSnapshot(),
 		PresentationHint: "brief", IdempotencyKey: "idem-1",
+	}
+}
+
+func validProfileSnapshot() ProfileSnapshot {
+	return ProfileSnapshot{
+		ProfileID: "insurance", ProfileVersion: 3, SnapshotHash: strings.Repeat("a", 64),
+		EngineVersion: "jinja-go-v1/test", RecipeID: "renewal", RecipeVersion: 2,
+		RecipeHash: strings.Repeat("b", 64), RegistryVersion: "registry-v1",
+		Knowledge: []KnowledgeVersion{{ID: "policy", Version: 7, Hash: strings.Repeat("c", 64)}},
+		Evidence:  json.RawMessage(`{"source":"turn"}`),
 	}
 }
 
@@ -545,6 +643,7 @@ func cloneCreateRequest(in CreateRequest) CreateRequest {
 	in.ToolAllowlist = append([]string(nil), in.ToolAllowlist...)
 	in.ToolPolicy = append(json.RawMessage(nil), in.ToolPolicy...)
 	in.ApprovalPolicy = append(json.RawMessage(nil), in.ApprovalPolicy...)
+	in.Profile = cloneProfileSnapshot(in.Profile)
 	return in
 }
 

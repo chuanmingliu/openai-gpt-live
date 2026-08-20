@@ -288,6 +288,7 @@ func newDurableSearchHarness(t *testing.T, configure ...durableSearchOption) *du
 		ContextRef: "context://web-search", ContextHash: "sha256:web-search", Deadline: now.Add(time.Hour), TokenBudget: 512, Priority: 12,
 		ToolAllowlist: []string{toolpolicy.WebSearchTool}, ToolPolicy: policyRaw, ApprovalPolicy: json.RawMessage(`{"mode":"none"}`),
 		Versions:         handoff.Versions{Model: "deepseek-v4-flash", Prompt: "prompt-web-v1", ToolRegistry: "tools-web-v1", Config: "config-web-v1"},
+		Profile:          handoff.LegacyProfileSnapshot(),
 		PresentationHint: "compact",
 	}}
 	gates := feature.New(map[string]bool{feature.HandoffsEnabled: true})

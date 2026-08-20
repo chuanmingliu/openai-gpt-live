@@ -501,13 +501,17 @@ func (d *durableDispatcher) DispatchHandoff(_ context.Context, trusted session.T
 	if err != nil {
 		return errors.New("handoff tool policy is invalid")
 	}
+	snapshot := cloneHandoffSnapshot(d.snapshot)
+	if effect.Profile.ProfileID != "" {
+		snapshot.Profile = cloneHandoffProfile(effect.Profile)
+	}
 	return d.handoffs.Enqueue(HandoffWork{
 		SessionID: trusted.IDs.SessionID, Incarnation: trusted.IDs.Incarnation,
 		OriginEpoch: effect.OriginEpoch,
 		Scope:       handoff.Scope{TenantID: trusted.Subject.TenantID, UserID: trusted.Subject.UserID, ConversationID: trusted.IDs.ConversationID},
 		CallID:      effect.CallID, ResponseID: effect.ResponseID, ToolName: effect.ToolName,
 		Arguments: append(json.RawMessage(nil), effect.Arguments...), Turn: effect.Turn,
-		Transcript: effect.Transcript, ToolPolicy: policy, Snapshot: cloneHandoffSnapshot(d.snapshot), RejectReason: effect.RejectReason,
+		Transcript: effect.Transcript, ToolPolicy: policy, Snapshot: snapshot, RejectReason: effect.RejectReason,
 	})
 }
 
@@ -526,7 +530,7 @@ func validateHandoffSnapshot(snapshot SessionHandoffSnapshot) error {
 		ToolAllowlist:  append([]string(nil), snapshot.ToolAllowlist...),
 		ToolPolicy:     append(json.RawMessage(nil), snapshot.ToolPolicy...),
 		ApprovalPolicy: append(json.RawMessage(nil), snapshot.ApprovalPolicy...),
-		Versions:       snapshot.Versions, PresentationHint: snapshot.PresentationHint,
+		Versions:       snapshot.Versions, Profile: cloneHandoffProfile(snapshot.Profile), PresentationHint: snapshot.PresentationHint,
 		IdempotencyKey: "snapshot-validation",
 	}, time.Now().UTC())
 	return err

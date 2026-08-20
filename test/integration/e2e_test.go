@@ -387,7 +387,8 @@ func startDeterministicSystem(t *testing.T, configure ...deterministicOption) *d
 	dispatcher := &deterministicDispatcher{work: make(chan gateway.HandoffWork, 8), snapshot: gateway.SessionHandoffSnapshot{
 		ContextRef: "context://e2e", ContextHash: "sha256:context-e2e", Deadline: now.Add(time.Hour), TokenBudget: 128, Priority: 12,
 		ToolAllowlist: []string{"fetch", "search"}, ApprovalPolicy: options.approvalPolicy,
-		Versions: handoff.Versions{Model: "model-v1", Prompt: "prompt-v2", ToolRegistry: "tools-v3", Config: "config-v4"}, PresentationHint: "brief",
+		Versions: handoff.Versions{Model: "model-v1", Prompt: "prompt-v2", ToolRegistry: "tools-v3", Config: "config-v4"},
+		Profile:  handoff.LegacyProfileSnapshot(), PresentationHint: "brief",
 	}}
 	wakeups := make(chan handoff.EventWakeup, 32)
 	var pumpNotifications <-chan handoff.EventWakeup = wakeups

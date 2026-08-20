@@ -21,7 +21,9 @@ const handoffColumns = `
 	id, tenant_id, conversation_id, user_id, session_id, source_turn_id, source_turn_revision,
 	user_request, objective, context_ref, context_hash, deadline, token_budget, priority,
 	tool_allowlist::text, tool_policy::text, approval_policy::text, model_version, prompt_version, tool_registry_version,
-	config_version, presentation_hint, idempotency_key, request_hash, state, objective_revision,
+	config_version, profile_id, profile_version, profile_snapshot_hash, profile_engine_version,
+	worker_recipe_id, worker_recipe_version, worker_recipe_hash, adapter_registry_version,
+	profile_knowledge::text, profile_evidence::text, presentation_hint, idempotency_key, request_hash, state, objective_revision,
 	input_revision, consumed_input_revision, input::text, attempt, retry_count, terminal_mutation_id,
 	result_summary, structured_result::text, safety_decision::text, usage::text, failure_code, failure_retryable,
 	failure_message, created_at, updated_at`
@@ -161,6 +163,13 @@ func (r *Repository) CreateHandoff(ctx context.Context, record handoff.CreateRec
 	if err != nil {
 		return handoff.Snapshot{}, false, err
 	}
+	knowledge := []byte(`[]`)
+	if len(record.Request.Profile.Knowledge) != 0 {
+		knowledge, err = json.Marshal(record.Request.Profile.Knowledge)
+		if err != nil {
+			return handoff.Snapshot{}, false, err
+		}
+	}
 	if err := r.lockEventAppend(ctx, tx); err != nil {
 		return handoff.Snapshot{}, false, err
 	}
@@ -170,9 +179,12 @@ func (r *Repository) CreateHandoff(ctx context.Context, record handoff.CreateRec
 			tenant_id, conversation_id, id, user_id, session_id, source_turn_id, source_turn_revision,
 			user_request, objective, context_ref, context_hash, deadline, token_budget, priority,
 			tool_allowlist, tool_policy, approval_policy, model_version, prompt_version, tool_registry_version, config_version,
+			profile_id, profile_version, profile_snapshot_hash, profile_engine_version,
+			worker_recipe_id, worker_recipe_version, worker_recipe_hash, adapter_registry_version, profile_knowledge, profile_evidence,
 			presentation_hint, idempotency_key, request_hash, ready_at, created_at, updated_at
 		)
-		SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::json,$16::jsonb,$17::json,$18,$19,$20,$21,$22,$23,$24,$25,$25,$25
+		SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::json,$16::jsonb,$17::json,$18,$19,$20,$21,
+		       $22,$23,$24,$25,$26,$27,$28,$29,$30::json,$31::json,$32,$33,$34,$35,$35,$35
 		FROM conversations c WHERE c.tenant_id=$1 AND c.id=$2 AND c.user_id=$4 AND c.status <> 'deleted'
 		  AND EXISTS (SELECT 1 FROM conversation_items i
 		    WHERE i.tenant_id=c.tenant_id AND i.conversation_id=c.id AND i.session_id=$5
@@ -184,7 +196,10 @@ func (r *Repository) CreateHandoff(ctx context.Context, record handoff.CreateRec
 		record.Request.UserRequest, record.Request.Objective, record.Request.ContextRef, record.Request.ContextHash,
 		record.Request.Deadline, record.Request.TokenBudget, record.Request.Priority, allowlist, record.Request.ToolPolicy, record.Request.ApprovalPolicy,
 		record.Request.Versions.Model, record.Request.Versions.Prompt, record.Request.Versions.ToolRegistry,
-		record.Request.Versions.Config, record.Request.PresentationHint, record.Request.IdempotencyKey,
+		record.Request.Versions.Config, record.Request.Profile.ProfileID, record.Request.Profile.ProfileVersion,
+		record.Request.Profile.SnapshotHash, record.Request.Profile.EngineVersion, record.Request.Profile.RecipeID,
+		record.Request.Profile.RecipeVersion, record.Request.Profile.RecipeHash, record.Request.Profile.RegistryVersion,
+		knowledge, record.Request.Profile.Evidence, record.Request.PresentationHint, record.Request.IdempotencyKey,
 		record.RequestHash, record.CreatedAt).Scan(&insertedID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		snapshot, loadErr := loadHandoffRow(tx.QueryRow(ctx, `SELECT `+handoffColumns+`
@@ -620,15 +635,19 @@ func loadHandoffRow(row pgx.Row) (handoff.Snapshot, error) {
 	var out handoff.Snapshot
 	var tenant, conversation, user, session, sourceTurn string
 	var sourceRevision, objectiveRevision, inputRevision, consumedInput, attempt, retryCount int64
+	var profileVersion, recipeVersion int64
 	var state string
-	var allowlistRaw, toolPolicyRaw, approvalRaw, inputRaw []byte
+	var allowlistRaw, toolPolicyRaw, approvalRaw, knowledgeRaw, evidenceRaw, inputRaw []byte
 	var mutationID, resultSummary, structured, safetyDecision, usage, failureCode, failureMessage sql.NullString
 	var failureRetryable sql.NullBool
 	err := row.Scan(&out.ID, &tenant, &conversation, &user, &session, &sourceTurn, &sourceRevision,
 		&out.Request.UserRequest, &out.Request.Objective, &out.Request.ContextRef, &out.Request.ContextHash,
 		&out.Request.Deadline, &out.Request.TokenBudget, &out.Request.Priority, &allowlistRaw, &toolPolicyRaw, &approvalRaw,
 		&out.Request.Versions.Model, &out.Request.Versions.Prompt, &out.Request.Versions.ToolRegistry,
-		&out.Request.Versions.Config, &out.Request.PresentationHint, &out.Request.IdempotencyKey, &out.RequestHash,
+		&out.Request.Versions.Config, &out.Request.Profile.ProfileID, &profileVersion, &out.Request.Profile.SnapshotHash,
+		&out.Request.Profile.EngineVersion, &out.Request.Profile.RecipeID, &recipeVersion, &out.Request.Profile.RecipeHash,
+		&out.Request.Profile.RegistryVersion, &knowledgeRaw, &evidenceRaw, &out.Request.PresentationHint,
+		&out.Request.IdempotencyKey, &out.RequestHash,
 		&state, &objectiveRevision, &inputRevision, &consumedInput, &inputRaw, &attempt, &retryCount, &mutationID,
 		&resultSummary, &structured, &safetyDecision, &usage, &failureCode, &failureRetryable, &failureMessage, &out.CreatedAt, &out.UpdatedAt)
 	if err != nil {
@@ -639,6 +658,9 @@ func loadHandoffRow(row pgx.Row) (handoff.Snapshot, error) {
 			return handoff.Snapshot{}, errors.New("postgres: handoff numeric value out of range")
 		}
 	}
+	if profileVersion <= 0 || recipeVersion <= 0 {
+		return handoff.Snapshot{}, errors.New("postgres: handoff profile version out of range")
+	}
 	out.Request.Scope = handoff.Scope{TenantID: tenant, UserID: user, ConversationID: identity.ConversationID(conversation)}
 	out.Request.SessionID = identity.SessionID(session)
 	out.Request.SourceTurn = identity.TurnKey{ID: sourceTurn, Revision: uint32(sourceRevision)}
@@ -647,6 +669,12 @@ func loadHandoffRow(row pgx.Row) (handoff.Snapshot, error) {
 	}
 	out.Request.ToolPolicy = append(json.RawMessage(nil), toolPolicyRaw...)
 	out.Request.ApprovalPolicy = append(json.RawMessage(nil), approvalRaw...)
+	out.Request.Profile.ProfileVersion = uint64(profileVersion)
+	out.Request.Profile.RecipeVersion = uint64(recipeVersion)
+	if err := json.Unmarshal(knowledgeRaw, &out.Request.Profile.Knowledge); err != nil {
+		return handoff.Snapshot{}, err
+	}
+	out.Request.Profile.Evidence = append(json.RawMessage(nil), evidenceRaw...)
 	out.State = handoff.State(state)
 	out.ObjectiveRevision, out.InputRevision, out.ConsumedInput = uint32(objectiveRevision), uint32(inputRevision), uint32(consumedInput)
 	out.Input = append(json.RawMessage(nil), inputRaw...)

@@ -20,7 +20,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const latestVersion uint = 10
+const latestVersion uint = 11
 
 const (
 	migrationCancelTimeout     = 2 * time.Second
@@ -34,6 +34,7 @@ var migrationRunnerSequence atomic.Uint64
 var ErrCoordinatorPendingWork = errors.New("coordinator journal contains undelivered replay work")
 var ErrToolInvocationScopeConflict = errors.New("tool invocation rows conflict under legacy scope")
 var ErrHandoffToolPolicyDataLoss = errors.New("handoff tool policy downgrade would lose non-default data")
+var ErrHandoffProfileSnapshotDataLoss = errors.New("handoff profile snapshot downgrade would lose non-default data")
 
 //go:embed *.sql
 var files embed.FS
@@ -314,6 +315,12 @@ func (d *cancellablePGXDriver) Run(migration io.Reader) error {
 			}
 			return errors.Join(ErrHandoffToolPolicyDataLoss, err)
 		}
+		if isHandoffProfileSnapshotDataLossRefusal(err) {
+			if recoveryErr := d.recoverHandoffProfileSnapshotDataLossRefusal(); recoveryErr != nil {
+				return errors.Join(err, fmt.Errorf("recover handoff profile snapshot downgrade refusal: %w", recoveryErr))
+			}
+			return errors.Join(ErrHandoffProfileSnapshotDataLoss, err)
+		}
 		if isToolInvocationScopeRefusal(err) {
 			if recoveryErr := d.recoverToolInvocationScopeRefusal(); recoveryErr != nil {
 				return errors.Join(err, fmt.Errorf("recover tool invocation scope downgrade refusal: %w", recoveryErr))
@@ -334,6 +341,11 @@ func (d *cancellablePGXDriver) Run(migration io.Reader) error {
 func isHandoffToolPolicyDataLossRefusal(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "55000" && pgErr.Message == ErrHandoffToolPolicyDataLoss.Error()
+}
+
+func isHandoffProfileSnapshotDataLossRefusal(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "55000" && pgErr.Message == ErrHandoffProfileSnapshotDataLoss.Error()
 }
 
 func isCoordinatorPendingRefusal(err error) bool {
@@ -452,6 +464,39 @@ func (d *cancellablePGXDriver) recoverHandoffToolPolicyDataLossRefusal() error {
 		return errors.New("handoff tool policy downgrade refusal invariant is absent")
 	}
 	return d.SetVersion(8, false)
+}
+
+func (d *cancellablePGXDriver) recoverHandoffProfileSnapshotDataLossRefusal() error {
+	if d.ctx == nil || d.ctx.Err() != nil {
+		return errors.New("migration context is not active")
+	}
+	version, dirty, err := d.Version()
+	if err != nil {
+		return err
+	}
+	if version != 10 || !dirty {
+		return fmt.Errorf("unexpected migration state version=%d dirty=%t", version, dirty)
+	}
+	var profileColumnPresent, nonDefaultProfilePresent bool
+	if err := d.connection.QueryRow(d.ctx, `SELECT
+		EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema=$1 AND table_name='handoffs' AND column_name='profile_snapshot_hash'
+		),
+		EXISTS (
+			SELECT 1 FROM handoffs
+			WHERE profile_id <> 'builtin' OR profile_version <> 1
+			   OR profile_snapshot_hash <> repeat('0',64) OR profile_engine_version <> 'jinja-go-v1/legacy'
+			   OR worker_recipe_id <> 'builtin' OR worker_recipe_version <> 1
+			   OR worker_recipe_hash <> repeat('0',64) OR adapter_registry_version <> 'builtin-v1'
+			   OR profile_knowledge::text <> '[]' OR profile_evidence::text <> '{}'
+		)`, d.schema).Scan(&profileColumnPresent, &nonDefaultProfilePresent); err != nil {
+		return err
+	}
+	if !profileColumnPresent || !nonDefaultProfilePresent {
+		return errors.New("handoff profile snapshot downgrade refusal invariant is absent")
+	}
+	return d.SetVersion(11, false)
 }
 
 func (d *cancellablePGXDriver) SetVersion(version int, dirty bool) error {

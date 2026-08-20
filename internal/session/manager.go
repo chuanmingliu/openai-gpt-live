@@ -3754,6 +3754,7 @@ func (s *runState) dispatchEffectsQueued(ctx context.Context, effects []Effect, 
 					}
 					owned := *effect.Handoff
 					owned.Arguments = append(json.RawMessage(nil), effect.Handoff.Arguments...)
+					owned.Profile = cloneHandoffProfileSnapshot(effect.Handoff.Profile)
 					owned.ToolPolicy = s.toolPolicySnapshot()
 					control.handoff = &owned
 					if control.kind == "" {
@@ -3778,6 +3779,7 @@ func (s *runState) dispatchEffectsQueued(ctx context.Context, effects []Effect, 
 				}
 				owned := *effect.Handoff
 				owned.Arguments = append(json.RawMessage(nil), effect.Handoff.Arguments...)
+				owned.Profile = cloneHandoffProfileSnapshot(effect.Handoff.Profile)
 				owned.ToolPolicy = s.toolPolicySnapshot()
 				if err := s.dispatcher.DispatchHandoff(ctx, trusted, owned); err != nil {
 					return 0, err
@@ -3789,6 +3791,12 @@ func (s *runState) dispatchEffectsQueued(ctx context.Context, effects []Effect, 
 		}
 	}
 	return clientCompletion, nil
+}
+
+func cloneHandoffProfileSnapshot(snapshot handoff.ProfileSnapshot) handoff.ProfileSnapshot {
+	snapshot.Knowledge = append([]handoff.KnowledgeVersion(nil), snapshot.Knowledge...)
+	snapshot.Evidence = append(json.RawMessage(nil), snapshot.Evidence...)
+	return snapshot
 }
 
 func (s *runState) durableWriter(ctx context.Context) error {

@@ -83,6 +83,7 @@ features: {handoffs: true, runtime_refresh_interval: 1s}
 			JournalOwner: "gateway-provisioning-owner", JournalClaimLease: time.Second,
 			HandoffQueueCapacity: 8, TranscriptQueueCapacity: 8,
 			Snapshot: SessionHandoffSnapshot{
+				Profile:    handoff.LegacyProfileSnapshot(),
 				ContextRef: "context://integration", ContextHash: "integration-hash", Deadline: time.Now().Add(time.Hour),
 				TokenBudget: 128, ToolAllowlist: []string{}, ApprovalPolicy: json.RawMessage(`{"mode":"none"}`),
 				Versions:         handoff.Versions{Model: "reasoner-v1", Prompt: "static-v1", ToolRegistry: "integration", Config: "integration"},

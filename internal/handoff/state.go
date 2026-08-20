@@ -15,23 +15,26 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/prompttmpl"
 	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 )
 
 const (
-	maxUserRequestBytes  = 16 * 1024
-	maxObjectiveBytes    = 8 * 1024
-	maxContextRefBytes   = 2 * 1024
-	maxJSONBytes         = 64 * 1024
-	maxToolNames         = 64
-	maxToolNameBytes     = 256
-	maxIdentityBytes     = 256
-	maxContextHashBytes  = 512
-	maxPresentationBytes = 2 * 1024
-	maxReasonBytes       = 2 * 1024
-	maxSummaryBytes      = 16 * 1024
-	maxJSONDepth         = 64
-	maxPriority          = 1000
+	maxUserRequestBytes     = 16 * 1024
+	maxObjectiveBytes       = 8 * 1024
+	maxContextRefBytes      = 2 * 1024
+	maxJSONBytes            = 64 * 1024
+	maxToolNames            = 64
+	maxToolNameBytes        = 256
+	maxIdentityBytes        = 256
+	maxContextHashBytes     = 512
+	maxPresentationBytes    = 2 * 1024
+	maxReasonBytes          = 2 * 1024
+	maxSummaryBytes         = 16 * 1024
+	maxJSONDepth            = 64
+	maxPriority             = 1000
+	maxProfileEvidenceBytes = 256 * 1024
+	maxProfileKnowledgeRefs = 32
 )
 
 func ValidateTransition(from, to State) error {
@@ -163,6 +166,11 @@ func normalizeCreateRequest(request CreateRequest, now time.Time, checkFuture bo
 			return CreateRequest{}, err
 		}
 	}
+	profileSnapshot, err := normalizeProfileSnapshot(request.Profile)
+	if err != nil {
+		return CreateRequest{}, err
+	}
+	request.Profile = profileSnapshot
 	if err := boundedOptional("presentation hint", request.PresentationHint, maxPresentationBytes); err != nil {
 		return CreateRequest{}, err
 	}
@@ -178,29 +186,35 @@ func CanonicalRequestHash(request CreateRequest) (string, error) {
 		return "", err
 	}
 	canonical := struct {
-		Scope            Scope           `json:"scope"`
-		SessionID        string          `json:"session_id"`
-		SourceTurnID     string          `json:"source_turn_id"`
-		SourceRevision   uint32          `json:"source_turn_revision"`
-		UserRequest      string          `json:"user_request"`
-		Objective        string          `json:"objective"`
-		ContextRef       string          `json:"context_ref"`
-		ContextHash      string          `json:"context_hash"`
-		Deadline         string          `json:"deadline"`
-		TokenBudget      int             `json:"token_budget"`
-		Priority         int16           `json:"priority"`
-		ToolAllowlist    []string        `json:"tool_allowlist"`
-		ToolPolicy       json.RawMessage `json:"tool_policy"`
-		ApprovalPolicy   json.RawMessage `json:"approval_policy"`
-		Versions         Versions        `json:"versions"`
-		PresentationHint string          `json:"presentation_hint"`
+		Scope            Scope            `json:"scope"`
+		SessionID        string           `json:"session_id"`
+		SourceTurnID     string           `json:"source_turn_id"`
+		SourceRevision   uint32           `json:"source_turn_revision"`
+		UserRequest      string           `json:"user_request"`
+		Objective        string           `json:"objective"`
+		ContextRef       string           `json:"context_ref"`
+		ContextHash      string           `json:"context_hash"`
+		Deadline         string           `json:"deadline"`
+		TokenBudget      int              `json:"token_budget"`
+		Priority         int16            `json:"priority"`
+		ToolAllowlist    []string         `json:"tool_allowlist"`
+		ToolPolicy       json.RawMessage  `json:"tool_policy"`
+		ApprovalPolicy   json.RawMessage  `json:"approval_policy"`
+		Versions         Versions         `json:"versions"`
+		Profile          *ProfileSnapshot `json:"profile,omitempty"`
+		PresentationHint string           `json:"presentation_hint"`
 	}{
 		Scope: normalized.Scope, SessionID: string(normalized.SessionID), SourceTurnID: normalized.SourceTurn.ID,
 		SourceRevision: normalized.SourceTurn.Revision, UserRequest: normalized.UserRequest, Objective: normalized.Objective,
 		ContextRef: normalized.ContextRef, ContextHash: normalized.ContextHash, Deadline: normalized.Deadline.Format(time.RFC3339Nano),
 		TokenBudget: normalized.TokenBudget, Priority: normalized.Priority, ToolAllowlist: normalized.ToolAllowlist,
 		ToolPolicy:     normalized.ToolPolicy,
-		ApprovalPolicy: normalized.ApprovalPolicy, Versions: normalized.Versions, PresentationHint: normalized.PresentationHint,
+		ApprovalPolicy: normalized.ApprovalPolicy, Versions: normalized.Versions,
+		PresentationHint: normalized.PresentationHint,
+	}
+	if !isLegacyProfileSnapshot(normalized.Profile) {
+		profile := cloneProfileSnapshot(normalized.Profile)
+		canonical.Profile = &profile
 	}
 	encoded, err := json.Marshal(canonical)
 	if err != nil {
@@ -208,6 +222,66 @@ func CanonicalRequestHash(request CreateRequest) (string, error) {
 	}
 	digest := sha256.Sum256(encoded)
 	return hex.EncodeToString(digest[:]), nil
+}
+
+func isLegacyProfileSnapshot(snapshot ProfileSnapshot) bool {
+	legacy := LegacyProfileSnapshot()
+	return snapshot.ProfileID == legacy.ProfileID && snapshot.ProfileVersion == legacy.ProfileVersion &&
+		snapshot.SnapshotHash == legacy.SnapshotHash && snapshot.EngineVersion == legacy.EngineVersion &&
+		snapshot.RecipeID == legacy.RecipeID && snapshot.RecipeVersion == legacy.RecipeVersion &&
+		snapshot.RecipeHash == legacy.RecipeHash && snapshot.RegistryVersion == legacy.RegistryVersion &&
+		len(snapshot.Knowledge) == 0 && bytes.Equal(snapshot.Evidence, legacy.Evidence)
+}
+
+func normalizeProfileSnapshot(snapshot ProfileSnapshot) (ProfileSnapshot, error) {
+	snapshot = cloneProfileSnapshot(snapshot)
+	for name, value := range map[string]string{
+		"profile id": snapshot.ProfileID, "recipe id": snapshot.RecipeID, "registry version": snapshot.RegistryVersion,
+	} {
+		if err := boundedRequired(name, value, maxIdentityBytes); err != nil {
+			return ProfileSnapshot{}, err
+		}
+	}
+	if snapshot.ProfileVersion == 0 || snapshot.ProfileVersion > math.MaxInt64 || snapshot.RecipeVersion == 0 || snapshot.RecipeVersion > math.MaxInt64 {
+		return ProfileSnapshot{}, invalid("profile or recipe version is invalid", nil)
+	}
+	if !validSHA256(snapshot.SnapshotHash) || !validSHA256(snapshot.RecipeHash) || prompttmpl.ValidateEngineIdentity(snapshot.EngineVersion) != nil {
+		return ProfileSnapshot{}, invalid("profile compatibility identity is invalid", nil)
+	}
+	if len(snapshot.Knowledge) > maxProfileKnowledgeRefs {
+		return ProfileSnapshot{}, invalid("too many knowledge versions", nil)
+	}
+	seen := make(map[string]struct{}, len(snapshot.Knowledge))
+	for _, reference := range snapshot.Knowledge {
+		if err := boundedRequired("knowledge id", reference.ID, maxIdentityBytes); err != nil || reference.Version == 0 || reference.Version > math.MaxInt64 || !validSHA256(reference.Hash) {
+			return ProfileSnapshot{}, invalid("knowledge version is invalid", err)
+		}
+		if _, exists := seen[reference.ID]; exists {
+			return ProfileSnapshot{}, invalid("duplicate knowledge id", nil)
+		}
+		seen[reference.ID] = struct{}{}
+	}
+	sort.Slice(snapshot.Knowledge, func(i, j int) bool {
+		return snapshot.Knowledge[i].ID < snapshot.Knowledge[j].ID
+	})
+	evidence, err := canonicalJSON(snapshot.Evidence, maxProfileEvidenceBytes, maxJSONDepth)
+	if err != nil || len(evidence) == 0 || evidence[0] != '{' {
+		return ProfileSnapshot{}, invalid("profile evidence", err)
+	}
+	snapshot.Evidence = evidence
+	return snapshot, nil
+}
+
+func validSHA256(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		if !(value[index] >= '0' && value[index] <= '9' || value[index] >= 'a' && value[index] <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func ValidateResult(result Result) (Result, error) {

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -38,7 +39,14 @@ func validCreateRecord(scope handoff.Scope, suffix string) handoff.CreateRecord 
 		UserRequest: "remember exact request", Objective: "perform durable work", ContextRef: "context://" + suffix,
 		ContextHash: "sha256:context-" + suffix, Deadline: repositoryTestNow.Add(time.Hour), TokenBudget: 4096, Priority: 12,
 		ToolAllowlist: []string{"fetch", "search"}, ToolPolicy: toolPolicy, ApprovalPolicy: json.RawMessage(`{"mode":"ask"}`),
-		Versions:         handoff.Versions{Model: "model-v1", Prompt: "prompt-v2", ToolRegistry: "tools-v3", Config: "config-v4"},
+		Versions: handoff.Versions{Model: "model-v1", Prompt: "prompt-v2", ToolRegistry: "tools-v3", Config: "config-v4"},
+		Profile: handoff.ProfileSnapshot{
+			ProfileID: "insurance-sales", ProfileVersion: 7, SnapshotHash: strings.Repeat("a", 64),
+			EngineVersion: "jinja-go-v1/minijinja-go/v2.24.0", RecipeID: "quote-followup", RecipeVersion: 3,
+			RecipeHash: strings.Repeat("b", 64), RegistryVersion: "registry-9",
+			Knowledge: []handoff.KnowledgeVersion{{ID: "policy-guide", Version: 4, Hash: strings.Repeat("c", 64)}},
+			Evidence:  json.RawMessage(`{"intent":"quote"}`),
+		},
 		PresentationHint: "compact", IdempotencyKey: "create-" + suffix,
 	}
 	hash, _ := handoff.CanonicalRequestHash(request)

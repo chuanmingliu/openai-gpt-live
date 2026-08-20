@@ -4,10 +4,23 @@ package handoff
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 )
+
+// LegacyProfileSnapshot is the explicit compatibility authority for handoffs
+// created without a published vertical profile before snapshot persistence was
+// introduced. New profile-backed sessions replace it at the session boundary.
+func LegacyProfileSnapshot() ProfileSnapshot {
+	return ProfileSnapshot{
+		ProfileID: "builtin", ProfileVersion: 1, SnapshotHash: strings.Repeat("0", 64),
+		EngineVersion: "jinja-go-v1/legacy", RecipeID: "builtin", RecipeVersion: 1,
+		RecipeHash: strings.Repeat("0", 64), RegistryVersion: "builtin-v1",
+		Evidence: json.RawMessage(`{}`),
+	}
+}
 
 type Scope struct {
 	TenantID       string
@@ -30,8 +43,31 @@ type CreateRequest struct {
 	ToolPolicy       json.RawMessage
 	ApprovalPolicy   json.RawMessage
 	Versions         Versions
+	Profile          ProfileSnapshot
 	PresentationHint string
 	IdempotencyKey   string
+}
+
+// KnowledgeVersion pins one immutable tenant-scoped knowledge version.
+type KnowledgeVersion struct {
+	ID      string `json:"id"`
+	Version uint64 `json:"version"`
+	Hash    string `json:"hash"`
+}
+
+// ProfileSnapshot is the complete immutable vertical authority accepted with
+// a durable handoff. It is never recomputed from the currently active profile.
+type ProfileSnapshot struct {
+	ProfileID       string             `json:"profile_id"`
+	ProfileVersion  uint64             `json:"profile_version"`
+	SnapshotHash    string             `json:"snapshot_hash"`
+	EngineVersion   string             `json:"engine_version"`
+	RecipeID        string             `json:"recipe_id"`
+	RecipeVersion   uint64             `json:"recipe_version"`
+	RecipeHash      string             `json:"recipe_hash"`
+	RegistryVersion string             `json:"registry_version"`
+	Knowledge       []KnowledgeVersion `json:"knowledge,omitempty"`
+	Evidence        json.RawMessage    `json:"evidence"`
 }
 
 type Versions struct {
@@ -175,6 +211,14 @@ func cloneRequest(in CreateRequest) CreateRequest {
 	}
 	out.ToolPolicy = cloneBytes(in.ToolPolicy)
 	out.ApprovalPolicy = cloneBytes(in.ApprovalPolicy)
+	out.Profile = cloneProfileSnapshot(in.Profile)
+	return out
+}
+
+func cloneProfileSnapshot(in ProfileSnapshot) ProfileSnapshot {
+	out := in
+	out.Knowledge = append([]KnowledgeVersion(nil), in.Knowledge...)
+	out.Evidence = cloneBytes(in.Evidence)
 	return out
 }
 

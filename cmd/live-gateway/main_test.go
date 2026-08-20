@@ -129,6 +129,7 @@ func TestDevelopmentDurableHandoffSnapshotUsesExactEnabledCatalog(t *testing.T) 
 		ContextHash: snapshot.ContextHash, Deadline: snapshot.Deadline, TokenBudget: snapshot.TokenBudget,
 		ToolAllowlist: snapshot.ToolAllowlist, ToolPolicy: snapshot.ToolPolicy,
 		ApprovalPolicy: json.RawMessage(`{"mode":"none"}`), Versions: snapshot.Versions,
+		Profile:          snapshot.Profile,
 		PresentationHint: snapshot.PresentationHint, IdempotencyKey: "snapshot-validation",
 	}, time.Now().UTC())
 	require.NoError(t, err)

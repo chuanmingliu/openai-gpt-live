@@ -3,10 +3,12 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/profile"
 	"github.com/chuanmingliu/openai-gpt-live/internal/prompttmpl"
@@ -61,6 +63,96 @@ func profileWithTurn(t *testing.T, source string) profile.Resolved {
 	require.NoError(t, err)
 	require.NoError(t, resolved.Validate())
 	return resolved
+}
+
+func profileWithWorkerRecipe(t *testing.T) profile.Resolved {
+	t.Helper()
+	resolved := profileWithTurn(t, "Answer: {{ transcript }}")
+	worker, err := (profile.Blob{MediaType: "text/plain; charset=utf-8", Content: []byte("Research {{ transcript }}")}).Canonical()
+	require.NoError(t, err)
+	ref := profile.TemplateRef{Hash: worker.Hash, MediaType: worker.MediaType, Bytes: worker.ContentBytes}
+	resolved.Definition.Templates["workers/renewal.j2"] = ref
+	resolved.Bundle.Templates["workers/renewal.j2"] = "Research {{ transcript }}"
+	resolved.Snapshot.Recipes = []profile.WorkerRecipe{{ID: "renewal", Version: 2, Objective: ref}}
+	resolved.Snapshot.Knowledge = []profile.KnowledgeRef{{ID: "policy", Version: 7, Hash: strings.Repeat("c", 64)}}
+	resolved.Snapshot.BundleHash, err = resolved.Definition.Hash()
+	require.NoError(t, err)
+	resolved.Snapshot.SnapshotHash = ""
+	resolved.Snapshot.SnapshotHash, err = resolved.Snapshot.Hash()
+	require.NoError(t, err)
+	require.NoError(t, resolved.Validate())
+	return resolved
+}
+
+func TestProfileRuntimePinsExactWorkerRecipeAndKnowledge(t *testing.T) {
+	selected := profileWithWorkerRecipe(t)
+	runtime, err := prepareProfileRuntime(t.Context(), selected, prompttmpl.NewMiniJinja())
+	require.NoError(t, err)
+	got, ok := runtime.HandoffProfileSnapshot("renewal question")
+	require.True(t, ok)
+	require.Equal(t, "insurance", got.ProfileID)
+	require.Equal(t, uint64(1), got.ProfileVersion)
+	require.Equal(t, selected.Snapshot.SnapshotHash, got.SnapshotHash)
+	require.Equal(t, "renewal", got.RecipeID)
+	require.Equal(t, uint64(2), got.RecipeVersion)
+	require.Equal(t, selected.Snapshot.AdapterRegistryVersion, got.RegistryVersion)
+	require.Equal(t, []handoff.KnowledgeVersion{{ID: "policy", Version: 7, Hash: strings.Repeat("c", 64)}}, got.Knowledge)
+	require.JSONEq(t, `{"transcript":"renewal question"}`, string(got.Evidence))
+}
+
+func TestProfileWithoutWorkerRecipeRejectsStartHandoffWithoutLegacyFallback(t *testing.T) {
+	selected := profileWithTurn(t, "Answer: {{ transcript }}")
+	runtime, err := prepareProfileRuntime(t.Context(), selected, prompttmpl.NewMiniJinja())
+	require.NoError(t, err)
+	reactor, _ := testReactor(1)
+	reactor.configureProfileBootstrap(runtime, false)
+	reactor.profileBootstrapComplete = true
+
+	epoch := reactor.fence.Current()
+	reactor.state.Response = ResponseStreaming
+	reactor.activeResponseID = "response-profile-handoff"
+	reactor.activeResponseEpoch = epoch
+	openManualInputTranscription(t, reactor, "turn-profile-handoff")
+	effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-profile-handoff", Text: "needs research",
+	}))
+	turn := effects[0].Transcript.Turn
+	applyOK(t, reactor, currentVoice(reactor, backgroundToolEvent(
+		epoch, "response-profile-handoff", "call-profile-handoff", json.RawMessage(`{"objective":"research"}`),
+	)))
+	effects = applyOK(t, reactor, TurnCommittedInput{Sequence: 1, Turn: turn, Transcript: "needs research"})
+	require.Len(t, effects, 1)
+	require.NotNil(t, effects[0].Handoff)
+	require.Equal(t, "profile_recipe_unavailable", effects[0].Handoff.RejectReason)
+	require.Empty(t, effects[0].Handoff.Profile.ProfileID)
+}
+
+func TestProfileStartHandoffCarriesExactImmutableRecipeAuthority(t *testing.T) {
+	selected := profileWithWorkerRecipe(t)
+	runtime, err := prepareProfileRuntime(t.Context(), selected, prompttmpl.NewMiniJinja())
+	require.NoError(t, err)
+	reactor, _ := testReactor(1)
+	reactor.configureProfileBootstrap(runtime, false)
+	reactor.profileBootstrapComplete = true
+	epoch := reactor.fence.Current()
+	reactor.state.Response = ResponseStreaming
+	reactor.activeResponseID = "response-profile-authority"
+	reactor.activeResponseEpoch = epoch
+	openManualInputTranscription(t, reactor, "turn-profile-authority")
+	effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-profile-authority", Text: "renewal question",
+	}))
+	turn := effects[0].Transcript.Turn
+	applyOK(t, reactor, currentVoice(reactor, backgroundToolEvent(
+		epoch, "response-profile-authority", "call-profile-authority", json.RawMessage(`{"objective":"research"}`),
+	)))
+	effects = applyOK(t, reactor, TurnCommittedInput{Sequence: 1, Turn: turn, Transcript: "renewal question"})
+	require.Len(t, effects, 1)
+	require.NotNil(t, effects[0].Handoff)
+	want, ok := runtime.HandoffProfileSnapshot("renewal question")
+	require.True(t, ok)
+	require.Equal(t, want, effects[0].Handoff.Profile)
+	require.Empty(t, effects[0].Handoff.RejectReason)
 }
 
 func finishProviderVADTurn(t *testing.T, reactor *Reactor, itemID, transcript string) []Effect {

@@ -250,6 +250,8 @@ type Reactor struct {
 	profileBootstrapComplete  bool
 	profileTurnEnabled        bool
 	pendingPromptRender       *pendingPromptRender
+	profileHandoff            handoff.ProfileSnapshot
+	profileHandoffAvailable   bool
 }
 
 func NewReactor(ids IDs, fence *EpochFence) *Reactor {
@@ -309,6 +311,7 @@ func (r *Reactor) configureProfileBootstrap(runtime *ProfileRuntime, suppressOpe
 	r.profileOwned = true
 	r.profileSnapshotHash = strings.Clone(runtime.Profile.Snapshot.SnapshotHash)
 	_, r.profileTurnEnabled = runtime.Profile.Bundle.Templates["turn_instruction.j2"]
+	r.profileHandoff, r.profileHandoffAvailable = runtime.HandoffProfileSnapshot("")
 	if !suppressOpening {
 		r.profileOpening = strings.Clone(runtime.Opening)
 	}
@@ -1105,6 +1108,7 @@ func (r *Reactor) applyTurnCommitted(input TurnCommittedInput) ([]Effect, error)
 			Arguments: cloneRaw(payload.Arguments), Turn: payload.Turn,
 			Transcript: input.Transcript, RejectReason: payload.Reason,
 		}
+		r.applyProfileHandoffAuthority(&handoffEffect, input.Transcript)
 		if call := r.handoffCalls[payload.CallID]; call != nil {
 			call.turn = payload.Turn
 			handoffEffect.OriginEpoch = call.originEpoch
@@ -1132,6 +1136,7 @@ func (r *Reactor) applyTypedStaleTurnCommit(input TurnCommittedInput) ([]Effect,
 			Arguments: cloneRaw(payload.Arguments), Turn: payload.Turn,
 			Transcript: input.Transcript, RejectReason: payload.Reason,
 		}
+		r.applyProfileHandoffAuthority(legacy[index].Handoff, input.Transcript)
 		if call := r.handoffCalls[payload.CallID]; call != nil {
 			legacy[index].Handoff.OriginEpoch = call.originEpoch
 		}
@@ -2471,6 +2476,7 @@ func (r *Reactor) applyFunctionCallDone(event realtime.Event) ([]Effect, error) 
 		} else {
 			handoffEffect.Transcript = r.committedTranscript
 		}
+		r.applyProfileHandoffAuthority(&handoffEffect, handoffEffect.Transcript)
 		effects[0].Handoff = &handoffEffect
 		return effects, nil
 	}
@@ -2489,6 +2495,7 @@ func (r *Reactor) applyFunctionCallDone(event realtime.Event) ([]Effect, error) 
 			OriginEpoch: event.Epoch, ResponseID: event.ResponseID, CallID: event.CallID, ToolName: event.Name,
 			Arguments: cloneRaw(event.Arguments), Turn: *committed, Transcript: r.committedTranscript,
 		}
+		r.applyProfileHandoffAuthority(&handoffEffect, r.committedTranscript)
 		effects = append(effects, Effect{Async: &async, Handoff: &handoffEffect})
 		return effects, nil
 	}
@@ -2502,6 +2509,32 @@ func (r *Reactor) applyFunctionCallDone(event realtime.Event) ([]Effect, error) 
 	})
 	r.pendingToolBytes += len(event.Arguments)
 	return effects, nil
+}
+
+func (r *Reactor) profileSnapshotForHandoff(transcript string) handoff.ProfileSnapshot {
+	if !r.profileHandoffAvailable {
+		return handoff.ProfileSnapshot{}
+	}
+	snapshot := r.profileHandoff
+	snapshot.Knowledge = append([]handoff.KnowledgeVersion(nil), snapshot.Knowledge...)
+	evidence, err := json.Marshal(struct {
+		Transcript string `json:"transcript"`
+	}{Transcript: transcript})
+	if err != nil {
+		return handoff.ProfileSnapshot{}
+	}
+	snapshot.Evidence = evidence
+	return snapshot
+}
+
+func (r *Reactor) applyProfileHandoffAuthority(effect *HandoffRequestedEffect, transcript string) {
+	if effect == nil {
+		return
+	}
+	effect.Profile = r.profileSnapshotForHandoff(transcript)
+	if effect.ToolName == StartBackgroundTaskTool && r.profileOwned && !r.profileHandoffAvailable && effect.RejectReason == "" {
+		effect.RejectReason = "profile_recipe_unavailable"
+	}
 }
 
 func isReservedHandoffTool(name string) bool {

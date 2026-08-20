@@ -76,7 +76,10 @@ var requiredColumns = map[string]map[string]string{
 		"context_ref": "text", "context_hash": "text", "deadline": "timestamp with time zone", "token_budget": "integer",
 		"priority": "smallint", "tool_allowlist": "json", "approval_policy": "json", "model_version": "text",
 		"tool_policy":    "jsonb",
-		"prompt_version": "text", "tool_registry_version": "text", "config_version": "text", "presentation_hint": "text",
+		"prompt_version": "text", "tool_registry_version": "text", "config_version": "text",
+		"profile_id": "text", "profile_version": "bigint", "profile_snapshot_hash": "text", "profile_engine_version": "text",
+		"worker_recipe_id": "text", "worker_recipe_version": "bigint", "worker_recipe_hash": "text",
+		"adapter_registry_version": "text", "profile_knowledge": "json", "profile_evidence": "json", "presentation_hint": "text",
 		"idempotency_key": "text", "request_hash": "text", "state": "text", "objective_revision": "bigint",
 		"input_revision": "bigint", "consumed_input_revision": "bigint", "input": "json", "ready_at": "timestamp with time zone",
 		"attempt": "integer", "retry_count": "integer", "lease_owner": "text", "lease_expires_at": "timestamp with time zone",
@@ -147,6 +150,16 @@ var requiredDefaults = map[string]string{
 	"handoffs.priority":                         `0`,
 	"handoffs.tool_allowlist":                   `'[]'::json`,
 	"handoffs.tool_policy":                      `'{"web_search": {"region": "wt-wt", "enabled": false, "timeout_ms": 8000, "max_results": 5, "safe_search": "moderate"}}'::jsonb`,
+	"handoffs.profile_id":                       `'builtin'::text`,
+	"handoffs.profile_version":                  `1`,
+	"handoffs.profile_snapshot_hash":            `'0000000000000000000000000000000000000000000000000000000000000000'::text`,
+	"handoffs.profile_engine_version":           `'jinja-go-v1/legacy'::text`,
+	"handoffs.worker_recipe_id":                 `'builtin'::text`,
+	"handoffs.worker_recipe_version":            `1`,
+	"handoffs.worker_recipe_hash":               `'0000000000000000000000000000000000000000000000000000000000000000'::text`,
+	"handoffs.adapter_registry_version":         `'builtin-v1'::text`,
+	"handoffs.profile_knowledge":                `'[]'::json`,
+	"handoffs.profile_evidence":                 `'{}'::json`,
 	"handoffs.presentation_hint":                `''::text`,
 	"handoffs.state":                            `'pending'::text`,
 	"handoffs.objective_revision":               `0`,
@@ -214,6 +227,7 @@ var requiredNamedConstraintNames = strings.Fields(`
 	handoffs_deadline_check handoffs_token_budget_check handoffs_priority_check handoffs_tool_allowlist_check
 	handoffs_approval_policy_check handoffs_model_version_size_check handoffs_prompt_version_size_check
 	handoffs_tool_registry_version_size_check handoffs_config_version_size_check handoffs_presentation_hint_size_check
+	handoffs_profile_snapshot_check
 	handoffs_idempotency_key_size_check handoffs_request_hash_size_check handoffs_state_check handoffs_revision_check
 	handoffs_input_check handoffs_ready_at_check handoffs_attempt_check handoffs_lease_tuple_check
 	handoffs_lease_owner_size_check handoffs_cancel_tuple_check handoffs_cancel_actor_size_check
@@ -304,7 +318,7 @@ func TestSchemaMigrationLifecycle(t *testing.T) {
 
 	version, dirty, err := migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
-	assert.Equal(t, uint(10), version)
+	assert.Equal(t, uint(11), version)
 	assert.False(t, dirty)
 	var journalPresent bool
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT to_regclass('coordinator_work_journal') IS NOT NULL`).Scan(&journalPresent))
@@ -597,6 +611,33 @@ func TestSchemaHandoffToolPolicyV8UpDownUpIsExactAndRefusesDataLoss(t *testing.T
 	assert.False(t, dirty)
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT tool_policy=$1::jsonb FROM handoffs WHERE id='handoff-v8'`, enabledPolicy).Scan(&exact))
 	assert.True(t, exact)
+}
+
+func TestSchemaHandoffProfileSnapshotV11UpDownUpIsExactAndRefusesDataLoss(t *testing.T) {
+	pool := migratedPostgres(t)
+	insertConversation(t, pool, "tenant-v11", "conversation-v11")
+	require.NoError(t, insertHandoff(t, pool, "tenant-v11", "conversation-v11", "handoff-v11", "idem-v11"))
+
+	stepDownTo(t, pool, 10)
+	var columnPresent bool
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT EXISTS (
+		SELECT 1 FROM information_schema.columns
+		WHERE table_schema=current_schema() AND table_name='handoffs' AND column_name='profile_snapshot_hash'
+	)`).Scan(&columnPresent))
+	assert.False(t, columnPresent)
+	require.NoError(t, migrations.Steps(t.Context(), pool, 1))
+
+	_, err := pool.Exec(t.Context(), `UPDATE handoffs SET profile_id='insurance' WHERE id='handoff-v11'`)
+	require.NoError(t, err)
+	err = migrations.Steps(t.Context(), pool, -1)
+	require.ErrorIs(t, err, migrations.ErrHandoffProfileSnapshotDataLoss)
+	version, dirty, versionErr := migrations.Version(t.Context(), pool)
+	require.NoError(t, versionErr)
+	assert.Equal(t, uint(11), version)
+	assert.False(t, dirty)
+	var profileID string
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT profile_id FROM handoffs WHERE id='handoff-v11'`).Scan(&profileID))
+	assert.Equal(t, "insurance", profileID)
 }
 
 func TestSchemaTask20RuntimeFlagsV4UpDownUpPreservesPriorDurableRowsAndTriggers(t *testing.T) {
@@ -967,6 +1008,7 @@ func TestSchemaNamedConstraints(t *testing.T) {
 		{"priority too large", "handoffs_priority_check", `UPDATE handoffs SET priority = 1001 WHERE id = 'handoff-a'`},
 		{"deadline before create", "handoffs_deadline_check", `UPDATE handoffs SET deadline = created_at WHERE id = 'handoff-a'`},
 		{"blank objective", "handoffs_objective_size_check", `UPDATE handoffs SET objective = '' WHERE id = 'handoff-a'`},
+		{"invalid profile snapshot", "handoffs_profile_snapshot_check", `UPDATE handoffs SET profile_id = '' WHERE id = 'handoff-a'`},
 	}
 	for _, mutation := range mutations {
 		t.Run(mutation.name, func(t *testing.T) {
@@ -1222,6 +1264,7 @@ func TestSchemaEveryNamedCheckRejectsInvalidMutation(t *testing.T) {
 		"handoffs_prompt_version_size_check":                       `UPDATE handoffs SET prompt_version='' WHERE id='handoff-c'`,
 		"handoffs_tool_registry_version_size_check":                `UPDATE handoffs SET tool_registry_version='' WHERE id='handoff-c'`,
 		"handoffs_config_version_size_check":                       `UPDATE handoffs SET config_version='' WHERE id='handoff-c'`,
+		"handoffs_profile_snapshot_check":                          `UPDATE handoffs SET profile_snapshot_hash='invalid' WHERE id='handoff-c'`,
 		"handoffs_presentation_hint_size_check":                    `UPDATE handoffs SET presentation_hint=repeat('x',2049) WHERE id='handoff-c'`,
 		"handoffs_idempotency_key_size_check":                      `UPDATE handoffs SET idempotency_key='' WHERE id='handoff-c'`,
 		"handoffs_request_hash_size_check":                         `UPDATE handoffs SET request_hash='' WHERE id='handoff-c'`,
