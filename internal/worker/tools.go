@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/reasoner"
@@ -22,8 +23,10 @@ import (
 )
 
 var (
-	ErrNonceReuse  = errors.New("worker argument nonce reused")
-	ErrNonceSource = errors.New("worker argument nonce source failed")
+	ErrNonceReuse        = errors.New("worker argument nonce reused")
+	ErrNonceSource       = errors.New("worker argument nonce source failed")
+	ErrToolArgumentLimit = errors.New("worker tool argument limit exceeded")
+	ErrToolResultLimit   = errors.New("worker tool result limit exceeded")
 )
 
 const maxSealsPerArgumentKey = 1 << 16
@@ -71,6 +74,12 @@ func validRegisteredPhase(phase string) bool {
 }
 
 type RegisteredTool struct {
+	AdapterID         string
+	AdapterVersion    string
+	RegistryVersion   string
+	DestinationID     string
+	TransportClass    string
+	Approval          string
 	Definition        reasoner.ToolDefinition
 	SideEffecting     bool
 	ReadOnly          bool
@@ -78,6 +87,10 @@ type RegisteredTool struct {
 	StableIdempotency bool
 	StartedPhase      string
 	CompletedPhase    string
+	Timeout           time.Duration
+	MaxConcurrency    int
+	MaxArgumentBytes  int
+	MaxResultBytes    int
 	Executor          ToolExecutor
 	Projector         ToolResultProjector
 }
@@ -114,7 +127,7 @@ func NewToolRegistry(versions map[string][]RegisteredTool) (ToolRegistry, error)
 		}
 		byName := make(map[string]RegisteredTool, len(tools))
 		for _, tool := range tools {
-			if nilValue(tool.Executor) || (tool.Projector != nil && nilValue(tool.Projector)) || !validRegisteredPhase(tool.StartedPhase) || !validRegisteredPhase(tool.CompletedPhase) || (tool.SideEffecting && (!tool.StableIdempotency || tool.ReadOnly)) || (tool.ParallelSafe && (!tool.ReadOnly || tool.SideEffecting)) {
+			if nilValue(tool.Executor) || (tool.Projector != nil && nilValue(tool.Projector)) || !validRegisteredPhase(tool.StartedPhase) || !validRegisteredPhase(tool.CompletedPhase) || (tool.SideEffecting && (!tool.StableIdempotency || tool.ReadOnly)) || (tool.ParallelSafe && (!tool.ReadOnly || tool.SideEffecting)) || !validAdapterAuthority(version, tool) {
 				return nil, errors.New("worker tool metadata is invalid")
 			}
 			definition := tool.Definition.Clone()
@@ -126,11 +139,52 @@ func NewToolRegistry(versions map[string][]RegisteredTool) (ToolRegistry, error)
 				return nil, errors.New("worker tool registration is duplicated")
 			}
 			tool.Definition = definition
+			if tool.AdapterID != "" {
+				tool.Executor = &boundedRegisteredExecutor{executor: tool.Executor, timeout: tool.Timeout, arguments: tool.MaxArgumentBytes, result: tool.MaxResultBytes, permits: make(chan struct{}, tool.MaxConcurrency)}
+			}
 			byName[definition.Name] = tool
 		}
 		owned.versions[version] = byName
 	}
 	return owned, nil
+}
+
+func validAdapterAuthority(version string, tool RegisteredTool) bool {
+	legacy := tool.AdapterID == "" && tool.AdapterVersion == "" && tool.RegistryVersion == "" && tool.DestinationID == "" && tool.TransportClass == "" && tool.Approval == "" && tool.Timeout == 0 && tool.MaxConcurrency == 0 && tool.MaxArgumentBytes == 0 && tool.MaxResultBytes == 0
+	if legacy {
+		return true
+	}
+	return tool.AdapterID != "" && tool.AdapterVersion != "" && tool.RegistryVersion == version && tool.DestinationID != "" && (tool.TransportClass == "native" || tool.TransportClass == "mcp") && (tool.Approval == "none" || tool.Approval == "required") && tool.Timeout >= 100*time.Millisecond && tool.Timeout <= 30*time.Second && tool.MaxConcurrency >= 1 && tool.MaxConcurrency <= 64 && tool.MaxArgumentBytes >= 1 && tool.MaxArgumentBytes <= 256<<10 && tool.MaxResultBytes >= 1 && tool.MaxResultBytes <= 256<<10
+}
+
+type boundedRegisteredExecutor struct {
+	executor  ToolExecutor
+	timeout   time.Duration
+	arguments int
+	result    int
+	permits   chan struct{}
+}
+
+func (executor *boundedRegisteredExecutor) Execute(ctx context.Context, request ToolExecutionRequest) (json.RawMessage, error) {
+	if len(request.Arguments) > executor.arguments {
+		return nil, ErrToolArgumentLimit
+	}
+	select {
+	case executor.permits <- struct{}{}:
+		defer func() { <-executor.permits }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	bounded, cancel := context.WithTimeout(ctx, executor.timeout)
+	defer cancel()
+	result, err := executor.executor.Execute(bounded, request)
+	if err != nil {
+		return nil, err
+	}
+	if len(result) > executor.result {
+		return nil, ErrToolResultLimit
+	}
+	return append(json.RawMessage(nil), result...), nil
 }
 
 func (r *immutableToolRegistry) Registered(ctx context.Context, version, name string) bool {

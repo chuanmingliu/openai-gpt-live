@@ -21,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/adaptercatalog"
 	"github.com/chuanmingliu/openai-gpt-live/internal/admin"
 	"github.com/chuanmingliu/openai-gpt-live/internal/auth"
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
@@ -547,15 +548,45 @@ func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecret
 }
 
 func workerRegistryForConfig(cfg config.Config, configHash string, resolver websearch.Resolver) (worker.ToolRegistry, error) {
-	registered := make([]worker.RegisteredTool, 0, 1)
-	if cfg.Tools.WebSearch.Enabled {
-		executor, err := websearch.New(resolver)
-		if err != nil {
-			return nil, fmt.Errorf("configure web search tool: %w", err)
-		}
-		registered = append(registered, websearch.RegisteredTool(executor))
+	if !cfg.Tools.WebSearch.Enabled {
+		return worker.NewToolRegistry(map[string][]worker.RegisteredTool{configHash: {}})
 	}
-	return worker.NewToolRegistry(map[string][]worker.RegisteredTool{configHash: registered})
+	executor, err := websearch.New(resolver)
+	if err != nil {
+		return nil, fmt.Errorf("configure web search tool: %w", err)
+	}
+	native := websearch.RegisteredTool(executor)
+	timeout := cfg.Tools.WebSearch.Timeout
+	if timeout == 0 {
+		timeout = 5 * time.Second
+	}
+	concurrency := cfg.Worker.Concurrency
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+	concurrency = minInt(concurrency, 64)
+	resultBytes := cfg.Worker.MaxOutputBytes
+	if resultBytes <= 0 {
+		resultBytes = 256 << 10
+	}
+	resultBytes = minInt(resultBytes, 256<<10)
+	manifest := adaptercatalog.Manifest{
+		AdapterID: "web_search", AdapterVersion: "native-v1", RegistryVersion: configHash,
+		Tool: native.Definition.Clone(), ReadOnly: true, ParallelSafe: true,
+		StableIdempotency: true, Approval: adaptercatalog.ApprovalNone,
+		Timeout: timeout, MaxConcurrency: concurrency, MaxArgumentBytes: 64 << 10,
+		MaxResultBytes: resultBytes, DestinationID: "public_web",
+		TransportClass: adaptercatalog.TransportNative, HealthClass: adaptercatalog.HealthRequired,
+	}
+	catalog, err := adaptercatalog.New(configHash, []adaptercatalog.Manifest{manifest}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("configure web search catalog: %w", err)
+	}
+	return adaptercatalog.CompileRegistry(catalog, map[string]adaptercatalog.Binding{"web_search": {Enabled: true}}, []adaptercatalog.Installed{{
+		AdapterID: "web_search", AdapterVersion: "native-v1", DestinationID: "public_web",
+		TransportClass: adaptercatalog.TransportNative, Executor: native.Executor, Projector: native.Projector,
+		StartedPhase: native.StartedPhase, CompletedPhase: native.CompletedPhase,
+	}})
 }
 
 type workerCapacity struct {
