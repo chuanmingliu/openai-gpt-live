@@ -29,6 +29,8 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/feature"
 	"github.com/chuanmingliu/openai-gpt-live/internal/health"
 	"github.com/chuanmingliu/openai-gpt-live/internal/lifecycle"
+	"github.com/chuanmingliu/openai-gpt-live/internal/profile"
+	"github.com/chuanmingliu/openai-gpt-live/internal/prompttmpl"
 	"github.com/chuanmingliu/openai-gpt-live/internal/reasoner/deepseek"
 	retentioncontrol "github.com/chuanmingliu/openai-gpt-live/internal/retention"
 	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
@@ -454,6 +456,15 @@ func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecret
 		Metrics: worker.MetricsHooks{Queue: func(d time.Duration) { metrics.WorkerQueue.WithLabelValues("ok").Observe(d.Seconds()) }, FirstToken: func(d time.Duration) { metrics.ReasonerFirstToken.WithLabelValues("ok").Observe(d.Seconds()) }, Duration: func(d time.Duration, result string) {
 			metrics.WorkerDuration.WithLabelValues(result).Observe(d.Seconds())
 		}, Retry: func(result string) { metrics.WorkerRetries.WithLabelValues(result).Inc() }},
+	}
+	if cfg.Features.VerticalProfiles.Enabled {
+		engine := prompttmpl.NewMiniJinja()
+		recipes, recipeErr := worker.NewRecipeResolver(profile.NewResolver(repo, engine), engine, registry)
+		if recipeErr != nil {
+			clear(privacyKey)
+			return nil, errors.New("configure worker profile recipes")
+		}
+		runnerConfig.Recipes = recipes
 	}
 	if len(secrets.ToolEncryptionKey) == 32 {
 		argumentSealer, err = worker.NewAESArgumentSealer(cfg.Features.ToolEncryptionKeyID, secrets.ToolEncryptionKey, rand.Reader)

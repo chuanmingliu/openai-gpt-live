@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/profile"
 	"github.com/chuanmingliu/openai-gpt-live/internal/worker"
 )
 
@@ -38,6 +39,20 @@ func TestCompileRegistryRequiresExactNativeIdentityAndClonesDefinitions(t *testi
 	}
 	if tool.AdapterID != "knowledge_search" || tool.AdapterVersion != "v1" || tool.Timeout != time.Second || tool.MaxConcurrency != 2 || tool.MaxResultBytes != 8<<10 {
 		t.Fatalf("compiled authority mismatch: %#v", tool)
+	}
+}
+
+func TestCatalogValidatesProfileBindingWithoutLoosening(t *testing.T) {
+	manifest := testManifest()
+	catalog, err := New("registry-v1", []Manifest{manifest}, []string{"crm_token"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := catalog.ValidateBindings(t.Context(), "tenant-a", []profile.AdapterBinding{{AdapterID: manifest.AdapterID, Version: manifest.AdapterVersion, ToolIDs: []string{manifest.Tool.Name}, MaxResultBytes: 8 << 10}}); err != nil {
+		t.Fatalf("tight binding: %v", err)
+	}
+	if err := catalog.ValidateBindings(t.Context(), "tenant-a", []profile.AdapterBinding{{AdapterID: manifest.AdapterID, Version: manifest.AdapterVersion, ToolIDs: []string{manifest.Tool.Name}, MaxResultBytes: manifest.MaxResultBytes + 1}}); !errors.Is(err, ErrBindingExpansion) {
+		t.Fatalf("widen binding: got %v", err)
 	}
 }
 

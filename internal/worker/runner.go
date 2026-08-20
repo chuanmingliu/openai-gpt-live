@@ -66,6 +66,7 @@ type Runner struct {
 	Reasoner          reasoner.Streamer
 	Safety            safety.Policy
 	Tools             ToolRegistry
+	Recipes           RecipeResolver
 	Clock             clock.Clock
 	Jitter            clock.JitterSource
 	Retry             RetryPolicy
@@ -93,6 +94,9 @@ type Runner struct {
 func NewRunner(config Runner) (*Runner, error) {
 	if nilValue(config.Store) || nilValue(config.Reasoner) || nilValue(config.Safety) || nilValue(config.Tools) || nilValue(config.Clock) || nilValue(config.Jitter) || config.ProviderSafetyID == nil {
 		return nil, errors.New("worker runner dependencies are required")
+	}
+	if config.Recipes != nil && nilValue(config.Recipes) {
+		return nil, errors.New("worker recipe resolver is invalid")
 	}
 	if config.Tools.HasTools() && nilValue(config.ArgumentSealer) {
 		return nil, errors.New("worker argument sealer is required for registered tools")
@@ -389,20 +393,23 @@ type generatedResult struct {
 }
 
 type jobExecution struct {
-	builder            *resultBuilder
-	toolCalls          int
-	toolRounds         int
-	policy             toolpolicy.Policy
-	projectionMu       sync.Mutex
-	projectedSources   json.RawMessage
-	hasProjection      bool
-	projectionRevision uint32
-	projectionInput    uint32
-	approvalMu         sync.Mutex
-	approvalRevision   uint32
-	approvalGeneration uint64
-	requiresApproval   bool
-	approved           bool
+	builder             *resultBuilder
+	toolCalls           int
+	toolRounds          int
+	policy              toolpolicy.Policy
+	projectionMu        sync.Mutex
+	projectedSources    json.RawMessage
+	hasProjection       bool
+	projectionRevision  uint32
+	projectionInput     uint32
+	approvalMu          sync.Mutex
+	approvalRevision    uint32
+	approvalGeneration  uint64
+	requiresApproval    bool
+	approved            bool
+	maxToolOutputBytes  int
+	maxFinalResultBytes int
+	toolTimeout         time.Duration
 }
 
 const maxPublicToolProjectionBytes = 32 << 10
@@ -572,20 +579,51 @@ func (e *jobExecution) consumeTools(calls, maxCalls, maxRounds int) error {
 }
 
 func (r *Runner) generate(ctx context.Context, lease Lease, control Control, execution *jobExecution, generation uint64) (generatedResult, error) {
+	allowlist := append([]string(nil), lease.Job.Request.ToolAllowlist...)
+	var rendered *RenderedRecipe
+	if profileBackedWorkerRequest(lease.Job.Request.Profile) {
+		if nilValue(r.Recipes) {
+			return generatedResult{}, ErrProfileIncompatible
+		}
+		resolved, resolveErr := r.Recipes.ResolveAndRender(ctx, lease.Job.Request.Profile, RecipeEvidence{TenantID: lease.Job.Request.Scope.TenantID, Values: append(json.RawMessage(nil), lease.Job.Request.Profile.Evidence...)})
+		if resolveErr != nil {
+			return generatedResult{}, resolveErr
+		}
+		if resolved.RegistryVersion != lease.Job.Request.Versions.ToolRegistry || !sameStringAuthority(allowlist, resolved.ToolAllowlist) {
+			return generatedResult{}, ErrProfileIncompatible
+		}
+		resolved = resolved.clone()
+		rendered = &resolved
+		allowlist = append([]string(nil), resolved.ToolAllowlist...)
+		execution.maxToolOutputBytes = minNonzero(r.MaxToolOutputBytes, resolved.Limits.MaxToolResultBytes)
+		execution.maxFinalResultBytes = minNonzero(MaxCompletionTextBytes, resolved.Limits.MaxFinalResultBytes)
+		execution.toolTimeout = resolved.Limits.ToolTimeout
+		if resolved.Limits.ExecutionTimeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, resolved.Limits.ExecutionTimeout)
+			defer cancel()
+		}
+	} else {
+		execution.maxToolOutputBytes = r.MaxToolOutputBytes
+		execution.maxFinalResultBytes = MaxCompletionTextBytes
+		execution.toolTimeout = 0
+	}
 	persistedPolicy, err := decodePersistedToolPolicy(lease.Job.Request.ToolPolicy)
 	if err != nil {
 		return generatedResult{}, err
 	}
-	webSearchAllowed := containsString(lease.Job.Request.ToolAllowlist, toolpolicy.WebSearchTool)
+	if rendered != nil && rendered.RequiresApproval && !workerApprovalRequired(lease.Job.Request.ApprovalPolicy) {
+		return generatedResult{}, ErrProfileIncompatible
+	}
+	webSearchAllowed := containsString(allowlist, toolpolicy.WebSearchTool)
 	if webSearchAllowed != persistedPolicy.WebSearch.Enabled {
 		return generatedResult{}, ErrToolNotAllowed
 	}
 	execution.policy = persistedPolicy
-	allowlist := lease.Job.Request.ToolAllowlist
 	if r.shadowMode() {
-		allowlist = make([]string, 0, len(lease.Job.Request.ToolAllowlist))
-		seen := make(map[string]struct{}, len(lease.Job.Request.ToolAllowlist))
-		for _, name := range lease.Job.Request.ToolAllowlist {
+		shadowAllowlist := make([]string, 0, len(allowlist))
+		seen := make(map[string]struct{}, len(allowlist))
+		for _, name := range allowlist {
 			if _, duplicate := seen[name]; duplicate {
 				return generatedResult{}, ErrToolNotAllowed
 			}
@@ -595,9 +633,10 @@ func (r *Runner) generate(ctx context.Context, lease Lease, control Control, exe
 				return generatedResult{}, ErrToolNotRegistered
 			}
 			if !tool.SideEffecting {
-				allowlist = append(allowlist, name)
+				shadowAllowlist = append(shadowAllowlist, name)
 			}
 		}
+		allowlist = shadowAllowlist
 	}
 	definitions, err := r.Tools.Definitions(lease.Job.Request.Versions.ToolRegistry, allowlist)
 	if err != nil {
@@ -607,7 +646,12 @@ func (r *Runner) generate(ctx context.Context, lease Lease, control Control, exe
 	if err != nil || safetyID == "" {
 		return generatedResult{}, errors.New("worker provider safety identity failed")
 	}
-	messages, err := initialMessages(lease.Job, control)
+	var messages []reasoner.Message
+	if rendered != nil {
+		messages, err = initialRecipeMessages(lease.Job, control, *rendered)
+	} else {
+		messages, err = initialMessages(lease.Job, control)
+	}
 	if err != nil {
 		return generatedResult{}, err
 	}
@@ -675,7 +719,7 @@ func (r *Runner) generate(ctx context.Context, lease Lease, control Control, exe
 			if strings.TrimSpace(result.Text) == "" {
 				return generatedResult{}, errors.New("worker reasoner returned empty result")
 			}
-			if len(result.Text) > MaxCompletionTextBytes {
+			if len(result.Text) > execution.maxFinalResultBytes {
 				return generatedResult{}, errOutputLimit
 			}
 			structured, err := execution.completionStructured(result.Text)
@@ -710,6 +754,58 @@ func (r *Runner) generate(ctx context.Context, lease Lease, control Control, exe
 			}
 		}
 	}
+}
+
+func workerApprovalRequired(raw json.RawMessage) bool {
+	var policy struct {
+		Mode string `json:"mode"`
+	}
+	if json.Unmarshal(raw, &policy) != nil {
+		return false
+	}
+	switch policy.Mode {
+	case "none", "not_required", "automatic", "allow":
+		return false
+	default:
+		return true
+	}
+}
+
+func profileBackedWorkerRequest(snapshot handoff.ProfileSnapshot) bool {
+	if snapshot.ProfileID == "" {
+		return false
+	}
+	legacy := handoff.LegacyProfileSnapshot()
+	return snapshot.ProfileID != legacy.ProfileID || snapshot.ProfileVersion != legacy.ProfileVersion || snapshot.SnapshotHash != legacy.SnapshotHash || snapshot.RecipeID != legacy.RecipeID || snapshot.RecipeHash != legacy.RecipeHash
+}
+
+func sameStringAuthority(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	seen := make(map[string]struct{}, len(left))
+	for _, value := range left {
+		if _, duplicate := seen[value]; duplicate {
+			return false
+		}
+		seen[value] = struct{}{}
+	}
+	for _, value := range right {
+		if _, ok := seen[value]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func minNonzero(first, second int) int {
+	if first <= 0 {
+		return second
+	}
+	if second <= 0 || first < second {
+		return first
+	}
+	return second
 }
 
 func decodePersistedToolPolicy(raw json.RawMessage) (toolpolicy.Policy, error) {
@@ -774,7 +870,7 @@ func (r *Runner) executeClaimedApprovedTool(ctx context.Context, lease Lease, re
 			clear(arguments)
 			return reasoner.ToolCall{}, nil, errors.New("worker durable tool result state is invalid")
 		}
-		output, err = boundedToolOutput(invocation.Result, r.MaxToolOutputBytes)
+		output, err = boundedToolOutput(invocation.Result, execution.maxToolOutputBytes)
 		if err == nil {
 			err = builder.reserve(len(output))
 		}
@@ -789,12 +885,12 @@ func (r *Runner) executeClaimedApprovedTool(ctx context.Context, lease Lease, re
 				break
 			}
 		}
-		output, err = tool.Executor.Execute(ctx, ToolExecutionRequest{InvocationID: expectedID, IdempotencyKey: expectedID, Arguments: append(json.RawMessage(nil), arguments...), Policy: execution.policy})
+		output, err = executeWithRecipeTimeout(ctx, execution.toolTimeout, tool.Executor, ToolExecutionRequest{InvocationID: expectedID, IdempotencyKey: expectedID, Arguments: append(json.RawMessage(nil), arguments...), Policy: execution.policy})
 		if err != nil {
 			err = fmt.Errorf("%w", errToolFailure)
 			break
 		}
-		output, err = boundedToolOutput(output, r.MaxToolOutputBytes)
+		output, err = boundedToolOutput(output, execution.maxToolOutputBytes)
 		if err != nil {
 			break
 		}
@@ -836,6 +932,31 @@ func initialMessages(job handoff.Snapshot, control Control) ([]reasoner.Message,
 		return nil, err
 	}
 	return []reasoner.Message{{Role: reasoner.RoleSystem, Content: workerSystemTemplate}, {Role: reasoner.RoleUser, Content: "Untrusted handoff data:\n" + string(payload)}}, nil
+}
+
+func initialRecipeMessages(job handoff.Snapshot, control Control, recipe RenderedRecipe) ([]reasoner.Message, error) {
+	payload, err := json.Marshal(struct {
+		UserRequest       string          `json:"user_request"`
+		RenderedObjective string          `json:"rendered_objective"`
+		Evidence          json.RawMessage `json:"evidence"`
+		SteeringObjective string          `json:"steering_objective"`
+		ContextRef        string          `json:"context_ref"`
+		ContextHash       string          `json:"context_hash"`
+		Input             json.RawMessage `json:"input,omitempty"`
+	}{job.Request.UserRequest, recipe.Objective, recipe.Evidence, control.Objective, job.Request.ContextRef, job.Request.ContextHash, control.Input})
+	if err != nil {
+		return nil, ErrRecipeContextInvalid
+	}
+	return []reasoner.Message{{Role: reasoner.RoleSystem, Content: recipe.System}, {Role: reasoner.RoleUser, Content: "Untrusted handoff data:\n" + string(payload)}}, nil
+}
+
+func executeWithRecipeTimeout(ctx context.Context, timeout time.Duration, executor ToolExecutor, request ToolExecutionRequest) (json.RawMessage, error) {
+	if timeout <= 0 {
+		return executor.Execute(ctx, request)
+	}
+	bounded, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return executor.Execute(bounded, request)
 }
 
 type resultBuilder struct {
@@ -1080,7 +1201,7 @@ func (r *Runner) executeOneTool(ctx context.Context, lease Lease, revision, ordi
 		execution.markApproved(revision, generation)
 	}
 	if invocation.Status == "succeeded" {
-		output, outputErr := boundedToolOutput(invocation.Result, r.MaxToolOutputBytes)
+		output, outputErr := boundedToolOutput(invocation.Result, execution.maxToolOutputBytes)
 		if outputErr != nil {
 			return nil, outputErr
 		}
@@ -1107,11 +1228,11 @@ func (r *Runner) executeOneTool(ctx context.Context, lease Lease, revision, ordi
 			return nil, err
 		}
 	}
-	output, err := tool.Executor.Execute(ctx, ToolExecutionRequest{InvocationID: invocationID, IdempotencyKey: invocationID, Arguments: append(json.RawMessage(nil), arguments...), Policy: execution.policy})
+	output, err := executeWithRecipeTimeout(ctx, execution.toolTimeout, tool.Executor, ToolExecutionRequest{InvocationID: invocationID, IdempotencyKey: invocationID, Arguments: append(json.RawMessage(nil), arguments...), Policy: execution.policy})
 	if err != nil {
 		return nil, fmt.Errorf("%w", errToolFailure)
 	}
-	output, err = boundedToolOutput(output, r.MaxToolOutputBytes)
+	output, err = boundedToolOutput(output, execution.maxToolOutputBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -1232,6 +1353,18 @@ func (r *Runner) handleExecutionError(ctx context.Context, lease Lease, revision
 		}
 	}
 	code := "worker_failed"
+	if errors.Is(executionErr, ErrProfileIncompatible) {
+		code = "profile_incompatible"
+	}
+	if errors.Is(executionErr, ErrRecipeTemplateInvalid) {
+		code = "template_invalid"
+	}
+	if errors.Is(executionErr, ErrRecipeContextInvalid) {
+		code = "context_invalid"
+	}
+	if errors.Is(executionErr, ErrRecipeRenderLimit) {
+		code = "render_limit_exceeded"
+	}
 	if errors.Is(executionErr, errOutputLimit) {
 		code = "output_limit"
 	}

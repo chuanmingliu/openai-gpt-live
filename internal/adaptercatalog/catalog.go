@@ -1,11 +1,13 @@
 package adaptercatalog
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"sort"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/profile"
 	"github.com/chuanmingliu/openai-gpt-live/internal/worker"
 )
 
@@ -61,6 +63,38 @@ func (catalog *Catalog) RegistryVersion() string {
 		return ""
 	}
 	return catalog.registryVersion
+}
+
+// Version and ValidateBindings satisfy profile.AdapterCatalog. Profiles can
+// only select exact reviewed tools and narrow approval/result authority.
+func (catalog *Catalog) Version() string { return catalog.RegistryVersion() }
+
+func (catalog *Catalog) ValidateBindings(ctx context.Context, tenantID string, bindings []profile.AdapterBinding) error {
+	if catalog == nil || ctx == nil || ctx.Err() != nil || !validID(tenantID) || len(bindings) > 256 {
+		return ErrInvalidManifest
+	}
+	seen := make(map[string]struct{}, len(bindings))
+	for _, binding := range bindings {
+		manifest, ok := catalog.manifestByID[binding.AdapterID]
+		if !ok || manifest.AdapterVersion != binding.Version || binding.MaxResultBytes < 0 || binding.MaxResultBytes > manifest.MaxResultBytes || manifest.Approval == ApprovalRequired && !binding.RequireApproval {
+			return ErrBindingExpansion
+		}
+		if _, duplicate := seen[binding.AdapterID]; duplicate {
+			return ErrInvalidManifest
+		}
+		seen[binding.AdapterID] = struct{}{}
+		tools := make(map[string]struct{}, len(binding.ToolIDs))
+		for _, toolID := range binding.ToolIDs {
+			if toolID != manifest.Tool.Name {
+				return ErrBindingExpansion
+			}
+			if _, duplicate := tools[toolID]; duplicate {
+				return ErrInvalidManifest
+			}
+			tools[toolID] = struct{}{}
+		}
+	}
+	return nil
 }
 
 func (catalog *Catalog) Hash() string {
