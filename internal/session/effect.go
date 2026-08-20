@@ -19,6 +19,7 @@ type Effect struct {
 	ResponseEpoch         identity.ResponseEpoch
 	Incarnation           identity.Incarnation
 	VoiceCommand          *realtime.Command
+	ProfileBootstrap      *ProfileBootstrapCompletedInput
 	Async                 *AsyncEffect
 	Transcript            *TranscriptRequestedEffect
 	Handoff               *HandoffRequestedEffect

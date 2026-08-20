@@ -238,6 +238,11 @@ type Reactor struct {
 	recentPresentations       []presentationCorrelation
 	deferPresentationSafety   bool
 	pendingPresentationSafety map[uint64]pendingPresentationSafety
+	profileOwned              bool
+	profileSnapshotHash       string
+	profileOpening            string
+	profileBootstrapQueued    bool
+	profileBootstrapComplete  bool
 }
 
 func NewReactor(ids IDs, fence *EpochFence) *Reactor {
@@ -284,6 +289,21 @@ func (r *Reactor) expectInitialInputTurnMode(turnDetection json.RawMessage) erro
 		r.initialInputTurnMode = mode
 	}
 	return nil
+}
+
+func (r *Reactor) setProfileOwned(owned bool) {
+	r.profileOwned = owned
+}
+
+func (r *Reactor) configureProfileBootstrap(runtime *ProfileRuntime, suppressOpening bool) {
+	if runtime == nil {
+		return
+	}
+	r.profileOwned = true
+	r.profileSnapshotHash = strings.Clone(runtime.Profile.Snapshot.SnapshotHash)
+	if !suppressOpening {
+		r.profileOpening = strings.Clone(runtime.Opening)
+	}
 }
 
 func validateSessionIDs(ids IDs) error {
@@ -338,6 +358,8 @@ func (r *Reactor) ApplyContext(ctx context.Context, input Input) ([]Effect, erro
 		return effects, err
 	case VoiceCommandCompletedInput:
 		return r.applyVoiceCommandCompleted(typed)
+	case ProfileBootstrapCompletedInput:
+		return r.applyProfileBootstrapCompleted(typed)
 	case ClientEffectCompletedInput:
 		if typed.Err != nil {
 			return nil, fmt.Errorf("client effect %d failed: %w", typed.Sequence, typed.Err)
@@ -1376,7 +1398,7 @@ func (r *Reactor) applySessionUpdate(event protocol.SessionUpdateEvent) ([]Effec
 	if len(r.pendingSessionUpdates) >= PendingSessionUpdateLimit {
 		return nil, ErrPendingSessionUpdateLimit
 	}
-	commandSession, err := normalizeSessionUpdate(event.Session, r.handoffToolsEnabled)
+	commandSession, err := normalizeSessionUpdate(event.Session, r.handoffToolsEnabled, r.profileOwned)
 	if err != nil {
 		return nil, err
 	}
@@ -1432,6 +1454,46 @@ func (r *Reactor) applySessionUpdate(event protocol.SessionUpdateEvent) ([]Effec
 		Sequence: sequence,
 		Session:  commandSession,
 	}
+	return []Effect{{VoiceCommand: &command}}, nil
+}
+
+func (r *Reactor) profileBootstrapAcknowledged() []Effect {
+	if !r.profileOwned || r.profileBootstrapQueued || r.profileBootstrapComplete {
+		return nil
+	}
+	r.profileBootstrapQueued = true
+	completed := ProfileBootstrapCompletedInput{Incarnation: r.ids.Incarnation, SnapshotHash: r.profileSnapshotHash}
+	return []Effect{{ProfileBootstrap: &completed}}
+}
+
+func (r *Reactor) applyProfileBootstrapCompleted(input ProfileBootstrapCompletedInput) ([]Effect, error) {
+	if !r.profileOwned || input.Incarnation != r.ids.Incarnation || input.SnapshotHash != r.profileSnapshotHash {
+		return nil, nil
+	}
+	if r.profileBootstrapComplete {
+		return nil, nil
+	}
+	r.profileBootstrapComplete = true
+	if r.profileOpening == "" {
+		return nil, nil
+	}
+	if r.state.Response != ResponseIdle && r.state.Response != ResponseTerminal {
+		return nil, ErrInvalidTransition
+	}
+	epoch := r.fence.Advance()
+	r.state.Response = ResponsePending
+	r.activeResponseID = ""
+	r.activeResponseEpoch = epoch
+	r.suppressedImplicitID = ""
+	r.terminal = nil
+	r.pendingCancelSequence = 0
+	command := realtime.Command{
+		Kind:     realtime.CommandCreateResponse,
+		Sequence: r.allocateSequence(),
+		Epoch:    epoch,
+		Response: realtime.ResponseConfig{Instructions: strings.Clone(r.profileOpening), ToolChoice: json.RawMessage(`"none"`)},
+	}
+	r.pendingCreateSequence = command.Sequence
 	return []Effect{{VoiceCommand: &command}}, nil
 }
 
@@ -1637,9 +1699,10 @@ func (r *Reactor) applyProviderSessionUpdated(event realtime.Event) ([]Effect, e
 	}
 
 	if event.SessionUpdateSequence == 0 {
+		bootstrap := r.profileBootstrapAcknowledged()
 		if r.inputTurnMode == realtime.InputTurnModeUnspecified {
 			if r.initialInputTurnMode == realtime.InputTurnModeUnspecified {
-				return nil, nil
+				return bootstrap, nil
 			}
 			if !specified {
 				return nil, errors.New("provider session.updated omitted input turn mode")
@@ -1649,15 +1712,15 @@ func (r *Reactor) applyProviderSessionUpdated(event realtime.Event) ([]Effect, e
 			}
 			r.inputTurnMode = r.initialInputTurnMode
 			r.initialInputTurnMode = realtime.InputTurnModeUnspecified
-			return nil, nil
+			return bootstrap, nil
 		}
 		if !specified {
-			return nil, nil
+			return bootstrap, nil
 		}
 		if mode != r.inputTurnMode {
 			return nil, ErrInputTurnModeImmutable
 		}
-		return nil, nil
+		return bootstrap, nil
 	}
 
 	sequence := event.SessionUpdateSequence
@@ -2802,7 +2865,7 @@ type sessionToolDTO struct {
 	Parameters  json.RawMessage `json:"parameters,omitempty"`
 }
 
-func normalizeSessionUpdate(update protocol.SessionUpdate, handoffToolsEnabled bool) (realtime.SessionConfig, error) {
+func normalizeSessionUpdate(update protocol.SessionUpdate, handoffToolsEnabled, profileOwned bool) (realtime.SessionConfig, error) {
 	if update.Type != "realtime" {
 		return realtime.SessionConfig{}, fmt.Errorf("session type must be realtime, got %q", update.Type)
 	}
@@ -2814,6 +2877,9 @@ func normalizeSessionUpdate(update protocol.SessionUpdate, handoffToolsEnabled b
 	}
 	if len(update.Metadata) > 0 {
 		return realtime.SessionConfig{}, fmt.Errorf("%w: session metadata", ErrUnsupportedField)
+	}
+	if profileOwned && (update.Instructions != "" || len(update.Tools) > 0 || len(update.ToolChoice) > 0) {
+		return realtime.SessionConfig{}, fmt.Errorf("%w: profile-owned session configuration", ErrUnsupportedField)
 	}
 	if update.Audio != nil {
 		if update.Audio.Input != nil {

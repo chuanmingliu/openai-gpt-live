@@ -22,6 +22,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/presentation"
 	"github.com/chuanmingliu/openai-gpt-live/internal/profile"
+	"github.com/chuanmingliu/openai-gpt-live/internal/prompttmpl"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
 	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
@@ -104,6 +105,7 @@ type Config struct {
 	ReconnectCleanupInterval        time.Duration
 	ReconnectCleanupBatch           int
 	InitialSession                  realtime.SessionConfig
+	ProfileEngine                   prompttmpl.Engine
 	ToolCatalog                     toolpolicy.Catalog
 	AsyncModel                      string
 	HandoffToolsEnabled             bool
@@ -716,34 +718,36 @@ func (a *activeAudioWrite) cancelActive() {
 }
 
 type runState struct {
-	cfg                Config
-	ids                IDs
-	runtime            *sessionRuntime
-	voice              realtime.Session
-	client             ClientConn
-	fence              *EpochFence
-	inbox              chan reactorMessage
-	completions        chan reactorMessage
-	ingress            chan ingressFrame
-	ingressSlots       chan struct{}
-	voiceCtl           chan voiceControl
-	egress             chan egressFrame
-	clientCtl          chan clientControl
-	inboxSlots         chan struct{}
-	voiceSlots         chan struct{}
-	clientSlots        chan struct{}
-	egressSlots        chan struct{}
-	progress           *sequenceProgress
-	activeWrite        *activeAudioWrite
-	activeControlWrite *activeAudioWrite
-	metrics            MetricsHooks
-	subject            Subject
-	dispatcher         DurableEffectDispatcher
-	safetyWork         chan presentationSafetyWork
-	durableCtl         chan durableEffectControl
-	durableSlots       chan struct{}
-	voiceReadReady     chan struct{}
-	voiceReadReadyOnce sync.Once
+	cfg                    Config
+	ids                    IDs
+	runtime                *sessionRuntime
+	voice                  realtime.Session
+	client                 ClientConn
+	fence                  *EpochFence
+	inbox                  chan reactorMessage
+	completions            chan reactorMessage
+	ingress                chan ingressFrame
+	ingressSlots           chan struct{}
+	voiceCtl               chan voiceControl
+	egress                 chan egressFrame
+	clientCtl              chan clientControl
+	inboxSlots             chan struct{}
+	voiceSlots             chan struct{}
+	clientSlots            chan struct{}
+	egressSlots            chan struct{}
+	progress               *sequenceProgress
+	activeWrite            *activeAudioWrite
+	activeControlWrite     *activeAudioWrite
+	metrics                MetricsHooks
+	subject                Subject
+	dispatcher             DurableEffectDispatcher
+	safetyWork             chan presentationSafetyWork
+	durableCtl             chan durableEffectControl
+	durableSlots           chan struct{}
+	voiceReadReady         chan struct{}
+	voiceReadReadyOnce     sync.Once
+	profileRuntime         *ProfileRuntime
+	suppressProfileOpening bool
 
 	ingressSequence uint64
 	egressSequence  uint64
@@ -924,6 +928,12 @@ func minimalReconnectSubject(subject Subject) Subject {
 
 func normalizeManagerConfig(cfg Config) (Config, error) {
 	cfg.InitialSession = cloneRealtimeSessionConfig(cfg.InitialSession)
+	if isNilInterface(cfg.ProfileEngine) {
+		cfg.ProfileEngine = prompttmpl.NewMiniJinja()
+	}
+	if prompttmpl.ValidateEngineIdentity(cfg.ProfileEngine.Version()) != nil {
+		return cfg, fmt.Errorf("%w: profile engine identity", ErrInvalidManagerConfig)
+	}
 	if emptyToolCatalog(cfg.ToolCatalog) {
 		cfg.ToolCatalog = toolpolicy.DefaultCatalog()
 	}
@@ -1101,6 +1111,13 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	if err != nil {
 		return err
 	}
+	var profileRuntime *ProfileRuntime
+	if profilePublic {
+		profileRuntime, err = prepareProfileRuntime(parent, selectedProfile, m.cfg.ProfileEngine)
+		if err != nil {
+			return err
+		}
+	}
 
 	sessionID := m.ids.NewSessionID()
 	if sessionID == "" {
@@ -1156,7 +1173,7 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	if isNilInterface(voice) {
 		return errors.New("realtime connector returned a nil session")
 	}
-	if err := m.sendInitialSession(sessionCtx, voice); err != nil {
+	if err := m.sendInitialSession(sessionCtx, voice, profileRuntime); err != nil {
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), internalCloseTimeout)
 		_ = voice.Close(closeCtx)
 		closeCancel()
@@ -1210,6 +1227,7 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	var quiescedOnce sync.Once
 	markQuiesced := func() { quiescedOnce.Do(func() { close(quiesced) }) }
 	state := newRunState(m.cfg, ids, voice, client, cancel)
+	state.profileRuntime = profileRuntime
 	state.subject = cloneSubject(subject)
 	state.metrics = m.metricsSnapshot()
 	runtime := &sessionRuntime{
@@ -1388,6 +1406,16 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 	selectedProfile, profilePublic, err := normalizeBoundProfile(request.Subject, request.Profile)
 	if err != nil {
 		return ErrInvalidReconnectCredential
+	}
+	var profileRuntime *ProfileRuntime
+	if profilePublic {
+		profileRuntime, err = prepareProfileRuntime(parent, selectedProfile, m.cfg.ProfileEngine)
+		if err != nil {
+			if parent.Err() != nil {
+				return parent.Err()
+			}
+			return ErrRecoveryUnavailable
+		}
 	}
 	if uint64(request.LastIncarnation) == math.MaxUint64 {
 		return ErrStaleReconnect
@@ -1655,7 +1683,7 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 		}
 		return ErrRecoveryExhausted
 	}
-	if err := m.sendInitialSession(sessionCtx, voice); err != nil {
+	if err := m.sendInitialSession(sessionCtx, voice, profileRuntime); err != nil {
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), internalCloseTimeout)
 		_ = voice.Close(closeCtx)
 		closeCancel()
@@ -1693,7 +1721,7 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 	ids := IDs{SessionID: request.SessionID, ConversationID: request.Scope.ConversationID, Incarnation: newIncarnation}
 	err = m.runReplacement(sessionCtx, cancel, subject, ids, client, voice, initialEpoch, logical, request.LastIncarnation,
 		request.LastEventSeq, reconnectIssued, reconnectMetadata, activeEvents, snapshot.PendingApprovals,
-		claimedLossDeadline, selectedProfile, profilePublic, advertisementAttempted.Store, durablyPublished.Store)
+		claimedLossDeadline, selectedProfile, profilePublic, profileRuntime, advertisementAttempted.Store, durablyPublished.Store)
 	result := "ok"
 	if err != nil {
 		result = "error"
@@ -1702,8 +1730,11 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 	return err
 }
 
-func (m *Manager) sendInitialSession(ctx context.Context, voice realtime.Session) error {
+func (m *Manager) sendInitialSession(ctx context.Context, voice realtime.Session, runtime *ProfileRuntime) error {
 	config := cloneRealtimeSessionConfig(m.cfg.InitialSession)
+	if runtime != nil {
+		config.Instructions = strings.Clone(runtime.System)
+	}
 	if len(config.Tools) == 0 && len(config.ToolChoice) == 0 && config.Instructions == "" &&
 		config.InputFormat == (realtime.AudioFormat{}) && config.OutputFormat == (realtime.AudioFormat{}) &&
 		config.Voice == "" && len(config.TurnDetection) == 0 {
@@ -2166,6 +2197,7 @@ func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.Canc
 	voice realtime.Session, initialEpoch identity.ResponseEpoch, logical *logicalSession, expected identity.Incarnation, replayAfter int64,
 	reconnectIssued *IssuedReconnectCredential, reconnectMetadata *protocol.ReconnectMetadata, activeHandoffs []protocol.ServerEvent,
 	pendingApprovals []RecoveryApproval, ownerLossDeadline time.Time, selectedProfile profile.Resolved, profilePublic bool,
+	profileRuntime *ProfileRuntime,
 	markAdvertisement func(bool), markPublished func(bool),
 ) (runErr error) {
 	group, groupCtx := errgroup.WithContext(sessionCtx)
@@ -2173,6 +2205,8 @@ func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.Canc
 	var quiescedOnce sync.Once
 	markQuiesced := func() { quiescedOnce.Do(func() { close(quiesced) }) }
 	state := newRunState(m.cfg, ids, voice, client, cancel)
+	state.profileRuntime = profileRuntime
+	state.suppressProfileOpening = true
 	state.fence = NewEpochFence(initialEpoch)
 	state.boundary = Snapshot{IDs: ids, Response: ResponseIdle, ResponseEpoch: initialEpoch}
 	state.subject = cloneSubject(subject)
@@ -3391,6 +3425,7 @@ func (s *runState) enqueueEgress(ctx context.Context, event realtime.Event, audi
 
 func (s *runState) reactorLoop(ctx context.Context) error {
 	reactor := newReactorWithPresentationAndHandoffTools(s.ids, s.fence, s.cfg.PresentationPolicy, s.cfg.SafetyPolicy, s.cfg.HandoffToolsEnabled)
+	reactor.configureProfileBootstrap(s.profileRuntime, s.suppressProfileOpening)
 	if err := reactor.expectInitialInputTurnMode(s.cfg.InitialSession.TurnDetection); err != nil {
 		return fmt.Errorf("initial input turn mode: %w", err)
 	}
@@ -3614,6 +3649,12 @@ func (s *runState) dispatchEffectsQueued(ctx context.Context, effects []Effect, 
 		if effect.FlushBefore != 0 {
 			s.activeWrite.cancelActive()
 			s.activeControlWrite.cancelActive()
+		}
+		if effect.ProfileBootstrap != nil {
+			completed := *effect.ProfileBootstrap
+			if err := s.enqueueCompletion(ctx, completed); err != nil {
+				return 0, err
+			}
 		}
 		if effect.ClientEvent != nil {
 			control := clientControl{afterSeq: egressAfter, afterVoice: voiceBarrier, event: effect.ClientEvent,

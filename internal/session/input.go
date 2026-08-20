@@ -35,6 +35,14 @@ type VoiceCommandCompletedInput struct {
 	Suppressed bool
 }
 
+// ProfileBootstrapCompletedInput is the local typed boundary produced only
+// after the provider acknowledges the manager-owned initial session update.
+// It carries no prompt text.
+type ProfileBootstrapCompletedInput struct {
+	Incarnation  identity.Incarnation
+	SnapshotHash string
+}
+
 type DurableInput struct {
 	Sequence uint64
 	Kind     string
@@ -81,13 +89,14 @@ type FailedInput struct {
 	Err    error
 }
 
-func (ConnectedInput) isSessionInput()             {}
-func (ClientInput) isSessionInput()                {}
-func (VoiceInput) isSessionInput()                 {}
-func (VoiceCommandCompletedInput) isSessionInput() {}
-func (DurableInput) isSessionInput()               {}
-func (TurnCommittedInput) isSessionInput()         {}
-func (TranscriptPersistedInput) isSessionInput()   {}
-func (HandoffAcceptedInput) isSessionInput()       {}
-func (HandoffEventInput) isSessionInput()          {}
-func (FailedInput) isSessionInput()                {}
+func (ConnectedInput) isSessionInput()                 {}
+func (ClientInput) isSessionInput()                    {}
+func (VoiceInput) isSessionInput()                     {}
+func (VoiceCommandCompletedInput) isSessionInput()     {}
+func (ProfileBootstrapCompletedInput) isSessionInput() {}
+func (DurableInput) isSessionInput()                   {}
+func (TurnCommittedInput) isSessionInput()             {}
+func (TranscriptPersistedInput) isSessionInput()       {}
+func (HandoffAcceptedInput) isSessionInput()           {}
+func (HandoffEventInput) isSessionInput()              {}
+func (FailedInput) isSessionInput()                    {}
