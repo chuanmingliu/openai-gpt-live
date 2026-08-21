@@ -107,6 +107,46 @@ func TestTwoAppsSharingPostgresCannotConsumeForeignAffinity(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
+func TestTranscriptCoordinatorDiscardsConflictingReplayWithoutChangingCommittedTurn(t *testing.T) {
+	repository, pool, manual := gatewayRepositoryHarness(t)
+	scope := handoff.Scope{TenantID: "tenant-conflict", UserID: "user-conflict", ConversationID: "conversation-conflict"}
+	insertGatewayConversation(t, pool, scope, manual.Now())
+	work := validTranscriptWork()
+	work.Scope, work.SessionID, work.Incarnation = scope, "session-conflict", 4
+	work.Turn = identity.TurnKey{ID: "turn-conflict", Revision: 1}
+	work.FinalText = "conflicting later final"
+	_, err := repository.AppendCommittedItem(t.Context(), scope, postgres.ConversationItem{
+		SessionID: work.SessionID, Turn: work.Turn, Sequence: 1, Role: work.Role,
+		Content: "authoritative first final", ContentHash: "authoritative-hash", CreatedAt: manual.Now(),
+	})
+	require.NoError(t, err)
+	payload, err := json.Marshal(work)
+	require.NoError(t, err)
+	_, err = repository.AdmitCoordinatorWork(t.Context(), postgres.CoordinatorJournalRecord{
+		WorkKey: transcriptWorkKey(work), Kind: postgres.CoordinatorKindTranscript, Scope: scope,
+		SessionID: work.SessionID, Incarnation: work.Incarnation, LocalSequence: work.Sequence,
+		DeliveryAffinity: "app-a", Payload: payload,
+	})
+	require.NoError(t, err)
+
+	inputs := make(chan session.Input, 1)
+	coordinator := NewTranscriptCoordinator(repository, &submitterFake{inputs: inputs}, 1)
+	require.NoError(t, coordinator.configureJournal(repository, "app-a", "worker-a", 200*time.Millisecond))
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- coordinator.Run(ctx) }()
+	require.Eventually(t, func() bool {
+		var count int
+		return pool.QueryRow(t.Context(), `SELECT count(*) FROM coordinator_work_journal WHERE work_key=$1`, transcriptWorkKey(work)).Scan(&count) == nil && count == 0
+	}, 2*time.Second, time.Millisecond)
+	assert.Empty(t, inputs)
+	var content string
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT content FROM conversation_items WHERE tenant_id=$1 AND conversation_id=$2`, scope.TenantID, scope.ConversationID).Scan(&content))
+	assert.Equal(t, "authoritative first final", content)
+	cancel()
+	require.NoError(t, <-done)
+}
+
 func TestDisabledQueuedCreationWritesNoHandoffEventOutboxOrJournalRows(t *testing.T) {
 	repository, pool, manual := gatewayRepositoryHarness(t)
 	service, err := handoff.NewService(repository, manual, coordinatorIDs{handoffID: "must-not-create", eventID: "must-not-create"})

@@ -77,6 +77,7 @@ type coordinatorJournalFake struct {
 	affinityRenewBlock <-chan struct{}
 	claimErr           error
 	claimCalls         int
+	discarded          map[string]bool
 }
 
 func newCoordinatorJournalFake() *coordinatorJournalFake {
@@ -84,6 +85,7 @@ func newCoordinatorJournalFake() *coordinatorJournalFake {
 		records: make(map[string]postgres.CoordinatorJournalRecord), delivered: make(map[string]bool),
 		claimOwner: make(map[string]string), claimUntil: make(map[string]time.Time), claimGeneration: make(map[string]uint64),
 		affinityOwner: make(map[string]string), affinityGeneration: make(map[string]uint64),
+		discarded: make(map[string]bool),
 	}
 }
 
@@ -217,6 +219,19 @@ func (f *coordinatorJournalFake) AckCoordinatorWork(_ context.Context, key, owne
 	return nil
 }
 
+func (f *coordinatorJournalFake) DiscardCoordinatorWork(_ context.Context, key, owner string, generation uint64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.claimOwner[key] != owner || f.claimGeneration[key] != generation || !f.claimUntil[key].After(time.Now()) {
+		return handoff.ErrNotFound
+	}
+	f.discarded[key] = true
+	delete(f.records, key)
+	delete(f.claimOwner, key)
+	delete(f.claimUntil, key)
+	return nil
+}
+
 func (f *coordinatorJournalFake) setAckError(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -227,6 +242,12 @@ func (f *coordinatorJournalFake) isDelivered(key string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.delivered[key]
+}
+
+func (f *coordinatorJournalFake) isDiscarded(key string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.discarded[key]
 }
 
 func repositoryTestTime() time.Time { return time.Date(2026, 8, 7, 1, 0, 0, 0, time.UTC) }
@@ -591,6 +612,36 @@ func TestTranscriptJournalStaleIncarnationIsTerminallyAcknowledged(t *testing.T)
 	require.Eventually(t, func() bool { return journal.isDelivered(transcriptWorkKey(work)) }, time.Second, time.Millisecond)
 	cancel()
 	require.NoError(t, <-done)
+}
+
+func TestTranscriptJournalConflictingCommittedTurnIsTerminallyDiscarded(t *testing.T) {
+	journal := newCoordinatorJournalFake()
+	writer := &transcriptWriterFake{items: make(chan postgres.ConversationItem, 1), err: handoff.ErrIdempotencyConflict}
+	inputs := make(chan session.Input, 1)
+	coordinator := NewTranscriptCoordinator(writer, &submitterFake{inputs: inputs}, 1)
+	require.NoError(t, coordinator.configureJournal(journal, "app-a", "owner", time.Minute))
+	work := validTranscriptWork()
+	require.NoError(t, coordinator.Enqueue(work))
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- coordinator.Run(ctx) }()
+	require.Eventually(t, func() bool { return journal.isDiscarded(transcriptWorkKey(work)) }, time.Second, time.Millisecond)
+	assert.Empty(t, inputs, "a conflicting immutable turn must not be resubmitted")
+	assert.False(t, journal.isDelivered(transcriptWorkKey(work)), "discard is distinct from successful delivery")
+	cancel()
+	require.NoError(t, <-done)
+}
+
+func TestTranscriptJournalSubmissionConflictIsNotDiscarded(t *testing.T) {
+	journal := newCoordinatorJournalFake()
+	writer := &transcriptWriterFake{items: make(chan postgres.ConversationItem, 1)}
+	coordinator := NewTranscriptCoordinator(writer, &submitterFake{err: handoff.ErrIdempotencyConflict}, 1)
+	require.NoError(t, coordinator.configureJournal(journal, "app-a", "owner", time.Minute))
+	work := validTranscriptWork()
+	require.NoError(t, coordinator.Enqueue(work))
+	require.ErrorIs(t, coordinator.Run(t.Context()), handoff.ErrIdempotencyConflict)
+	assert.False(t, journal.isDiscarded(transcriptWorkKey(work)), "a live submission conflict is not an immutable database collision")
+	assert.False(t, journal.isDelivered(transcriptWorkKey(work)), "a failed live submission remains pending")
 }
 
 func TestTranscriptJournalTypedCorruptionFailsClosed(t *testing.T) {

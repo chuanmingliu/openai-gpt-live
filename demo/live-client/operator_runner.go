@@ -198,10 +198,12 @@ func (runner *localOperatorRunner) rehydrateComposeOwnership() {
 			continue
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), runner.identityTimeout)
-		id, exists, err := runner.composeID(ctx, component)
+		id, exists, err := runner.discoverComposeIdentity(ctx, component)
 		cancel()
 		if err == nil && exists && id == proof {
 			runner.composeOwned[component] = id
+		} else if err == nil && !exists {
+			runner.removeRecordIfMatch(string(component)+".owner", proof+"\n")
 		}
 	}
 }
@@ -620,13 +622,17 @@ func (runner *localOperatorRunner) transferComposeOwnership(component operatorCo
 	runner.composeEphemeral[component] = after
 	delete(runner.composePending, component)
 	runner.mu.Unlock()
-	if err := runner.replaceOwner(component, before, after); err != nil {
+	transferErr := runner.replaceOwner(component, before, after)
+	for attempt := 1; transferErr != nil && attempt < 3 && runner.ownerMatches(component, before); attempt++ {
+		transferErr = runner.replaceOwner(component, before, after)
+	}
+	if transferErr != nil {
 		runner.mu.Lock()
 		if runner.composeOwned[component] == after {
 			runner.composeStale[component] = before
 		}
 		runner.mu.Unlock()
-		return err
+		return transferErr
 	}
 	runner.mu.Lock()
 	if runner.composeOwned[component] == after && runner.composeEphemeral[component] == after {

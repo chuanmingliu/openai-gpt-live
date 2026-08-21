@@ -523,6 +523,39 @@ func TestLocalOperatorRunnerSupervisorTransfersOwnedRecreationAndStopsOnlyNewIde
 	assert.NoFileExists(t, runner.ownerPath(componentWorker))
 }
 
+func TestLocalOperatorRunnerRetriesOwnedRecreationProofWhileOldProofIsUnchanged(t *testing.T) {
+	setRequiredOperatorEnvironment(t)
+	const oldID = "worker-owned-old"
+	const newID = "worker-owned-new"
+	identity := oldID
+	runner := newTestLocalOperatorRunner(t, func(ctx context.Context, _ string, args ...string) *exec.Cmd {
+		if len(args) == 1 && args[0] == "worker-start" {
+			identity = newID
+		}
+		return exec.CommandContext(ctx, "/usr/bin/true")
+	})
+	require.NoError(t, runner.writeOwner(componentWorker, oldID))
+	runner.mu.Lock()
+	runner.composeOwned[componentWorker] = oldID
+	runner.mu.Unlock()
+	runner.composeIdentity = func(context.Context, operatorComponent) (string, bool, error) {
+		return identity, true, nil
+	}
+	originalReplace := runner.records.replace
+	var attempts atomic.Int32
+	runner.records.replace = func(root *os.Root, temporary, final string) error {
+		if attempts.Add(1) == 1 {
+			return errors.New("transient owner replacement failure")
+		}
+		return originalReplace(root, temporary, final)
+	}
+
+	require.NoError(t, runner.Run(t.Context(), fixedOperation{Component: componentWorker, Action: actionStart}))
+	assert.EqualValues(t, 2, attempts.Load())
+	assert.True(t, runner.ownerMatches(componentWorker, newID))
+	assert.False(t, runner.ownerMatches(componentWorker, oldID))
+}
+
 func TestLocalOperatorRunnerSupervisorTransfersOwnedRecreationAfterFailureOrTimeout(t *testing.T) {
 	for _, test := range []struct {
 		name       string
@@ -1181,6 +1214,21 @@ func TestLocalOperatorRunnerRehydratesMatchingComposeOwnershipAfterRestart(t *te
 	t.Cleanup(func() { _ = second.stateRoot.Close() })
 	assert.True(t, second.Owned(componentGateway), "a matching private owner proof must survive a BFF restart")
 	require.NoError(t, second.Run(t.Context(), fixedOperation{Component: componentGateway, Action: actionStop}))
+}
+
+func TestLocalOperatorRunnerReclaimsOwnerProofAfterStableComposeAbsence(t *testing.T) {
+	runner := newTestLocalOperatorRunner(t, nil)
+	require.NoError(t, runner.writeOwner(componentGateway, "gateway-definitively-absent"))
+	runner.composeIdentity = func(context.Context, operatorComponent) (string, bool, error) {
+		return "", false, nil
+	}
+	runner.identityTimeout = 20 * time.Millisecond
+	runner.identityRetryWait = time.Millisecond
+
+	runner.rehydrateComposeOwnership()
+
+	assert.False(t, runner.Owned(componentGateway))
+	assert.NoFileExists(t, runner.ownerPath(componentGateway))
 }
 
 func TestLocalOperatorRunnerFreshPostgresStartReadyMigrateWithoutDocker(t *testing.T) {

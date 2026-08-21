@@ -572,11 +572,23 @@ func (c *TranscriptCoordinator) drainJournal(ctx context.Context) error {
 			ctx, c.journal, record.WorkKey, c.journalOwner, record.ClaimGeneration, c.claimLease,
 		)
 		err := c.append(operationCtx, work, record.StorageSequence)
+		appendConflict := errors.Is(err, handoff.ErrIdempotencyConflict)
 		if err == nil {
 			err = c.submitPersisted(operationCtx, work)
 		}
+		discarded := false
+		if appendConflict {
+			if discarder, ok := c.journal.(interface {
+				DiscardCoordinatorWork(context.Context, string, string, uint64) error
+			}); ok {
+				err = discarder.DiscardCoordinatorWork(
+					operationCtx, record.WorkKey, c.journalOwner, record.ClaimGeneration,
+				)
+				discarded = err == nil
+			}
+		}
 		var fenceErr error
-		if err == nil || errors.Is(err, session.ErrSessionNotActive) {
+		if !discarded && (err == nil || errors.Is(err, session.ErrSessionNotActive)) {
 			fenceErr = c.journal.RenewCoordinatorWork(
 				operationCtx, record.WorkKey, c.journalOwner, record.ClaimGeneration, c.claimLease,
 			)
@@ -590,6 +602,15 @@ func (c *TranscriptCoordinator) drainJournal(ctx context.Context) error {
 		}
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if discarded {
+			// A committed turn is immutable. A later journal entry that collides
+			// with it cannot safely overwrite or resubmit that turn, and leaving
+			// it pending would make one poison row prevent every gateway restart.
+			// DiscardCoordinatorWork is fenced by the current shard, owner,
+			// generation, and lease, so only the active coordinator can make this
+			// terminal decision.
+			continue
 		}
 		if errors.Is(err, session.ErrSessionNotActive) {
 			// The item is already durable and an exact incarnation cannot become
