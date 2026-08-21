@@ -109,23 +109,53 @@ case "$operation" in
     ;;
 esac
 
+docker_cli=${LIVE_DOCKER_CLI:-}
+if [ -n "$docker_cli" ]; then
+  case "$docker_cli" in
+    /*) ;;
+    *) echo "LIVE_DOCKER_CLI must be an absolute executable file" >&2; exit 127 ;;
+  esac
+  [ -f "$docker_cli" ] && [ -x "$docker_cli" ] || {
+    echo "LIVE_DOCKER_CLI must be an absolute executable file" >&2
+    exit 127
+  }
+else
+  docker_cli=$(command -v docker 2>/dev/null || true)
+  if [ -z "$docker_cli" ]; then
+    for candidate in \
+      /Applications/Docker.app/Contents/Resources/bin/docker \
+      /usr/local/bin/docker \
+      /opt/homebrew/bin/docker \
+      /usr/bin/docker; do
+      if [ -f "$candidate" ] && [ -x "$candidate" ]; then
+        docker_cli=$candidate
+        break
+      fi
+    done
+  fi
+  [ -n "$docker_cli" ] || {
+    echo "Docker CLI is unavailable; start Docker Desktop or set LIVE_DOCKER_CLI to an absolute executable path" >&2
+    exit 127
+  }
+fi
+
 case "$operation" in
   *-id|*-stop)
-    exec docker compose \
+    exec "$docker_cli" compose \
       --project-name gpt-live-durable-demo \
       -f deploy/docker-compose.yml \
       -f deploy/compose.development-control-panel-identities.yml \
       "$@"
     ;;
   postgres-*|gateway-*|worker-*)
-    exec docker compose \
+    exec "$docker_cli" compose \
       --project-name gpt-live-durable-demo \
       -f deploy/docker-compose.yml \
       -f deploy/compose.development-control-panel.yml \
       "$@"
     ;;
   *)
-    exec docker compose \
+    exec "$docker_cli" compose \
       --project-name gpt-live-durable-demo \
       -f deploy/docker-compose.yml \
       -f deploy/compose.development-durable.yml \

@@ -34,6 +34,22 @@ EOF
 chmod +x "$scratch/docker"
 : >"$scratch/docker.calls"
 
+# The browser BFF may be launched by a GUI process whose PATH omits Docker
+# Desktop.  An absolute, executable CLI override must keep the public wrapper
+# usable without relying on the parent process' PATH.
+: >"$scratch/docker.calls"
+if ! env -u POSTGRES_PASSWORD PATH=/usr/bin:/bin \
+  LIVE_DOCKER_CLI="$scratch/docker" DURABLE_DOCKER_CALLS="$scratch/docker.calls" \
+  "$root/deploy/scripts/durable-compose.sh" postgres-id; then
+  echo "durable Compose wrapper ignored the absolute Docker CLI override" >&2
+  exit 1
+fi
+grep -Fx 'compose --project-name gpt-live-durable-demo -f deploy/docker-compose.yml -f deploy/compose.development-control-panel-identities.yml ps -q postgres' \
+  "$scratch/docker.calls" >/dev/null || {
+  echo "durable Compose wrapper did not use the absolute Docker CLI override" >&2
+  exit 1
+}
+
 PATH="$scratch:$PATH" POSTGRES_PASSWORD='p@ss:/?#% with space' \
   "$root/deploy/scripts/durable-compose.sh" migrate-check
 
