@@ -45,6 +45,7 @@ if [[ "${1:-}" == 'build' && "${2:-}" == '-o' ]]; then
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "live-client $*" >>"${0}.calls"
+if [[ -n "${DEMO_TEST_LIVE_CLIENT_EXIT:-}" ]]; then exit 98; fi
 [[ -n "${LIVE_DEMO_BEARER:-}" ]] || exit 91
 if [[ "$*" != *'-operator'* ]]; then
   for forbidden in POSTGRES_PASSWORD S2S_API_KEY DEEPSEEK_API_KEY LIVE_STATIC_BEARER_TOKEN LIVE_ADMIN_BEARER_TOKEN LIVE_PRIVACY_HMAC_KEY LIVE_RETENTION_HMAC_KEY LIVE_RECONNECT_HMAC_KEY LIVE_TOOL_ENCRYPTION_KEY; do
@@ -101,6 +102,7 @@ set -euo pipefail
 printf '%s\n' "$*" >>"$DEMO_TEST_CALLS"
 case "$*" in
   *3000/health/ready*)
+    [[ -z "${DEMO_TEST_STALE_READY:-}" ]] || exit 0
     for _ in {1..20}; do
       find "${DEMO_WIZARD_STATE_DIR:?}" -name 'live-client.calls' -type f -exec grep -E '^live-client ' {} \; | grep -q . && exit "${DEMO_TEST_CURL_EXIT:-0}"
       sleep 0.01
@@ -214,6 +216,14 @@ if grep -F -- '-vertical-profiles' "$scratch/state-control/live-client.calls" >/
   fail "control-panel mode enabled vertical profiles without a profile database"
 fi
 grep -F 'Vertical profiles: off' "$scratch/control.out" >/dev/null || fail "control-panel mode did not report that profiles are off"
+
+if DEMO_TEST_STALE_READY=1 DEMO_TEST_LIVE_CLIENT_EXIT=1 run_wizard stale-listener "$control_input"; then
+  fail "control-panel mode accepted readiness from a stale port listener"
+fi
+grep -F 'browser-bff port is already in use' "$scratch/stale-listener.err" >/dev/null || {
+  fail "stale port rejection lacks a concise action"
+}
+[[ ! -s "$scratch/state-stale-listener/bff.pid" ]] || fail "stale port rejection overwrote BFF ownership proof"
 
 # With a profile database URL exported, the wizard enables the profile tabs and
 # passes the variable name only. The URL must reach the child environment and

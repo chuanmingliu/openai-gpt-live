@@ -140,6 +140,14 @@ wait_ready() {
   return 1
 }
 
+require_bff_port_free() {
+  if curl --fail --silent --output /dev/null \
+    --connect-timeout 0.05 --max-time 0.1 http://127.0.0.1:3000/health/ready; then
+    printf 'browser-bff port is already in use; stop the existing local demo before retrying\n' >&2
+    return 1
+  fi
+}
+
 check_status() {
   local label="$1" url="$2"
   if curl --fail --silent --output /dev/null \
@@ -153,6 +161,7 @@ check_status() {
 start_bff() {
   local bearer="$1" gateway_url="$2" model="$3"
   stop_current_bff
+  require_bff_port_free
   rm -f "$state_dir/live-client.calls"
   go build -o "$state_dir/live-client" ./demo/live-client
   env -i PATH="$PATH" LIVE_DEMO_BEARER="$bearer" "$state_dir/live-client" \
@@ -160,6 +169,10 @@ start_bff() {
   bff_pid=$!
   printf '%s\n' "$bff_pid" >"$state_dir/bff.pid"
   wait_ready browser-bff http://127.0.0.1:3000/health/ready
+  kill -0 "$bff_pid" 2>/dev/null || {
+    printf 'browser-bff exited before readiness was confirmed\n' >&2
+    return 1
+  }
 }
 
 # profile_arguments emits the vertical-profile flags only when the operator has
@@ -183,6 +196,7 @@ start_operator_bff() {
   local speech_root="$1" speech_profile="$2"
   set_profile_arguments
   stop_current_bff
+  require_bff_port_free
   rm -f "$state_dir/live-client.calls"
   go build -o "$state_dir/live-client" ./demo/live-client
   env -i PATH="$PATH" \
@@ -213,6 +227,10 @@ start_operator_bff() {
   bff_pid=$!
   printf '%s\n' "$bff_pid" >"$state_dir/bff.pid"
   wait_ready browser-bff http://127.0.0.1:3000/health/ready
+  kill -0 "$bff_pid" 2>/dev/null || {
+    printf 'browser-bff exited before readiness was confirmed\n' >&2
+    return 1
+  }
 }
 
 print_success() {
