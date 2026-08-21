@@ -15,3 +15,11 @@ Before registration, review the generated manifest and replace each `review-requ
 MCP-backed tools still require a native adapter implementation. Pin the MCP server identity, protocol/version, destination, tool schema, and result projection in code and in the reviewed manifest. Do not add a generic shell, command, arbitrary HTTP, package installer, or runtime cross-repository adapter.
 
 Generated tests are a starting boundary: retain cancellation, argument/result bounds, output ownership, privacy, timeout, approval/idempotency, and concurrency coverage as the implementation grows.
+
+## Built-in pinned knowledge search
+
+`knowledge.search/v1` is a native, read-only adapter registered as the model tool `knowledge_search`. The model supplies only a bounded query and result count. Tenant identity and the exact knowledge pack IDs, versions, and content hashes come from the accepted handoff snapshot; tool arguments cannot widen or replace that authority. Results use deterministic lexical ranking and carry the immutable pack reference plus source title, section/page, and excerpt hash.
+
+Knowledge search fails the background task when any pinned version is missing or the store is unavailable. It does not terminate, reconnect, or otherwise mutate the live voice session. Tombstoned material remains readable by work that pinned it before retirement, while new profile publications cannot select it.
+
+This adapter does not provide arbitrary SQL, filesystem access, OCR, embeddings, vector search, Redis caching, or runtime installation. Add any future implementation as a separately reviewed, pinned native adapter rather than linking to another repository at runtime.

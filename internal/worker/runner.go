@@ -885,7 +885,7 @@ func (r *Runner) executeClaimedApprovedTool(ctx context.Context, lease Lease, re
 				break
 			}
 		}
-		output, err = executeWithRecipeTimeout(ctx, execution.toolTimeout, tool.Executor, ToolExecutionRequest{InvocationID: expectedID, IdempotencyKey: expectedID, Arguments: append(json.RawMessage(nil), arguments...), Policy: execution.policy})
+		output, err = executeWithRecipeTimeout(ctx, execution.toolTimeout, tool.Executor, ToolExecutionRequest{InvocationID: expectedID, IdempotencyKey: expectedID, TenantID: lease.Job.Request.Scope.TenantID, Knowledge: cloneKnowledgeAuthority(lease.Job.Request.Profile.Knowledge), Arguments: append(json.RawMessage(nil), arguments...), Policy: execution.policy})
 		if err != nil {
 			err = fmt.Errorf("%w", errToolFailure)
 			break
@@ -1228,7 +1228,7 @@ func (r *Runner) executeOneTool(ctx context.Context, lease Lease, revision, ordi
 			return nil, err
 		}
 	}
-	output, err := executeWithRecipeTimeout(ctx, execution.toolTimeout, tool.Executor, ToolExecutionRequest{InvocationID: invocationID, IdempotencyKey: invocationID, Arguments: append(json.RawMessage(nil), arguments...), Policy: execution.policy})
+	output, err := executeWithRecipeTimeout(ctx, execution.toolTimeout, tool.Executor, ToolExecutionRequest{InvocationID: invocationID, IdempotencyKey: invocationID, TenantID: lease.Job.Request.Scope.TenantID, Knowledge: cloneKnowledgeAuthority(lease.Job.Request.Profile.Knowledge), Arguments: append(json.RawMessage(nil), arguments...), Policy: execution.policy})
 	if err != nil {
 		return nil, fmt.Errorf("%w", errToolFailure)
 	}

@@ -22,12 +22,14 @@ import (
 	"time"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/adaptercatalog"
+	knowledgeadapter "github.com/chuanmingliu/openai-gpt-live/internal/adapters/knowledge"
 	"github.com/chuanmingliu/openai-gpt-live/internal/admin"
 	"github.com/chuanmingliu/openai-gpt-live/internal/auth"
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
 	"github.com/chuanmingliu/openai-gpt-live/internal/config"
 	"github.com/chuanmingliu/openai-gpt-live/internal/feature"
 	"github.com/chuanmingliu/openai-gpt-live/internal/health"
+	"github.com/chuanmingliu/openai-gpt-live/internal/knowledge"
 	"github.com/chuanmingliu/openai-gpt-live/internal/lifecycle"
 	"github.com/chuanmingliu/openai-gpt-live/internal/profile"
 	"github.com/chuanmingliu/openai-gpt-live/internal/prompttmpl"
@@ -409,7 +411,19 @@ func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecret
 	if err != nil {
 		return nil, err
 	}
-	registry, err := workerRegistryForConfig(cfg, configHash, net.DefaultResolver)
+	var knowledgeSearchers []knowledgeadapter.Searcher
+	if cfg.Features.VerticalProfiles.Enabled {
+		// The material view and the final worker repository share one pool. The
+		// separate view breaks the catalog/repository construction cycle without
+		// widening either interface: search sees knowledge.Store only, while the
+		// final repository receives the compiled tool gate below.
+		materialRepo, materialErr := postgres.NewRepository(pool, realClock)
+		if materialErr != nil {
+			return nil, materialErr
+		}
+		knowledgeSearchers = []knowledgeadapter.Searcher{knowledge.NewSearcher(materialRepo.KnowledgeStore())}
+	}
+	registry, err := workerRegistryForConfig(cfg, configHash, net.DefaultResolver, knowledgeSearchers...)
 	if err != nil {
 		return nil, err
 	}
@@ -558,46 +572,61 @@ func buildRuntime(ctx context.Context, cfg config.Config, secrets resolvedSecret
 	return runtime, nil
 }
 
-func workerRegistryForConfig(cfg config.Config, configHash string, resolver websearch.Resolver) (worker.ToolRegistry, error) {
-	if !cfg.Tools.WebSearch.Enabled {
+func workerRegistryForConfig(cfg config.Config, configHash string, resolver websearch.Resolver, knowledgeSearchers ...knowledgeadapter.Searcher) (worker.ToolRegistry, error) {
+	manifests := make([]adaptercatalog.Manifest, 0, 2)
+	bindings := make(map[string]adaptercatalog.Binding, 2)
+	installed := make([]adaptercatalog.Installed, 0, 2)
+	if cfg.Tools.WebSearch.Enabled {
+		executor, err := websearch.New(resolver)
+		if err != nil {
+			return nil, fmt.Errorf("configure web search tool: %w", err)
+		}
+		native := websearch.RegisteredTool(executor)
+		timeout := cfg.Tools.WebSearch.Timeout
+		if timeout == 0 {
+			timeout = 5 * time.Second
+		}
+		concurrency := cfg.Worker.Concurrency
+		if concurrency <= 0 {
+			concurrency = 1
+		}
+		concurrency = minInt(concurrency, 64)
+		resultBytes := cfg.Worker.MaxOutputBytes
+		if resultBytes <= 0 {
+			resultBytes = 256 << 10
+		}
+		resultBytes = minInt(resultBytes, 256<<10)
+		manifests = append(manifests, adaptercatalog.Manifest{
+			AdapterID: "web_search", AdapterVersion: "native-v1", RegistryVersion: configHash,
+			Tool: native.Definition.Clone(), ReadOnly: true, ParallelSafe: true,
+			StableIdempotency: true, Approval: adaptercatalog.ApprovalNone,
+			Timeout: timeout, MaxConcurrency: concurrency, MaxArgumentBytes: 64 << 10,
+			MaxResultBytes: resultBytes, DestinationID: "public_web",
+			TransportClass: adaptercatalog.TransportNative, HealthClass: adaptercatalog.HealthRequired,
+		})
+		bindings["web_search"] = adaptercatalog.Binding{Enabled: true}
+		installed = append(installed, adaptercatalog.Installed{AdapterID: "web_search", AdapterVersion: "native-v1", DestinationID: "public_web", TransportClass: adaptercatalog.TransportNative, Executor: native.Executor, Projector: native.Projector, StartedPhase: native.StartedPhase, CompletedPhase: native.CompletedPhase})
+	}
+	if cfg.Features.VerticalProfiles.Enabled {
+		if len(knowledgeSearchers) != 1 || knowledgeSearchers[0] == nil {
+			return nil, errors.New("configure knowledge search dependency")
+		}
+		executor, err := knowledgeadapter.New(knowledgeSearchers[0])
+		if err != nil {
+			return nil, errors.New("configure knowledge search tool")
+		}
+		manifests = append(manifests, knowledgeadapter.Manifest(configHash))
+		bindings[knowledgeadapter.AdapterID] = adaptercatalog.Binding{Enabled: true}
+		installed = append(installed, knowledgeadapter.Installed(executor))
+	}
+	if len(manifests) == 0 {
 		return worker.NewToolRegistry(map[string][]worker.RegisteredTool{configHash: {}})
 	}
-	executor, err := websearch.New(resolver)
+	catalog, err := adaptercatalog.New(configHash, manifests, nil)
 	if err != nil {
-		return nil, fmt.Errorf("configure web search tool: %w", err)
+		return nil, fmt.Errorf("configure worker adapter catalog: %w", err)
 	}
-	native := websearch.RegisteredTool(executor)
-	timeout := cfg.Tools.WebSearch.Timeout
-	if timeout == 0 {
-		timeout = 5 * time.Second
-	}
-	concurrency := cfg.Worker.Concurrency
-	if concurrency <= 0 {
-		concurrency = 1
-	}
-	concurrency = minInt(concurrency, 64)
-	resultBytes := cfg.Worker.MaxOutputBytes
-	if resultBytes <= 0 {
-		resultBytes = 256 << 10
-	}
-	resultBytes = minInt(resultBytes, 256<<10)
-	manifest := adaptercatalog.Manifest{
-		AdapterID: "web_search", AdapterVersion: "native-v1", RegistryVersion: configHash,
-		Tool: native.Definition.Clone(), ReadOnly: true, ParallelSafe: true,
-		StableIdempotency: true, Approval: adaptercatalog.ApprovalNone,
-		Timeout: timeout, MaxConcurrency: concurrency, MaxArgumentBytes: 64 << 10,
-		MaxResultBytes: resultBytes, DestinationID: "public_web",
-		TransportClass: adaptercatalog.TransportNative, HealthClass: adaptercatalog.HealthRequired,
-	}
-	catalog, err := adaptercatalog.New(configHash, []adaptercatalog.Manifest{manifest}, nil)
-	if err != nil {
-		return nil, fmt.Errorf("configure web search catalog: %w", err)
-	}
-	return adaptercatalog.CompileRegistry(catalog, map[string]adaptercatalog.Binding{"web_search": {Enabled: true}}, []adaptercatalog.Installed{{
-		AdapterID: "web_search", AdapterVersion: "native-v1", DestinationID: "public_web",
-		TransportClass: adaptercatalog.TransportNative, Executor: native.Executor, Projector: native.Projector,
-		StartedPhase: native.StartedPhase, CompletedPhase: native.CompletedPhase,
-	}})
+	return adaptercatalog.CompileRegistry(catalog, bindings, installed)
 }
 
 type workerCapacity struct {

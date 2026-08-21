@@ -28,3 +28,11 @@ Configuration names secret-bearing environment variables but never embeds their 
 All queues, frames, sessions, tenant/user admission, retries, tool rounds, output bytes/tokens, deadlines, leases, and retention batches are bounded. Side-effecting tools require the configured policy and an unexpired durable approval. Safety failures suppress or degrade content; they do not fall through. Urgent safety can fence active speech before a fixed permitted announcement.
 
 Report suspected cross-session output as a critical incident: disable handoffs, drain traffic, preserve content-free metrics/evidence, rotate affected credentials if indicated, and follow [runbooks/rollback.md](runbooks/rollback.md).
+
+## Vertical profiles, adapters, and knowledge
+
+Prompt templates are immutable logical Jinja-Go bundle entries, never filesystem paths. Published snapshots bind the exact engine identity, recipe hashes, reviewed adapter registry, and knowledge content hashes. Rendered prompts and recipe evidence remain untrusted user-message data beneath fixed server-owned system instructions.
+
+Adapter manifests are a closed server-owned allowlist. A profile may disable or tighten a reviewed binding but cannot choose code, transport, destination, secrets, timeout, concurrency, or a larger result allowance. MCP tools require the same pinned native wrapper and must not become a generic MCP, HTTP, shell, installer, or cross-repository execution escape hatch.
+
+Knowledge ingestion accepts bounded UTF-8 text/Markdown and stores immutable cited excerpts. Search authority is copied from the accepted handoff, not accepted from model arguments. Tombstones prevent new selection but preserve already accepted work; retention must therefore cover the maximum accepted-work lifetime. Knowledge dependency, timeout, or citation failures remain isolated to the background task and must not weaken the realtime output epoch fence, audio-commit single flight, or barge-in cancellation path.

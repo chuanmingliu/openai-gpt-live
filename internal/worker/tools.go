@@ -18,6 +18,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/reasoner"
 	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 )
@@ -34,8 +35,14 @@ const maxSealsPerArgumentKey = 1 << 16
 type ToolExecutionRequest struct {
 	InvocationID   string
 	IdempotencyKey string
+	TenantID       string
+	Knowledge      []handoff.KnowledgeVersion
 	Arguments      json.RawMessage
 	Policy         toolpolicy.Policy
+}
+
+func cloneKnowledgeAuthority(values []handoff.KnowledgeVersion) []handoff.KnowledgeVersion {
+	return append([]handoff.KnowledgeVersion(nil), values...)
 }
 
 type ToolExecutor interface {

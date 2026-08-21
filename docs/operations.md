@@ -60,3 +60,11 @@ cosign verify \
 ## Backup and incidents
 
 Backups must be encrypted, access-controlled, retention-aligned, and restore-tested. A restore is promoted only after schema check, config-hash verification, outbox/cursor consistency, and synthetic isolation pass. For incidents, preserve machine evidence and timestamps but never capture customer media or content. Use the database, provider, overload, and rollback runbooks in this directory.
+
+## Vertical-profile worker operations
+
+When `features.vertical_profiles.enabled` is true, worker readiness requires schema migrations, the composite Jinja-Go engine identity, the exact adapter registry version, the profile resolver, and the PostgreSQL knowledge store. An accepted handoff pins its profile snapshot, worker recipe, adapter registry, evidence, and knowledge hashes. Publishing a newer profile or knowledge version does not change running work.
+
+Worker recipes render only `workers/<recipe-id>.j2` under the fixed server-owned worker system instruction. Recipe execution, tool calls, tool results, final results, concurrency, and overall handoff deadlines remain bounded. `knowledge_search` resolves only the tenant and immutable versions copied from the accepted handoff; missing material fails that task without ending the voice session.
+
+For rollout, apply migrations before enabling the feature, verify the catalog hash on gateway and worker, publish and activate a profile in `/setup`, then open a new voice session. Roll back new admission by deactivating or revoking the affected version. Existing accepted work retains its immutable snapshot, while revoked profiles are rejected for new sessions and reconnect according to the profile lifecycle rules. Monitor only content-free failure classes and timing; never log prompt source, evidence, queries, excerpts, transcripts, or model results.

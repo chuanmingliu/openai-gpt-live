@@ -17,6 +17,7 @@ import (
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
 	"github.com/chuanmingliu/openai-gpt-live/internal/config"
+	"github.com/chuanmingliu/openai-gpt-live/internal/knowledge"
 	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 	"github.com/chuanmingliu/openai-gpt-live/internal/worker"
 	"github.com/stretchr/testify/assert"
@@ -104,6 +105,25 @@ func TestWorkerRegistryRegistersWebSearchOnlyWhenConfigured(t *testing.T) {
 			assert.False(t, wrongVersion)
 		})
 	}
+}
+
+func TestWorkerRegistryRegistersKnowledgeOnlyWithProfileRuntimeAndDependency(t *testing.T) {
+	cfg := config.Config{}
+	cfg.Features.VerticalProfiles.Enabled = true
+	_, err := workerRegistryForConfig(cfg, "config-v1", net.DefaultResolver)
+	require.Error(t, err)
+	registry, err := workerRegistryForConfig(cfg, "config-v1", net.DefaultResolver, knowledgeSearcherFunc(func(context.Context, knowledge.SearchRequest) ([]knowledge.Result, error) { return nil, nil }))
+	require.NoError(t, err)
+	registered, ok := registry.Lookup("config-v1", "knowledge_search")
+	require.True(t, ok)
+	assert.Equal(t, "knowledge.search", registered.AdapterID)
+	assert.True(t, registered.ReadOnly)
+}
+
+type knowledgeSearcherFunc func(context.Context, knowledge.SearchRequest) ([]knowledge.Result, error)
+
+func (function knowledgeSearcherFunc) Search(ctx context.Context, request knowledge.SearchRequest) ([]knowledge.Result, error) {
+	return function(ctx, request)
 }
 
 func TestDevelopmentDurableWorkerUsesStaticAdminAuthenticator(t *testing.T) {
