@@ -137,6 +137,12 @@ def create_runtime_profile(source: Path, expected: os.stat_result | None = None)
 def build_child_environment(parent: dict[str, str], speech: dict[str, str]) -> dict[str, str]:
     environment = {name: parent[name] for name in SAFE_PARENT_ENVIRONMENT if parent.get(name)}
     environment.update(speech)
+    # The fixed speech profile uses the OpenAI-compatible DeepSeek client. The
+    # SDK falls back to OPENAI_API_KEY when the profile deliberately omits a
+    # plaintext responses_api_api_key. Keep the reviewed speech-scoped name as
+    # authority and create the SDK alias only inside this child environment.
+    if speech.get("DEEPSEEK_API_KEY"):
+        environment["OPENAI_API_KEY"] = speech["DEEPSEEK_API_KEY"]
     return environment
 
 

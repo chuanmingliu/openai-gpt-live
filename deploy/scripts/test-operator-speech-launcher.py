@@ -79,9 +79,11 @@ class OperatorSpeechLauncherTest(unittest.TestCase):
             "HOME": "/private/home",
             "POSTGRES_PASSWORD": "database-secret",
             "LIVE_STATIC_BEARER_TOKEN": "gateway-secret",
+            "OPENAI_API_KEY": "unrelated-parent-secret",
         }
         child = MODULE.build_child_environment(parent, {"DEEPSEEK_API_KEY": "speech-secret"})
         self.assertEqual("speech-secret", child["DEEPSEEK_API_KEY"])
+        self.assertEqual("speech-secret", child["OPENAI_API_KEY"])
         self.assertEqual("/usr/bin:/bin", child["PATH"])
         self.assertNotIn("POSTGRES_PASSWORD", child)
         self.assertNotIn("LIVE_STATIC_BEARER_TOKEN", child)
