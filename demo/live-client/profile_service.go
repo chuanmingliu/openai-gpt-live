@@ -4,13 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"time"
 
+	"github.com/chuanmingliu/openai-gpt-live/internal/adaptercatalog"
+	knowledgeadapter "github.com/chuanmingliu/openai-gpt-live/internal/adapters/knowledge"
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
 	"github.com/chuanmingliu/openai-gpt-live/internal/knowledge"
 	"github.com/chuanmingliu/openai-gpt-live/internal/profile"
 	"github.com/chuanmingliu/openai-gpt-live/internal/prompttmpl"
 	"github.com/chuanmingliu/openai-gpt-live/internal/store/postgres"
+	"github.com/chuanmingliu/openai-gpt-live/internal/tools/websearch"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -19,19 +23,6 @@ import (
 // no trailing newline so the seeded fixture expectation is engine-exact.
 const defaultSystemTemplate = "You are a realtime spoken assistant. Reply in the user's language using at most three short sentences unless the user explicitly asks for more detail. Use natural speech without markdown, headings, lists, or narrated reasoning. Keep background work silent and mention it only after a result is available."
 
-// demoAdapterCatalog is the fixed empty catalog for the loopback demo: no
-// adapters are installed, so any adapter binding fails publication closed.
-type demoAdapterCatalog struct{}
-
-func (demoAdapterCatalog) Version() string { return "demo-empty-catalog-v1" }
-
-func (demoAdapterCatalog) ValidateBindings(_ context.Context, _ string, bindings []profile.AdapterBinding) error {
-	if len(bindings) != 0 {
-		return errors.New("no adapters are installed in the loopback demo")
-	}
-	return nil
-}
-
 // profileAdminService owns the loopback profile administration dependencies.
 // The browser never sees tenant, actor, database, or engine configuration.
 type profileAdminService struct {
@@ -39,6 +30,7 @@ type profileAdminService struct {
 	actor     string
 	store     profile.Store
 	knowledge knowledge.Store
+	catalog   *adaptercatalog.Catalog
 	publisher *profile.Publisher
 	closeFn   func()
 }
@@ -52,6 +44,10 @@ func newProfileAdminService(cfg profileAdminConfig, store profile.Store, knowled
 		return nil, errors.New("demo profile administration is unavailable")
 	}
 	engine := prompttmpl.NewMiniJinja()
+	catalog, err := newDemoAdapterCatalog(cfg.AdapterRegistryVersion)
+	if err != nil {
+		return nil, errors.New("demo adapter catalog is unavailable")
+	}
 	var validator profile.KnowledgeReferenceValidator
 	if knowledgeStore != nil {
 		validator = knowledge.NewReferenceValidator(knowledgeStore)
@@ -61,9 +57,26 @@ func newProfileAdminService(cfg profileAdminConfig, store profile.Store, knowled
 		actor:     cfg.Actor,
 		store:     store,
 		knowledge: knowledgeStore,
-		publisher: profile.NewPublisher(store, engine, demoAdapterCatalog{}, validator),
+		catalog:   catalog,
+		publisher: profile.NewPublisher(store, engine, catalog, validator),
 		closeFn:   closeFn,
 	}, nil
+}
+
+func newDemoAdapterCatalog(registryVersion string) (*adaptercatalog.Catalog, error) {
+	webExecutor, err := websearch.New(net.DefaultResolver)
+	if err != nil {
+		return nil, err
+	}
+	webTool := websearch.RegisteredTool(webExecutor)
+	webManifest := adaptercatalog.Manifest{
+		AdapterID: "web_search", AdapterVersion: "native-v1", RegistryVersion: registryVersion,
+		Tool: webTool.Definition.Clone(), ReadOnly: true, ParallelSafe: true, StableIdempotency: true,
+		Approval: adaptercatalog.ApprovalNone, Timeout: 8 * time.Second, MaxConcurrency: 4,
+		MaxArgumentBytes: 64 << 10, MaxResultBytes: 64 << 10, DestinationID: "public_web",
+		TransportClass: adaptercatalog.TransportNative, HealthClass: adaptercatalog.HealthRequired,
+	}
+	return adaptercatalog.New(registryVersion, []adaptercatalog.Manifest{knowledgeadapter.Manifest(registryVersion), webManifest}, nil)
 }
 
 // openProfileAdminService resolves the private database URL by environment

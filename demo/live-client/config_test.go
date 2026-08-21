@@ -123,12 +123,14 @@ func TestVerticalProfileConfigurationIsPrivateAndValidated(t *testing.T) {
 		"-profile-tenant", "local",
 		"-profile-actor", "operator",
 		"-profile-database-url-env", "LIVE_PROFILE_DATABASE_URL",
+		"-profile-adapter-registry-version", "registry-v1",
 	})
 	require.NoError(t, err)
 	assert.True(t, cfg.Profiles.Enabled)
 	assert.Equal(t, "local", cfg.Profiles.TenantID)
 	assert.Equal(t, "operator", cfg.Profiles.Actor)
 	assert.Equal(t, "LIVE_PROFILE_DATABASE_URL", cfg.Profiles.DatabaseURLEnv)
+	assert.Equal(t, "registry-v1", cfg.Profiles.AdapterRegistryVersion)
 
 	for name, args := range map[string][]string{
 		"missing identity": {"-vertical-profiles"},
@@ -146,6 +148,7 @@ func TestVerticalProfileConfigurationIsPrivateAndValidated(t *testing.T) {
 func TestProfileConfigurationNeverCarriesDatabaseValues(t *testing.T) {
 	cfg, err := parseConfig([]string{
 		"-vertical-profiles", "-profile-tenant", "local", "-profile-actor", "operator",
+		"-profile-adapter-registry-version", "registry-v1",
 	})
 	require.NoError(t, err)
 	rendered := fmt.Sprintf("%+v", cfg)

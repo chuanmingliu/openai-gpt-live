@@ -18,6 +18,7 @@ function recipeBody(id, version = 1, overrides = {}) {
     maxEvidenceBytes: 32768,
     maxToolResultBytes: 16384,
     maxFinalResultBytes: 16384,
+    bindingIDs: Object.freeze([]),
     ...overrides,
   });
 }
@@ -31,6 +32,7 @@ function draftBody(generation, templates = ['system.j2'], recipes = []) {
     fixtures: Object.freeze([]),
     recipes: Object.freeze(recipes),
     knowledge: Object.freeze([]),
+    bindings: Object.freeze([]),
   });
 }
 
@@ -43,6 +45,7 @@ function apiError(code) {
 function fakeAPI(overrides = {}) {
   return {
     listPublished: async () => Object.freeze([]),
+    adapterCatalog: async () => Object.freeze({registryVersion: 'registry-v1', adapters: Object.freeze([])}),
     createProfile: async () => draftBody(1),
     loadDraft: async () => draftBody(1),
     saveDescription: async () => draftBody(2),
@@ -58,6 +61,8 @@ function fakeAPI(overrides = {}) {
     pinKnowledge: async () => draftBody(2),
     unpinKnowledge: async () => true,
     deleteRecipe: async () => true,
+    saveBinding: async () => draftBody(2),
+    deleteBinding: async () => draftBody(2),
     ...overrides,
   };
 }
@@ -77,7 +82,7 @@ function harness(overrides = {}) {
 
 test('tabs are the approved set and default to runtime', () => {
   const {workspace} = harness();
-  assert.deepEqual([...PROFILE_TABS], ['runtime', 'profile', 'prompts', 'workers', 'knowledge', 'publish']);
+  assert.deepEqual([...PROFILE_TABS], ['runtime', 'profile', 'prompts', 'workers', 'adapters', 'knowledge', 'publish']);
   assert.equal(workspace.snapshot().tab, 'runtime');
   workspace.selectTab('prompts');
   assert.equal(workspace.snapshot().tab, 'prompts');
@@ -292,6 +297,23 @@ test('recipe actions refuse to run concurrently', async () => {
   assert.equal(announced.at(-1), 'Another profile action is still running.');
   release();
   assert.equal(await first, true);
+});
+
+test('adapter bindings advance the draft and never accept authority outside the API port', async () => {
+  const calls = [];
+  const catalog = Object.freeze({registryVersion: 'registry-v1', adapters: Object.freeze([{id: 'knowledge.search'}])});
+  const bound = {...draftBody(2), bindings: Object.freeze([{id: 'knowledge.search', version: 'v1', toolIDs: Object.freeze(['knowledge_search']), maxResultBytes: 8192, requireApproval: false}])};
+  const {workspace} = harness({
+    adapterCatalog: async () => catalog,
+    saveBinding: async (id, generation, adapterID, binding) => { calls.push({id, generation, adapterID, binding}); return bound; },
+    deleteBinding: async () => draftBody(3),
+  });
+  await workspace.openOrCreate('insurance');
+  await workspace.saveBinding('knowledge.search', {max_result_bytes: 8192, require_approval: false});
+  assert.equal(workspace.snapshot().bindings[0].id, 'knowledge.search');
+  assert.deepEqual(calls, [{id: 'insurance', generation: 1, adapterID: 'knowledge.search', binding: {max_result_bytes: 8192, require_approval: false}}]);
+  await workspace.deleteBinding('knowledge.search');
+  assert.deepEqual([...workspace.snapshot().bindings], []);
 });
 
 test('pinning knowledge advances the generation and shows the resolved hash', async () => {

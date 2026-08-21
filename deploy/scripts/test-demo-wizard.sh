@@ -220,7 +220,7 @@ grep -F 'Vertical profiles: off' "$scratch/control.out" >/dev/null || fail "cont
 # never appear in argv, stdout, or any state file.
 LIVE_PROFILE_DATABASE_URL='postgres://live:profile-url-sentinel@127.0.0.1:5432/live?sslmode=disable' \
   run_wizard profiles "$control_input"
-grep -F -- '-vertical-profiles -profile-tenant development -profile-actor operator -profile-database-url-env LIVE_PROFILE_DATABASE_URL' \
+grep -F -- '-vertical-profiles -profile-tenant development -profile-actor operator -profile-database-url-env LIVE_PROFILE_DATABASE_URL -profile-adapter-registry-version v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \
   "$scratch/state-profiles/live-client.calls" >/dev/null || {
   sed 's/^/call: /' "$scratch/state-profiles/live-client.calls" >&2
   fail "profile mode did not pass the profile flags by environment-variable name"

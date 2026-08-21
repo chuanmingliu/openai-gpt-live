@@ -79,6 +79,10 @@ features:
   tool_encryption_key_env: LIVE_TOOL_ENCRYPTION_KEY
   tool_encryption_key_id: development-durable-tools-v1
   runtime_refresh_interval: 1s
+  vertical_profiles:
+    enabled: true
+    render_workers: 4
+    render_queue: 64
 tools:
   web_search:
     enabled: true

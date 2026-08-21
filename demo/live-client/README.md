@@ -65,8 +65,8 @@ gateway connection.
 
 ## Vertical profiles in /setup
 
-`/setup` has six tabs. **Runtime** keeps the existing service controls.
-**Profile**, **Prompts**, **Workers**, **Knowledge**, and **Review & publish**
+`/setup` has seven tabs. **Runtime** keeps the existing service controls.
+**Profile**, **Prompts**, **Workers**, **Tools & adapters**, **Knowledge**, and **Review & publish**
 appear when the BFF runs with loopback profile administration:
 
 ```bash
@@ -75,7 +75,8 @@ go run ./demo/live-client \
   -vertical-profiles \
   -profile-tenant local \
   -profile-actor operator \
-  -profile-database-url-env LIVE_PROFILE_DATABASE_URL
+  -profile-database-url-env LIVE_PROFILE_DATABASE_URL \
+  -profile-adapter-registry-version "$LIVE_EXPECTED_CONFIG_HASH"
 ```
 
 `-profile-database-url-env` names an environment variable; the URL value itself
@@ -97,7 +98,13 @@ Typical flow:
    the Prompts tab first, then set the recipe's timeouts and payload limits and
    **Save recipe**. The service links the objective itself; the browser never
    supplies a template reference, a command, or an adapter field.
-4. **Knowledge** — upload reference material the background worker can cite.
+4. **Tools & adapters** — enable a reviewed adapter for every recipe in this
+   draft, optionally lower its result-byte ceiling, and require approval. The
+   page never exposes or accepts commands, endpoints, transports, secret names,
+   packages, or executable/MCP configuration. `knowledge.search/v1` searches
+   only exact material pinned by the accepted handoff; `web_search/native-v1`
+   is the reviewed public-web adapter.
+5. **Knowledge** — upload reference material the background worker can cite.
    **UTF-8 text and Markdown only**; convert other documents first. Markdown
    headings become citation sections. **Preview excerpts** shows exactly what
    would be stored and computes a content hash; **Publish version** re-sends the
@@ -107,7 +114,7 @@ Typical flow:
    version to the open profile draft; the service resolves the content hash, so
    the browser never asserts bytes it did not publish. Publication then refuses
    any pin it cannot resolve, and a retired version cannot be pinned at all.
-5. **Review & publish** — **Validate**, **Preview** the rendered fixtures, then
+6. **Review & publish** — **Validate**, **Preview** the rendered fixtures, then
    **Publish and activate**. Published versions are immutable; use **Activate**
    and **Revoke** to control which version new sessions may select.
 

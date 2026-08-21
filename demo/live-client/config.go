@@ -34,16 +34,18 @@ type demoConfig struct {
 // configuration. Identity and database access are operator-supplied and are
 // never returned to or accepted from the browser.
 type profileAdminConfig struct {
-	Enabled        bool
-	DatabaseURLEnv string
-	TenantID       string
-	Actor          string
+	Enabled                bool
+	DatabaseURLEnv         string
+	TenantID               string
+	Actor                  string
+	AdapterRegistryVersion string
 
 	// service is a test seam; production composition opens PostgreSQL.
 	service *profileAdminService
 }
 
 var profileIdentifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+var profileRegistryPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$`)
 
 func (cfg profileAdminConfig) validate() error {
 	if !cfg.Enabled {
@@ -54,6 +56,9 @@ func (cfg profileAdminConfig) validate() error {
 	}
 	if !profileIdentifierPattern.MatchString(cfg.TenantID) || !profileIdentifierPattern.MatchString(cfg.Actor) {
 		return errors.New("demo profile identity is required")
+	}
+	if !profileRegistryPattern.MatchString(cfg.AdapterRegistryVersion) {
+		return errors.New("demo profile adapter registry version is required")
 	}
 	return nil
 }
@@ -88,6 +93,7 @@ func parseConfig(args []string) (demoConfig, error) {
 	flags.StringVar(&cfg.Profiles.DatabaseURLEnv, "profile-database-url-env", "LIVE_PROFILE_DATABASE_URL", "environment variable containing the private profile database URL")
 	flags.StringVar(&cfg.Profiles.TenantID, "profile-tenant", "", "exact profile tenant identifier")
 	flags.StringVar(&cfg.Profiles.Actor, "profile-actor", "", "exact profile operator actor identifier")
+	flags.StringVar(&cfg.Profiles.AdapterRegistryVersion, "profile-adapter-registry-version", "", "exact deployed worker adapter registry version")
 	flags.BoolVar(&cfg.Operator.Enabled, "operator", false, "enable fixed local demo operator controls")
 	flags.StringVar(&cfg.Operator.StateDir, "operator-state-dir", "", "private operator state directory")
 	flags.StringVar(&cfg.Operator.RepositoryRoot, "operator-repository-root", "", "fixed repository root")

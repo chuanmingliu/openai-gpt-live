@@ -1,6 +1,6 @@
 import {createDraftModel} from './profile-draft-state.mjs';
 
-export const PROFILE_TABS = Object.freeze(['runtime', 'profile', 'prompts', 'workers', 'knowledge', 'publish']);
+export const PROFILE_TABS = Object.freeze(['runtime', 'profile', 'prompts', 'workers', 'adapters', 'knowledge', 'publish']);
 
 const NOTICES = Object.freeze({
   '': '',
@@ -11,6 +11,8 @@ const NOTICES = Object.freeze({
   template_deleted: 'Template deleted.',
   recipe_saved: 'Worker recipe saved.',
   recipe_deleted: 'Worker recipe removed.',
+  binding_saved: 'Adapter binding saved.',
+  binding_deleted: 'Adapter disabled for this draft.',
   previewed_document: 'Document preview ready. Review the excerpts, then publish.',
   published_document: 'Knowledge version published.',
   tombstoned: 'Knowledge version retired from new selection.',
@@ -58,6 +60,7 @@ export function createProfileWorkspace({api, dom}) {
   let tab = 'runtime';
   let profileID = '';
   let published = Object.freeze([]);
+  let catalog = Object.freeze({registryVersion: '', adapters: Object.freeze([])});
   let notice = '';
   let adminAvailable = true;
   let busy = false;
@@ -79,6 +82,8 @@ export function createProfileWorkspace({api, dom}) {
       preview: editor.preview,
       recipes: editor.draft === null ? Object.freeze([]) : editor.draft.recipes,
       knowledge: editor.draft === null ? Object.freeze([]) : editor.draft.knowledge,
+      bindings: editor.draft === null ? Object.freeze([]) : (editor.draft.bindings ?? Object.freeze([])),
+      catalog,
       published,
       notice,
       publishDisabled: editor.draft === null || editor.dirty || editor.conflict,
@@ -141,6 +146,7 @@ export function createProfileWorkspace({api, dom}) {
         }
         profileID = draft.id;
         model.loadDraft(draft);
+        catalog = await api.adapterCatalog(signal);
       }, 'loaded');
     },
     saveDescription(description) {
@@ -198,6 +204,20 @@ export function createProfileWorkspace({api, dom}) {
         const draft = await api.loadDraft(profileID, signal);
         model.loadDraft(draft);
       }, 'recipe_deleted');
+    },
+    saveBinding(adapterID, binding) {
+      return act(async (signal) => {
+        const current = model.snapshot().draft;
+        if (!current) throw Object.assign(new Error('profile_invalid'), {code: 'profile_invalid'});
+        model.applySaved(await api.saveBinding(profileID, current.generation, adapterID, binding, signal));
+      }, 'binding_saved');
+    },
+    deleteBinding(adapterID) {
+      return act(async (signal) => {
+        const current = model.snapshot().draft;
+        if (!current) throw Object.assign(new Error('profile_invalid'), {code: 'profile_invalid'});
+        model.applySaved(await api.deleteBinding(profileID, current.generation, adapterID, signal));
+      }, 'binding_deleted');
     },
     // pinKnowledge attaches a published version to the draft. The generation
     // advances, so a stale editor cannot pin against a draft that moved.
@@ -274,6 +294,7 @@ export function createProfileWorkspace({api, dom}) {
       controller = null;
       model.destroy();
       published = Object.freeze([]);
+      catalog = Object.freeze({registryVersion: '', adapters: Object.freeze([])});
       profileID = '';
     },
   });

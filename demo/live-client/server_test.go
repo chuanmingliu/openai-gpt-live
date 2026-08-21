@@ -454,7 +454,7 @@ func TestJavaScriptAssetsAreServedAsNoStoreJavaScript(t *testing.T) {
 
 func TestSetupAssetsAreNoStoreAndRejectMutations(t *testing.T) {
 	handler := mustTestHandler(t, nil, []byte("sentinel-browser-secret"))
-	for _, path := range []string{"/setup", "/setup.css", "/setup.mjs", "/setup-profile.mjs", "/profile-api.mjs", "/profile-draft-state.mjs"} {
+	for _, path := range []string{"/setup", "/setup.css", "/setup.mjs", "/setup-profile.mjs", "/profile-api.mjs", "/profile-draft-state.mjs", "/adapter-editor.mjs", "/recipe-editor.mjs"} {
 		path := path
 		t.Run(path, func(t *testing.T) {
 			response := httptest.NewRecorder()

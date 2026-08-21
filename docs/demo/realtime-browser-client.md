@@ -363,7 +363,8 @@ go run ./demo/live-client \
   -vertical-profiles \
   -profile-tenant local \
   -profile-actor operator \
-  -profile-database-url-env LIVE_PROFILE_DATABASE_URL
+  -profile-database-url-env LIVE_PROFILE_DATABASE_URL \
+  -profile-adapter-registry-version "$LIVE_EXPECTED_CONFIG_HASH"
 ```
 
 The database URL is resolved from that environment variable name inside the
@@ -375,10 +376,13 @@ rendered in the browser. Without the flags every `/api/setup/v1/*` route answers
 
 The browser may submit only a profile ID, a description, logical `.j2` template
 paths and their plain-text source, synthetic fixtures, an exact draft
-generation, and a published version number. Tenant, actor, engine version,
-adapter registry version, snapshot hashes, and publication timestamps are
-server-owned. Adapter bindings fail closed because the loopback demo installs no
-adapters, and raw `mcpServers` JSON is intentionally rejected here as well.
+generation, a reviewed adapter ID with tighter result/approval limits, and a
+published version number. Tenant, actor, engine version, adapter registry
+version, adapter executable/destination/transport/secrets, snapshot hashes, and
+publication timestamps are server-owned. The catalog endpoint projects only
+safe display identity and ceilings for the native `knowledge.search/v1` and
+`web_search/native-v1` adapters. Raw `mcpServers`, command, URL, package, and
+secret configuration is rejected.
 
 ### Worker recipes
 

@@ -23,6 +23,7 @@
       <button type="button" role="tab" id="tab-profile" data-tab="profile" aria-controls="panel-profile" aria-selected="false" tabindex="-1">Profile</button>
       <button type="button" role="tab" id="tab-prompts" data-tab="prompts" aria-controls="panel-prompts" aria-selected="false" tabindex="-1">Prompts</button>
       <button type="button" role="tab" id="tab-workers" data-tab="workers" aria-controls="panel-workers" aria-selected="false" tabindex="-1">Workers</button>
+      <button type="button" role="tab" id="tab-adapters" data-tab="adapters" aria-controls="panel-adapters" aria-selected="false" tabindex="-1">Tools &amp; adapters</button>
       <button type="button" role="tab" id="tab-knowledge" data-tab="knowledge" aria-controls="panel-knowledge" aria-selected="false" tabindex="-1">Knowledge</button>
       <button type="button" role="tab" id="tab-publish" data-tab="publish" aria-controls="panel-publish" aria-selected="false" tabindex="-1">Review &amp; publish</button>
     </div>
@@ -125,6 +126,13 @@
       </form>
       <h3>Recipes in this draft</h3>
       <ul id="recipe-list" class="recipe-list" aria-label="Worker recipes"></ul>
+    </section>
+
+    <section id="panel-adapters" role="tabpanel" aria-labelledby="tab-adapters" data-panel="adapters" hidden>
+      <h2>Tools &amp; adapters</h2>
+      <p class="panel-note">Enable only reviewed server adapters for this profile. These controls can tighten result bytes and require approval; they cannot set commands, endpoints, transports, packages, secrets, or executable configuration. Enabled bindings apply to every worker recipe in this draft.</p>
+      <dl class="profile-facts"><dt>Registry</dt><dd id="adapter-registry">Load a profile draft to inspect the deployed catalog.</dd></dl>
+      <ul id="adapter-list" class="adapter-list" aria-label="Reviewed tools and adapters"></ul>
     </section>
 
     <section id="panel-knowledge" role="tabpanel" aria-labelledby="tab-knowledge" data-panel="knowledge" hidden>

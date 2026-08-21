@@ -311,6 +311,7 @@ func newProfileTestHandler(t *testing.T) (http.Handler, *fakeProfileStore, demoC
 	cfg.Profiles.Enabled = true
 	cfg.Profiles.TenantID = "local"
 	cfg.Profiles.Actor = "operator"
+	cfg.Profiles.AdapterRegistryVersion = "registry-v1"
 	store := newFakeProfileStore()
 	service, err := newProfileAdminService(cfg.Profiles, store, nil, nil)
 	require.NoError(t, err)
@@ -318,6 +319,63 @@ func newProfileTestHandler(t *testing.T) (http.Handler, *fakeProfileStore, demoC
 	handler, err := newHandlerWithToolSearch(cfg, []byte("profile-test-bearer"), nil, &recordingToolSearch{})
 	require.NoError(t, err)
 	return handler, store, cfg
+}
+
+func TestAdapterCatalogAPIProjectsOnlySafeReviewedFields(t *testing.T) {
+	handler, _, cfg := newProfileTestHandler(t)
+	response := serveProfile(handler, profileRequest(cfg, http.MethodGet, "/api/setup/v1/catalog", "", "", nil))
+	require.Equal(t, http.StatusOK, response.Code)
+	body := response.Body.String()
+	for _, forbidden := range []string{"destination", "transport", "secret", "command", "executable", "url"} {
+		assert.NotContains(t, body, forbidden)
+	}
+	var decoded struct {
+		RegistryVersion string `json:"registry_version"`
+		Adapters        []struct {
+			ID               string          `json:"id"`
+			Version          string          `json:"version"`
+			ToolName         string          `json:"tool_name"`
+			ReadOnly         bool            `json:"read_only"`
+			ApprovalRequired bool            `json:"approval_required"`
+			MaxResultBytes   int             `json:"max_result_bytes"`
+			ToolSchema       json.RawMessage `json:"tool_schema"`
+		} `json:"adapters"`
+	}
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &decoded))
+	assert.Equal(t, "registry-v1", decoded.RegistryVersion)
+	require.Len(t, decoded.Adapters, 2)
+	assert.Equal(t, "knowledge.search", decoded.Adapters[0].ID)
+	assert.Equal(t, "knowledge_search", decoded.Adapters[0].ToolName)
+	assert.True(t, decoded.Adapters[0].ReadOnly)
+	assert.JSONEq(t, `{"type":"object","properties":{"query":{"type":"string","maxLength":512},"max_results":{"type":"integer","minimum":1,"maximum":10}},"required":["query"],"additionalProperties":false}`, string(decoded.Adapters[0].ToolSchema))
+}
+
+func TestAdapterBindingAPIEnablesReviewedAuthorityAndUpdatesRecipes(t *testing.T) {
+	handler, _, cfg := newProfileTestHandler(t)
+	created := serveProfile(handler, profileRequest(cfg, http.MethodPost, "/api/setup/v1/profiles", "application/json", `{"id":"insurance","description":"Insurance"}`, nil))
+	require.Equal(t, http.StatusCreated, created.Code)
+	system := serveProfile(handler, profileRequest(cfg, http.MethodPut, "/api/setup/v1/profiles/insurance/templates/workers/policy_followup.j2", "text/plain; charset=utf-8", "Research {{ topic }}", map[string]string{"If-Match": `"1"`}))
+	require.Equal(t, http.StatusOK, system.Code)
+	recipe := serveProfile(handler, profileRequest(cfg, http.MethodPut, "/api/setup/v1/profiles/insurance/recipes/policy_followup", "application/json", `{"require_approval":false}`, map[string]string{"If-Match": `"2"`}))
+	require.Equal(t, http.StatusOK, recipe.Code)
+
+	bound := serveProfile(handler, profileRequest(cfg, http.MethodPut, "/api/setup/v1/profiles/insurance/bindings/knowledge.search", "application/json", `{"max_result_bytes":8192,"require_approval":false}`, map[string]string{"If-Match": `"3"`}))
+	require.Equal(t, http.StatusOK, bound.Code, bound.Body.String())
+	var draft profileDraftResponse
+	require.NoError(t, json.Unmarshal(bound.Body.Bytes(), &draft))
+	require.Len(t, draft.Bindings, 1)
+	assert.Equal(t, "knowledge.search", draft.Bindings[0].ID)
+	require.Len(t, draft.Recipes, 1)
+	assert.Equal(t, []string{"knowledge.search"}, draft.Recipes[0].BindingIDs)
+
+	expanded := serveProfile(handler, profileRequest(cfg, http.MethodPut, "/api/setup/v1/profiles/insurance/bindings/knowledge.search", "application/json", `{"max_result_bytes":999999,"require_approval":false}`, map[string]string{"If-Match": `"4"`}))
+	assert.Equal(t, http.StatusUnprocessableEntity, expanded.Code)
+
+	removed := serveProfile(handler, profileRequest(cfg, http.MethodDelete, "/api/setup/v1/profiles/insurance/bindings/knowledge.search", "", "", map[string]string{"If-Match": `"4"`}))
+	require.Equal(t, http.StatusOK, removed.Code)
+	require.NoError(t, json.Unmarshal(removed.Body.Bytes(), &draft))
+	assert.Empty(t, draft.Bindings)
+	assert.Empty(t, draft.Recipes[0].BindingIDs)
 }
 
 func profileRequest(cfg demoConfig, method, path, contentType, body string, headers map[string]string) *http.Request {
@@ -347,7 +405,7 @@ func TestProfileAdminConfigRequiresIdentity(t *testing.T) {
 	_, err = parseConfig([]string{"-vertical-profiles", "-profile-tenant", "local", "-profile-actor", "operator", "-profile-database-url-env", "lowercase"})
 	require.ErrorContains(t, err, "demo profile database environment name is invalid")
 
-	cfg, err := parseConfig([]string{"-vertical-profiles", "-profile-tenant", "local", "-profile-actor", "operator"})
+	cfg, err := parseConfig([]string{"-vertical-profiles", "-profile-tenant", "local", "-profile-actor", "operator", "-profile-adapter-registry-version", "registry-v1"})
 	require.NoError(t, err)
 	assert.Equal(t, "LIVE_PROFILE_DATABASE_URL", cfg.Profiles.DatabaseURLEnv)
 }
@@ -650,6 +708,7 @@ func TestPublicationWithoutAKnowledgeStoreRejectsPinnedKnowledge(t *testing.T) {
 	cfg.Profiles.Enabled = true
 	cfg.Profiles.TenantID = "local"
 	cfg.Profiles.Actor = "operator"
+	cfg.Profiles.AdapterRegistryVersion = "registry-v1"
 	store := newFakeProfileStore()
 	service, err := newProfileAdminService(cfg.Profiles, store, nil, nil)
 	require.NoError(t, err)

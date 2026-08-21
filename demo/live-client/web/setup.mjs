@@ -1,6 +1,8 @@
 import {createProfileAPI} from './profile-api.mjs';
 import {createProfileWorkspace, profileNoticeText, PROFILE_TABS} from './setup-profile.mjs';
 import {createKnowledgeAPI, createKnowledgeController} from './knowledge-editor.mjs';
+import {bindingRequest} from './adapter-editor.mjs';
+import {recipeSettings} from './recipe-editor.mjs';
 
 export const COMPONENTS = Object.freeze(['speech', 'postgres', 'gateway', 'worker', 'client']);
 
@@ -363,6 +365,8 @@ export function createProfileDOMPort(document) {
   const templateSource = document.querySelector('#template-source');
   const publishedList = document.querySelector('#published-list');
   const recipeList = document.querySelector('#recipe-list');
+  const adapterList = document.querySelector('#adapter-list');
+  const adapterRegistry = document.querySelector('#adapter-registry');
   const previewOutput = document.querySelector('#profile-preview-output');
   const buttons = {
     saveDescription: document.querySelector('#profile-save-description'),
@@ -430,6 +434,60 @@ export function createProfileDOMPort(document) {
       controls.append(remove);
       row.append(label, meta, controls);
       recipeList.append(row);
+    }
+  }
+
+  function renderAdapters(model) {
+    if (adapterList === null || adapterRegistry === null) return;
+    adapterRegistry.textContent = model.catalog.registryVersion || 'Load a profile draft to inspect the deployed catalog.';
+    adapterList.replaceChildren();
+    for (const adapter of model.catalog.adapters) {
+      const binding = model.bindings.find((entry) => entry.id === adapter.id);
+      const row = document.createElement('li');
+      row.dataset.adapterId = adapter.id;
+      const heading = document.createElement('strong');
+      heading.textContent = `${adapter.id} ${adapter.version}`;
+      const detail = document.createElement('span');
+      detail.className = 'adapter-meta';
+      detail.textContent = `${adapter.toolName} · ${adapter.readOnly ? 'read-only' : 'side effect'} · ${adapter.description}`;
+      const resultLabel = document.createElement('label');
+      resultLabel.textContent = 'Max result bytes';
+      const result = document.createElement('input');
+      result.type = 'number';
+      result.min = '1';
+      result.max = String(adapter.maxResultBytes);
+      result.value = String(binding?.maxResultBytes ?? Math.min(adapter.maxResultBytes, 16384));
+      result.dataset.adapterResult = adapter.id;
+      result.disabled = model.busy || !model.draft;
+      resultLabel.append(result);
+      const approvalLabel = document.createElement('label');
+      approvalLabel.className = 'checkbox-row';
+      const approval = document.createElement('input');
+      approval.type = 'checkbox';
+      approval.checked = binding?.requireApproval ?? adapter.approvalRequired;
+      approval.disabled = model.busy || !model.draft || adapter.approvalRequired;
+      approval.dataset.adapterApproval = adapter.id;
+      approvalLabel.append(approval, document.createTextNode('Require approval'));
+      const controls = document.createElement('span');
+      controls.className = 'actions';
+      const save = document.createElement('button');
+      save.type = 'button';
+      save.dataset.adapterAction = 'save';
+      save.dataset.adapterId = adapter.id;
+      save.textContent = binding ? 'Save limits' : 'Enable';
+      save.disabled = model.busy || !model.draft;
+      controls.append(save);
+      if (binding) {
+        const disable = document.createElement('button');
+        disable.type = 'button';
+        disable.dataset.adapterAction = 'delete';
+        disable.dataset.adapterId = adapter.id;
+        disable.textContent = 'Disable';
+        disable.disabled = model.busy;
+        controls.append(disable);
+      }
+      row.append(heading, detail, resultLabel, approvalLabel, controls);
+      adapterList.append(row);
     }
   }
 
@@ -520,6 +578,7 @@ export function createProfileDOMPort(document) {
         : "Run Preview to render the profile's synthetic fixtures.";
       renderTemplates(model);
       renderRecipes(model);
+      renderAdapters(model);
       renderPinnedKnowledge(model);
       renderPublished(model);
     },
@@ -562,16 +621,20 @@ function bootProfileWorkspace(document, window) {
       event.preventDefault();
       const recipeID = document.querySelector('#recipe-id').value.trim();
       if (recipeID === '') return;
-      void workspace.saveRecipe(recipeID, {
-        require_approval: document.querySelector('#recipe-require-approval').checked,
-        execution_timeout_ms: Number(document.querySelector('#recipe-execution-timeout').value),
-        tool_timeout_ms: Number(document.querySelector('#recipe-tool-timeout').value),
-        overall_timeout_ms: Number(document.querySelector('#recipe-overall-timeout').value),
-        max_objective_bytes: Number(document.querySelector('#recipe-objective-bytes').value),
-        max_evidence_bytes: Number(document.querySelector('#recipe-evidence-bytes').value),
-        max_tool_result_bytes: Number(document.querySelector('#recipe-tool-result-bytes').value),
-        max_final_result_bytes: Number(document.querySelector('#recipe-final-result-bytes').value),
-      });
+      try {
+        void workspace.saveRecipe(recipeID, recipeSettings({
+          requireApproval: document.querySelector('#recipe-require-approval').checked,
+          executionTimeoutMS: Number(document.querySelector('#recipe-execution-timeout').value),
+          toolTimeoutMS: Number(document.querySelector('#recipe-tool-timeout').value),
+          overallTimeoutMS: Number(document.querySelector('#recipe-overall-timeout').value),
+          maxObjectiveBytes: Number(document.querySelector('#recipe-objective-bytes').value),
+          maxEvidenceBytes: Number(document.querySelector('#recipe-evidence-bytes').value),
+          maxToolResultBytes: Number(document.querySelector('#recipe-tool-result-bytes').value),
+          maxFinalResultBytes: Number(document.querySelector('#recipe-final-result-bytes').value),
+        }));
+      } catch {
+        return;
+      }
     });
   }
   const knowledgeForm = document.querySelector('#knowledge-form');
@@ -623,6 +686,25 @@ function bootProfileWorkspace(document, window) {
     const recipe = event.target.closest('button[data-recipe-action]');
     if (recipe && !recipe.disabled) {
       void workspace.deleteRecipe(recipe.dataset.recipeId);
+      return;
+    }
+    const adapterButton = event.target.closest('button[data-adapter-action]');
+    if (adapterButton && !adapterButton.disabled) {
+      const adapter = workspace.snapshot().catalog.adapters.find((entry) => entry.id === adapterButton.dataset.adapterId);
+      if (!adapter) return;
+      if (adapterButton.dataset.adapterAction === 'delete') {
+        void workspace.deleteBinding(adapter.id);
+        return;
+      }
+      const row = adapterButton.closest('li[data-adapter-id]');
+      const result = row?.querySelector('input[data-adapter-result]');
+      const approval = row?.querySelector('input[data-adapter-approval]');
+      if (!result || !approval) return;
+      try {
+        void workspace.saveBinding(adapter.id, bindingRequest(adapter, {maxResultBytes: Number(result.value), requireApproval: approval.checked}));
+      } catch {
+        return;
+      }
       return;
     }
     const version = event.target.closest('button[data-version-action]');

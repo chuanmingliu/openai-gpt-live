@@ -40,8 +40,8 @@ input:disabled, textarea:disabled { opacity: .55; cursor: not-allowed; }
 .profile-notice { min-height: 1.5em; margin-top: 1.25rem; color: #ffd479; }
 .prompt-layout { display: grid; grid-template-columns: minmax(12rem, 18rem) 1fr; gap: 1.5rem; align-items: start; }
 @media (max-width: 52rem) { .prompt-layout { grid-template-columns: 1fr; } }
-.template-list, .published-list, .recipe-list, .excerpt-list { margin: 1.25rem 0 0; padding: 0; list-style: none; display: grid; gap: .5rem; }
-.template-list li, .published-list li, .recipe-list li, .excerpt-list li { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; justify-content: space-between; padding: .7rem .85rem; border: 1px solid #2a3540; border-radius: .7rem; background: #10161e; }
+.template-list, .published-list, .recipe-list, .excerpt-list, .adapter-list { margin: 1.25rem 0 0; padding: 0; list-style: none; display: grid; gap: .5rem; }
+.template-list li, .published-list li, .recipe-list li, .excerpt-list li, .adapter-list li { display: flex; flex-wrap: wrap; gap: .6rem; align-items: center; justify-content: space-between; padding: .7rem .85rem; border: 1px solid #2a3540; border-radius: .7rem; background: #10161e; }
 .template-list li[aria-current="true"] { border-color: #6ff0bf; }
 .template-list button { min-height: 2.2rem; }
 .published-list .version-meta { color: #9ba8b4; font-size: .85rem; }
@@ -51,6 +51,10 @@ input:disabled, textarea:disabled { opacity: .55; cursor: not-allowed; }
 .excerpt-list .excerpt-section { color: #6ff0bf; font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; }
 .excerpt-list .excerpt-body { display: block; margin-top: .35rem; white-space: pre-wrap; word-break: break-word; }
 .recipe-list .recipe-meta { color: #9ba8b4; font-size: .85rem; word-break: break-word; }
+.adapter-list li { align-items: end; }
+.adapter-list .adapter-meta { flex: 1 1 22rem; color: #9ba8b4; font-size: .85rem; word-break: break-word; }
+.adapter-list label { display: grid; gap: .25rem; color: #dce5eb; font-size: .75rem; }
+.adapter-list input[type="number"] { width: 9rem; padding: .55rem; border: 1px solid #34424f; border-radius: .55rem; background: #0d141b; color: #edf3f7; }
 .checkbox-row { display: flex; align-items: center; gap: .5rem; }
 .checkbox-row input { width: auto; }
 .preview-output { max-height: 18rem; overflow: auto; padding: 1rem; border: 1px solid #2a3540; border-radius: .7rem; background: #0d141b; color: #cfe6dc; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }

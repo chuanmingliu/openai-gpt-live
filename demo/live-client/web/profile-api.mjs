@@ -1,3 +1,5 @@
+import {decodeAdapterCatalog} from './adapter-editor.mjs';
+
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const HASH_PATTERN = /^[0-9a-f]{64}$/;
 const TEMPLATE_PATH_PATTERN = /^[a-z0-9][a-z0-9_./-]{0,254}$/;
@@ -60,15 +62,29 @@ function decodeKnowledgeRefs(value) {
 }
 
 const RECIPE_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+const ADAPTER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
+
+function decodeBindings(value) {
+  if (!Array.isArray(value) || value.length > 256) fail('invalid_response');
+  return value.map((entry) => {
+    if (entry === null || typeof entry !== 'object' || !ADAPTER_ID_PATTERN.test(entry.id)
+        || !ADAPTER_ID_PATTERN.test(entry.version) || !Array.isArray(entry.tool_ids) || entry.tool_ids.length !== 1
+        || !ADAPTER_ID_PATTERN.test(entry.tool_ids[0]) || !Number.isSafeInteger(entry.max_result_bytes) || entry.max_result_bytes < 1
+        || typeof entry.require_approval !== 'boolean') fail('invalid_response');
+    return Object.freeze({id: entry.id, version: entry.version, toolIDs: Object.freeze([...entry.tool_ids]), maxResultBytes: entry.max_result_bytes, requireApproval: entry.require_approval});
+  });
+}
 
 function decodeRecipes(value) {
   if (!Array.isArray(value) || value.length > MAX_FILE_ENTRIES) fail('invalid_response');
   return value.map((entry) => {
+    const bindingIDs = entry?.binding_ids ?? [];
     if (entry === null || typeof entry !== 'object'
         || typeof entry.id !== 'string' || !RECIPE_ID_PATTERN.test(entry.id)
         || typeof entry.version !== 'number' || !Number.isSafeInteger(entry.version) || entry.version < 1
         || typeof entry.objective !== 'string' || entry.objective !== `workers/${entry.id}.j2`
-        || typeof entry.require_approval !== 'boolean') {
+        || typeof entry.require_approval !== 'boolean' || !Array.isArray(bindingIDs)
+        || bindingIDs.some((id) => typeof id !== 'string' || !ADAPTER_ID_PATTERN.test(id))) {
       fail('invalid_response');
     }
     for (const key of ['execution_timeout_ms', 'tool_timeout_ms', 'overall_timeout_ms',
@@ -87,6 +103,7 @@ function decodeRecipes(value) {
       maxEvidenceBytes: entry.max_evidence_bytes,
       maxToolResultBytes: entry.max_tool_result_bytes,
       maxFinalResultBytes: entry.max_final_result_bytes,
+      bindingIDs: Object.freeze([...bindingIDs]),
     });
   });
 }
@@ -106,6 +123,7 @@ export function decodeDraft(value) {
     fixtures: Object.freeze(decodeFileInfos(value.fixtures)),
     recipes: Object.freeze(decodeRecipes(value.recipes ?? [])),
     knowledge: Object.freeze(decodeKnowledgeRefs(value.knowledge ?? [])),
+    bindings: Object.freeze(decodeBindings(value.bindings ?? [])),
   });
 }
 
@@ -206,6 +224,22 @@ export function createProfileAPI(fetchImpl) {
   }
 
   return Object.freeze({
+    async adapterCatalog(signal) {
+      const response = await request('GET', '/api/setup/v1/catalog', {signal});
+      return expectJSON(response, decodeAdapterCatalog);
+    },
+    async saveBinding(id, generation, adapterID, binding, signal) {
+      if (typeof adapterID !== 'string' || !ADAPTER_ID_PATTERN.test(adapterID)) fail('invalid_response');
+      const response = await request('PUT', `/api/setup/v1/profiles/${encodeURIComponent(id)}/bindings/${encodeURIComponent(adapterID)}`, {
+        body: JSON.stringify(binding), contentType: 'application/json', ifMatch: generation, signal,
+      });
+      return expectJSON(response, decodeDraft);
+    },
+    async deleteBinding(id, generation, adapterID, signal) {
+      if (typeof adapterID !== 'string' || !ADAPTER_ID_PATTERN.test(adapterID)) fail('invalid_response');
+      const response = await request('DELETE', `/api/setup/v1/profiles/${encodeURIComponent(id)}/bindings/${encodeURIComponent(adapterID)}`, {ifMatch: generation, signal});
+      return expectJSON(response, decodeDraft);
+    },
     async listPublished(signal) {
       const response = await request('GET', '/api/setup/v1/profiles?state=published', {signal});
       return expectJSON(response, decodePublishedList);

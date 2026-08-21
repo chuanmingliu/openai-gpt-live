@@ -175,6 +175,7 @@ set_profile_arguments() {
     -profile-tenant "${DEMO_PROFILE_TENANT:-development}"
     -profile-actor "${DEMO_PROFILE_ACTOR:-operator}"
     -profile-database-url-env LIVE_PROFILE_DATABASE_URL
+    -profile-adapter-registry-version "$LIVE_EXPECTED_CONFIG_HASH"
   )
 }
 
@@ -371,7 +372,7 @@ run_control_panel() {
   printf '\n%s%s✓ Browser control panel ready%s\n' "$BOLD" "$GREEN" "$RESET"
   printf '  Open: http://127.0.0.1:3000/setup\n'
   if [[ -n "${LIVE_PROFILE_DATABASE_URL:-}" ]]; then
-    printf '  Vertical profiles: on. Use the Profile, Prompts, and Workers tabs to publish a profile.\n'
+    printf '  Vertical profiles: on. Use Profile, Prompts, Workers, Tools & adapters, and Knowledge to publish.\n'
   else
     printf '  Vertical profiles: off. Export LIVE_PROFILE_DATABASE_URL with a reachable\n'
     printf '  profile database URL before starting the wizard to enable the profile tabs.\n'

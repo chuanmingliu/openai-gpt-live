@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"mime"
@@ -62,6 +63,10 @@ func (handler *demoHandler) serveProfileAPI(writer http.ResponseWriter, request 
 		handler.serveKnowledge(writer, request, segments)
 		return
 	}
+	if len(segments) == 1 && segments[0] == "catalog" {
+		handler.serveAdapterCatalog(writer, request)
+		return
+	}
 	if segments[0] != "profiles" {
 		writer.WriteHeader(http.StatusNotFound)
 		return
@@ -90,12 +95,133 @@ func (handler *demoHandler) serveProfileAPI(writer http.ResponseWriter, request 
 		handler.serveProfileKnowledgePin(writer, request, profile.ID(id), segments[3])
 	case len(segments) == 4 && segments[2] == "recipes":
 		handler.serveProfileRecipe(writer, request, profile.ID(id), segments[3])
+	case len(segments) == 4 && segments[2] == "bindings":
+		handler.serveProfileBinding(writer, request, profile.ID(id), segments[3])
 	case len(segments) == 3 && (segments[2] == "validate" || segments[2] == "preview" || segments[2] == "publish"):
 		handler.serveProfilePublication(writer, request, profile.ID(id), segments[2])
 	case len(segments) == 3 && (segments[2] == "activate" || segments[2] == "revoke"):
 		handler.serveProfileLifecycle(writer, request, profile.ID(id), segments[2])
 	default:
 		writer.WriteHeader(http.StatusNotFound)
+	}
+}
+
+type safeAdapterCatalog struct {
+	RegistryVersion string                `json:"registry_version"`
+	Adapters        []safeAdapterManifest `json:"adapters"`
+}
+
+type safeAdapterManifest struct {
+	ID               string          `json:"id"`
+	Version          string          `json:"version"`
+	ToolName         string          `json:"tool_name"`
+	Description      string          `json:"description"`
+	ToolSchema       json.RawMessage `json:"tool_schema"`
+	ReadOnly         bool            `json:"read_only"`
+	SideEffecting    bool            `json:"side_effecting"`
+	ParallelSafe     bool            `json:"parallel_safe"`
+	ApprovalRequired bool            `json:"approval_required"`
+	HealthClass      string          `json:"health_class"`
+	MaxResultBytes   int             `json:"max_result_bytes"`
+}
+
+func (handler *demoHandler) serveAdapterCatalog(writer http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodGet {
+		writer.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if request.URL.RawQuery != "" {
+		writer.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	service := handler.profiles
+	if service == nil || service.catalog == nil {
+		writer.WriteHeader(http.StatusNotFound)
+		return
+	}
+	manifests := service.catalog.Manifests()
+	adapters := make([]safeAdapterManifest, 0, len(manifests))
+	for _, manifest := range manifests {
+		adapters = append(adapters, safeAdapterManifest{
+			ID: manifest.AdapterID, Version: manifest.AdapterVersion, ToolName: manifest.Tool.Name,
+			Description: manifest.Tool.Description, ToolSchema: append(json.RawMessage(nil), manifest.Tool.Parameters...), ReadOnly: manifest.ReadOnly, SideEffecting: manifest.SideEffecting,
+			ParallelSafe: manifest.ParallelSafe, ApprovalRequired: manifest.Approval == "required",
+			HealthClass: manifest.HealthClass, MaxResultBytes: manifest.MaxResultBytes,
+		})
+	}
+	writeProfileJSON(writer, http.StatusOK, safeAdapterCatalog{RegistryVersion: service.catalog.RegistryVersion(), Adapters: adapters})
+}
+
+var profileBindingFields = map[string]byte{"max_result_bytes": 'n', "require_approval": 'b'}
+
+func (handler *demoHandler) serveProfileBinding(writer http.ResponseWriter, request *http.Request, id profile.ID, adapterID string) {
+	service := handler.profiles
+	manifest, reviewed := service.catalog.Manifest(adapterID)
+	if !reviewed {
+		writer.WriteHeader(http.StatusNotFound)
+		return
+	}
+	if request.Method != http.MethodPut && request.Method != http.MethodDelete {
+		writer.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	generation, present, err := parseIfMatchGeneration(request)
+	if !present {
+		writer.WriteHeader(http.StatusPreconditionRequired)
+		return
+	}
+	if err != nil {
+		writer.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if request.Method == http.MethodDelete {
+		handler.mutateProfileDraft(writer, request, id, generation, func(profileManifest *profile.Manifest) error {
+			removeProfileBinding(profileManifest, adapterID)
+			return nil
+		})
+		return
+	}
+	if !requireProfileJSON(writer, request) {
+		return
+	}
+	values, err := decodeProfileObject(writer, request, profileBindingFields)
+	if err != nil {
+		writeProfileBodyError(writer, err)
+		return
+	}
+	maxBytes, err := strconv.Atoi(values["max_result_bytes"])
+	requireApproval := values["require_approval"] == "true"
+	if err != nil || maxBytes < 1 || maxBytes > manifest.MaxResultBytes || manifest.Approval == "required" && !requireApproval {
+		writeProfileErrorCode(writer, http.StatusUnprocessableEntity, "profile_incompatible")
+		return
+	}
+	binding := profile.AdapterBinding{AdapterID: manifest.AdapterID, Version: manifest.AdapterVersion, ToolIDs: []string{manifest.Tool.Name}, MaxResultBytes: maxBytes, RequireApproval: requireApproval}
+	handler.mutateProfileDraft(writer, request, id, generation, func(profileManifest *profile.Manifest) error {
+		removeProfileBinding(profileManifest, adapterID)
+		profileManifest.Bindings = append(profileManifest.Bindings, binding)
+		for index := range profileManifest.Recipes {
+			profileManifest.Recipes[index].BindingIDs = append(profileManifest.Recipes[index].BindingIDs, adapterID)
+		}
+		return nil
+	})
+}
+
+func removeProfileBinding(manifest *profile.Manifest, adapterID string) {
+	bindings := make([]profile.AdapterBinding, 0, len(manifest.Bindings))
+	for _, binding := range manifest.Bindings {
+		if binding.AdapterID != adapterID {
+			bindings = append(bindings, binding)
+		}
+	}
+	manifest.Bindings = bindings
+	for index := range manifest.Recipes {
+		ids := make([]string, 0, len(manifest.Recipes[index].BindingIDs))
+		for _, bindingID := range manifest.Recipes[index].BindingIDs {
+			if bindingID != adapterID {
+				ids = append(ids, bindingID)
+			}
+		}
+		manifest.Recipes[index].BindingIDs = ids
 	}
 }
 
@@ -429,6 +555,10 @@ func (handler *demoHandler) serveProfileRecipe(writer http.ResponseWriter, reque
 			// template reference exactly, so the server always relinks it.
 			recipe.Objective = objective
 			recipe.Version = 1
+			recipe.BindingIDs = make([]string, 0, len(manifest.Bindings))
+			for _, binding := range manifest.Bindings {
+				recipe.BindingIDs = append(recipe.BindingIDs, binding.AdapterID)
+			}
 			replaced := false
 			for index, existing := range manifest.Recipes {
 				if existing.ID != recipeID {

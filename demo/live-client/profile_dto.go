@@ -45,17 +45,26 @@ type profileTemplateInfo struct {
 // profileRecipeInfo is the safe worker-recipe projection. The objective is the
 // logical template name the server linked, never a browser-supplied reference.
 type profileRecipeInfo struct {
-	ID                  string `json:"id"`
-	Version             uint64 `json:"version"`
-	Objective           string `json:"objective"`
-	RequireApproval     bool   `json:"require_approval"`
-	ExecutionTimeoutMS  int64  `json:"execution_timeout_ms"`
-	ToolTimeoutMS       int64  `json:"tool_timeout_ms"`
-	OverallTimeoutMS    int64  `json:"overall_timeout_ms"`
-	MaxObjectiveBytes   int    `json:"max_objective_bytes"`
-	MaxEvidenceBytes    int    `json:"max_evidence_bytes"`
-	MaxToolResultBytes  int    `json:"max_tool_result_bytes"`
-	MaxFinalResultBytes int    `json:"max_final_result_bytes"`
+	ID                  string   `json:"id"`
+	Version             uint64   `json:"version"`
+	Objective           string   `json:"objective"`
+	RequireApproval     bool     `json:"require_approval"`
+	ExecutionTimeoutMS  int64    `json:"execution_timeout_ms"`
+	ToolTimeoutMS       int64    `json:"tool_timeout_ms"`
+	OverallTimeoutMS    int64    `json:"overall_timeout_ms"`
+	MaxObjectiveBytes   int      `json:"max_objective_bytes"`
+	MaxEvidenceBytes    int      `json:"max_evidence_bytes"`
+	MaxToolResultBytes  int      `json:"max_tool_result_bytes"`
+	MaxFinalResultBytes int      `json:"max_final_result_bytes"`
+	BindingIDs          []string `json:"binding_ids"`
+}
+
+type profileBindingInfo struct {
+	ID              string   `json:"id"`
+	Version         string   `json:"version"`
+	ToolIDs         []string `json:"tool_ids"`
+	MaxResultBytes  int      `json:"max_result_bytes"`
+	RequireApproval bool     `json:"require_approval"`
 }
 
 // profileKnowledgeRef is the exact pinned reference. The hash is server
@@ -74,6 +83,7 @@ type profileDraftResponse struct {
 	Fixtures    []profileTemplateInfo `json:"fixtures"`
 	Recipes     []profileRecipeInfo   `json:"recipes"`
 	Knowledge   []profileKnowledgeRef `json:"knowledge"`
+	Bindings    []profileBindingInfo  `json:"bindings"`
 	UpdatedAt   string                `json:"updated_at"`
 }
 
@@ -122,6 +132,7 @@ func draftResponse(draft profile.Draft) profileDraftResponse {
 		Fixtures:    sortedTemplateInfos(draft.Manifest.Bundle.Fixtures),
 		Recipes:     recipeInfos(draft.Manifest.Recipes),
 		Knowledge:   knowledgeRefs(draft.Manifest.Knowledge),
+		Bindings:    bindingInfos(draft.Manifest.Bindings),
 		UpdatedAt:   draft.UpdatedAt.UTC().Format(time.RFC3339Nano),
 	}
 	return response
@@ -142,7 +153,17 @@ func recipeInfos(recipes []profile.WorkerRecipe) []profileRecipeInfo {
 			MaxEvidenceBytes:    recipe.MaxEvidenceBytes,
 			MaxToolResultBytes:  recipe.MaxToolResultBytes,
 			MaxFinalResultBytes: recipe.MaxFinalResultBytes,
+			BindingIDs:          append([]string(nil), recipe.BindingIDs...),
 		})
+	}
+	sort.Slice(infos, func(left, right int) bool { return infos[left].ID < infos[right].ID })
+	return infos
+}
+
+func bindingInfos(bindings []profile.AdapterBinding) []profileBindingInfo {
+	infos := make([]profileBindingInfo, 0, len(bindings))
+	for _, binding := range bindings {
+		infos = append(infos, profileBindingInfo{ID: binding.AdapterID, Version: binding.Version, ToolIDs: append([]string(nil), binding.ToolIDs...), MaxResultBytes: binding.MaxResultBytes, RequireApproval: binding.RequireApproval})
 	}
 	sort.Slice(infos, func(left, right int) bool { return infos[left].ID < infos[right].ID })
 	return infos

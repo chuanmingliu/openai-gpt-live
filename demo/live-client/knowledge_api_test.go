@@ -315,6 +315,7 @@ func newKnowledgeTestHandler(t *testing.T) (http.Handler, *fakeKnowledgeStore, d
 	cfg.Profiles.Enabled = true
 	cfg.Profiles.TenantID = "local"
 	cfg.Profiles.Actor = "operator"
+	cfg.Profiles.AdapterRegistryVersion = "registry-v1"
 	knowledgeStore := newFakeKnowledgeStore()
 	service, err := newProfileAdminService(cfg.Profiles, newFakeProfileStore(), knowledgeStore, nil)
 	require.NoError(t, err)
@@ -441,6 +442,7 @@ func newPinningTestHandler(t *testing.T) (http.Handler, *fakeKnowledgeStore, *fa
 	cfg.Profiles.Enabled = true
 	cfg.Profiles.TenantID = "local"
 	cfg.Profiles.Actor = "operator"
+	cfg.Profiles.AdapterRegistryVersion = "registry-v1"
 	knowledgeStore := newFakeKnowledgeStore()
 	profileStore := newFakeProfileStore()
 	service, err := newProfileAdminService(cfg.Profiles, profileStore, knowledgeStore, nil)
