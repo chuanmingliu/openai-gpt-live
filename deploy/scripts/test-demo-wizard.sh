@@ -226,6 +226,7 @@ grep -F -- '-vertical-profiles -profile-tenant development -profile-actor operat
   fail "profile mode did not pass the profile flags by environment-variable name"
 }
 grep -F 'Vertical profiles: on' "$scratch/profiles.out" >/dev/null || fail "profile mode did not report that profiles are on"
+grep -F 'Tools & adapters' "$scratch/profiles.out" >/dev/null || fail "profile mode omitted the adapter workspace"
 grep -Fx 'profile database sentinel' "$scratch/profiles.err" >/dev/null || fail "profile mode did not forward the profile database URL to the child"
 for location in "$scratch/state-profiles/live-client.calls" "$scratch/profiles.out" "$scratch/profiles.err" "$scratch/profiles.calls"; do
   if grep -F 'profile-url-sentinel' "$location" >/dev/null; then

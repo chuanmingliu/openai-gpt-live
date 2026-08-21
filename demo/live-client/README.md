@@ -155,7 +155,7 @@ at `ws://127.0.0.1:8766/v1/realtime`. Its private `.env.local` must be mode
 `0600`; the checked-in launcher creates and removes a private non-secret
 runtime profile pinned to loopback port 8766. The reviewed source is the fixed
 `/Users/chuanmingliu/speech-to-speech` checkout (revision
-`d0270d79ccb6f5c99f76499bb1dbe8a65608cf51`); its launcher diagnostics remain
+`90f1925b21348f12c6f52e3f517206d4d992090d`); its launcher diagnostics remain
 in the terminal and are never returned by `/setup`.
 
 For manual audio/barge-in acceptance, idle-pool checks, troubleshooting, and

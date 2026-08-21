@@ -35,7 +35,7 @@ configurable. `/setup` is for local development only. It is not production
 administration, a deployment controller, or release evidence.
 
 The launcher executes the reviewed `/Users/chuanmingliu/speech-to-speech`
-checkout at `d0270d79ccb6f5c99f76499bb1dbe8a65608cf51`, rather than a separate
+checkout at `90f1925b21348f12c6f52e3f517206d4d992090d`, rather than a separate
 mutable worktree. Its stdout/stderr are retained only in the operator terminal;
 the API exposes fixed status codes, never child diagnostics. Client Stop closes
 active browser voice WebSockets and rejects later `/ws` upgrades while keeping

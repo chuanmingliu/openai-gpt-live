@@ -68,3 +68,15 @@ When `features.vertical_profiles.enabled` is true, worker readiness requires sch
 Worker recipes render only `workers/<recipe-id>.j2` under the fixed server-owned worker system instruction. Recipe execution, tool calls, tool results, final results, concurrency, and overall handoff deadlines remain bounded. `knowledge_search` resolves only the tenant and immutable versions copied from the accepted handoff; missing material fails that task without ending the voice session.
 
 For rollout, apply migrations before enabling the feature, verify the catalog hash on gateway and worker, publish and activate a profile in `/setup`, then open a new voice session. Roll back new admission by deactivating or revoking the affected version. Existing accepted work retains its immutable snapshot, while revoked profiles are rejected for new sessions and reconnect according to the profile lifecycle rules. Monitor only content-free failure classes and timing; never log prompt source, evidence, queries, excerpts, transcripts, or model results.
+
+For the insurance-sales acceptance, create `insurance-sales`, save and preview
+its Jinja-Go prompts, publish cited policy knowledge, create the
+`policy_followup` asynchronous worker recipe, enable only reviewed adapters,
+then validate, preview, publish, and activate. Open v1 and record its snapshot
+hash; publish/activate v2 and prove the open/reconnected v1 remains pinned while
+a new selection receives v2. Revoke v1 and prove new reconnect admission is
+rejected. Finally speak continuously and interrupt pending and streaming
+responses repeatedly: the microphone waits for profile/provider/tool-policy
+acknowledgements, stale transcript/audio never resumes after the barge fence,
+and cited background work remains task-local. Audible/provider evidence is a
+manual release artifact and is never inferred from automated tests.

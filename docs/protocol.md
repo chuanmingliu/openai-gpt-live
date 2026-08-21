@@ -16,6 +16,25 @@ The durable extensions are:
 - `live.session.degraded` and `live.session.resumed` for bounded recoverable service state.
 - `live.tool.approval.required`, which exposes a bounded action summary and risk class but no executable inputs.
 - `live.tool.approval.resolve`, the only client-to-server extension.
+- `live.profile.selected`, emitted before custom-profile audio admission with
+  only the exact profile ID, version, and immutable snapshot hash.
+
+## Vertical profile selection and setup
+
+A new WebSocket session selects a published profile only through the paired
+`profile=<id>&profile_version=<uint64>` query values. The pair is immutable for
+that connection, duplicate/partial/unknown query fields fail closed, and a
+reconnect resolves the same exact version under reconnect lifecycle rules. The
+browser must not send microphone audio for a custom profile until it receives
+the matching `live.profile.selected` acknowledgement. Publishing a later
+version never changes an open or reconnecting session.
+
+The loopback-only `/api/setup/v1` workspace uses strict JSON and exact draft
+generations. It exposes profile drafts, logical Jinja-Go templates, worker
+recipes, a safe projection of the reviewed adapter catalog, tighten-only
+bindings, versioned knowledge, validation/preview/publication, activation, and
+revocation. It never accepts a command, endpoint, transport, package, secret
+reference, model choice, database URL, tenant, or actor from the browser.
 
 When the static handoff capability is disabled, `/v1/realtime/capabilities` omits the `live.handoff.*` extensions while retaining the remaining extension contract.
 

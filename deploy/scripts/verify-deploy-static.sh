@@ -25,6 +25,12 @@ cmp -s "$scratch/production-config.yaml" "$scratch/production-copy.yaml" || { ec
 durable_gateway_hash=$(cd "$root" && GOCACHE="$cache" go run ./cmd/live-gateway config-hash --config "$root/deploy/config/development-durable.yaml")
 durable_worker_hash=$(cd "$root" && GOCACHE="$cache" go run ./cmd/live-worker config-hash --config "$root/deploy/config/development-durable.yaml")
 [ "$durable_gateway_hash" = "$durable_worker_hash" ] || { echo "durable gateway/worker config hash drift" >&2; exit 1; }
+for vertical_config in "$root/deploy/config/development-durable.yaml" "$root/deploy/config/development-control-panel.yaml"; do
+  grep -A4 'vertical_profiles:' "$vertical_config" | grep -q 'enabled: true' || {
+    echo "vertical profile deployment config is not enabled: $vertical_config" >&2
+    exit 1
+  }
+done
 
 env -i PATH="$PATH" docker compose --env-file /dev/null -f "$root/deploy/docker-compose.yml" config >"$scratch/compose.yaml"
 env -i PATH="$PATH" docker compose --env-file /dev/null -f "$root/deploy/docker-compose.yml" -f "$root/deploy/compose.chaos.yml" config >"$scratch/compose-chaos.yaml"
