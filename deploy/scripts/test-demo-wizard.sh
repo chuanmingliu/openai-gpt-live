@@ -103,6 +103,11 @@ printf '%s\n' "$*" >>"$DEMO_TEST_CALLS"
 case "$*" in
   *3000/health/ready*)
     [[ -z "${DEMO_TEST_STALE_READY:-}" ]] || exit 0
+    if [[ -n "${DEMO_TEST_READY_AFTER:-}" ]]; then
+      printf '%s\n' attempt >>"${DEMO_TEST_READY_COUNTER:?}"
+      attempts=$(wc -l <"$DEMO_TEST_READY_COUNTER" | tr -d ' ')
+      [[ "$attempts" -ge "$DEMO_TEST_READY_AFTER" ]] || exit 22
+    fi
     for _ in {1..20}; do
       find "${DEMO_WIZARD_STATE_DIR:?}" -name 'live-client.calls' -type f -exec grep -E '^live-client ' {} \; | grep -q . && exit "${DEMO_TEST_CURL_EXIT:-0}"
       sleep 0.01
@@ -216,6 +221,23 @@ if grep -F -- '-vertical-profiles' "$scratch/state-control/live-client.calls" >/
   fail "control-panel mode enabled vertical profiles without a profile database"
 fi
 grep -F 'Vertical profiles: off' "$scratch/control.out" >/dev/null || fail "control-panel mode did not report that profiles are off"
+
+# Operator construction may perform bounded local ownership discovery before
+# the listener is published. The wizard must allow more than its historical
+# two-second readiness window instead of killing a healthy delayed BFF.
+: >"$scratch/delayed-ready.calls"
+DEMO_TEST_CALLS="$scratch/delayed-ready.calls" \
+  DEMO_TEST_READY_AFTER=100 DEMO_TEST_READY_COUNTER="$scratch/delayed-ready.attempts" \
+  DEMO_TEST_FAST_WAIT=1 DEMO_WIZARD_STATE_DIR="$scratch/state-delayed-ready" \
+  DEMO_OPERATOR_SPEECH_ROOT="$operator_speech_root" \
+  DEMO_OPERATOR_SPEECH_PROFILE="$operator_speech_profile" \
+  DEMO_OPERATOR_SPEECH_ENV="$operator_speech_env" \
+  DEMO_OPERATOR_SPEECH_EXECUTABLE="$operator_speech_executable" \
+  PATH="$scratch/bin:/usr/bin:/bin" \
+  "$root/deploy/scripts/demo-wizard.sh" \
+    >"$scratch/delayed-ready.out" 2>"$scratch/delayed-ready.err" <<<"$control_input"
+grep -F 'Browser control panel ready' "$scratch/delayed-ready.out" >/dev/null || fail "wizard rejected a delayed healthy BFF"
+[[ "$(wc -l <"$scratch/delayed-ready.attempts" | tr -d ' ')" -eq 100 ]] || fail "delayed readiness fixture did not exercise 100 probes"
 
 if DEMO_TEST_STALE_READY=1 DEMO_TEST_LIVE_CLIENT_EXIT=1 run_wizard stale-listener "$control_input"; then
   fail "control-panel mode accepted readiness from a stale port listener"

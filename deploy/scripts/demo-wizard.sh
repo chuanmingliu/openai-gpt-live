@@ -128,7 +128,10 @@ require_nonempty() {
 
 wait_ready() {
   local label="$1" url="$2"
-  for _ in {1..20}; do
+  # Operator construction may perform bounded local ownership discovery
+  # before publishing the listener. Keep every probe short, but allow the
+  # complete local startup path enough scheduling headroom.
+  for _ in {1..150}; do
     if curl --fail --silent --output /dev/null \
       --connect-timeout 0.05 --max-time 0.1 "$url"; then
       printf '  %s: ready\n' "$label"
