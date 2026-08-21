@@ -95,6 +95,18 @@ func TestLocalOperatorRunnerUsesOnlyFixedEntryPoints(t *testing.T) {
 	_ = compose
 }
 
+func TestLocalOperatorRunnerPostgresReadinessAllowsDockerCLIStartup(t *testing.T) {
+	setRequiredOperatorEnvironment(t)
+	runner := newTestLocalOperatorRunner(t, func(ctx context.Context, _ string, args ...string) *exec.Cmd {
+		if len(args) == 1 && args[0] == "postgres-ready" {
+			return exec.CommandContext(ctx, "/bin/sh", "-c", "sleep 0.15")
+		}
+		return exec.CommandContext(ctx, "/usr/bin/true")
+	})
+
+	assert.True(t, runner.Ready(t.Context(), componentPostgres))
+}
+
 func TestLocalOperatorRunnerRejectsUnsafeStartupConfiguration(t *testing.T) {
 	root := t.TempDir()
 	speech := writeRunnerScript(t, root, "tools/speech-launcher.sh", "#!/bin/sh\n")

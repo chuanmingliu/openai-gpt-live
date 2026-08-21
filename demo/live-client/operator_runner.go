@@ -21,6 +21,9 @@ import (
 const (
 	operatorReadinessTimeout = 100 * time.Millisecond
 	operatorConnectTimeout   = 50 * time.Millisecond
+	// PostgreSQL readiness starts the local Docker CLI and Compose plugin, so
+	// it needs the same bounded process-start headroom as identity discovery.
+	operatorComposeReadinessTimeout = 3 * time.Second
 	// The launcher has a one-second in-process group cleanup. Leave it enough
 	// scheduling headroom to remove the real speech child before the BFF ever
 	// escalates against the launcher itself.
@@ -365,7 +368,11 @@ func (runner *localOperatorRunner) Ready(ctx context.Context, component operator
 	if !runner.cfg.Enabled {
 		return false
 	}
-	readyCtx, cancel := context.WithTimeout(nonNilContext(ctx), operatorReadinessTimeout)
+	readinessTimeout := operatorReadinessTimeout
+	if component == componentPostgres {
+		readinessTimeout = operatorComposeReadinessTimeout
+	}
+	readyCtx, cancel := context.WithTimeout(nonNilContext(ctx), readinessTimeout)
 	defer cancel()
 	if component == componentPostgres {
 		return runner.requiredEnvironment(fixedOperation{Component: componentPostgres, Action: actionStart}) && runner.runFixed(readyCtx, runner.composeCommand(), "postgres-ready") == nil
