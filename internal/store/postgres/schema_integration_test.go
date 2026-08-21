@@ -2123,6 +2123,10 @@ func TestSchemaKnowledgeV10UpDownUpCatalogAndConstraints(t *testing.T) {
 		VALUES ('tenant-a','policy',1,0,'body',5,$1,ARRAY['body'],'policy.md','',0)`, strings.Repeat("d", 64))
 	assertConstraint(t, err, "knowledge_excerpts_body_check")
 
+	// The schema now has v11 handoff snapshot persistence above the v10
+	// knowledge catalog. Roll back both steps so this test still exercises the
+	// exact v10 down migration rather than merely landing on v10.
+	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
 	require.NoError(t, migrations.Steps(t.Context(), pool, -1))
 	version, dirty, err := migrations.Version(t.Context(), pool)
 	require.NoError(t, err)
