@@ -6,7 +6,8 @@ FROM ${GO_IMAGE} AS certs
 FROM ${GO_IMAGE} AS build
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod go mod download
+COPY deploy/scripts/download-go-modules.sh /usr/local/bin/download-go-modules
+RUN --mount=type=cache,target=/go/pkg/mod /usr/local/bin/download-go-modules
 COPY cmd ./cmd
 COPY internal ./internal
 COPY migrations ./migrations

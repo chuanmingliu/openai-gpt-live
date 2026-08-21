@@ -28,6 +28,7 @@ test-demo-live-client:
 	python3 deploy/scripts/test-operator-speech-launcher.py
 	./deploy/scripts/test-demo-wizard.sh
 	./deploy/scripts/test-durable-compose.sh
+	./deploy/scripts/test-download-go-modules.sh
 	./deploy/scripts/test-control-panel-compose-render.sh
 	./deploy/scripts/test-control-panel-port-publish-boundary.sh
 

@@ -50,6 +50,7 @@ env -i PATH="$PATH" \
   S2S_CONFIG_PATH="$root/deploy/config/local.yaml" \
   docker compose --env-file /dev/null -f "$root/deploy/docker-compose.yml" -f "$root/deploy/compose.development-durable.yml" config >"$scratch/compose-development-durable.yaml"
 "$root/deploy/scripts/test-durable-compose.sh"
+"$root/deploy/scripts/test-download-go-modules.sh"
 "$root/deploy/scripts/render-kustomize.sh" local >"$scratch/local.yaml"
 LIVE_PRODUCTION_RENDER_MODE=fixture "$root/deploy/scripts/render-kustomize.sh" production >"$scratch/production-fixture.yaml"
 "$root/deploy/scripts/validate-render.sh" local local "$scratch/local.yaml"
