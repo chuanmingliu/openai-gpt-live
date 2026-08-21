@@ -242,7 +242,15 @@ print_success() {
   printf '\n%s%s✓ Demo ready%s\n' "$BOLD" "$GREEN" "$RESET"
   printf '  Open: http://127.0.0.1:3000/\n'
   printf '  Grant microphone and speaker permission, then select Start listening.\n'
-  printf '  Run make demo-wizard again for status or shutdown.\n\n'
+  printf '  Keep this terminal open; use Ctrl-C or run make demo-wizard again for shutdown.\n\n'
+}
+
+hold_bff() {
+  # Keep the recipe shell as the explicit lifecycle parent. Some terminals and
+  # task runners reap a background child as soon as its launching shell exits;
+  # that invokes the BFF's owned-service cleanup and drops an active voice
+  # session. A second wizard invocation can still stop the exact recorded PID.
+  wait "$bff_pid"
 }
 
 run_full() {
@@ -294,6 +302,7 @@ run_full() {
   stage "Browser client"
   start_bff "$LIVE_STATIC_BEARER_TOKEN" ws://127.0.0.1:18080/v1/realtime gpt-live-simulator
   print_success
+  hold_bff
 }
 
 run_client() {
@@ -312,6 +321,7 @@ run_client() {
   stage "Browser client"
   start_bff "$LIVE_DEMO_BEARER" "$GATEWAY_URL" "$GATEWAY_MODEL"
   print_success
+  hold_bff
 }
 
 run_status() {
@@ -401,6 +411,8 @@ run_control_panel() {
   printf '  Worker is optional for voice-only; use it for durable asynchronous tools.\n'
   printf '  Stop dependencies in this order: Client, Worker, Gateway, PostgreSQL, then Speech.\n'
   printf '  Stops preserve the PostgreSQL volume. This surface is for local development only.\n\n'
+  printf '  Keep this terminal open; use Ctrl-C or run make demo-wizard again for shutdown.\n\n'
+  hold_bff
 }
 
 _clear

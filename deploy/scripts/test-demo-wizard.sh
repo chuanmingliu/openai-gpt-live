@@ -64,6 +64,10 @@ if [[ "$*" == *'-operator'* ]]; then
     printf '%s\n' 'profile database sentinel' >&2
   fi
 fi
+if [[ "$0" != *'state-attached/live-client' ]]; then
+  /bin/sleep 1
+  exit 0
+fi
 trap 'exit 0' TERM INT
 while :; do sleep 1; done
 SCRIPT
@@ -221,6 +225,32 @@ if grep -F -- '-vertical-profiles' "$scratch/state-control/live-client.calls" >/
   fail "control-panel mode enabled vertical profiles without a profile database"
 fi
 grep -F 'Vertical profiles: off' "$scratch/control.out" >/dev/null || fail "control-panel mode did not report that profiles are off"
+
+# Success must keep the wizard attached to its owned BFF. If the recipe shell
+# exits, launch environments may reap the background child; the BFF then
+# correctly shuts down Gateway/Speech and the browser reports a transport
+# close. Stop the exact fake BFF to release this dedicated foreground probe.
+: >"$scratch/attached.calls"
+DEMO_TEST_CALLS="$scratch/attached.calls" \
+  DEMO_WIZARD_STATE_DIR="$scratch/state-attached" \
+  DEMO_OPERATOR_SPEECH_ROOT="$operator_speech_root" \
+  DEMO_OPERATOR_SPEECH_PROFILE="$operator_speech_profile" \
+  DEMO_OPERATOR_SPEECH_ENV="$operator_speech_env" \
+  DEMO_OPERATOR_SPEECH_EXECUTABLE="$operator_speech_executable" \
+  PATH="$scratch/bin:/usr/bin:/bin" \
+  "$root/deploy/scripts/demo-wizard.sh" \
+    >"$scratch/attached.out" 2>"$scratch/attached.err" <<<"$control_input" &
+attached_wizard_pid=$!
+for _ in {1..100}; do
+  grep -F 'Browser control panel ready' "$scratch/attached.out" >/dev/null 2>&1 && break
+  /bin/sleep 0.02
+done
+grep -F 'Browser control panel ready' "$scratch/attached.out" >/dev/null || fail "attached wizard did not become ready"
+kill -0 "$attached_wizard_pid" 2>/dev/null || fail "successful wizard exited while its BFF was still running"
+IFS= read -r attached_bff_pid <"$scratch/state-attached/bff.pid"
+[[ "$attached_bff_pid" =~ ^[1-9][0-9]*$ ]] || fail "attached wizard did not retain BFF ownership"
+kill "$attached_bff_pid"
+wait "$attached_wizard_pid" 2>/dev/null || true
 
 # Operator construction may perform bounded local ownership discovery before
 # the listener is published. The wizard must allow more than its historical
