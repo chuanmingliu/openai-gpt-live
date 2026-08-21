@@ -26,7 +26,10 @@ case "${1:-}" in
     set -- up --build --wait --no-deps postgres
     ;;
   postgres-migrate)
-    set -- run --rm --no-deps migrate
+    # The Gateway image is rebuilt on every operator start. Rebuild the
+    # migrator from the same source tree so a cached older binary cannot report
+    # success while leaving a schema the new Gateway rejects.
+    set -- run --rm --no-deps --build migrate
     ;;
   postgres-ready)
     set -- exec -T postgres pg_isready -U live -d live
