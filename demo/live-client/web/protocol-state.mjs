@@ -21,7 +21,6 @@ export function buildSessionUpdate() {
     type: 'session.update',
     session: {
       type: 'realtime',
-      instructions: "You are a realtime spoken assistant. Reply in the user's language using at most three short sentences unless the user explicitly asks for more detail. Use natural speech without markdown, headings, lists, or narrated reasoning. Keep background work silent and mention it only after a result is available.",
       audio: {
         input: {
           format: {type: 'audio/pcm', rate: 24000},
