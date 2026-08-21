@@ -142,8 +142,50 @@ func newLocalOperatorRunner(cfg operatorConfig, factory commandFactory, probe re
 		children: make(map[operatorComponent]*ownedChild), composeOwned: make(map[operatorComponent]string), composeEphemeral: make(map[operatorComponent]string), composePending: make(map[operatorComponent]bool), composeStale: make(map[operatorComponent]string), clientOwned: cfg.ClientStop != nil, speechFile: speechFile, profileFile: profileFile,
 	}
 	runner.composeIdentity = runner.queryComposeIdentity
+	runner.reclaimExitedSpeechRecord()
 	runner.rehydrateComposeOwnership()
 	return runner, nil
+}
+
+// reclaimExitedSpeechRecord removes only a strict private proof whose recorded
+// process is definitively absent. A live PID, permission error, malformed file,
+// or unsafe filesystem object remains fail-closed and blocks a replacement.
+func (runner *localOperatorRunner) reclaimExitedSpeechRecord() {
+	const name = "speech.pid"
+	if !runner.stateUnchanged() {
+		return
+	}
+	file, err := runner.stateRoot.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 || info.Size() < 4 || info.Size() > 80 {
+		return
+	}
+	data, err := io.ReadAll(io.LimitReader(file, 81))
+	if err != nil || int64(len(data)) != info.Size() || data[len(data)-1] != '\n' {
+		return
+	}
+	record := string(data[:len(data)-1])
+	pidText, marker, ok := strings.Cut(record, " ")
+	if !ok || pidText == "" || len(marker) < 2 || len(marker) > 32 || strings.Contains(marker, " ") {
+		return
+	}
+	for _, character := range marker {
+		if !((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f')) {
+			return
+		}
+	}
+	pid, err := strconv.Atoi(pidText)
+	if err != nil || pid <= 0 || strconv.Itoa(pid) != pidText {
+		return
+	}
+	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+		return
+	}
+	runner.removeRecordIfMatch(name, string(data))
 }
 
 // rehydrateComposeOwnership accepts only a private proof that still names the

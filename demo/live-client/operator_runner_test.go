@@ -1098,6 +1098,26 @@ func TestLocalOperatorRunnerSpeechStartWaitsForDelayedReadiness(t *testing.T) {
 	require.NoError(t, runner.Run(t.Context(), fixedOperation{Component: componentSpeech, Action: actionStop}))
 }
 
+func TestLocalOperatorRunnerReclaimsExitedSpeechRecordBeforeStart(t *testing.T) {
+	t.Setenv("S2S_API_KEY", "test-speech-key")
+	root, speech, profile := newRunnerRepository(t)
+	state := filepath.Join(t.TempDir(), "state")
+	require.NoError(t, os.Mkdir(state, 0o700))
+	const exitedPID = 1 << 30
+	require.ErrorIs(t, syscall.Kill(exitedPID, 0), syscall.ESRCH)
+	require.NoError(t, os.WriteFile(filepath.Join(state, "speech.pid"), []byte("1073741824 0123456789abcdef0123456789abcdef\n"), 0o600))
+
+	runnerInterface, err := newLocalOperatorRunner(operatorConfig{
+		Enabled: true, StateDir: state, RepositoryRoot: root, SpeechCommand: speech,
+		SpeechProfile: profile, Readiness: fixedReadiness(),
+	}, nil, func(context.Context, string) bool { return true })
+	require.NoError(t, err)
+	runner := runnerInterface.(*localOperatorRunner)
+	require.NoError(t, runner.Run(t.Context(), fixedOperation{Component: componentSpeech, Action: actionStart}))
+	assert.True(t, runner.Owned(componentSpeech))
+	require.NoError(t, runner.Run(t.Context(), fixedOperation{Component: componentSpeech, Action: actionStop}))
+}
+
 func TestLocalOperatorRunnerSpeechStartFailsForEarlyExitAndNeverReadyCleanup(t *testing.T) {
 	t.Run("early exit", func(t *testing.T) {
 		t.Setenv("S2S_API_KEY", "test-speech-key")
