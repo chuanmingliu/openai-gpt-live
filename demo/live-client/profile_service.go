@@ -73,7 +73,7 @@ func newDemoAdapterCatalog(registryVersion string) (*adaptercatalog.Catalog, err
 		AdapterID: "web_search", AdapterVersion: "native-v1", RegistryVersion: registryVersion,
 		Tool: webTool.Definition.Clone(), ReadOnly: true, ParallelSafe: true, StableIdempotency: true,
 		Approval: adaptercatalog.ApprovalNone, Timeout: 8 * time.Second, MaxConcurrency: 4,
-		MaxArgumentBytes: 64 << 10, MaxResultBytes: 64 << 10, DestinationID: "public_web",
+		MaxArgumentBytes: 64 << 10, MaxResultBytes: 256 << 10, DestinationID: "public_web",
 		TransportClass: adaptercatalog.TransportNative, HealthClass: adaptercatalog.HealthRequired,
 	}
 	return adaptercatalog.New(registryVersion, []adaptercatalog.Manifest{knowledgeadapter.Manifest(registryVersion), webManifest}, nil)

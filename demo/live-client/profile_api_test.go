@@ -348,6 +348,8 @@ func TestAdapterCatalogAPIProjectsOnlySafeReviewedFields(t *testing.T) {
 	assert.Equal(t, "knowledge_search", decoded.Adapters[0].ToolName)
 	assert.True(t, decoded.Adapters[0].ReadOnly)
 	assert.JSONEq(t, `{"type":"object","properties":{"query":{"type":"string","maxLength":512},"max_results":{"type":"integer","minimum":1,"maximum":10}},"required":["query"],"additionalProperties":false}`, string(decoded.Adapters[0].ToolSchema))
+	assert.Equal(t, "web_search", decoded.Adapters[1].ID)
+	assert.Equal(t, 256<<10, decoded.Adapters[1].MaxResultBytes, "setup projection must match the deployed worker catalog")
 }
 
 func TestAdapterBindingAPIEnablesReviewedAuthorityAndUpdatesRecipes(t *testing.T) {
