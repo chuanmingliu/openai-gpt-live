@@ -87,6 +87,9 @@ test('truthful presentation states name controls that remain enabled', () => {
   ui = presentationUI(state.snapshot(), 'transport-closed');
   assert.match(ui.noticeText, /Select Start listening to reconnect/);
   assert.equal(ui.startDisabled, false);
+
+  ui = presentationUI(state.snapshot(), 'services-not-ready');
+  assert.match(ui.noticeText, /\/setup/);
 });
 
 test('pending response status never announces model thinking or reasoning', () => {

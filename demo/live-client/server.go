@@ -176,6 +176,8 @@ func (handler *demoHandler) ServeHTTP(writer http.ResponseWriter, request *http.
 		return
 	}
 	switch request.URL.Path {
+	case "/api/voice-readiness":
+		handler.serveVoiceReadiness(writer, request)
 	case "/api/operator/status":
 		handler.serveOperatorStatus(writer, request)
 	case "/api/operator/action":

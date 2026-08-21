@@ -356,6 +356,22 @@ test('accepted session sends current policy once per socket and reconnect resend
   await runtime.stop();
 });
 
+test('operator mode refuses a known-dead voice path before requesting microphone access', async () => {
+  const harness = new BrowserHarness({fetchHandler: async (path) => {
+    if (path === '/api/voice-readiness') return {ok: false, status: 503, json: async () => ({})};
+    if (path === '/api/tool-policy') return {ok: true, status: 200, json: async () => structuredClone(DEFAULT_TOOL_POLICY)};
+    return {ok: true, status: 200, json: async () => ({ok: true})};
+  }});
+  const runtime = createBrowserRuntime(harness.dependencies());
+
+  await runtime.start();
+
+  assert.equal(harness.getUserMediaCalls, 0);
+  assert.equal(harness.sockets.length, 0);
+  assert.equal(harness.presentation.snapshot().status, 'error');
+  assert.deepEqual(harness.notices, ['', 'services-not-ready']);
+});
+
 test('capture stays closed until delayed restored policy receives its exact acknowledgement', async () => {
 	let resolvePolicy;
 	const restored = structuredClone(DEFAULT_TOOL_POLICY);
@@ -949,8 +965,10 @@ test('late stop completion cannot overwrite a restarted generation', async () =>
   });
   const runtime = createBrowserRuntime(harness.dependencies());
   const firstStart = runtime.start();
+  await new Promise((resolve) => setImmediate(resolve));
   const stopping = runtime.stop();
   const secondStart = runtime.start();
+  await new Promise((resolve) => setImmediate(resolve));
 
   await stopping;
   assert.equal(harness.snapshots.at(-1).status, 'connecting');
@@ -976,6 +994,7 @@ test('double start shares one in-flight acquisition and creates one browser sess
 
   const first = runtime.start();
   const second = runtime.start();
+  await new Promise((resolve) => setImmediate(resolve));
   assert.equal(harness.getUserMediaCalls, 1);
   resolveMedia(harness.makeMediaStream());
   await Promise.all([first, second]);

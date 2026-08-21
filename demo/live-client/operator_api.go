@@ -66,6 +66,31 @@ func (handler *demoHandler) serveOperatorStatus(writer http.ResponseWriter, requ
 	writeOperatorJSON(writer, http.StatusOK, response)
 }
 
+func (handler *demoHandler) serveVoiceReadiness(writer http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodGet {
+		writer.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	// Client-only mode deliberately delegates readiness to its externally
+	// managed Gateway. Operator mode has stronger local knowledge and must not
+	// let the browser open a microphone or WebSocket into a stopped voice path.
+	if handler.operator == nil {
+		writer.WriteHeader(http.StatusNoContent)
+		return
+	}
+	ready := make(map[operatorComponent]bool, 3)
+	for _, status := range handler.operator.Snapshot(request.Context()) {
+		ready[status.Component] = status.Ready
+	}
+	for _, component := range []operatorComponent{componentSpeech, componentGateway, componentClient} {
+		if !ready[component] {
+			writer.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+	}
+	writer.WriteHeader(http.StatusNoContent)
+}
+
 func (handler *demoHandler) serveOperatorAction(writer http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodPost {
 		writer.WriteHeader(http.StatusMethodNotAllowed)

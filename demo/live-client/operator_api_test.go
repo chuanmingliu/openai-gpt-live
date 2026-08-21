@@ -28,6 +28,29 @@ func TestOperatorAPIStatusReturnsOnlyFixedSnapshotSchema(t *testing.T) {
 	assertContentFreeOperatorResponse(t, response, "sentinel-browser-secret")
 }
 
+func TestVoiceReadinessRejectsStoppedOperatorDependenciesAndAllowsReadyOrUnmanagedGateway(t *testing.T) {
+	handler, runner := newOperatorAPIHandler(t)
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/voice-readiness", nil))
+	assert.Equal(t, http.StatusServiceUnavailable, response.Code)
+	assert.Empty(t, response.Body.String())
+
+	for _, component := range []operatorComponent{componentSpeech, componentGateway, componentClient} {
+		runner.ready[component] = true
+	}
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/voice-readiness", nil))
+	assert.Equal(t, http.StatusNoContent, response.Code)
+	assert.Empty(t, response.Body.String())
+
+	unmanaged := mustTestHandler(t, nil, []byte("sentinel-browser-secret"))
+	response = httptest.NewRecorder()
+	unmanaged.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/voice-readiness", nil))
+	assert.Equal(t, http.StatusNoContent, response.Code)
+	assert.Empty(t, response.Body.String())
+}
+
 func TestOperatorAPIOwnedUnreadyComponentIsFailedAndCanBeStopped(t *testing.T) {
 	handler, runner := newOperatorAPIHandler(t)
 	runner.owned[componentSpeech] = true

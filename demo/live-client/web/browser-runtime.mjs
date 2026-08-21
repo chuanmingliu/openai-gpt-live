@@ -22,6 +22,7 @@ const NOTICE_CODES = new Set([
   'profile-unavailable',
   'session-created-timeout',
   'session-updated-timeout',
+  'services-not-ready',
   'socket-open-timeout',
   'transport-closed',
   'tool-state-overflow',
@@ -273,6 +274,18 @@ export function createBrowserRuntime(dependencies) {
   }
 
   async function initialize(currentGeneration) {
+    try {
+      const response = await boundedFetch('/api/voice-readiness', {
+        method: 'GET',
+        credentials: 'same-origin',
+      });
+      if (!response.ok) throw new Error('voice path unavailable');
+    } catch {
+      if (generation === currentGeneration) await failSession('services-not-ready', currentGeneration);
+      return;
+    }
+    if (generation !== currentGeneration) return;
+
     let acquired;
     try {
       acquired = await mediaDevices.getUserMedia({

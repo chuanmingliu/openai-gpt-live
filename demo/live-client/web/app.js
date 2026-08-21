@@ -31,6 +31,7 @@ const errorLabels = {
   'microphone-suspended': 'Microphone capture paused and could not resume. Select Start listening to reconnect.',
   'session-created-timeout': 'The gateway did not create a voice session in time. Select Start listening to reconnect.',
   'session-updated-timeout': 'The gateway did not confirm voice configuration in time. Select Start listening to reconnect.',
+  'services-not-ready': 'The local voice services are not ready. Open /setup and start Speech, PostgreSQL, and Gateway first.',
   'socket-open-timeout': 'The local voice connection did not open in time. Select Start listening to reconnect.',
   'transport-closed': 'The local voice connection closed. Select Start listening to reconnect.',
   'profile-mismatch': 'The gateway confirmed a different profile version. Select Start listening to reconnect.',
