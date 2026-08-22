@@ -196,6 +196,7 @@ func TestBargeInAcknowledgedFenceSuppressesEveryStaleFrame(t *testing.T) {
 	manager := session.NewManager(session.Config{
 		IngressFrames: 4, EgressFrames: 4, ControlEvents: 16, WriterControlEvents: 8,
 		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		InitialSession: realtime.SessionConfig{TurnDetection: json.RawMessage(`{"type":"server_vad"}`)},
 	}, connector, bargeIDs{})
 	handler := transportws.NewHandler(transportws.Options{MaxFrameBytes: 64 << 10, MaxAudioBytes: 8 << 10, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second}, manager,
 		transportws.AdmissionFunc(func(context.Context, *http.Request) (session.Subject, func(), error) {
@@ -218,12 +219,23 @@ func TestBargeInAcknowledgedFenceSuppressesEveryStaleFrame(t *testing.T) {
 	readErrors := make(chan error, 1)
 	go readBargeClient(ctx, client, events, readErrors)
 	requireClientType(t, ctx, events, readErrors, "session.created")
+	initial, err := voice.NextCommand(ctx)
+	if err != nil || initial.Kind != realtime.CommandSessionUpdate {
+		t.Fatalf("initial provider VAD command=%+v err=%v", initial, err)
+	}
+	if err := voice.Emit(ctx, realtime.Event{
+		Kind: realtime.EventSessionUpdated, InputTurnMode: realtime.InputTurnModeProviderVAD,
+		InputTurnModeSpecified: true, SessionUpdateAcknowledgement: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	histogram := loadgen.NewHistogram(time.Second, 3)
 	const samples = 20
 	for sample := 1; sample <= samples; sample++ {
 		responseID := "barge-response-" + strconv.Itoa(sample)
 		itemID := "barge-item-" + strconv.Itoa(sample)
+		inputItemID := "new-turn-" + strconv.Itoa(sample)
 		writeClient(t, ctx, client, protocol.ResponseCreateEvent{Type: "response.create"})
 		create, err := voice.NextCommand(ctx)
 		if err != nil || create.Kind != realtime.CommandCreateResponse {
@@ -240,7 +252,7 @@ func TestBargeInAcknowledgedFenceSuppressesEveryStaleFrame(t *testing.T) {
 		requireClientType(t, ctx, events, readErrors, "response.output_audio.delta")
 
 		started := time.Now()
-		if err := voice.Emit(ctx, realtime.Event{Kind: realtime.EventSpeechStarted, ProviderEventID: "speech", ItemID: "new-turn"}); err != nil {
+		if err := voice.Emit(ctx, realtime.Event{Kind: realtime.EventSpeechStarted, ProviderEventID: "speech", ItemID: inputItemID}); err != nil {
 			t.Fatal(err)
 		}
 		cancelCommand, err := voice.NextCommand(ctx)
@@ -256,7 +268,7 @@ func TestBargeInAcknowledgedFenceSuppressesEveryStaleFrame(t *testing.T) {
 			}
 		}
 		requireSilenceDeadline(t, events, readErrors, 10*time.Millisecond)
-		if err := voice.Emit(ctx, realtime.Event{Kind: realtime.EventSpeechStopped, ProviderEventID: "speech-stopped", ItemID: "new-turn"}); err != nil {
+		if err := voice.Emit(ctx, realtime.Event{Kind: realtime.EventSpeechStopped, ProviderEventID: "speech-stopped", ItemID: inputItemID}); err != nil {
 			t.Fatal(err)
 		}
 		requireClientType(t, ctx, events, readErrors, "input_audio_buffer.speech_stopped")

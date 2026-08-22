@@ -34,6 +34,9 @@ export function protocolEventDetail(entry) {
   if (entry?.type === 'response.done') {
     return responseStatuses.has(entry.status) ? `status=${entry.status}` : '';
   }
+  if (entry?.type === 'live.transport.closed') {
+    return Number.isInteger(entry.code) && entry.code >= 1000 && entry.code <= 4999 ? `code=${entry.code}` : '';
+  }
   if (!Number.isSafeInteger(entry?.bytes) || entry.bytes <= 0) return entry?.count > 1 ? `${entry.count} events` : '';
   const unit = transcriptTypes.has(entry.type) ? 'text bytes' : 'encoded chars';
   return entry.count > 1 ? `${entry.count} events · ${entry.bytes} ${unit}` : `${entry.bytes} ${unit}`;
@@ -65,6 +68,9 @@ export class ProtocolEventJournal {
     }
     const entry = {sequence: this.nextSequence++, at, direction, type, count: 1, bytes};
     if (type === 'response.done' && responseStatuses.has(event?.response?.status)) entry.status = event.response.status;
+    if (type === 'live.transport.closed' && Number.isInteger(event?.code) && event.code >= 1000 && event.code <= 4999) {
+      entry.code = event.code;
+    }
     this.entries.push(entry);
     if (this.entries.length > this.maximumEntries) this.entries.splice(0, this.entries.length - this.maximumEntries);
   }

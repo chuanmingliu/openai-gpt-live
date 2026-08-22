@@ -54,6 +54,7 @@ class BrowserHarness {
     this.mediaSources = [];
     this.mediaStreams = [];
     this.notices = [];
+    this.protocolEvents = [];
     this.oscillators = [];
     this.requests = [];
     this.sent = [];
@@ -228,6 +229,7 @@ class BrowserHarness {
         this.timeline.push({kind: 'snapshot', snapshot});
       },
       onNotice: (notice) => this.notices.push(notice),
+      onProtocolEvent: (direction, event) => this.protocolEvents.push({direction, event}),
     };
   }
 
@@ -320,6 +322,21 @@ class BrowserHarness {
     return this.timers.filter(({cleared, fired}) => !cleared && !fired);
   }
 }
+
+test('unexpected socket close records its content-free code before teardown', async () => {
+  const harness = new BrowserHarness();
+  const runtime = createBrowserRuntime(harness.dependencies());
+  await runtime.start();
+  harness.server({type: 'session.created'});
+  harness.socket.emit('close', {code: 1011, reason: 'private upstream detail'});
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(harness.protocolEvents.at(-1), {
+    direction: 'inbound',
+    event: {type: 'live.transport.closed', code: 1011},
+  });
+  assert.equal(harness.notices.at(-1), 'transport-closed');
+});
 
 test('accepted session sends current policy once per socket and reconnect resends it', async (t) => {
   const harness = new BrowserHarness();

@@ -41,6 +41,23 @@ test('protocol journal aggregates consecutive high-rate audio frames without ret
   assert.doesNotMatch(JSON.stringify(snapshot), /QUJD|REVG|R0hJ/);
 });
 
+test('protocol journal records a bounded transport close code without retaining its reason', () => {
+  const journal = new ProtocolEventJournal({now: () => 10});
+
+  journal.record('inbound', {type: 'live.transport.closed', code: 1011, reason: 'must not be retained'});
+
+  assert.deepEqual(journal.snapshot(), [{
+    sequence: 1,
+    at: 10,
+    direction: 'inbound',
+    type: 'live.transport.closed',
+    count: 1,
+    bytes: 0,
+    code: 1011,
+  }]);
+  assert.equal(protocolEventDetail(journal.snapshot()[0]), 'code=1011');
+});
+
 test('protocol journal clear releases retained session metadata', () => {
   const journal = new ProtocolEventJournal({now: () => 3000});
   journal.record('inbound', {type: 'session.created'});

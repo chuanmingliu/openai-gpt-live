@@ -431,8 +431,12 @@ export function createBrowserRuntime(dependencies) {
       ownedSocket.addEventListener('message', ({data}) => {
         handleServerMessage(data, currentGeneration, ownedSocket);
       });
-      ownedSocket.addEventListener('close', () => {
+      ownedSocket.addEventListener('close', ({code} = {}) => {
         if (generation === currentGeneration && socket === ownedSocket) {
+          reportProtocolEvent('inbound', {
+            type: 'live.transport.closed',
+            code: Number.isInteger(code) && code >= 1000 && code <= 4999 ? code : 1006,
+          });
           void failSession('transport-closed', currentGeneration);
         }
       }, {once: true});
