@@ -142,6 +142,32 @@ else
   }
 fi
 
+if [ "$operation" = postgres-start ]; then
+  "$docker_cli" compose \
+    --project-name gpt-live-durable-demo \
+    -f deploy/docker-compose.yml \
+    -f deploy/compose.development-control-panel.yml \
+    "$@"
+
+  # The development volume is intentionally preserved across wizard runs,
+  # while credentials are intentionally session-only. PostgreSQL applies
+  # POSTGRES_PASSWORD only during first initialization, so synchronize the
+  # private local role after every owned start. Carry the credential through
+  # stdin rather than Docker argv or logs.
+  encoded_password=$(printf '%s' "$POSTGRES_PASSWORD" | jq -sRr @base64)
+  {
+    printf 'BEGIN;\n'
+    printf "SELECT format('ALTER ROLE live PASSWORD %%L', convert_from(decode('%s', 'base64'), 'UTF8')) \\gexec\n" "$encoded_password"
+    printf 'COMMIT;\n'
+  } | "$docker_cli" compose \
+    --project-name gpt-live-durable-demo \
+    -f deploy/docker-compose.yml \
+    -f deploy/compose.development-control-panel.yml \
+    exec -T postgres psql -U live -d live -v ON_ERROR_STOP=1
+  unset encoded_password
+  exit 0
+fi
+
 case "$operation" in
   *-id|*-stop)
     exec "$docker_cli" compose \
