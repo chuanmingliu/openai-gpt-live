@@ -103,12 +103,36 @@
       <p id="final-announcement" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
       <p id="tool-announcement" class="visually-hidden" aria-live="polite" aria-atomic="true"></p>
 
-      <div id="transcript" class="transcript" role="region" aria-label="Live transcript">
-        <div id="empty-transcript" class="empty-transcript">
-          <div class="orb" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
-          <p>Your live transcript will appear here.</p>
-          <small>Press Start, allow microphone access, then speak normally.</small>
-        </div>
+      <div class="live-panels">
+        <section class="conversation-pane" aria-labelledby="transcript-title">
+          <div class="pane-header">
+            <div>
+              <p class="label">CONVERSATION</p>
+              <h3 id="transcript-title">Transcription history</h3>
+            </div>
+          </div>
+          <div id="transcript" class="transcript" role="region" aria-label="Live transcript">
+            <div id="empty-transcript" class="empty-transcript">
+              <div class="orb" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+              <p>Your live transcript will appear here.</p>
+              <small>Press Start, allow microphone access, then speak normally.</small>
+            </div>
+          </div>
+        </section>
+
+        <section class="protocol-pane" aria-labelledby="protocol-title">
+          <div class="pane-header">
+            <div>
+              <p class="label">WEBSOCKET</p>
+              <h3 id="protocol-title">Realtime protocol events</h3>
+            </div>
+            <button id="protocol-clear" class="button button-compact" type="button">Clear</button>
+          </div>
+          <div id="protocol-log" class="protocol-log" role="region" aria-label="Redacted realtime protocol event log">
+            <p id="empty-protocol-log" class="empty-protocol-log">Protocol events will appear when the session starts.</p>
+          </div>
+          <p class="protocol-privacy">Payloads are redacted. Audio frames are aggregated.</p>
+        </section>
       </div>
 
     </section>

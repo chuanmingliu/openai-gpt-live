@@ -38,6 +38,7 @@ export function createBrowserRuntime(dependencies) {
     presentation,
     onSnapshot,
     onNotice,
+    onProtocolEvent = () => {},
     // profileState is optional. When present it owns the immutable selection
     // and the second capture acknowledgement gate; the builtin default keeps
     // existing single-ack behavior for voice-only gateways.
@@ -70,6 +71,14 @@ export function createBrowserRuntime(dependencies) {
   const playbackFeedTimer = new SinglePendingTimer();
   const establishmentTimer = new SinglePendingTimer();
   const captureResumeTimer = new SinglePendingTimer();
+
+  function reportProtocolEvent(direction, event) {
+    try {
+      onProtocolEvent(direction, event);
+    } catch {
+      // Diagnostics are observational and must never affect the voice path.
+    }
+  }
 
   function publishSnapshot() {
     onSnapshot(presentation.snapshot());
@@ -124,7 +133,9 @@ export function createBrowserRuntime(dependencies) {
     if (initial && initialPolicySent) return false;
     const eventID = `browser-policy-${nextPolicyEventID++}`;
     const policy = presentation.tools.snapshot().policy;
-    ownedSocket.send(JSON.stringify(buildToolPolicyUpdate(policy, eventID)));
+    const event = buildToolPolicyUpdate(policy, eventID);
+    ownedSocket.send(JSON.stringify(event));
+    reportProtocolEvent('outbound', event);
     if (initial) initialPolicySent = true;
     presentation.tools.markPolicySent(eventID, policy);
     publishSnapshot();
@@ -241,13 +252,16 @@ export function createBrowserRuntime(dependencies) {
       void failSession('invalid-event', currentGeneration);
       return;
     }
+    reportProtocolEvent('inbound', event);
     if (event?.type === 'session.created') {
       if (!socketOpenObserved || ownedSocket.readyState !== WebSocket.OPEN || sessionUpdateSent) {
         void failSession('invalid-event', currentGeneration);
         return;
       }
       establishmentTimer.clear();
-      ownedSocket.send(JSON.stringify(buildSessionUpdate()));
+      const update = buildSessionUpdate();
+      ownedSocket.send(JSON.stringify(update));
+      reportProtocolEvent('outbound', update);
       sessionUpdateSent = true;
       armEstablishmentDeadline('session-updated-timeout', currentGeneration, ownedSocket);
     } else if (event?.type === 'session.updated') {
@@ -367,12 +381,14 @@ export function createBrowserRuntime(dependencies) {
         if (generation !== currentGeneration || captureNode !== ownedCaptureNode) return;
         if (!streamReady || presentation.isMuted() || socket?.readyState !== WebSocket.OPEN || data?.type !== 'frame' || !(data.pcm instanceof ArrayBuffer)) return;
         try {
-          const encoded = JSON.stringify(buildAudioAppend(new Uint8Array(data.pcm)));
+          const event = buildAudioAppend(new Uint8Array(data.pcm));
+          const encoded = JSON.stringify(event);
           if (!Number.isFinite(socket.bufferedAmount) || socket.bufferedAmount + encoded.length > MAXIMUM_SOCKET_BUFFERED_BYTES) {
             void failSession('microphone-backpressure', currentGeneration);
             return;
           }
           socket.send(encoded);
+          reportProtocolEvent('outbound', event);
         } catch {
           void failSession('invalid-audio', currentGeneration);
         }

@@ -288,6 +288,12 @@ func (handler *demoHandler) ServeHTTP(writer http.ResponseWriter, request *http.
 			return
 		}
 		handler.serveClientAsset(writer, request, "web/client-state.mjs", "text/javascript; charset=utf-8")
+	case "/protocol-log.mjs":
+		if request.Method != http.MethodGet {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		handler.serveClientAsset(writer, request, "web/protocol-log.mjs", "text/javascript; charset=utf-8")
 	case "/protocol-state.mjs":
 		if request.Method != http.MethodGet {
 			writer.WriteHeader(http.StatusMethodNotAllowed)

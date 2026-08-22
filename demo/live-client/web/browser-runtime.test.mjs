@@ -356,6 +356,23 @@ test('accepted session sends current policy once per socket and reconnect resend
   await runtime.stop();
 });
 
+test('runtime reports inbound and outbound protocol events at the WebSocket boundary', async () => {
+  const harness = new BrowserHarness();
+  const observed = [];
+  const runtime = createBrowserRuntime(harness.dependencies({
+    onProtocolEvent: (direction, event) => observed.push({direction, type: event.type}),
+  }));
+
+  await runtime.start();
+  harness.server({type: 'session.created'});
+
+  assert.deepEqual(observed.slice(0, 2), [
+    {direction: 'inbound', type: 'session.created'},
+    {direction: 'outbound', type: 'session.update'},
+  ]);
+  await runtime.stop();
+});
+
 test('operator mode refuses a known-dead voice path before requesting microphone access', async () => {
   const harness = new BrowserHarness({fetchHandler: async (path) => {
     if (path === '/api/voice-readiness') return {ok: false, status: 503, json: async () => ({})};

@@ -1,5 +1,6 @@
 import {createBrowserRuntime} from './browser-runtime.mjs';
 import {ClientPresentation} from './client-state.mjs';
+import {ProtocolEventJournal, protocolEventDetail} from './protocol-log.mjs';
 import {createVoiceProfileState} from './voice-profile-state.mjs';
 
 const terminalStatuses = new Set(['idle', 'stopped', 'error']);
@@ -103,6 +104,9 @@ if (typeof document !== 'undefined') {
     finalAnnouncement: document.querySelector('#final-announcement'),
     mute: document.querySelector('#mute'),
     notice: document.querySelector('#notice'),
+    protocolClear: document.querySelector('#protocol-clear'),
+    protocolEmpty: document.querySelector('#empty-protocol-log'),
+    protocolLog: document.querySelector('#protocol-log'),
     resumeAudio: document.querySelector('#resume-audio'),
     start: document.querySelector('#start'),
     status: document.querySelector('#status'),
@@ -123,10 +127,12 @@ if (typeof document !== 'undefined') {
   };
 
   const presentation = new ClientPresentation();
+  const protocolJournal = new ProtocolEventJournal();
   const profileState = createVoiceProfileState();
   presentation.endSession('idle');
   let noticeCode = '';
   let renderFrame = null;
+  let protocolRenderFrame = null;
   let toolFormDirty = false;
 
   function renderTurn(item) {
@@ -212,11 +218,50 @@ if (typeof document !== 'undefined') {
     elements.toolAnnouncement.textContent = presentation.drainToolAnnouncements().join(' ');
   }
 
+  function renderProtocolLog() {
+    const entries = protocolJournal.snapshot();
+    elements.protocolEmpty.hidden = entries.length > 0;
+    for (const item of elements.protocolLog.querySelectorAll('.protocol-event')) item.remove();
+    for (const entry of entries) {
+      const row = document.createElement('div');
+      row.className = `protocol-event ${entry.direction}`;
+      const time = document.createElement('time');
+      time.className = 'protocol-time';
+      const instant = new Date(entry.at);
+      time.dateTime = instant.toISOString();
+      time.textContent = instant.toISOString().slice(11, 23);
+      const direction = document.createElement('span');
+      direction.className = 'protocol-direction';
+      direction.textContent = entry.direction === 'inbound' ? '← IN' : '→ OUT';
+      const event = document.createElement('span');
+      event.className = 'protocol-type';
+      event.textContent = entry.type;
+      const detailText = protocolEventDetail(entry);
+      if (detailText !== '') {
+        const detail = document.createElement('small');
+        detail.className = 'protocol-detail';
+        detail.textContent = detailText;
+        event.append(detail);
+      }
+      row.append(time, direction, event);
+      elements.protocolLog.append(row);
+    }
+    elements.protocolLog.scrollTop = elements.protocolLog.scrollHeight;
+  }
+
   function scheduleRender() {
     if (renderFrame !== null) return;
     renderFrame = requestAnimationFrame(() => {
       renderFrame = null;
       renderPresentation(presentation.snapshot());
+    });
+  }
+
+  function scheduleProtocolRender() {
+    if (protocolRenderFrame !== null) return;
+    protocolRenderFrame = requestAnimationFrame(() => {
+      protocolRenderFrame = null;
+      renderProtocolLog();
     });
   }
 
@@ -263,6 +308,10 @@ if (typeof document !== 'undefined') {
     presentation,
     onSnapshot: scheduleRender,
     onNotice: setNotice,
+    onProtocolEvent: (direction, event) => {
+      protocolJournal.record(direction, event);
+      scheduleProtocolRender();
+    },
     fetch: window.fetch.bind(window),
     profileState,
   });
@@ -280,6 +329,8 @@ if (typeof document !== 'undefined') {
   }
 
   elements.start.addEventListener('click', () => {
+    protocolJournal.clear();
+    scheduleProtocolRender();
     if (elements.voiceProfile) elements.voiceProfile.disabled = true;
     void runtime.start();
   });
@@ -290,6 +341,10 @@ if (typeof document !== 'undefined') {
   });
   elements.mute.addEventListener('click', () => { runtime.mute(!presentation.isMuted()); });
   elements.resumeAudio.addEventListener('click', () => { void runtime.resumeAudio(); });
+  elements.protocolClear.addEventListener('click', () => {
+    protocolJournal.clear();
+    scheduleProtocolRender();
+  });
   elements.toolForm.addEventListener('input', () => { toolFormDirty = true; });
   elements.toolForm.addEventListener('submit', (event) => {
     event.preventDefault();
@@ -309,5 +364,6 @@ if (typeof document !== 'undefined') {
   window.addEventListener('beforeunload', () => { void runtime.stop(); });
 
   scheduleRender();
+  scheduleProtocolRender();
   void loadVoiceProfiles();
 }
