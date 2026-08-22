@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import {toolPolicyStatusText} from './app.js';
+import {toolPolicyStatusText, toolProgressView} from './app.js';
 import {ToolState, buildToolPolicyUpdate, normalizeToolPolicy} from './tool-state.mjs';
 
 const DEFAULT_POLICY = {
@@ -42,6 +42,33 @@ test('progress updates one card monotonically', () => {
   tools.consume(progressEvent({summary: 'duplicate'}));
   assert.deepEqual(tools.snapshot().cards.map(({id, phase}) => ({id, phase})), [{id: 'h1', phase: 'searching'}]);
   assert.equal(tools.snapshot().cards[0].summary, 'Searching the web.');
+});
+
+test('handoff cards expose authoritative segmented progress and preserve it at failure', () => {
+  const tools = new ToolState();
+  tools.consume(createdEvent('segmented'));
+  assert.equal(tools.snapshot().cards[0].progressStep, 1);
+  tools.consume(progressEvent({id: 'segmented', sequence_id: 2, phase: 'searching'}));
+  assert.equal(tools.snapshot().cards[0].progressStep, 2);
+  tools.consume(progressEvent({id: 'segmented', sequence_id: 3, phase: 'reading_sources'}));
+  assert.equal(tools.snapshot().cards[0].progressStep, 3);
+  tools.consume({
+    type: 'live.handoff.failed', handoff_id: 'segmented', sequence_id: 4,
+    status: 'failed', details: {summary: 'Search failed.'},
+  });
+  assert.equal(tools.snapshot().cards[0].progressStep, 3);
+});
+
+test('handoff progress view derives accessible segments only from authoritative card state', () => {
+  assert.deepEqual(toolProgressView({phase: 'reading_sources', progressStep: 3}), {
+    label: 'Reading sources', state: 'active', step: 3, segments: [true, true, true, false],
+  });
+  assert.deepEqual(toolProgressView({phase: 'failed', progressStep: 3}), {
+    label: 'Failed', state: 'failed', step: 3, segments: [true, true, true, false],
+  });
+  assert.deepEqual(toolProgressView({phase: 'completed', progressStep: 4}), {
+    label: 'Completed', state: 'completed', step: 4, segments: [true, true, true, true],
+  });
 });
 
 test('terminal card rejects a later progress regression', () => {
@@ -170,7 +197,8 @@ test('unknown detail fields and caller mutations never enter owned card snapshot
   const first = tools.snapshot();
   first.cards[0].summary = 'caller mutation';
   assert.deepEqual(tools.snapshot().cards[0], {
-    id: 'h1', sequence: 2, status: 'running', phase: 'searching', summary: 'Searching the web.', sources: [], terminal: false,
+    id: 'h1', sequence: 2, status: 'running', phase: 'searching', progressStep: 2,
+    summary: 'Searching the web.', sources: [], terminal: false,
   });
 });
 

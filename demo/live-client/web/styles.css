@@ -238,9 +238,19 @@ h3 { margin: 0; font-size: 1rem; font-weight: 650; }
   background: #111821;
 }
 .tool-card.terminal { border-left-color: #6ff0bf; }
+.tool-card.state-failed { border-left-color: #ff7d86; }
+.tool-card.state-cancelled { border-left-color: #7d8994; }
+.tool-card.state-needs-input { border-left-color: #f4c66d; }
 .tool-card-header { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; }
 .tool-card-title { color: #dce5eb; font-size: 0.78rem; font-weight: 720; letter-spacing: 0.08em; text-transform: uppercase; }
 .tool-card-phase { color: #8fa1b1; font-size: 0.75rem; }
+.tool-card-progress { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.35rem; margin-top: 0.7rem; }
+.tool-card-progress-segment { height: 0.3rem; border-radius: 999px; background: #26323e; }
+.tool-card-progress-segment.complete { background: #7ea2ff; }
+.tool-card.state-completed .tool-card-progress-segment.complete { background: #6ff0bf; }
+.tool-card.state-failed .tool-card-progress-segment.complete { background: #ff7d86; }
+.tool-card.state-cancelled .tool-card-progress-segment.complete { background: #7d8994; }
+.tool-card.state-needs-input .tool-card-progress-segment.complete { background: #f4c66d; }
 .tool-card-summary { margin: 0.55rem 0 0; color: #c8d1d9; line-height: 1.55; overflow-wrap: anywhere; }
 .tool-sources { display: grid; gap: 0.35rem; margin: 0.75rem 0 0; padding-left: 1.25rem; }
 .tool-sources a { color: #8eb0ff; overflow-wrap: anywhere; }

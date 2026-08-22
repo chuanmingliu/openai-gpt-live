@@ -35,6 +35,13 @@ const PHASE_ORDER = new Map([
   ['failed', 5],
   ['cancelled', 5],
 ]);
+const PHASE_PROGRESS_STEP = new Map([
+  ['queued', 1],
+  ['searching', 2],
+  ['reading_sources', 3],
+  ['preparing_answer', 4],
+  ['completed', 4],
+]);
 const TERMINAL_PHASES = new Set(['completed', 'failed', 'cancelled']);
 const STABLE_PHASE_TEXT = {
   queued: 'Background task queued.',
@@ -218,6 +225,7 @@ function cloneCard(card) {
     sequence: card.sequence,
     status: card.status,
     phase: card.phase,
+    progressStep: card.progressStep,
     summary: card.summary,
     sources: card.sources.map((source) => ({...source})),
     terminal: card.terminal,
@@ -403,6 +411,7 @@ export class ToolState {
       sequence: 0,
       status: event.status,
       phase: nextPhase,
+      progressStep: 1,
       summary: '',
       sources: [],
       terminal: false,
@@ -410,6 +419,7 @@ export class ToolState {
     card.sequence = event.sequence_id;
     card.status = event.status;
     card.phase = nextPhase;
+    card.progressStep = Math.max(card.progressStep, PHASE_PROGRESS_STEP.get(nextPhase) ?? 1);
     card.terminal = TERMINAL_PHASES.has(nextPhase);
     if (event.details.summary) card.summary = event.details.summary;
     if (!card.summary) card.summary = STABLE_PHASE_TEXT[nextPhase];

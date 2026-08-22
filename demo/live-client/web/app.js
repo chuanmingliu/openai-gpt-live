@@ -69,6 +69,21 @@ const toolPhaseLabels = {
   cancelled: 'Stopped',
 };
 
+export function toolProgressView(item) {
+  const step = Number.isInteger(item?.progressStep) ? Math.min(4, Math.max(1, item.progressStep)) : 1;
+  let state = 'active';
+  if (item?.phase === 'completed') state = 'completed';
+  else if (item?.phase === 'failed') state = 'failed';
+  else if (item?.phase === 'cancelled') state = 'cancelled';
+  else if (item?.phase === 'needs_input') state = 'needs-input';
+  return {
+    label: toolPhaseLabels[item?.phase] ?? 'Updated',
+    state,
+    step,
+    segments: Array.from({length: 4}, (_, index) => index < step),
+  };
+}
+
 export function safeSourceHref(value) {
   if (typeof value !== 'string' || value.length > 2048 || !/^[\x20-\x7e]+$/.test(value)) return null;
   try {
@@ -149,8 +164,9 @@ if (typeof document !== 'undefined') {
   }
 
   function renderToolCard(item) {
+    const progressView = toolProgressView(item);
     const card = document.createElement('article');
-    card.className = `tool-card${item.terminal ? ' terminal' : ''}`;
+    card.className = `tool-card state-${progressView.state}${item.terminal ? ' terminal' : ''}`;
     const header = document.createElement('div');
     header.className = 'tool-card-header';
     const title = document.createElement('span');
@@ -158,12 +174,26 @@ if (typeof document !== 'undefined') {
     title.textContent = 'Web Search';
     const phase = document.createElement('span');
     phase.className = 'tool-card-phase';
-    phase.textContent = toolPhaseLabels[item.phase] ?? 'Updated';
+    phase.textContent = progressView.label;
     header.append(title, phase);
+    const progress = document.createElement('div');
+    progress.className = 'tool-card-progress';
+    progress.setAttribute('role', 'progressbar');
+    progress.setAttribute('aria-label', 'Web Search progress');
+    progress.setAttribute('aria-valuemin', '1');
+    progress.setAttribute('aria-valuemax', '4');
+    progress.setAttribute('aria-valuenow', String(progressView.step));
+    progress.setAttribute('aria-valuetext', progressView.label);
+    for (const complete of progressView.segments) {
+      const segment = document.createElement('span');
+      segment.className = `tool-card-progress-segment${complete ? ' complete' : ''}`;
+      segment.setAttribute('aria-hidden', 'true');
+      progress.append(segment);
+    }
     const summary = document.createElement('p');
     summary.className = 'tool-card-summary';
     summary.textContent = item.summary;
-    card.append(header, summary);
+    card.append(header, progress, summary);
     if (item.sources.length > 0) {
       const sources = document.createElement('ol');
       sources.className = 'tool-sources';
