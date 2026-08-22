@@ -107,6 +107,31 @@ func TestUnsolicitedSequenceZeroCannotConfirmExpectedInitialMode(t *testing.T) {
 	assert.Equal(t, realtime.InputTurnModeManual, reactor.Snapshot().InputTurnMode)
 }
 
+func TestMatchingBrowserModeWaitsBehindInitialProviderAcknowledgement(t *testing.T) {
+	reactor, _ := unconfiguredTestReactor(1)
+	turnDetection := json.RawMessage(`{"type":"server_vad"}`)
+	require.NoError(t, reactor.expectInitialInputTurnMode(turnDetection))
+
+	effects, err := reactor.Apply(ClientInput{Event: inputTurnSessionUpdate(turnDetection)})
+	require.NoError(t, err, "the browser repeats the configured mode immediately after session.created")
+	require.Len(t, effects, 1)
+	command := effects[0].VoiceCommand
+	require.NotNil(t, command)
+	require.NotZero(t, command.Sequence)
+
+	initialAck := providerSessionUpdated(string(turnDetection))
+	initialAck.SessionUpdateAcknowledgement = true
+	applyOK(t, reactor, currentVoice(reactor, initialAck))
+	assert.Equal(t, realtime.InputTurnModeProviderVAD, reactor.Snapshot().InputTurnMode)
+	assert.Len(t, reactor.pendingSessionUpdates, 1, "the browser acknowledgement is still independently pending")
+
+	browserAck := providerSessionUpdated(string(turnDetection), command.Sequence)
+	effects = applyOK(t, reactor, currentVoice(reactor, browserAck))
+	require.Len(t, effects, 1)
+	assert.IsType(t, protocol.SessionUpdatedEvent{}, effects[0].ClientEvent)
+	assert.Empty(t, reactor.pendingSessionUpdates)
+}
+
 func TestWrongNonzeroSessionUpdateSequenceCannotConsumePendingMode(t *testing.T) {
 	reactor, _ := unconfiguredTestReactor(1)
 	effects := applyOK(t, reactor, ClientInput{Event: inputTurnSessionUpdate(json.RawMessage(`null`))})

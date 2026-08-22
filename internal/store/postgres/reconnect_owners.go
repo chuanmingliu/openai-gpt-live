@@ -202,7 +202,8 @@ func (s *ReconnectOwners) renew(ctx context.Context, key session.ReconnectOwnerK
 			owner_lease_expires_at=db.now + $7::bigint * interval '1 millisecond',updated_at=db.now
 		FROM db WHERE session_id=$1 AND incarnation=$2::numeric AND owner_id=$3 AND credential_id=$4
 			AND owner_state=ANY($8::text[]) AND owner_lease_expires_at>db.now
-			AND (owner_state<>'active' OR (turn_boundary=$5 AND response_epoch=$6::numeric))
+			AND (owner_state<>'active' OR response_epoch<$6::numeric OR
+				(response_epoch=$6::numeric AND (NOT turn_boundary OR $5)))
 		RETURNING db.now,owner_lease_expires_at)
 		SELECT * FROM changed`, key.SessionID, strconv.FormatUint(uint64(key.Incarnation), 10), key.OwnerID, key.CredentialID,
 		boundary, strconv.FormatUint(uint64(epoch), 10), leaseDuration.Milliseconds(), states)

@@ -1432,10 +1432,15 @@ func (r *Reactor) applySessionUpdate(event protocol.SessionUpdateEvent) ([]Effec
 		if !modeSpecified {
 			return nil, ErrInputTurnModeUnconfirmed
 		}
-		if r.initialInputTurnMode != realtime.InputTurnModeUnspecified || r.pendingInputTurnMode != 0 || len(r.pendingSessionUpdates) != 0 {
+		if r.initialInputTurnMode != realtime.InputTurnModeUnspecified {
+			if requestedMode != r.initialInputTurnMode {
+				return nil, ErrInputTurnModeImmutable
+			}
+		} else if r.pendingInputTurnMode != 0 || len(r.pendingSessionUpdates) != 0 {
 			return nil, ErrPendingInputTurnMode
+		} else {
+			modeSetting = true
 		}
-		modeSetting = true
 	} else if modeSpecified && requestedMode != r.inputTurnMode {
 		return nil, ErrInputTurnModeImmutable
 	}

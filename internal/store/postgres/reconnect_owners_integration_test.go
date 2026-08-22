@@ -52,6 +52,33 @@ func TestReconnectOwnersPostgresCrossReplicaCASAndDuplicateFence(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestReconnectOwnerHeartbeatAdvancesTurnStateMonotonically(t *testing.T) {
+	pool := testkit.Postgres(t)
+	require.NoError(t, migrations.Up(t.Context(), pool))
+	owners, err := postgres.NewReconnectOwners(pool)
+	require.NoError(t, err)
+	now := time.Now().UTC()
+	owner := session.ReconnectOwner{
+		Scope:     handoff.Scope{TenantID: "tenant-heartbeat", UserID: "user-heartbeat", ConversationID: "conversation-heartbeat"},
+		SessionID: "session-heartbeat", Incarnation: 1, Model: "provider-model", ResponseEpoch: 5,
+		CredentialID: "credential-heartbeat", OwnerID: "replica-heartbeat", State: session.ReconnectOwnerEstablishing,
+		ExpiresAt: now.Add(time.Minute), SubjectExpiresAt: now.Add(time.Hour),
+	}
+	_, err = owners.Create(t.Context(), owner, 5*time.Second)
+	require.NoError(t, err)
+	_, err = owners.Publish(t.Context(), owner.Key(), 5, true, 5*time.Second)
+	require.NoError(t, err)
+
+	_, err = owners.Heartbeat(t.Context(), owner.Key(), 6, false, 5*time.Second)
+	require.NoError(t, err, "a new response epoch may leave the turn boundary")
+	_, err = owners.Heartbeat(t.Context(), owner.Key(), 6, true, 5*time.Second)
+	require.NoError(t, err, "the same response epoch may complete at a turn boundary")
+	_, err = owners.Heartbeat(t.Context(), owner.Key(), 5, true, 5*time.Second)
+	require.ErrorIs(t, err, session.ErrStaleReconnect, "response epochs never regress")
+	_, err = owners.Heartbeat(t.Context(), owner.Key(), 6, false, 5*time.Second)
+	require.ErrorIs(t, err, session.ErrStaleReconnect, "a completed turn cannot reopen without a new epoch")
+}
+
 func TestReconnectOwnersPostgresPostClaimCrashKeepsPriorAndAdvertisedStageRetryable(t *testing.T) {
 	pool := testkit.Postgres(t)
 	require.NoError(t, migrations.Up(t.Context(), pool))
