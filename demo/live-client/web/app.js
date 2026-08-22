@@ -54,7 +54,15 @@ const toolTestLabels = {
 };
 
 export function toolPolicyStatusText(tools) {
-  if (tools.lastOperation === 'test') return toolTestLabels[tools.testStatus] ?? '';
+  if (tools.lastOperation === 'test') {
+    if (tools.testStatus === 'error' && tools.testCode === 'provider_challenge') {
+      return 'DuckDuckGo temporarily rejected automated search. Try again later.';
+    }
+    if (tools.testStatus === 'error' && tools.testCode === 'network_policy') {
+      return 'Local DNS or proxy policy blocked DuckDuckGo Web Search.';
+    }
+    return toolTestLabels[tools.testStatus] ?? '';
+  }
   return toolSaveLabels[tools.saveStatus] ?? '';
 }
 

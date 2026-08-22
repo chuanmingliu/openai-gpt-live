@@ -244,6 +244,7 @@ export class ToolState {
     this.announcements = [];
     this.saveStatus = 'ready';
     this.testStatus = 'idle';
+    this.testCode = '';
     this.lastOperation = 'save';
     this.pendingPolicy = null;
     this.pendingPolicyEventID = null;
@@ -376,14 +377,17 @@ export class ToolState {
     this.latestOperationGeneration = operation;
     this.pendingTestOperation = operation;
     this.testStatus = 'running';
+    this.testCode = '';
     this.lastOperation = 'test';
     return operation;
   }
 
-  finishTest(passed, operation = this.pendingTestOperation) {
+  finishTest(passed, operation = this.pendingTestOperation, failureCode = '') {
     if (operation !== this.pendingTestOperation) return false;
     this.pendingTestOperation = null;
     this.testStatus = passed ? 'passed' : 'error';
+    const stableFailure = failureCode === 'provider_challenge' || failureCode === 'network_policy';
+    this.testCode = passed ? '' : (stableFailure ? failureCode : 'unavailable');
     if (operation === this.latestOperationGeneration) this.lastOperation = 'test';
     return true;
   }
@@ -466,6 +470,7 @@ export class ToolState {
       policy: clonePolicy(this.policy),
       saveStatus: this.saveStatus,
       testStatus: this.testStatus,
+      testCode: this.testCode,
       lastOperation: this.lastOperation,
       model: this.model,
       cards: this.cards.map(cloneCard),

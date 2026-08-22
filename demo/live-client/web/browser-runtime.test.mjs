@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {createBrowserRuntime} from './browser-runtime.mjs';
 import {ClientPresentation} from './client-state.mjs';
 import {createVoiceProfileState} from './voice-profile-state.mjs';
+import {toolPolicyStatusText} from './app.js';
 
 const SCHEDULED_PCM_BASE64 = Buffer.alloc(16000).toString('base64');
 const FRAME_PCM_BASE64 = Buffer.alloc(960).toString('base64');
@@ -582,6 +583,40 @@ test('policy request failures expose only stable state and never private respons
   assert.equal(harness.presentation.snapshot().tools.saveStatus, 'error');
   assert.equal(harness.presentation.snapshot().tools.testStatus, 'error');
   assert.doesNotMatch(serialized, /private|credential|provider body/);
+  await runtime.stop();
+});
+
+test('DuckDuckGo challenge response becomes a stable content-free Test status', async () => {
+  const harness = new BrowserHarness({fetchHandler: async (path, options) => {
+    if (path === '/api/tool-policy' && options.method === 'GET') return {ok: true, json: async () => structuredClone(DEFAULT_TOOL_POLICY)};
+    if (path === '/api/tool-policy/test') return {
+      ok: false, privateBody: 'must not survive', json: async () => ({ok: false, code: 'provider_challenge'}),
+    };
+    return {ok: true};
+  }});
+  const runtime = createBrowserRuntime(harness.dependencies());
+  await runtime.start();
+  await runtime.testToolPolicy();
+  const tools = harness.presentation.snapshot().tools;
+  assert.equal(tools.testStatus, 'error');
+  assert.equal(tools.testCode, 'provider_challenge');
+  assert.equal(toolPolicyStatusText(tools), 'DuckDuckGo temporarily rejected automated search. Try again later.');
+  assert.doesNotMatch(JSON.stringify(tools), /private_body|must not survive/);
+  await runtime.stop();
+});
+
+test('synthetic DNS rejection becomes a stable content-free Test status', async () => {
+  const harness = new BrowserHarness({fetchHandler: async (path, options) => {
+    if (path === '/api/tool-policy' && options.method === 'GET') return {ok: true, json: async () => structuredClone(DEFAULT_TOOL_POLICY)};
+    if (path === '/api/tool-policy/test') return {ok: false, json: async () => ({ok: false, code: 'network_policy'})};
+    return {ok: true};
+  }});
+  const runtime = createBrowserRuntime(harness.dependencies());
+  await runtime.start();
+  await runtime.testToolPolicy();
+  const tools = harness.presentation.snapshot().tools;
+  assert.equal(tools.testCode, 'network_policy');
+  assert.equal(toolPolicyStatusText(tools), 'Local DNS or proxy policy blocked DuckDuckGo Web Search.');
   await runtime.stop();
 });
 

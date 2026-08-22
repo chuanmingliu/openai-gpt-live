@@ -317,6 +317,26 @@ test('the latest operation selects Test then later Save success and failure stat
   assert.equal(toolPolicyStatusText(tools.snapshot()), 'Policy action failed. Try again.');
 });
 
+test('only stable provider and network classifications specialize Web Search Test failures', () => {
+  const challenged = new ToolState();
+  challenged.beginTest();
+  challenged.finishTest(false, undefined, 'provider_challenge');
+  assert.equal(challenged.snapshot().testCode, 'provider_challenge');
+  assert.equal(toolPolicyStatusText(challenged.snapshot()), 'DuckDuckGo temporarily rejected automated search. Try again later.');
+
+  const network = new ToolState();
+  network.beginTest();
+  network.finishTest(false, undefined, 'network_policy');
+  assert.equal(network.snapshot().testCode, 'network_policy');
+  assert.equal(toolPolicyStatusText(network.snapshot()), 'Local DNS or proxy policy blocked DuckDuckGo Web Search.');
+
+  const unknown = new ToolState();
+  unknown.beginTest();
+  unknown.finishTest(false, undefined, 'private-provider-body');
+  assert.equal(unknown.snapshot().testCode, 'unavailable');
+  assert.equal(toolPolicyStatusText(unknown.snapshot()), 'Web Search test failed.');
+});
+
 test('an older Test completion cannot reclaim status from a later successful Save', () => {
   for (const passed of [true, false]) {
     const tools = new ToolState();

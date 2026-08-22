@@ -86,7 +86,14 @@ func (handler *demoHandler) serveToolPolicyTest(writer http.ResponseWriter, requ
 	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if err != nil {
 		writer.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = writer.Write([]byte(`{"ok":false}`))
+		switch {
+		case errors.Is(err, websearch.ErrProviderChallenge):
+			_, _ = writer.Write([]byte(`{"ok":false,"code":"provider_challenge"}`))
+		case errors.Is(err, websearch.ErrNetworkPolicy):
+			_, _ = writer.Write([]byte(`{"ok":false,"code":"network_policy"}`))
+		default:
+			_, _ = writer.Write([]byte(`{"ok":false}`))
+		}
 		return
 	}
 	_, _ = writer.Write([]byte(`{"ok":true,"result_count":` + strconv.Itoa(len(results)) + `}`))

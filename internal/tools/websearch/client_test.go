@@ -320,6 +320,24 @@ func TestSearchRejectsStatusTypeEncodingAndUTF8(t *testing.T) {
 	}
 }
 
+func TestSearchClassifiesDuckDuckGoChallengeWithoutLeakingBody(t *testing.T) {
+	executor := executorWithTransport(roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return response(http.StatusAccepted, "text/html", "", []byte("private challenge body")), nil
+	}))
+	_, err := executor.Search(t.Context(), validRequest())
+	require.ErrorIs(t, err, ErrProviderChallenge)
+	assert.NotContains(t, err.Error(), "private")
+}
+
+func TestSearchClassifiesRejectedSyntheticDNSWithoutLeakingTransport(t *testing.T) {
+	executor := executorWithTransport(roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, &url.Error{Op: "dial", URL: "https://private.invalid/", Err: ErrNetworkPolicy}
+	}))
+	_, err := executor.Search(t.Context(), validRequest())
+	require.ErrorIs(t, err, ErrNetworkPolicy)
+	assert.NotContains(t, err.Error(), "private.invalid")
+}
+
 func TestSearchCapsCandidatesAtTwentyAndResultsAtTen(t *testing.T) {
 	var document strings.Builder
 	document.WriteString("<html><body>")

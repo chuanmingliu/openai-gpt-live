@@ -103,6 +103,30 @@ func TestToolPolicyDiagnosticBoundsFailuresAndHonorsCancellation(t *testing.T) {
 	assert.True(t, search.canceled)
 }
 
+func TestToolPolicyDiagnosticReportsOnlyStableProviderChallengeCode(t *testing.T) {
+	handler, search := newDemoHandlerWithTools(t)
+	search.err = websearch.ErrProviderChallenge
+	request := httptest.NewRequest(http.MethodPost, "/api/tool-policy/test", nil)
+	request.Header.Set("Origin", "http://127.0.0.1:3000")
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	assert.Equal(t, http.StatusServiceUnavailable, response.Code)
+	assert.JSONEq(t, `{"ok":false,"code":"provider_challenge"}`, response.Body.String())
+}
+
+func TestToolPolicyDiagnosticReportsOnlyStableNetworkPolicyCode(t *testing.T) {
+	handler, search := newDemoHandlerWithTools(t)
+	search.err = websearch.ErrNetworkPolicy
+	request := httptest.NewRequest(http.MethodPost, "/api/tool-policy/test", nil)
+	request.Header.Set("Origin", "http://127.0.0.1:3000")
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	assert.Equal(t, http.StatusServiceUnavailable, response.Code)
+	assert.JSONEq(t, `{"ok":false,"code":"network_policy"}`, response.Body.String())
+}
+
 func assertRejectedToolPolicy(t *testing.T, body, origin string) {
 	t.Helper()
 	handler, _ := newDemoHandlerWithTools(t)

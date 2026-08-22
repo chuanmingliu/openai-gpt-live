@@ -37,6 +37,14 @@ const (
 	maximumURLBytes          = 2048
 )
 
+// ErrProviderChallenge classifies a content-free refusal by the fixed search
+// provider. Callers may expose only this stable class, never the response body.
+var ErrProviderChallenge = errors.New("web search provider challenge")
+
+// ErrNetworkPolicy classifies a content-free rejection when local DNS or
+// proxying resolves the fixed provider to an address that is not public.
+var ErrNetworkPolicy = errors.New("web search network policy")
+
 // Resolver is the narrow DNS boundary used by the fixed search transport.
 type Resolver interface {
 	LookupNetIP(context.Context, string, string) ([]netip.Addr, error)
@@ -94,7 +102,7 @@ func newExecutor(resolver Resolver, dial dialContextFunc) (*Executor, error) {
 		}
 		for _, address := range addresses {
 			if !publicAddress(address) {
-				return nil, errors.New("web search resolution is not public")
+				return nil, ErrNetworkPolicy
 			}
 		}
 		for _, address := range addresses {
@@ -161,9 +169,15 @@ func (e *Executor) Search(ctx context.Context, request Request) ([]Result, error
 		if requestContext.Err() != nil {
 			return nil, fmt.Errorf("web search request canceled: %w", requestContext.Err())
 		}
+		if errors.Is(err, ErrNetworkPolicy) {
+			return nil, ErrNetworkPolicy
+		}
 		return nil, errors.New("web search request failed")
 	}
 	defer response.Body.Close()
+	if response.StatusCode == http.StatusAccepted {
+		return nil, ErrProviderChallenge
+	}
 	if response.StatusCode != http.StatusOK {
 		return nil, errors.New("web search response status is invalid")
 	}

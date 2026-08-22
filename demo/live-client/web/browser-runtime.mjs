@@ -600,6 +600,7 @@ export function createBrowserRuntime(dependencies) {
     const operation = presentation.tools.beginTest();
     publishSnapshot();
     let passed = false;
+    let failureCode = '';
     try {
       const response = await boundedFetch('/api/tool-policy/test', {
         method: 'POST',
@@ -607,8 +608,15 @@ export function createBrowserRuntime(dependencies) {
         body: '{}',
       });
       passed = response.ok;
+      if (!passed) {
+        const body = await response.json();
+        if (body && typeof body === 'object' && !Array.isArray(body)
+            && Object.keys(body).sort().join(',') === 'code,ok'
+            && body.ok === false
+            && (body.code === 'provider_challenge' || body.code === 'network_policy')) failureCode = body.code;
+      }
     } catch {}
-    presentation.tools.finishTest(passed, operation);
+    presentation.tools.finishTest(passed, operation, failureCode);
     publishSnapshot();
   }
 
