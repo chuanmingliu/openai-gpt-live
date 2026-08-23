@@ -259,6 +259,7 @@ func TestRunRequiresConfig(t *testing.T) {
 func TestRunBackendNoneDoesNotReadConfigResolveSecretsOrBuildDurableRuntime(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	started := make(chan struct{})
+	unexpected := make(chan string, 2)
 	idleBuilder := func(context.Context) (serviceRuntime, error) {
 		return &functionRuntime{run: func(runCtx context.Context) error {
 			close(started)
@@ -269,16 +270,30 @@ func TestRunBackendNoneDoesNotReadConfigResolveSecretsOrBuildDurableRuntime(t *t
 	done := make(chan error, 1)
 	go func() {
 		done <- runWithBuilders(ctx, []string{"--backend", "none"}, func(name string) (string, bool) {
-			t.Fatalf("idle worker looked up environment variable %q", name)
+			unexpected <- "idle worker looked up environment variable " + name
 			return "", false
 		}, func(context.Context, config.Config, resolvedSecrets) (serviceRuntime, error) {
-			t.Fatal("durable builder called")
+			unexpected <- "durable builder called"
 			return nil, nil
 		}, idleBuilder)
 	}()
-	<-started
+	select {
+	case <-started:
+	case err := <-done:
+		select {
+		case message := <-unexpected:
+			t.Fatal(message)
+		default:
+			t.Fatalf("idle worker stopped before startup: %v", err)
+		}
+	}
 	cancel()
 	require.NoError(t, <-done)
+	select {
+	case message := <-unexpected:
+		t.Fatal(message)
+	default:
+	}
 }
 
 func TestRunRejectsInvalidBackendFlagCombinationsBeforeConstruction(t *testing.T) {
@@ -313,21 +328,37 @@ func TestRunSelectsDurableBackendWithOrWithoutExplicitFlag(t *testing.T) {
 			path := writeWorkerConfig(t)
 			ctx, cancel := context.WithCancel(t.Context())
 			runtime := &fakeRuntime{started: make(chan resolvedSecrets, 1), drained: make(chan struct{})}
+			unexpected := make(chan string, 1)
 			done := make(chan error, 1)
 			go func() {
 				done <- runWithBuilders(ctx, argsForPath(path), lookupFrom(dummySecrets()), func(_ context.Context, _ config.Config, secrets resolvedSecrets) (serviceRuntime, error) {
 					runtime.started <- secrets
 					return runtime, nil
 				}, func(context.Context) (serviceRuntime, error) {
-					t.Fatal("idle builder called")
+					unexpected <- "idle builder called"
 					return nil, nil
 				})
 			}()
-			resolved := <-runtime.started
+			var resolved resolvedSecrets
+			select {
+			case resolved = <-runtime.started:
+			case err := <-done:
+				select {
+				case message := <-unexpected:
+					t.Fatal(message)
+				default:
+					t.Fatalf("durable worker stopped before startup: %v", err)
+				}
+			}
 			assert.NotEmpty(t, resolved.DatabaseURL)
 			assert.NotEmpty(t, resolved.ProviderAPIKey)
 			cancel()
 			require.NoError(t, <-done)
+			select {
+			case message := <-unexpected:
+				t.Fatal(message)
+			default:
+			}
 		})
 	}
 }
