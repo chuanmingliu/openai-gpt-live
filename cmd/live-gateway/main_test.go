@@ -259,3 +259,70 @@ func TestGatewayExpectedHashMismatchIsContentFree(t *testing.T) {
 	})
 	require.EqualError(t, err, "config hash mismatch")
 }
+
+func TestLoadGatewayConfigUsesCredentialFreeDefaultWhenPathIsEmpty(t *testing.T) {
+	cfg, err := loadGatewayConfig("")
+	require.NoError(t, err)
+	assert.Equal(t, "127.0.0.1:8080", cfg.Gateway.ListenAddr)
+	assert.Equal(t, "ws://127.0.0.1:8765/v1/realtime", cfg.Gateway.Voice.URL)
+	assert.Empty(t, cfg.Gateway.Voice.APIKeyEnv)
+}
+
+func TestGatewayStartupDoesNotResolveWorkerOnlySecrets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "shared-local.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+mode: local
+gateway:
+  listen_addr: 127.0.0.1:0
+  advertised_model: local
+  voice:
+    provider: speech_to_speech
+    url: ws://127.0.0.1:8765/v1/realtime
+    model: local
+worker:
+  reasoner:
+    api_key_env: WORKER_PROVIDER_SECRET
+store:
+  database_url_env: WORKER_DATABASE_SECRET
+  retention:
+    hmac_key_env: WORKER_RETENTION_SECRET
+    hmac_key_id: retention-v1
+safety:
+  privacy_hmac_key_env: WORKER_PRIVACY_SECRET
+features:
+  tool_encryption_key_env: WORKER_TOOL_SECRET
+  tool_encryption_key_id: tool-v1
+`), 0o600))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	allowedRuntimeLookups := map[string]struct{}{
+		"LIVE_EXPECTED_CONFIG_HASH": {},
+		"LIVE_METRIC_INSTANCE":      {},
+		"LIVE_DEPLOYMENT_REGION":    {},
+	}
+	err := run(ctx, []string{"-config", path}, func(name string) (string, bool) {
+		if _, allowed := allowedRuntimeLookups[name]; !allowed {
+			t.Fatalf("gateway resolved inactive secret %q", name)
+		}
+		return "", false
+	})
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
+func TestGatewayConfiguredVoiceCredentialRemainsStrict(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gateway.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+mode: local
+gateway:
+  voice:
+    url: ws://127.0.0.1:8765/v1/realtime
+    model: local
+    api_key_env: LOCAL_PROVIDER_SECRET
+`), 0o600))
+
+	err := run(t.Context(), []string{"-config", path}, func(name string) (string, bool) {
+		return "", false
+	})
+	assert.EqualError(t, err, "configured provider credential is unavailable")
+}

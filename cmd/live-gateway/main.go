@@ -63,10 +63,10 @@ func main() {
 
 func deploymentRegion(mode string, lookup func(string) (string, bool)) (string, error) {
 	region, regionOK := lookup("LIVE_DEPLOYMENT_REGION")
-	allowed, allowedOK := lookup("LIVE_ALLOWED_REGIONS")
 	if !regionOK && mode != "production" {
 		return "local", nil
 	}
+	allowed, allowedOK := lookup("LIVE_ALLOWED_REGIONS")
 	if !regionOK || !allowedOK {
 		return "", errors.New("production requires LIVE_DEPLOYMENT_REGION and LIVE_ALLOWED_REGIONS")
 	}
@@ -115,6 +115,13 @@ func canaryRuntimeIdentity(mode, configHash, region string, lookup func(string) 
 	return identity, nil
 }
 
+func loadGatewayConfig(path string) (config.Config, error) {
+	if path == "" {
+		return config.DefaultLocalGateway()
+	}
+	return config.LoadUnresolved(path)
+}
+
 func run(ctx context.Context, args []string, lookup func(string) (string, bool)) (runErr error) {
 	if handled, err := runCommand(ctx, args, lookup); handled {
 		return err
@@ -128,10 +135,7 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 	if flags.NArg() != 0 {
 		return errors.New("extra arguments are not accepted")
 	}
-	if *configPath == "" {
-		return errors.New("-config is required")
-	}
-	cfg, err := config.LoadUnresolved(*configPath)
+	cfg, err := loadGatewayConfig(*configPath)
 	if err != nil {
 		return fmt.Errorf("load gateway configuration: %w", err)
 	}
@@ -141,9 +145,6 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 	}
 	if err := verifyExpectedHash(cfg, lookup); err != nil {
 		return err
-	}
-	if err := cfg.ResolveSecrets(lookup); err != nil {
-		return fmt.Errorf("load gateway configuration: %w", err)
 	}
 	admissionController, closeAdmission, err := composeAdmission(ctx, cfg, lookup)
 	if err != nil {
