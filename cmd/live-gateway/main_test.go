@@ -326,3 +326,18 @@ gateway:
 	})
 	assert.EqualError(t, err, "configured provider credential is unavailable")
 }
+
+func TestGatewayProductionDatabaseURLRejectsEnvironmentTLSDisableBeforeDial(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	cfg := config.Config{
+		Mode:  "production",
+		Store: config.StoreConfig{DatabaseURLEnv: "PRODUCTION_DATABASE_URL"},
+	}
+
+	_, err := composeGatewayFeatures(ctx, cfg, func(name string) (string, bool) {
+		assert.Equal(t, "PRODUCTION_DATABASE_URL", name)
+		return "postgres://db.example/live?sslmode=disable", true
+	})
+	assert.EqualError(t, err, "production database URL must not disable SSL")
+}

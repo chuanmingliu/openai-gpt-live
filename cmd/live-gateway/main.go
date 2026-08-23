@@ -296,17 +296,28 @@ type gatewayFeatureRuntime struct {
 
 var composeGatewayRepositoryHook func(*postgres.Repository) error
 
-func composeGatewayFeatures(ctx context.Context, cfg config.Config, lookup func(string) (string, bool)) (*gatewayFeatureRuntime, error) {
-	if cfg.Mode != "production" {
-		return nil, nil
-	}
+func resolveGatewayDatabaseURL(cfg config.Config, lookup func(string) (string, bool)) (string, error) {
 	databaseURL := cfg.Store.URL
 	if cfg.Store.DatabaseURLEnv != "" {
 		value, ok := lookup(cfg.Store.DatabaseURLEnv)
 		if !ok || value == "" {
-			return nil, errors.New("configured database credential is unavailable")
+			return "", errors.New("configured database credential is unavailable")
 		}
 		databaseURL = value
+	}
+	if cfg.Mode == "production" && strings.Contains(databaseURL, "sslmode=disable") {
+		return "", errors.New("production database URL must not disable SSL")
+	}
+	return databaseURL, nil
+}
+
+func composeGatewayFeatures(ctx context.Context, cfg config.Config, lookup func(string) (string, bool)) (*gatewayFeatureRuntime, error) {
+	if cfg.Mode != "production" {
+		return nil, nil
+	}
+	databaseURL, err := resolveGatewayDatabaseURL(cfg, lookup)
+	if err != nil {
+		return nil, err
 	}
 	pool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
@@ -604,13 +615,9 @@ func composeAdmission(ctx context.Context, cfg config.Config, lookup func(string
 		}
 		return controller, nil, nil
 	}
-	databaseURL := cfg.Store.URL
-	if cfg.Store.DatabaseURLEnv != "" {
-		value, ok := lookup(cfg.Store.DatabaseURLEnv)
-		if !ok || value == "" {
-			return nil, nil, errors.New("configured database credential is unavailable")
-		}
-		databaseURL = value
+	databaseURL, err := resolveGatewayDatabaseURL(cfg, lookup)
+	if err != nil {
+		return nil, nil, err
 	}
 	pool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
