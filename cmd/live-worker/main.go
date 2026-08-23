@@ -83,6 +83,16 @@ func main() {
 }
 
 func runWithBuilder(ctx context.Context, args []string, lookup func(string) (string, bool), builder runtimeBuilder) error {
+	return runWithBuilders(ctx, args, lookup, builder, buildIdleRuntime)
+}
+
+func runWithBuilders(
+	ctx context.Context,
+	args []string,
+	lookup func(string) (string, bool),
+	durableBuilder runtimeBuilder,
+	idleBuilder idleRuntimeBuilder,
+) error {
 	if ctx == nil {
 		return errors.New("worker context is required")
 	}
@@ -91,6 +101,7 @@ func runWithBuilder(ctx context.Context, args []string, lookup func(string) (str
 	}
 	flags := flag.NewFlagSet("live-worker", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
+	backend := flags.String("backend", "", "worker backend: none or durable")
 	configPath := flags.String("config", "", "path to worker YAML configuration")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -98,8 +109,39 @@ func runWithBuilder(ctx context.Context, args []string, lookup func(string) (str
 	if flags.NArg() != 0 {
 		return errors.New("positional arguments are not accepted")
 	}
-	if *configPath == "" {
+	selectedBackend := *backend
+	if selectedBackend == "" && *configPath != "" {
+		selectedBackend = "durable"
+	}
+	switch selectedBackend {
+	case "none":
+		if *configPath != "" {
+			return errors.New("backend none does not accept -config")
+		}
+		if idleBuilder == nil {
+			return errors.New("idle worker runtime builder is required")
+		}
+		runtime, err := idleBuilder(ctx)
+		if err != nil {
+			return err
+		}
+		if runtime == nil {
+			return errors.New("idle worker runtime builder returned nil")
+		}
+		defer runtime.Close()
+		err = runtime.Run(ctx)
+		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
+			return nil
+		}
+		return err
+	case "durable":
+		if *configPath == "" {
+			return errors.New("-config is required for durable backend")
+		}
+	case "":
 		return errors.New("-config is required")
+	default:
+		return errors.New("worker backend must be none or durable")
 	}
 	if lookup == nil {
 		lookup = os.LookupEnv
@@ -118,7 +160,7 @@ func runWithBuilder(ctx context.Context, args []string, lookup func(string) (str
 	}
 	redactions := append([]string(nil), secrets.raw...)
 	defer secrets.clear()
-	runtime, err := builder(ctx, cfg, secrets)
+	runtime, err := durableBuilder(ctx, cfg, secrets)
 	// Builders own any copies needed by the runtime. Clear the resolver-owned
 	// byte buffers before Run begins, on both success and error paths.
 	secrets.clear()

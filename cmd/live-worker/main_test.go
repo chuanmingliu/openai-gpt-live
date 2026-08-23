@@ -256,6 +256,82 @@ func TestRunRequiresConfig(t *testing.T) {
 	assert.ErrorContains(t, err, "-config is required")
 }
 
+func TestRunBackendNoneDoesNotReadConfigResolveSecretsOrBuildDurableRuntime(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	started := make(chan struct{})
+	idleBuilder := func(context.Context) (serviceRuntime, error) {
+		return &functionRuntime{run: func(runCtx context.Context) error {
+			close(started)
+			<-runCtx.Done()
+			return runCtx.Err()
+		}}, nil
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- runWithBuilders(ctx, []string{"--backend", "none"}, func(name string) (string, bool) {
+			t.Fatalf("idle worker looked up environment variable %q", name)
+			return "", false
+		}, func(context.Context, config.Config, resolvedSecrets) (serviceRuntime, error) {
+			t.Fatal("durable builder called")
+			return nil, nil
+		}, idleBuilder)
+	}()
+	<-started
+	cancel()
+	require.NoError(t, <-done)
+}
+
+func TestRunRejectsInvalidBackendFlagCombinationsBeforeConstruction(t *testing.T) {
+	for name, args := range map[string][]string{
+		"unknown":           {"--backend", "mystery"},
+		"none with config":  {"--backend", "none", "-config", "worker.yaml"},
+		"durable no config": {"--backend", "durable"},
+		"positional":        {"--backend", "none", "extra"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := runWithBuilders(t.Context(), args, func(string) (string, bool) {
+				t.Fatal("environment lookup occurred")
+				return "", false
+			}, func(context.Context, config.Config, resolvedSecrets) (serviceRuntime, error) {
+				t.Fatal("durable builder called")
+				return nil, nil
+			}, func(context.Context) (serviceRuntime, error) {
+				t.Fatal("idle builder called")
+				return nil, nil
+			})
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestRunSelectsDurableBackendWithOrWithoutExplicitFlag(t *testing.T) {
+	for name, argsForPath := range map[string]func(string) []string{
+		"legacy":   func(path string) []string { return []string{"-config", path} },
+		"explicit": func(path string) []string { return []string{"--backend", "durable", "-config", path} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := writeWorkerConfig(t)
+			ctx, cancel := context.WithCancel(t.Context())
+			runtime := &fakeRuntime{started: make(chan resolvedSecrets, 1), drained: make(chan struct{})}
+			done := make(chan error, 1)
+			go func() {
+				done <- runWithBuilders(ctx, argsForPath(path), lookupFrom(dummySecrets()), func(_ context.Context, _ config.Config, secrets resolvedSecrets) (serviceRuntime, error) {
+					runtime.started <- secrets
+					return runtime, nil
+				}, func(context.Context) (serviceRuntime, error) {
+					t.Fatal("idle builder called")
+					return nil, nil
+				})
+			}()
+			resolved := <-runtime.started
+			assert.NotEmpty(t, resolved.DatabaseURL)
+			assert.NotEmpty(t, resolved.ProviderAPIKey)
+			cancel()
+			require.NoError(t, <-done)
+		})
+	}
+}
+
 func TestRunResolvesSecretsAndDrainsOnCancellation(t *testing.T) {
 	path := writeWorkerConfig(t)
 	ctx, cancel := context.WithCancel(t.Context())
