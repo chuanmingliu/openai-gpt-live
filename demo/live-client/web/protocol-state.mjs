@@ -77,6 +77,9 @@ export function reduceProtocolEvent(state, event) {
     case 'client.start_failed':
       return withStatus({ ...state, connected: false, phase: 'idle', effect: null }, 'start-failed');
 
+    case 'client.session_unavailable':
+      return withStatus({ ...state, connected: false, phase: 'idle', effect: null }, 'session-unavailable');
+
     default:
       return withStatus({ ...state, effect: null }, 'unknown-event');
   }

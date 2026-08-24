@@ -141,6 +141,18 @@ test('local startup failure keeps a sanitized reachable status', () => {
   assert.doesNotMatch(JSON.stringify(state), /sentinel-private-exception/);
 });
 
+test('unavailable local session retains a fixed status without close payload', () => {
+  const secret = 'sentinel-private-close-reason';
+  const state = reduceProtocolEvent(initialProtocolState(), {
+    type: 'client.session_unavailable',
+    close_reason: secret,
+  });
+
+  assert.equal(state.phase, 'idle');
+  assert.equal(state.status.at(-1).kind, 'session-unavailable');
+  assert.doesNotMatch(JSON.stringify(state), /sentinel-private-close-reason/);
+});
+
 test('transcript history retains its newest one hundred finalized turns', () => {
   let state = initialProtocolState();
   for (let index = 0; index < 102; index += 1) {

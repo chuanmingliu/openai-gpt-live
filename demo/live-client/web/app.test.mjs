@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { canSendCaptureFrame, sessionReadinessAfter, statusLabel } from './app.js';
+import { canSendCaptureFrame, sessionReadinessAfter, socketTerminationReason, statusLabel } from './app.js';
 
 test('session readiness waits for an acknowledgement after the update is sent', () => {
   const initial = { updateSent: false, configured: false };
@@ -22,4 +22,10 @@ test('capture frames cannot send before session acknowledgement', () => {
 
 test('startup failure label remains available to the rendered event list', () => {
   assert.equal(statusLabel({ kind: 'start-failed' }), 'Unable to start the local voice session.');
+});
+
+test('pre-acknowledgement socket termination is shown as an unavailable session', () => {
+  assert.equal(socketTerminationReason({ configured: false }), 'session-unavailable');
+  assert.equal(statusLabel({ kind: 'session-unavailable' }), 'Local voice session is unavailable. Select Start to retry.');
+  assert.equal(socketTerminationReason({ configured: true }), 'connection-closed');
 });

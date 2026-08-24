@@ -88,8 +88,8 @@ async function startSession() {
 
     session.socket = new WebSocket(new URL('/ws', location.href).href.replace(/^http/, 'ws'));
     session.socket.onmessage = (message) => handleSocketMessage(session, message.data);
-    session.socket.onerror = () => stopSession('connection-error', session);
-    session.socket.onclose = () => stopSession('connection-closed', session);
+    session.socket.onerror = () => stopSession(socketTerminationReason(session), session);
+    session.socket.onclose = () => stopSession(socketTerminationReason(session), session);
     setGatewayMessage('Microphone ready. Connecting to the local gateway…');
     render();
   } catch {
@@ -269,10 +269,14 @@ function stopSession(reason, session = activeSession) {
     state = initialProtocolState();
     if (reason === 'start-failed') {
       state = reduceProtocolEvent(state, { type: 'client.start_failed' });
+    } else if (reason === 'session-unavailable') {
+      state = reduceProtocolEvent(state, { type: 'client.session_unavailable' });
     } else {
       recordLocalStatus(reason === 'user-stopped' ? 'stopped' : 'disconnected');
     }
-    setGatewayMessage('Waiting to verify the local gateway audio contract.');
+    setGatewayMessage(reason === 'session-unavailable'
+      ? 'Local voice session is unavailable. Select Start to retry.'
+      : 'Waiting to verify the local gateway audio contract.');
     restoreIdleControls();
   }
 }
@@ -296,6 +300,10 @@ export function sessionReadinessAfter(session, eventType) {
 export function canSendCaptureFrame({ active, configured, muted, socketOpen, message }) {
   return active && configured && !muted && socketOpen && message?.type === 'frame' &&
     message.pcm instanceof ArrayBuffer && message.pcm.byteLength === CAPTURE_FRAME_BYTES;
+}
+
+export function socketTerminationReason(session) {
+  return session?.configured ? 'connection-closed' : 'session-unavailable';
 }
 
 function recordLocalStatus(kind) {
@@ -325,6 +333,9 @@ function render() {
 
 function connectionLabel() {
   if (!activeSession) {
+    if (state.status.at(-1)?.kind === 'session-unavailable') {
+      return 'Local voice session unavailable. Select Start to retry.';
+    }
     return 'Idle';
   }
   return {
@@ -387,6 +398,7 @@ export function statusLabel(entry) {
     'invalid-audio': 'Invalid output audio was ignored.',
     'invalid-message': 'Invalid gateway message was ignored.',
     'start-failed': 'Unable to start the local voice session.',
+    'session-unavailable': 'Local voice session is unavailable. Select Start to retry.',
     stopped: 'Session stopped.',
     disconnected: 'Session disconnected.',
   };
