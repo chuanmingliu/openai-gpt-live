@@ -42,6 +42,14 @@ func TestStaticAndHealthRoutesUseStrictHeaders(t *testing.T) {
 	}
 }
 
+func TestHealthRouteReturnsExactLiveBody(t *testing.T) {
+	handler := mustTestHandler(t, upstreamDependencies{})
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:3000/health/live", nil))
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, "ok\n", w.Body.String())
+}
+
 func TestStaticRoutesServeOnlyExplicitPaths(t *testing.T) {
 	handler := mustTestHandler(t, upstreamDependencies{})
 	for _, path := range []string{"/web/index.html", "/missing", "/styles.css/extra"} {

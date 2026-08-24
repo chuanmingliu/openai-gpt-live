@@ -67,7 +67,7 @@ func newHandler(cfg demoConfig, bearer []byte, dependencies upstreamDependencies
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health/live", func(w http.ResponseWriter, r *http.Request) {
 		browserHeaders(w.Header())
-		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok\n"))
 	})
 	mux.HandleFunc("GET /api/capabilities", func(w http.ResponseWriter, r *http.Request) {
 		browserHeaders(w.Header())
