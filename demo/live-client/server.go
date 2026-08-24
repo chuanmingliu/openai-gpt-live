@@ -6,10 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"io/fs"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/coder/websocket"
@@ -22,6 +20,21 @@ const (
 
 //go:embed web/*
 var webAssets embed.FS
+
+type browserAsset struct {
+	path        string
+	contentType string
+}
+
+var browserAssets = map[string]browserAsset{
+	"/":                    {path: "web/index.html", contentType: "text/html; charset=utf-8"},
+	"/styles.css":          {path: "web/styles.css", contentType: "text/css; charset=utf-8"},
+	"/app.js":              {path: "web/app.js", contentType: "text/javascript; charset=utf-8"},
+	"/audio-core.mjs":      {path: "web/audio-core.mjs", contentType: "text/javascript; charset=utf-8"},
+	"/protocol-state.mjs":  {path: "web/protocol-state.mjs", contentType: "text/javascript; charset=utf-8"},
+	"/capture-worklet.js":  {path: "web/capture-worklet.js", contentType: "text/javascript; charset=utf-8"},
+	"/playback-worklet.js": {path: "web/playback-worklet.js", contentType: "text/javascript; charset=utf-8"},
+}
 
 type dialUpstream func(context.Context, *url.URL, http.Header) (*websocket.Conn, error)
 
@@ -110,27 +123,12 @@ func browserHeaders(header http.Header) {
 
 func serveAsset(w http.ResponseWriter, r *http.Request) {
 	browserHeaders(w.Header())
-	if r.URL.Path == "/" {
-		serveEmbeddedAsset(w, "web/index.html", "text/html; charset=utf-8")
-		return
-	}
-	if !strings.HasPrefix(r.URL.Path, "/") || !fs.ValidPath(strings.TrimPrefix(r.URL.Path, "/")) {
+	asset, ok := browserAssets[r.URL.Path]
+	if !ok {
 		http.NotFound(w, r)
 		return
 	}
-	asset := "web" + r.URL.Path
-	content, err := webAssets.ReadFile(asset)
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-	if strings.HasSuffix(asset, ".css") {
-		w.Header().Set("Content-Type", "text/css; charset=utf-8")
-	} else if strings.HasSuffix(asset, ".js") {
-		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-	}
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(content)
+	serveEmbeddedAsset(w, asset.path, asset.contentType)
 }
 
 func serveEmbeddedAsset(w http.ResponseWriter, asset, contentType string) {

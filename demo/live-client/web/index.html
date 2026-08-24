@@ -3,13 +3,33 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>GPT Live Voice Client</title>
+    <title>GPT Live Voice Test</title>
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
-    <main>
-      <h1>GPT Live Voice Client</h1>
-      <p role="status">UI loading</p>
+    <main id="app">
+      <header>
+        <p class="eyebrow">Local development tool</p>
+        <h1>GPT Live Voice Test</h1>
+        <p id="connection-status" role="status" aria-live="polite">Idle</p>
+      </header>
+      <section class="controls" aria-label="Voice controls">
+        <button id="start-stop" type="button">Start</button>
+        <button id="mute" type="button" disabled>Mute microphone</button>
+      </section>
+      <section id="capabilities" aria-labelledby="capabilities-title">
+        <h2 id="capabilities-title">Gateway</h2>
+        <p>Waiting to verify the local gateway audio contract.</p>
+      </section>
+      <section id="transcript" aria-labelledby="transcript-title">
+        <h2 id="transcript-title">Transcript</h2>
+        <ol id="turns"></ol>
+      </section>
+      <details>
+        <summary>Connection events</summary>
+        <ol id="events"></ol>
+      </details>
     </main>
+    <script type="module" src="/app.js"></script>
   </body>
 </html>

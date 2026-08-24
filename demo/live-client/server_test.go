@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -48,6 +49,54 @@ func TestStaticRoutesServeOnlyExplicitPaths(t *testing.T) {
 		handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:3000"+path, nil))
 		assert.Equal(t, http.StatusNotFound, w.Code, path)
 	}
+}
+
+func TestBrowserAssetsServeExpectedContentTypes(t *testing.T) {
+	handler := mustTestHandler(t, upstreamDependencies{})
+	assets := []struct {
+		path        string
+		contentType string
+	}{
+		{path: "/", contentType: "text/html"},
+		{path: "/styles.css", contentType: "text/css"},
+		{path: "/app.js", contentType: "text/javascript"},
+		{path: "/audio-core.mjs", contentType: "text/javascript"},
+		{path: "/protocol-state.mjs", contentType: "text/javascript"},
+		{path: "/capture-worklet.js", contentType: "text/javascript"},
+		{path: "/playback-worklet.js", contentType: "text/javascript"},
+	}
+
+	for _, asset := range assets {
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:3000"+asset.path, nil))
+		assert.Equal(t, http.StatusOK, w.Code, asset.path)
+		assert.Contains(t, w.Header().Get("Content-Type"), asset.contentType, asset.path)
+	}
+}
+
+func TestBrowserDocumentAndCSPPermitOnlySelfHostedCode(t *testing.T) {
+	handler := mustTestHandler(t, upstreamDependencies{})
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "http://127.0.0.1:3000/", nil))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	document := w.Body.String()
+	scripts := regexp.MustCompile(`(?is)<script\b([^>]*)>(.*?)</script>`).FindAllStringSubmatch(document, -1)
+	require.NotEmpty(t, scripts)
+	for _, script := range scripts {
+		assert.Regexp(t, regexp.MustCompile(`(?i)\bsrc\s*=`), script[1])
+		assert.Empty(t, strings.TrimSpace(script[2]))
+	}
+	lowerDocument := strings.ToLower(document)
+	assert.NotContains(t, lowerDocument, "style=")
+	assert.NotContains(t, lowerDocument, "http://")
+	assert.NotContains(t, lowerDocument, "https://")
+
+	csp := w.Header().Get("Content-Security-Policy")
+	assert.Contains(t, csp, "script-src 'self'")
+	assert.Contains(t, csp, "worker-src 'self'")
+	assert.NotContains(t, csp, "unsafe-inline")
+	assert.NotContains(t, csp, "unsafe-eval")
 }
 
 func TestCapabilitiesUsesOptionalAuthorizationWithoutExposingIt(t *testing.T) {
