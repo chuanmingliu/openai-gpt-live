@@ -129,6 +129,18 @@ test('only known protocol error codes are retained', () => {
   assert.doesNotMatch(JSON.stringify(state), /sentinel-private-code/);
 });
 
+test('local startup failure keeps a sanitized reachable status', () => {
+  const secret = 'sentinel-private-exception';
+  const state = reduceProtocolEvent(initialProtocolState(), {
+    type: 'client.start_failed',
+    error: { message: secret },
+  });
+
+  assert.equal(state.phase, 'idle');
+  assert.equal(state.status.at(-1).kind, 'start-failed');
+  assert.doesNotMatch(JSON.stringify(state), /sentinel-private-exception/);
+});
+
 test('transcript history retains its newest one hundred finalized turns', () => {
   let state = initialProtocolState();
   for (let index = 0; index < 102; index += 1) {

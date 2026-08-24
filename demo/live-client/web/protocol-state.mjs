@@ -74,6 +74,9 @@ export function reduceProtocolEvent(state, event) {
     case 'error':
       return withStatus({ ...state, phase: 'error', effect: null }, 'protocol-error', sanitizedErrorCode(event?.error?.code));
 
+    case 'client.start_failed':
+      return withStatus({ ...state, connected: false, phase: 'idle', effect: null }, 'start-failed');
+
     default:
       return withStatus({ ...state, effect: null }, 'unknown-event');
   }

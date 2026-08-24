@@ -5,7 +5,7 @@ const CAPTURE_FRAME_BYTES = 960;
 const MAX_OUTPUT_AUDIO_BYTES = 96_000;
 const MAX_STATUS = 50;
 
-const elements = {
+const elements = typeof document === 'undefined' ? null : {
   startStop: document.querySelector('#start-stop'),
   mute: document.querySelector('#mute'),
   status: document.querySelector('#connection-status'),
@@ -17,24 +17,26 @@ const elements = {
 let state = initialProtocolState();
 let activeSession = null;
 
-elements.startStop.addEventListener('click', () => {
-  if (activeSession) {
-    stopSession('user-stopped');
-    return;
-  }
-  void startSession();
-});
+if (elements) {
+  elements.startStop.addEventListener('click', () => {
+    if (activeSession) {
+      stopSession('user-stopped');
+      return;
+    }
+    void startSession();
+  });
 
-elements.mute.addEventListener('click', () => {
-  if (!activeSession?.captureNode) {
-    return;
-  }
-  state = { ...state, muted: !state.muted };
-  activeSession.captureNode.port.postMessage({ type: 'enabled', enabled: !state.muted && activeSession.configured });
+  elements.mute.addEventListener('click', () => {
+    if (!activeSession?.captureNode) {
+      return;
+    }
+    state = { ...state, muted: !state.muted };
+    activeSession.captureNode.port.postMessage({ type: 'enabled', enabled: !state.muted && activeSession.configured });
+    render();
+  });
+
   render();
-});
-
-render();
+}
 
 async function startSession() {
   const session = createSessionResources();
@@ -91,9 +93,6 @@ async function startSession() {
     setGatewayMessage('Microphone ready. Connecting to the local gateway…');
     render();
   } catch {
-    if (isActive(session)) {
-      recordLocalStatus('start-failed');
-    }
     stopSession('start-failed', session);
   }
 }
@@ -101,6 +100,7 @@ async function startSession() {
 function createSessionResources() {
   return {
     stopped: false,
+    updateSent: false,
     configured: false,
     stream: null,
     audioContext: null,
@@ -126,8 +126,13 @@ async function fetchCapabilities() {
 }
 
 function handleCaptureFrame(session, message) {
-  if (!isActive(session) || !session.configured || state.muted || session.socket?.readyState !== WebSocket.OPEN ||
-    message?.type !== 'frame' || !(message.pcm instanceof ArrayBuffer) || message.pcm.byteLength !== CAPTURE_FRAME_BYTES) {
+  if (!canSendCaptureFrame({
+    active: isActive(session),
+    configured: session.configured,
+    muted: state.muted,
+    socketOpen: session.socket?.readyState === WebSocket.OPEN,
+    message,
+  })) {
     return;
   }
 
@@ -171,7 +176,8 @@ function handleSocketMessage(session, payload) {
   applyEffect(session, state.effect);
   state = { ...state, effect: null };
 
-  if (event.type === 'session.created' && !session.configured && session.socket?.readyState === WebSocket.OPEN) {
+  const readiness = sessionReadinessAfter(session, event.type);
+  if (readiness.sendUpdate && session.socket?.readyState === WebSocket.OPEN) {
     session.socket.send(JSON.stringify({
       type: 'session.update',
       session: {
@@ -183,6 +189,10 @@ function handleSocketMessage(session, payload) {
         output_modalities: ['audio'],
       },
     }));
+    session.updateSent = true;
+    setGatewayMessage('Awaiting local gateway session acknowledgement…');
+  }
+  if (readiness.enableCapture) {
     session.configured = true;
     session.captureNode?.port.postMessage({ type: 'enabled', enabled: !state.muted });
     setGatewayMessage('Connected with verified PCM16 audio. Speak when ready.');
@@ -252,11 +262,16 @@ function stopSession(reason, session = activeSession) {
   session.playbackNode = null;
   session.silentGainNode = null;
   session.socket = null;
+  session.updateSent = false;
   session.configured = false;
 
   if (wasActive) {
     state = initialProtocolState();
-    recordLocalStatus(reason === 'user-stopped' ? 'stopped' : 'disconnected');
+    if (reason === 'start-failed') {
+      state = reduceProtocolEvent(state, { type: 'client.start_failed' });
+    } else {
+      recordLocalStatus(reason === 'user-stopped' ? 'stopped' : 'disconnected');
+    }
     setGatewayMessage('Waiting to verify the local gateway audio contract.');
     restoreIdleControls();
   }
@@ -264,6 +279,23 @@ function stopSession(reason, session = activeSession) {
 
 function isActive(session) {
   return activeSession === session && !session.stopped;
+}
+
+export function sessionReadinessAfter(session, eventType) {
+  const updateSent = Boolean(session?.updateSent);
+  const configured = Boolean(session?.configured);
+  if (eventType === 'session.created' && !updateSent) {
+    return { updateSent: true, configured: false, sendUpdate: true, enableCapture: false };
+  }
+  if (eventType === 'session.updated' && updateSent && !configured) {
+    return { updateSent: true, configured: true, sendUpdate: false, enableCapture: true };
+  }
+  return { updateSent, configured, sendUpdate: false, enableCapture: false };
+}
+
+export function canSendCaptureFrame({ active, configured, muted, socketOpen, message }) {
+  return active && configured && !muted && socketOpen && message?.type === 'frame' &&
+    message.pcm instanceof ArrayBuffer && message.pcm.byteLength === CAPTURE_FRAME_BYTES;
 }
 
 function recordLocalStatus(kind) {
@@ -337,7 +369,7 @@ function renderEvents() {
   }
 }
 
-function statusLabel(entry) {
+export function statusLabel(entry) {
   const labels = {
     'session-created': 'Session created.',
     'session-updated': 'Session updated.',
