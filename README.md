@@ -49,6 +49,33 @@ server on its loopback OpenAI Realtime endpoint,
 is absent, but a realtime session requires it and will fail cleanly if it cannot
 be reached. This repository neither embeds nor launches the speech service.
 
+## Test with the browser UI
+
+Run these in separate terminals:
+
+```sh
+go run ./cmd/live-gateway
+go run ./cmd/live-worker --backend none
+go run ./demo/live-client
+```
+
+Open `http://127.0.0.1:3000`, press Start, grant microphone permission, and use
+Mute or Stop to control the session. The page and its capabilities load without
+speech, while realtime conversation requires a compatible local speech endpoint
+at `ws://127.0.0.1:8765/v1/realtime`.
+
+### Optional configured gateway authentication
+
+For a configured gateway that requires bearer authentication, pass the value by
+environment variable:
+
+```sh
+LIVE_DEMO_BEARER=... go run ./demo/live-client -bearer-env LIVE_DEMO_BEARER
+```
+
+Avoid putting credential values in shell history. This demo is loopback
+development tooling, not a production proxy.
+
 ## Use explicit configuration
 
 Use explicit configuration once the gateway needs a chosen speech provider or a

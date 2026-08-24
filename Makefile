@@ -1,4 +1,4 @@
-.PHONY: test test-race vet fmt verify-deploy verify-deploy-static smoke-deploy load-unit chaos capacity barge soak load-smoke load-evidence release-gate release-gate-verify
+.PHONY: test test-race vet fmt demo-live-client test-demo-live-client verify-deploy verify-deploy-static smoke-deploy load-unit chaos capacity barge soak load-smoke load-evidence release-gate release-gate-verify
 
 test:
 	go test ./...
@@ -11,6 +11,13 @@ vet:
 
 fmt:
 	gofmt -w $$(find . -name '*.go' -not -path './.worktrees/*')
+
+demo-live-client:
+	go run ./demo/live-client
+
+test-demo-live-client:
+	go test -count=1 ./demo/live-client
+	node --test demo/live-client/web/audio-core.test.mjs demo/live-client/web/protocol-state.test.mjs
 
 # Builds and validates every deployable artifact. Tool absence is an explicit
 # prerequisite failure; the validator never silently skips a deployment gate.
