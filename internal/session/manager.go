@@ -133,10 +133,6 @@ type HandoffSubscriptionRegistrar interface {
 	Unregister(handoff.EventSubscription)
 }
 
-type HandoffReplayRegistrar interface {
-	RegisterReplay(handoff.EventSubscription, int64) error
-}
-
 type TrustedSessionContext struct {
 	IDs     IDs
 	Subject Subject
@@ -271,9 +267,10 @@ type Manager struct {
 }
 
 type publicationAttempt struct {
-	runtime  *sessionRuntime
-	previous *sessionRuntime
-	replay   bool
+	runtime       *sessionRuntime
+	previous      *sessionRuntime
+	replay        bool
+	replayAttempt handoff.ReplayAttempt
 }
 
 type logicalSession struct {
@@ -401,12 +398,10 @@ func (m *Manager) commitPublication(r *sessionRuntime) {
 	r.publicationAccepting = false
 	r.publicationGeneration = 0
 	r.publicationAttempt = nil
-	if m.pendingPublications[scope] == attempt {
-		delete(m.pendingPublications, scope)
-	}
 	r.mu.Unlock()
 	m.activeMu.Unlock()
 	r.presentationMu.Unlock()
+	m.commitPublicationAttempt(attempt)
 }
 
 // fenceAtTurnBoundary linearizes the final boundary decision with every
@@ -2484,27 +2479,41 @@ func (m *Manager) clearPublicationAttempt(attempt *publicationAttempt) {
 	m.activeMu.Unlock()
 }
 
+func (m *Manager) commitPublicationAttempt(attempt *publicationAttempt) {
+	if attempt == nil {
+		return
+	}
+	if attempt.replay && !isNilInterface(attempt.replayAttempt) {
+		attempt.replayAttempt.Commit()
+	}
+	m.clearPublicationAttempt(attempt)
+}
+
 // compensatePublicationAttempt runs after a registrar callback may have
 // mutated state but its exact directory CAS cannot commit. The attempt token
 // stays reserved until all compensation callbacks finish, so they cannot
 // unregister a newer owner.
 func (m *Manager) compensatePublicationAttempt(attempt *publicationAttempt, restorePrevious bool) error {
-	if m == nil || attempt == nil || attempt.runtime == nil || isNilInterface(m.cfg.HandoffSubscriptions) {
+	if m == nil || attempt == nil || attempt.runtime == nil {
+		return nil
+	}
+	if attempt.replay {
+		if !isNilInterface(attempt.replayAttempt) {
+			attempt.replayAttempt.Rollback()
+		}
+		m.clearPublicationAttempt(attempt)
+		return nil
+	}
+	if isNilInterface(m.cfg.HandoffSubscriptions) {
 		m.clearPublicationAttempt(attempt)
 		return nil
 	}
 	subscription := attempt.runtime.handoffSubscription(m.cfg.HandoffConsumerID)
-	if attempt.replay || !restorePrevious {
+	if !restorePrevious {
 		m.cfg.HandoffSubscriptions.Unregister(subscription)
 	}
-	var restoreErr error
-	if attempt.replay && restorePrevious && attempt.previous != nil {
-		if err := m.cfg.HandoffSubscriptions.Register(attempt.previous.handoffSubscription(m.cfg.HandoffConsumerID)); err != nil {
-			restoreErr = fmt.Errorf("restore handoff presentation: %w", err)
-		}
-	}
 	m.clearPublicationAttempt(attempt)
-	return restoreErr
+	return nil
 }
 
 func (m *Manager) publicationAttemptCanRestorePrevious(attempt *publicationAttempt) bool {
@@ -2532,10 +2541,10 @@ func (m *Manager) registerReplacement(runtime *sessionRuntime, logical *logicalS
 		m.activeMu.Unlock()
 		return ErrStaleReconnect
 	}
-	var replay HandoffReplayRegistrar
+	var replay handoff.TransactionalReplayRegistrar
 	if !isNilInterface(m.cfg.HandoffSubscriptions) {
 		var ok bool
-		replay, ok = m.cfg.HandoffSubscriptions.(HandoffReplayRegistrar)
+		replay, ok = m.cfg.HandoffSubscriptions.(handoff.TransactionalReplayRegistrar)
 		if !ok || isNilInterface(replay) {
 			m.activeMu.Unlock()
 			return ErrRecoveryUnavailable
@@ -2547,10 +2556,11 @@ func (m *Manager) registerReplacement(runtime *sessionRuntime, logical *logicalS
 		return err
 	}
 	if replay != nil {
-		if err := replay.RegisterReplay(runtime.handoffSubscription(m.cfg.HandoffConsumerID), *runtime.replayAfter); err != nil {
-			restorePrevious := m.publicationAttemptCanRestorePrevious(attempt)
-			compensationErr := m.compensatePublicationAttempt(attempt, restorePrevious)
-			return errors.Join(ErrRecoveryUnavailable, compensationErr)
+		replayAttempt, replayErr := replay.BeginReplay(runtime.handoffSubscription(m.cfg.HandoffConsumerID), *runtime.replayAfter)
+		attempt.replayAttempt = replayAttempt
+		if replayErr != nil || isNilInterface(replayAttempt) {
+			compensationErr := m.compensatePublicationAttempt(attempt, false)
+			return errors.Join(ErrRecoveryUnavailable, replayErr, compensationErr)
 		}
 	}
 
@@ -2603,12 +2613,12 @@ func (m *Manager) registerReplacement(runtime *sessionRuntime, logical *logicalS
 	logical.turnBoundary = true
 	logical.tombstonedAt = time.Time{}
 	logical.state = logicalActive
-	if !pending {
-		delete(m.pendingPublications, scope)
-	}
 	m.activeMu.Unlock()
 	if presentationLocked {
 		previous.presentationMu.Unlock()
+	}
+	if !pending {
+		m.commitPublicationAttempt(attempt)
 	}
 	return nil
 }
@@ -3096,7 +3106,8 @@ func (m *Manager) OfferHandoffEvent(ctx context.Context, scope handoff.Scope, ev
 	m.activeMu.RLock()
 	runtime.mu.Lock()
 	current := m.current[scope]
-	if current != runtime || !runtime.accepting || runtime.publicationPending {
+	pending := m.pendingPublications[scope]
+	if current != runtime || !runtime.accepting || runtime.publicationPending || pending != nil && pending.replay {
 		runtime.mu.Unlock()
 		m.activeMu.RUnlock()
 		runtime.presentationMu.Unlock()

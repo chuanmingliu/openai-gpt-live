@@ -775,11 +775,40 @@ type replayRegistrarFake struct {
 	sub   handoff.EventSubscription
 }
 
+type replayAttemptCallbacks struct {
+	terminal sync.Once
+	commit   func()
+	rollback func()
+}
+
+func (a *replayAttemptCallbacks) Commit() {
+	if a != nil {
+		a.terminal.Do(func() {
+			if a.commit != nil {
+				a.commit()
+			}
+		})
+	}
+}
+
+func (a *replayAttemptCallbacks) Rollback() {
+	if a != nil {
+		a.terminal.Do(func() {
+			if a.rollback != nil {
+				a.rollback()
+			}
+		})
+	}
+}
+
 func (*replayRegistrarFake) Register(handoff.EventSubscription) error { return nil }
 func (*replayRegistrarFake) Unregister(handoff.EventSubscription)     {}
 func (r *replayRegistrarFake) RegisterReplay(sub handoff.EventSubscription, after int64) error {
 	r.sub, r.after = sub, after
 	return nil
+}
+func (r *replayRegistrarFake) BeginReplay(sub handoff.EventSubscription, after int64) (handoff.ReplayAttempt, error) {
+	return &replayAttemptCallbacks{commit: func() { r.sub, r.after = sub, after }}, nil
 }
 
 func (s *blockingRecoveryStore) LoadRecovery(ctx context.Context, _ handoff.Scope, _, _ int) (RecoverySnapshot, error) {

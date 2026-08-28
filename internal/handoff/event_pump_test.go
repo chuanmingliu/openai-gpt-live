@@ -286,6 +286,161 @@ func TestEventPumpReconnectReplayUsesClientCursorWithoutRollingBackGlobalCursor(
 	assert.Equal(t, []int64{6}, store.advances, "replay ACKs never roll the global cursor backward")
 }
 
+func TestEventPumpReplayAttemptIsInvisibleUntilCommitAndCommitsOnce(t *testing.T) {
+	controlScope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "replay-control"}
+	targetScope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "replay-target"}
+	store := newPumpStore()
+	store.events[targetScope] = []handoff.Event{pumpEvent(targetScope, 1, "handoff.completed", handoff.StateSucceeded)}
+	store.cursors[pumpKey("client", targetScope)] = 1
+	manual := clock.NewManual(time.Unix(0, 0))
+	pump := &handoff.EventPump{Reader: store, Cursors: store, Sink: store, Clock: manual, PollInterval: time.Second}
+	replay, err := pump.BeginReplay(handoff.EventSubscription{ConsumerID: "client", Scope: targetScope}, 0)
+	require.NoError(t, err)
+	require.NotNil(t, replay)
+	require.NoError(t, pump.Register(handoff.EventSubscription{ConsumerID: "client", Scope: controlScope}))
+	runPump(t, pump)
+
+	select {
+	case loaded := <-store.loads:
+		require.Equal(t, controlScope, loaded, "a tentative replay must not appear in the initial subscription snapshot")
+	case <-time.After(time.Second):
+		t.Fatal("event pump did not complete its control subscription poll")
+	}
+	select {
+	case event := <-store.offered:
+		t.Fatalf("tentative replay reached the sink before commit: %#v", event)
+	default:
+	}
+
+	replay.Commit()
+	replay.Commit()
+	select {
+	case event := <-store.offered:
+		require.Equal(t, int64(1), event.Seq)
+	case <-time.After(time.Second):
+		t.Fatal("committed replay did not reach the sink")
+	}
+	for targetPolled := false; !targetPolled; {
+		select {
+		case loaded := <-store.loads:
+			targetPolled = loaded == targetScope
+		case <-time.After(time.Second):
+			t.Fatal("event pump did not complete its committed replay poll")
+		}
+	}
+	manual.Advance(time.Second)
+	for targetPolled := false; !targetPolled; {
+		select {
+		case loaded := <-store.loads:
+			targetPolled = loaded == targetScope
+		case <-time.After(time.Second):
+			t.Fatal("event pump did not complete the post-commit idempotency poll")
+		}
+	}
+	select {
+	case event := <-store.offered:
+		t.Fatalf("idempotent replay commit delivered twice: %#v", event)
+	default:
+	}
+	replay.Rollback()
+}
+
+func TestEventPumpReplayAttemptRollbackPreservesBaseAndPriorOverlayExactly(t *testing.T) {
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "replay-rollback"}
+	store := newPumpStore()
+	for seq := int64(1); seq <= 5; seq++ {
+		store.events[scope] = append(store.events[scope], pumpEvent(scope, seq, "handoff.completed", handoff.StateSucceeded))
+	}
+	subscription := handoff.EventSubscription{ConsumerID: "client", Scope: scope}
+	store.cursors[pumpKey(subscription.ConsumerID, scope)] = 5
+	pump := &handoff.EventPump{Reader: store, Cursors: store, Sink: store, Clock: clock.NewManual(time.Unix(0, 0)), PollInterval: time.Second}
+	require.NoError(t, pump.RegisterReplay(subscription, 2))
+	replay, err := pump.BeginReplay(subscription, 0)
+	require.NoError(t, err)
+
+	replay.Rollback()
+	replay.Rollback()
+	replay.Commit()
+	runPump(t, pump)
+	for _, seq := range []int64{3, 4, 5} {
+		select {
+		case event := <-store.offered:
+			require.Equal(t, seq, event.Seq, "rollback changed the prior replay overlay")
+		case <-time.After(time.Second):
+			t.Fatalf("rollback lost the base subscription or prior replay at sequence %d", seq)
+		}
+	}
+	select {
+	case event := <-store.offered:
+		t.Fatalf("rollback lowered the prior replay cursor: %#v", event)
+	default:
+	}
+}
+
+func TestEventPumpReplayAttemptCommitKeepsMinimumOverlay(t *testing.T) {
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "replay-minimum"}
+	store := newPumpStore()
+	for seq := int64(1); seq <= 5; seq++ {
+		store.events[scope] = append(store.events[scope], pumpEvent(scope, seq, "handoff.completed", handoff.StateSucceeded))
+	}
+	subscription := handoff.EventSubscription{ConsumerID: "client", Scope: scope}
+	store.cursors[pumpKey(subscription.ConsumerID, scope)] = 5
+	pump := &handoff.EventPump{Reader: store, Cursors: store, Sink: store, Clock: clock.NewManual(time.Unix(0, 0)), PollInterval: time.Second}
+	require.NoError(t, pump.RegisterReplay(subscription, 2))
+	replay, err := pump.BeginReplay(subscription, 4)
+	require.NoError(t, err)
+	replay.Commit()
+	runPump(t, pump)
+
+	select {
+	case event := <-store.offered:
+		require.Equal(t, int64(3), event.Seq, "commit must retain the lower pre-existing replay cursor")
+	case <-time.After(time.Second):
+		t.Fatal("committed replay did not preserve the minimum overlay")
+	}
+}
+
+func TestEventPumpReplayAttemptRejectsOverlapAndAccountsForPendingCapacity(t *testing.T) {
+	pump := &handoff.EventPump{}
+	subscription := handoff.EventSubscription{
+		ConsumerID: "client",
+		Scope:      handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "pending-replay"},
+	}
+	first, err := pump.BeginReplay(subscription, 0)
+	require.NoError(t, err)
+	_, err = pump.BeginReplay(subscription, 0)
+	require.Error(t, err, "an exact subscription can have only one pending replay attempt")
+	first.Rollback()
+	second, err := pump.BeginReplay(subscription, 0)
+	require.NoError(t, err, "rollback must release the exact replay reservation")
+	second.Rollback()
+
+	for index := 0; index < 9_999; index++ {
+		sub := handoff.EventSubscription{
+			ConsumerID: "client",
+			Scope: handoff.Scope{
+				TenantID:       "tenant",
+				UserID:         "user",
+				ConversationID: identity.ConversationID(fmt.Sprintf("committed-%d", index)),
+			},
+		}
+		require.NoError(t, pump.Register(sub))
+	}
+	pending := handoff.EventSubscription{
+		ConsumerID: "client",
+		Scope:      handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "capacity-pending"},
+	}
+	reservation, err := pump.BeginReplay(pending, 0)
+	require.NoError(t, err)
+	overflow := handoff.EventSubscription{
+		ConsumerID: "client",
+		Scope:      handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "capacity-overflow"},
+	}
+	require.Error(t, pump.Register(overflow), "pending unique replays must consume subscription capacity")
+	reservation.Rollback()
+	require.NoError(t, pump.Register(overflow), "rolling back a pending replay must release its capacity")
+}
+
 func TestEventPumpCoalescesOnlyConsecutiveProgressWithoutCursorSkips(t *testing.T) {
 	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "conversation"}
 	store := newPumpStore()

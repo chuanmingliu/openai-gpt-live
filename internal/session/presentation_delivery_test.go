@@ -331,6 +331,90 @@ type reentrantUnregisterSubscriptions struct {
 	timedOut atomic.Bool
 }
 
+type replayRegistrarProbe struct {
+	pump            *handoff.EventPump
+	mu              sync.Mutex
+	registerCalls   int
+	replayInstalled chan struct{}
+	replayRelease   <-chan struct{}
+	replayErr       error
+	restoreErr      error
+	installOnce     sync.Once
+}
+
+func (r *replayRegistrarProbe) Register(subscription handoff.EventSubscription) error {
+	r.mu.Lock()
+	r.registerCalls++
+	call := r.registerCalls
+	r.mu.Unlock()
+	if call > 1 && r.restoreErr != nil {
+		return r.restoreErr
+	}
+	return r.pump.Register(subscription)
+}
+
+func (r *replayRegistrarProbe) RegisterReplay(subscription handoff.EventSubscription, after int64) error {
+	if err := r.pump.RegisterReplay(subscription, after); err != nil {
+		return err
+	}
+	if r.replayInstalled != nil {
+		r.installOnce.Do(func() { close(r.replayInstalled) })
+	}
+	if r.replayRelease != nil {
+		<-r.replayRelease
+	}
+	return r.replayErr
+}
+
+func (r *replayRegistrarProbe) BeginReplay(subscription handoff.EventSubscription, after int64) (handoff.ReplayAttempt, error) {
+	attempt, err := r.pump.BeginReplay(subscription, after)
+	if err != nil {
+		return nil, err
+	}
+	if r.replayInstalled != nil {
+		r.installOnce.Do(func() { close(r.replayInstalled) })
+	}
+	if r.replayRelease != nil {
+		<-r.replayRelease
+	}
+	return attempt, r.replayErr
+}
+
+func (r *replayRegistrarProbe) Unregister(subscription handoff.EventSubscription) {
+	r.pump.Unregister(subscription)
+}
+
+type observingDeliveryStore struct {
+	*deliveryStore
+	readAfter chan int64
+	readDone  chan int64
+	release   <-chan struct{}
+}
+
+func (s *observingDeliveryStore) ReadEvents(ctx context.Context, scope handoff.Scope, after int64, limit int) ([]handoff.Event, error) {
+	select {
+	case s.readAfter <- after:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	if s.release != nil {
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	events, err := s.deliveryStore.ReadEvents(ctx, scope, after, limit)
+	if s.readDone != nil {
+		select {
+		case s.readDone <- after:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return events, err
+}
+
 func (*reentrantUnregisterSubscriptions) Register(handoff.EventSubscription) error { return nil }
 
 func (s *reentrantUnregisterSubscriptions) Unregister(handoff.EventSubscription) {
@@ -361,6 +445,22 @@ func (s *racingReplaySubscriptions) RegisterReplay(_ handoff.EventSubscription, 
 	s.once.Do(func() { close(s.replayStarted) })
 	<-s.replayRelease
 	return nil
+}
+
+func (s *racingReplaySubscriptions) BeginReplay(_ handoff.EventSubscription, after int64) (handoff.ReplayAttempt, error) {
+	s.once.Do(func() { close(s.replayStarted) })
+	<-s.replayRelease
+	return &replayAttemptCallbacks{commit: func() {
+		s.mu.Lock()
+		s.registered = true
+		s.replayOverlay = true
+		s.replayAfter = after
+		s.mu.Unlock()
+	}, rollback: func() {
+		s.mu.Lock()
+		s.replayOverlay = false
+		s.mu.Unlock()
+	}}, nil
 }
 
 func (s *racingReplaySubscriptions) Unregister(handoff.EventSubscription) {
@@ -401,6 +501,22 @@ func (s *deliveryRecordingSink) OfferHandoffEvent(ctx context.Context, scope han
 	err := s.manager.OfferHandoffEvent(ctx, scope, event)
 	s.results <- err
 	return err
+}
+
+func startOwnedEventPump(t *testing.T, pump *handoff.EventPump) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- pump.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			assert.ErrorIs(t, err, context.Canceled)
+		case <-time.After(time.Second):
+			t.Error("event pump did not stop")
+		}
+	})
 }
 
 func startDeliveryStack(t *testing.T, store *deliveryStore, scope handoff.Scope, client *deliveryClient, timeout time.Duration, suffix string) deliveryStack {
@@ -1282,6 +1398,184 @@ func TestReconnectReplayPublicationCannotLeakOverlayToConcurrentInitialOwner(t *
 	require.Same(t, replacement, current)
 	require.True(t, replayOverlay)
 	require.Equal(t, replayAfter, retainedAfter)
+}
+
+func TestPendingReplayPublicationCannotDeliverThroughActivePreviousOwner(t *testing.T) {
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "pending-replay-active-previous"}
+	event := handoff.Event{
+		Seq: 1, EventID: "pending-replay-event", HandoffID: "handoff", TenantID: scope.TenantID,
+		ConversationID: scope.ConversationID, Kind: "handoff.created", State: handoff.StatePending,
+		Payload: json.RawMessage(`{}`),
+	}
+	store := &deliveryStore{event: event, cursor: 1}
+	manual := clock.NewManual(time.Unix(0, 0))
+	pump := &handoff.EventPump{Reader: store, Cursors: store, Clock: manual, PollInterval: time.Second}
+	replayInstalled := make(chan struct{})
+	replayRelease := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(replayRelease) }) }
+	t.Cleanup(release)
+	registrar := &replayRegistrarProbe{pump: pump, replayInstalled: replayInstalled, replayRelease: replayRelease}
+	manager := &Manager{
+		cfg:    Config{HandoffConsumerID: "replay-client", HandoffSubscriptions: registrar, EgressBlockTimeout: time.Second},
+		active: make(map[runtimeKey]*sessionRuntime), current: make(map[handoff.Scope]*sessionRuntime),
+		logical: make(map[identity.SessionID]*logicalSession), pendingPublications: make(map[handoff.Scope]*publicationAttempt),
+	}
+	offerResults := make(chan error, 4)
+	pump.Sink = &deliveryRecordingSink{manager: manager, results: offerResults}
+	previous, previousInputs, previousDone := currentRuntime(scope, "pending-replay-previous")
+	replacement, replacementInputs, replacementDone := currentRuntime(scope, "pending-replay-replacement")
+	t.Cleanup(func() { close(previousDone); close(replacementDone) })
+	require.NoError(t, manager.register(previous))
+	startOwnedEventPump(t, pump)
+	require.Eventually(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return store.loads > 0
+	}, time.Second, time.Millisecond, "event pump did not complete its initial stored-cursor poll")
+
+	replacement.key.incarnation = 2
+	replacement.state.ids.Incarnation = 2
+	replayAfter := int64(0)
+	replacement.replayAfter = &replayAfter
+	logical := &logicalSession{scope: scope, highWater: 1, reconnecting: true, turnBoundary: true, state: logicalTombstoned}
+	manager.activeMu.Lock()
+	manager.logical[replacement.key.sessionID] = logical
+	manager.activeMu.Unlock()
+	published := make(chan error, 1)
+	go func() { published <- manager.registerReplacement(replacement, logical, 1) }()
+	select {
+	case <-replayInstalled:
+	case <-time.After(time.Second):
+		t.Fatal("replacement did not install its replay overlay")
+	}
+	pendingOfferErr := manager.OfferHandoffEvent(t.Context(), scope, event)
+	assert.ErrorIs(t, pendingOfferErr, handoff.ErrNoLiveSession,
+		"a replay publication attempt must not deliver through the still-current previous owner even on a direct wakeup")
+	select {
+	case input := <-previousInputs:
+		t.Errorf("pending replay sequence %d reached the previous owner", input.(HandoffEventInput).Event.Seq)
+	default:
+	}
+
+	release()
+	require.NoError(t, <-published)
+	manual.Advance(time.Second)
+	select {
+	case input := <-replacementInputs:
+		require.Equal(t, event.Seq, input.(HandoffEventInput).Event.Seq, "the unchanged replay must reach the committed replacement")
+	case <-time.After(time.Second):
+		t.Fatal("committed replacement did not receive the replay rejected during publication")
+	}
+}
+
+func TestReplayCompensationPreservesPreviousSubscriptionAndExactOverlay(t *testing.T) {
+	partialErr := errors.New("replay callback failed after mutation")
+	restoreErr := errors.New("base subscription restore failed")
+	for _, test := range []struct {
+		name        string
+		callbackErr error
+		rollback    bool
+	}{
+		{name: "partial mutation callback error", callbackErr: partialErr},
+		{name: "rollback restore error", rollback: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: identity.ConversationID("replay-compensation-" + strings.ReplaceAll(test.name, " ", "-"))}
+			stale := handoff.Event{
+				Seq: 1, EventID: "stale-replay-event", HandoffID: "handoff", TenantID: scope.TenantID,
+				ConversationID: scope.ConversationID, Kind: "handoff.created", State: handoff.StatePending,
+				Payload: json.RawMessage(`{}`),
+			}
+			baseStore := &deliveryStore{event: stale, cursor: 1}
+			readRelease := make(chan struct{})
+			var readReleaseOnce sync.Once
+			releaseReads := func() { readReleaseOnce.Do(func() { close(readRelease) }) }
+			t.Cleanup(releaseReads)
+			store := &observingDeliveryStore{
+				deliveryStore: baseStore, readAfter: make(chan int64, 8), readDone: make(chan int64, 8), release: readRelease,
+			}
+			manual := clock.NewManual(time.Unix(0, 0))
+			pump := &handoff.EventPump{Reader: store, Cursors: store, Clock: manual, PollInterval: time.Second}
+			registrar := &replayRegistrarProbe{pump: pump, replayErr: test.callbackErr, restoreErr: restoreErr}
+			manager := &Manager{
+				cfg:    Config{HandoffConsumerID: "replay-client", HandoffSubscriptions: registrar, EgressBlockTimeout: time.Second},
+				active: make(map[runtimeKey]*sessionRuntime), current: make(map[handoff.Scope]*sessionRuntime),
+				logical: make(map[identity.SessionID]*logicalSession), pendingPublications: make(map[handoff.Scope]*publicationAttempt),
+			}
+			pump.Sink = manager
+			previous, previousInputs, previousDone := currentRuntime(scope, identity.SessionID("previous-"+test.name))
+			replacement, _, replacementDone := currentRuntime(scope, identity.SessionID("replacement-"+test.name))
+			t.Cleanup(func() { close(previousDone); close(replacementDone) })
+			require.NoError(t, manager.register(previous))
+			replacement.key.incarnation = 2
+			replacement.state.ids.Incarnation = 2
+			replacement.publicationRequiresCommit = test.rollback
+			replayAfter := int64(0)
+			replacement.replayAfter = &replayAfter
+			logical := &logicalSession{scope: scope, highWater: 1, reconnecting: true, turnBoundary: true, state: logicalTombstoned}
+			manager.activeMu.Lock()
+			manager.logical[replacement.key.sessionID] = logical
+			manager.activeMu.Unlock()
+
+			publicationErr := manager.registerReplacement(replacement, logical, 1)
+			if test.rollback {
+				require.NoError(t, publicationErr)
+				manager.rollbackReplacementPublication(replacement, logical, 1, 0)
+			} else {
+				require.ErrorIs(t, publicationErr, ErrRecoveryUnavailable)
+				require.NotErrorIs(t, publicationErr, restoreErr, "transactional replay rollback must not use fallible base restoration")
+			}
+			registrar.mu.Lock()
+			require.Equal(t, 1, registrar.registerCalls, "replay compensation must leave the existing base registration untouched")
+			registrar.mu.Unlock()
+			manager.activeMu.RLock()
+			current := manager.current[scope]
+			manager.activeMu.RUnlock()
+			require.Same(t, previous, current)
+			previous.mu.Lock()
+			require.True(t, previous.accepting)
+			previous.mu.Unlock()
+
+			startOwnedEventPump(t, pump)
+			var observedRead bool
+			select {
+			case after := <-store.readAfter:
+				observedRead = true
+				assert.Equal(t, int64(1), after, "compensation must remove only its replay overlay and retain the stored base cursor")
+			case <-time.After(time.Second):
+				t.Error("published previous owner lost its base event-pump subscription during replay compensation")
+			}
+			releaseReads()
+			if !observedRead {
+				return
+			}
+			select {
+			case <-store.readDone:
+			case <-time.After(time.Second):
+				t.Fatal("event pump did not complete its compensated subscription read")
+			}
+			select {
+			case input := <-previousInputs:
+				t.Errorf("cancelled replay overlay leaked stale sequence %d", input.(HandoffEventInput).Event.Seq)
+			default:
+			}
+
+			fresh := stale
+			fresh.Seq = 2
+			fresh.EventID = "fresh-event"
+			baseStore.mu.Lock()
+			baseStore.event = fresh
+			baseStore.mu.Unlock()
+			manual.Advance(time.Second)
+			select {
+			case input := <-previousInputs:
+				require.Equal(t, fresh.Seq, input.(HandoffEventInput).Event.Seq)
+			case <-time.After(time.Second):
+				t.Fatal("restored previous owner did not receive a fresh event after replay compensation")
+			}
+		})
+	}
 }
 
 func TestFailedReconnectSameScopePublicationRestoresPriorRuntime(t *testing.T) {

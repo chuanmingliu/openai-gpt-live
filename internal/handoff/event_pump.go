@@ -51,6 +51,20 @@ type ReplayRegistrar interface {
 	RegisterReplay(EventSubscription, int64) error
 }
 
+// ReplayAttempt is an exact, one-shot reservation for publishing a replay
+// subscription. Commit and Rollback are infallible, concurrency-safe, and
+// idempotent; the first terminal operation wins.
+type ReplayAttempt interface {
+	Commit()
+	Rollback()
+}
+
+// TransactionalReplayRegistrar keeps a replay invisible until the live
+// session publication that owns it commits.
+type TransactionalReplayRegistrar interface {
+	BeginReplay(EventSubscription, int64) (ReplayAttempt, error)
+}
+
 type EventPump struct {
 	Reader        EventReader
 	Cursors       DeliveryCursorStore
@@ -62,11 +76,18 @@ type EventPump struct {
 	Tracer        trace.Tracer
 	Gates         interface{ Enabled(string) bool }
 
-	mu            sync.Mutex
-	subscriptions map[EventSubscription]struct{}
-	replays       map[EventSubscription]int64
-	changed       chan struct{}
-	running       bool
+	mu             sync.Mutex
+	subscriptions  map[EventSubscription]struct{}
+	replays        map[EventSubscription]int64
+	replayAttempts map[EventSubscription]*eventPumpReplayAttempt
+	changed        chan struct{}
+	running        bool
+}
+
+type eventPumpReplayAttempt struct {
+	pump         *EventPump
+	subscription EventSubscription
+	afterSeq     int64
 }
 
 type EventPumpMetrics struct {
@@ -75,18 +96,55 @@ type EventPumpMetrics struct {
 }
 
 func (p *EventPump) RegisterReplay(subscription EventSubscription, afterSeq int64) error {
-	if afterSeq < 0 {
-		return errors.New("event pump replay cursor is negative")
-	}
-	if err := p.Register(subscription); err != nil {
+	attempt, err := p.BeginReplay(subscription, afterSeq)
+	if err != nil {
 		return err
 	}
-	p.mu.Lock()
-	if p.replays == nil {
-		p.replays = make(map[EventSubscription]int64)
+	attempt.Commit()
+	return nil
+}
+
+// BeginReplay reserves capacity and exact ownership of a replay publication.
+// The tentative base subscription and replay cursor stay outside the committed
+// maps, so Run and polling cannot observe either before Commit.
+func (p *EventPump) BeginReplay(subscription EventSubscription, afterSeq int64) (ReplayAttempt, error) {
+	if p == nil {
+		return nil, errors.New("event pump is nil")
 	}
-	if current, exists := p.replays[subscription]; !exists || afterSeq < current {
-		p.replays[subscription] = afterSeq
+	if afterSeq < 0 {
+		return nil, errors.New("event pump replay cursor is negative")
+	}
+	if err := validateEventSubscription(subscription); err != nil {
+		return nil, err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.initializeRegistrationsLocked()
+	if p.replayAttempts[subscription] != nil {
+		return nil, errors.New("event pump replay attempt is already pending")
+	}
+	if _, committed := p.subscriptions[subscription]; !committed && p.subscriptionCountLocked() >= maximumEventSubscriptions {
+		return nil, errors.New("event pump subscription limit exceeded")
+	}
+	attempt := &eventPumpReplayAttempt{pump: p, subscription: subscription, afterSeq: afterSeq}
+	p.replayAttempts[subscription] = attempt
+	return attempt, nil
+}
+
+func (a *eventPumpReplayAttempt) Commit() {
+	if a == nil || a.pump == nil {
+		return
+	}
+	p := a.pump
+	p.mu.Lock()
+	if p.replayAttempts[a.subscription] != a {
+		p.mu.Unlock()
+		return
+	}
+	delete(p.replayAttempts, a.subscription)
+	p.subscriptions[a.subscription] = struct{}{}
+	if current, exists := p.replays[a.subscription]; !exists || a.afterSeq < current {
+		p.replays[a.subscription] = a.afterSeq
 	}
 	changed := p.changed
 	p.mu.Unlock()
@@ -94,7 +152,18 @@ func (p *EventPump) RegisterReplay(subscription EventSubscription, afterSeq int6
 	case changed <- struct{}{}:
 	default:
 	}
-	return nil
+}
+
+func (a *eventPumpReplayAttempt) Rollback() {
+	if a == nil || a.pump == nil {
+		return
+	}
+	p := a.pump
+	p.mu.Lock()
+	if p.replayAttempts[a.subscription] == a {
+		delete(p.replayAttempts, a.subscription)
+	}
+	p.mu.Unlock()
 }
 
 func (p *EventPump) Register(subscription EventSubscription) error {
@@ -106,16 +175,11 @@ func (p *EventPump) Register(subscription EventSubscription) error {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.subscriptions == nil {
-		p.subscriptions = make(map[EventSubscription]struct{})
-	}
-	if p.changed == nil {
-		p.changed = make(chan struct{}, 1)
-	}
+	p.initializeRegistrationsLocked()
 	if _, exists := p.subscriptions[subscription]; exists {
 		return nil
 	}
-	if len(p.subscriptions) >= maximumEventSubscriptions {
+	if p.subscriptionCountLocked() >= maximumEventSubscriptions {
 		return errors.New("event pump subscription limit exceeded")
 	}
 	p.subscriptions[subscription] = struct{}{}
@@ -133,7 +197,33 @@ func (p *EventPump) Unregister(subscription EventSubscription) {
 	p.mu.Lock()
 	delete(p.subscriptions, subscription)
 	delete(p.replays, subscription)
+	delete(p.replayAttempts, subscription)
 	p.mu.Unlock()
+}
+
+func (p *EventPump) initializeRegistrationsLocked() {
+	if p.subscriptions == nil {
+		p.subscriptions = make(map[EventSubscription]struct{})
+	}
+	if p.replays == nil {
+		p.replays = make(map[EventSubscription]int64)
+	}
+	if p.replayAttempts == nil {
+		p.replayAttempts = make(map[EventSubscription]*eventPumpReplayAttempt)
+	}
+	if p.changed == nil {
+		p.changed = make(chan struct{}, 1)
+	}
+}
+
+func (p *EventPump) subscriptionCountLocked() int {
+	count := len(p.subscriptions)
+	for subscription := range p.replayAttempts {
+		if _, committed := p.subscriptions[subscription]; !committed {
+			count++
+		}
+	}
+	return count
 }
 
 func (p *EventPump) Run(ctx context.Context) error {
@@ -158,12 +248,7 @@ func (p *EventPump) Run(ctx context.Context) error {
 		return errors.New("event pump is already running")
 	}
 	p.running = true
-	if p.subscriptions == nil {
-		p.subscriptions = make(map[EventSubscription]struct{})
-	}
-	if p.changed == nil {
-		p.changed = make(chan struct{}, 1)
-	}
+	p.initializeRegistrationsLocked()
 	changed := p.changed
 	p.mu.Unlock()
 	defer func() {
