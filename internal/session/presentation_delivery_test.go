@@ -534,48 +534,6 @@ func (s *sequenceDeliveryStore) AdvanceDeliveryCursor(ctx context.Context, _ str
 	return nil
 }
 
-func bufferedPresentationRuntime(scope handoff.Scope, sessionID identity.SessionID, capacity int) (*sessionRuntime, <-chan Input, chan struct{}) {
-	inbox := make(chan reactorMessage, capacity)
-	slots := make(chan struct{}, capacity)
-	for range capacity {
-		slots <- struct{}{}
-	}
-	done := make(chan struct{})
-	inputs := make(chan Input, capacity)
-	state := &runState{ids: IDs{SessionID: sessionID, ConversationID: scope.ConversationID, Incarnation: 1}}
-	runtime := &sessionRuntime{
-		key: runtimeKey{sessionID: sessionID, incarnation: 1}, subject: Subject{TenantID: scope.TenantID, UserID: scope.UserID},
-		inbox: inbox, done: done, state: state, accepting: true, inboxSlots: slots,
-	}
-	go func() {
-		for {
-			select {
-			case message := <-inbox:
-				select {
-				case inputs <- message.input:
-				case <-done:
-					return
-				}
-				if message.done != nil {
-					select {
-					case message.done <- nil:
-					case <-done:
-						return
-					}
-				}
-				select {
-				case slots <- struct{}{}:
-				case <-done:
-					return
-				}
-			case <-done:
-				return
-			}
-		}
-	}()
-	return runtime, inputs, done
-}
-
 func (s *observingDeliveryStore) ReadEvents(ctx context.Context, scope handoff.Scope, after int64, limit int) ([]handoff.Event, error) {
 	select {
 	case s.readAfter <- after:
@@ -1766,8 +1724,8 @@ func TestCanceledOlderGenerationOfferCannotEnterReplacementBeforeReplay(t *testi
 	}
 	offerResults := make(chan error, 16)
 	pump.Sink = &deliveryRecordingSink{manager: manager, results: offerResults}
-	previous, previousInputs, previousDone := bufferedPresentationRuntime(scope, "canceled-generation-previous", 16)
-	replacement, replacementInputs, replacementDone := bufferedPresentationRuntime(scope, "canceled-generation-replacement", 16)
+	previous, previousInputs, previousDone := currentRuntimeWithCapacity(scope, "canceled-generation-previous", 16)
+	replacement, replacementInputs, replacementDone := currentRuntimeWithCapacity(scope, "canceled-generation-replacement", 16)
 	t.Cleanup(func() { close(previousDone); close(replacementDone) })
 	require.NoError(t, manager.register(previous))
 

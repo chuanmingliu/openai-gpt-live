@@ -37,13 +37,17 @@ func (r *subscriptionRecorder) Unregister(subscription handoff.EventSubscription
 }
 
 func currentRuntime(scope handoff.Scope, sessionID identity.SessionID) (*sessionRuntime, chan Input, chan struct{}) {
-	inbox := make(chan reactorMessage, 4)
-	slots := make(chan struct{}, 4)
-	for range cap(slots) {
+	return currentRuntimeWithCapacity(scope, sessionID, 4)
+}
+
+func currentRuntimeWithCapacity(scope handoff.Scope, sessionID identity.SessionID, capacity int) (*sessionRuntime, chan Input, chan struct{}) {
+	inbox := make(chan reactorMessage, capacity)
+	slots := make(chan struct{}, capacity)
+	for range capacity {
 		slots <- struct{}{}
 	}
 	done := make(chan struct{})
-	inputs := make(chan Input, 4)
+	inputs := make(chan Input, capacity)
 	state := &runState{ids: IDs{SessionID: sessionID, ConversationID: scope.ConversationID, Incarnation: 1}}
 	runtime := &sessionRuntime{
 		key: runtimeKey{sessionID: sessionID, incarnation: 1}, subject: Subject{TenantID: scope.TenantID, UserID: scope.UserID},
@@ -53,11 +57,23 @@ func currentRuntime(scope handoff.Scope, sessionID identity.SessionID) (*session
 		for {
 			select {
 			case message := <-inbox:
-				inputs <- message.input
-				if message.done != nil {
-					message.done <- nil
+				select {
+				case inputs <- message.input:
+				case <-done:
+					return
 				}
-				slots <- struct{}{}
+				if message.done != nil {
+					select {
+					case message.done <- nil:
+					case <-done:
+						return
+					}
+				}
+				select {
+				case slots <- struct{}{}:
+				case <-done:
+					return
+				}
 			case <-done:
 				return
 			}
