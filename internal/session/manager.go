@@ -118,6 +118,7 @@ type Config struct {
 	ConversationProvisioner         ConversationProvisioner
 	ConversationTTL                 time.Duration
 	reactorApplyGate                func(Input) <-chan struct{}
+	offerRevalidationGate           func() <-chan struct{}
 	reconnectBoundaryGate           func() <-chan struct{}
 	initialRegisterGate             func() <-chan struct{}
 	reconnectHeartbeatReady         func()
@@ -305,6 +306,8 @@ type runtimeKey struct {
 	incarnation identity.Incarnation
 }
 
+// Lock order: presentationMu -> Manager.activeMu -> sessionRuntime.mu.
+// reconnectMu is never held across directory locks, channel waits, or I/O.
 type sessionRuntime struct {
 	key      runtimeKey
 	subject  Subject
@@ -381,7 +384,7 @@ func (r *sessionRuntime) commitPublication() {
 // external intake path. Callers that acquired the acceptance gate first are
 // fully represented in the boundary high-waters; callers arriving afterward
 // observe a closed gate and cannot enqueue into the old runtime.
-func (r *sessionRuntime) fenceAtTurnBoundary(ctx context.Context, gate func() <-chan struct{}) error {
+func (r *sessionRuntime) fenceAtTurnBoundary(ctx context.Context) error {
 	if r == nil {
 		return nil
 	}
@@ -399,15 +402,6 @@ func (r *sessionRuntime) fenceAtTurnBoundary(ctx context.Context, gate func() <-
 	}
 	if !r.atTurnBoundary() {
 		return ErrReconnectNotAtBoundary
-	}
-	if gate != nil {
-		if wait := gate(); wait != nil {
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-wait:
-			}
-		}
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -428,6 +422,8 @@ func (r *sessionRuntime) handoffSubscription(consumer string) handoff.EventSubsc
 }
 
 func (r *sessionRuntime) stop() {
+	// stop owns runtime intake only; callers never retain a directory lock, so
+	// the forbidden runtime -> directory edge cannot be completed.
 	r.mu.Lock()
 	r.accepting = false
 	r.mu.Unlock()
@@ -1479,6 +1475,9 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 
 	// Re-run the complete CAS after the preflight read. A competing reconnect,
 	// new accepted control, or boundary transition loses without being stopped.
+	// No presentation lock is needed for the reconnect CAS: offers acquire the
+	// directory before runtime state, so this suffix of the global order cannot
+	// create an inverse edge.
 	m.activeMu.Lock()
 	if m.logical[request.SessionID] != logical {
 		m.activeMu.Unlock()
@@ -1494,7 +1493,7 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 		}
 		old = logical.runtime
 		if old != nil {
-			if err := old.fenceAtTurnBoundary(parent, m.cfg.reconnectBoundaryGate); err != nil {
+			if err := old.fenceAtTurnBoundary(parent); err != nil {
 				m.activeMu.Unlock()
 				return err
 			}
@@ -1513,6 +1512,58 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 		model = request.Credential.Model
 	}
 	newIncarnation := request.LastIncarnation + 1
+	m.activeMu.Unlock()
+
+	reopenFencedRuntime := func() {
+		m.activeMu.Lock()
+		if m.logical[request.SessionID] == logical && logical.highWater == request.LastIncarnation && logical.runtime == old && logical.reconnecting {
+			if old != nil {
+				old.mu.Lock()
+				select {
+				case <-old.done:
+				default:
+					old.accepting = true
+				}
+				old.mu.Unlock()
+			}
+			logical.reconnecting = false
+		}
+		m.activeMu.Unlock()
+	}
+	if m.cfg.reconnectBoundaryGate != nil {
+		if gate := m.cfg.reconnectBoundaryGate(); gate != nil {
+			select {
+			case <-parent.Done():
+				reopenFencedRuntime()
+				return parent.Err()
+			case <-gate:
+			}
+		}
+	}
+	if err := parent.Err(); err != nil {
+		reopenFencedRuntime()
+		return err
+	}
+	// Intake is already closed. Recheck after the lock-free test boundary so
+	// internal completions cannot make a dirty boundary reconnectable.
+	m.activeMu.Lock()
+	if m.logical[request.SessionID] != logical || logical.highWater != request.LastIncarnation || logical.runtime != old || !logical.reconnecting {
+		m.activeMu.Unlock()
+		return ErrStaleReconnect
+	}
+	if old != nil {
+		old.mu.Lock()
+		boundary := old.atTurnBoundary()
+		if !boundary {
+			old.accepting = true
+			logical.reconnecting = false
+		}
+		old.mu.Unlock()
+		if !boundary {
+			m.activeMu.Unlock()
+			return ErrReconnectNotAtBoundary
+		}
+	}
 	m.activeMu.Unlock()
 
 	var durablyPublished atomic.Bool
@@ -1796,6 +1847,8 @@ func (r *sessionRuntime) reconnectKey() ReconnectOwnerKey {
 	if r == nil {
 		return ReconnectOwnerKey{}
 	}
+	// Credential identity is copied under reconnectMu and returned by value;
+	// durable owner I/O happens only after this lock is released.
 	r.reconnectMu.Lock()
 	defer r.reconnectMu.Unlock()
 	if r.reconnect == nil {
@@ -1955,6 +2008,8 @@ func (m *Manager) maintainReconnectOwner(ctx context.Context, runtime *sessionRu
 }
 
 func (m *Manager) heartbeatReconnectOwner(ctx context.Context, runtime *sessionRuntime, lossDeadline time.Time) (ReconnectOwnerLease, error) {
+	// Snapshot credential identity only. The owner-store call, channel wait, and
+	// runtime boundary sample all happen after reconnectMu is released.
 	runtime.reconnectMu.Lock()
 	if runtime.reconnect == nil {
 		runtime.reconnectMu.Unlock()
@@ -1991,6 +2046,8 @@ func (m *Manager) rotateReconnectCredential(ctx context.Context, runtime *sessio
 	case <-runtime.reconnectRotate:
 	}
 	defer func() { runtime.reconnectRotate <- struct{}{} }()
+	// Rotation admission above is complete before reconnectMu is acquired; copy
+	// credential state, then release it before durable I/O or client waits.
 	runtime.reconnectMu.Lock()
 	if runtime.reconnect == nil {
 		runtime.reconnectMu.Unlock()
@@ -2372,6 +2429,8 @@ func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.Canc
 
 func (m *Manager) registerReplacement(runtime *sessionRuntime, logical *logicalSession, expected identity.Incarnation) error {
 	scope := runtime.handoffScope()
+	// Snapshotting the presentation owner holds no runtime lock; the owner is
+	// revalidated after its presentation lock is acquired.
 	m.activeMu.RLock()
 	previous := m.current[scope]
 	m.activeMu.RUnlock()
@@ -2380,26 +2439,46 @@ func (m *Manager) registerReplacement(runtime *sessionRuntime, logical *logicalS
 		defer previous.presentationMu.Unlock()
 	}
 	m.activeMu.Lock()
-	defer m.activeMu.Unlock()
 	if m.logical[runtime.key.sessionID] != logical || !logical.reconnecting || logical.highWater != expected ||
 		logical.scope != runtime.handoffScope() || runtime.key.incarnation != expected+1 ||
 		logical.state == logicalEstablishing {
+		m.activeMu.Unlock()
+		return ErrStaleReconnect
+	}
+	if _, exists := m.active[runtime.key]; exists {
+		m.activeMu.Unlock()
+		return ErrStaleReconnect
+	}
+	if m.current[scope] != previous {
+		m.activeMu.Unlock()
+		return ErrStaleReconnect
+	}
+	var replay HandoffReplayRegistrar
+	if !isNilInterface(m.cfg.HandoffSubscriptions) {
+		var ok bool
+		replay, ok = m.cfg.HandoffSubscriptions.(HandoffReplayRegistrar)
+		if !ok || isNilInterface(replay) {
+			m.activeMu.Unlock()
+			return ErrRecoveryUnavailable
+		}
+	}
+	m.activeMu.Unlock()
+	if replay != nil {
+		if err := replay.RegisterReplay(runtime.handoffSubscription(m.cfg.HandoffConsumerID), *runtime.replayAfter); err != nil {
+			return ErrRecoveryUnavailable
+		}
+	}
+	// The previous presentation lock excludes every same-scope publication
+	// while the external registrar runs. Revalidate before committing anyway.
+	m.activeMu.Lock()
+	defer m.activeMu.Unlock()
+	if m.logical[runtime.key.sessionID] != logical || !logical.reconnecting || logical.highWater != expected ||
+		logical.scope != runtime.handoffScope() || runtime.key.incarnation != expected+1 || logical.state == logicalEstablishing ||
+		m.current[scope] != previous {
 		return ErrStaleReconnect
 	}
 	if _, exists := m.active[runtime.key]; exists {
 		return ErrStaleReconnect
-	}
-	if m.current[scope] != previous {
-		return ErrStaleReconnect
-	}
-	if !isNilInterface(m.cfg.HandoffSubscriptions) {
-		replay, ok := m.cfg.HandoffSubscriptions.(HandoffReplayRegistrar)
-		if !ok || isNilInterface(replay) {
-			return ErrRecoveryUnavailable
-		}
-		if err := replay.RegisterReplay(runtime.handoffSubscription(m.cfg.HandoffConsumerID), *runtime.replayAfter); err != nil {
-			return ErrRecoveryUnavailable
-		}
 	}
 	m.active[runtime.key] = runtime
 	if previous != nil && previous != runtime {
@@ -2427,10 +2506,10 @@ func (m *Manager) rollbackInitialPublication(runtime *sessionRuntime, logical *l
 		return
 	}
 	previous := runtime.publicationPrevious
-	if previous != nil {
-		previous.presentationMu.Lock()
-		defer previous.presentationMu.Unlock()
-	}
+	// The failing published runtime is the current presentation owner. Lock it
+	// before the directory and the restored runtime state.
+	runtime.presentationMu.Lock()
+	defer runtime.presentationMu.Unlock()
 	m.activeMu.Lock()
 	if m.active[runtime.key] == runtime {
 		delete(m.active, runtime.key)
@@ -2463,10 +2542,10 @@ func (m *Manager) rollbackReplacementPublication(runtime *sessionRuntime, logica
 		return
 	}
 	previous := runtime.publicationPrevious
-	if previous != nil {
-		previous.presentationMu.Lock()
-		defer previous.presentationMu.Unlock()
-	}
+	// The failing published runtime is the current presentation owner. Lock it
+	// before the directory and the restored runtime state.
+	runtime.presentationMu.Lock()
+	defer runtime.presentationMu.Unlock()
 	m.activeMu.Lock()
 	if m.active[runtime.key] == runtime {
 		delete(m.active, runtime.key)
@@ -2653,6 +2732,8 @@ func (m *Manager) Submit(ctx context.Context, sessionID identity.SessionID, inca
 
 func (m *Manager) register(runtime *sessionRuntime) error {
 	scope := runtime.handoffScope()
+	// Snapshotting the presentation owner holds no runtime lock; the owner is
+	// revalidated after its presentation lock is acquired.
 	m.activeMu.RLock()
 	previous := m.current[scope]
 	m.activeMu.RUnlock()
@@ -2661,11 +2742,12 @@ func (m *Manager) register(runtime *sessionRuntime) error {
 		defer previous.presentationMu.Unlock()
 	}
 	m.activeMu.Lock()
-	defer m.activeMu.Unlock()
 	if m.current[scope] != previous {
+		m.activeMu.Unlock()
 		return ErrStaleReconnect
 	}
 	if _, exists := m.active[runtime.key]; exists {
+		m.activeMu.Unlock()
 		return ErrSessionAlreadyActive
 	}
 	if m.logical == nil {
@@ -2684,12 +2766,28 @@ func (m *Manager) register(runtime *sessionRuntime) error {
 	}
 	if logical.scope != scope || logical.highWater != runtime.key.incarnation || logical.state != logicalEstablishing ||
 		logical.runtime != nil || logical.reconnecting {
+		m.activeMu.Unlock()
 		return ErrStaleReconnect
 	}
+	m.activeMu.Unlock()
 	if !isNilInterface(m.cfg.HandoffSubscriptions) {
 		if err := m.cfg.HandoffSubscriptions.Register(runtime.handoffSubscription(m.cfg.HandoffConsumerID)); err != nil {
 			return fmt.Errorf("register handoff presentation: %w", err)
 		}
+	}
+	// The previous presentation lock excludes every same-scope publication
+	// while the external registrar runs. Revalidate before committing anyway.
+	m.activeMu.Lock()
+	defer m.activeMu.Unlock()
+	if m.current[scope] != previous {
+		return ErrStaleReconnect
+	}
+	if _, exists := m.active[runtime.key]; exists {
+		return ErrSessionAlreadyActive
+	}
+	if m.logical[runtime.key.sessionID] != logical || logical.scope != scope || logical.highWater != runtime.key.incarnation ||
+		logical.state != logicalEstablishing || logical.runtime != nil || logical.reconnecting {
+		return ErrStaleReconnect
 	}
 	if m.current == nil {
 		m.current = make(map[handoff.Scope]*sessionRuntime)
@@ -2719,7 +2817,13 @@ func (m *Manager) unregister(key runtimeKey, runtime *sessionRuntime) error {
 	var reconnectEpoch identity.ResponseEpoch
 	var reconnectBoundary bool
 	tombstoneReconnectOwner := false
+	// Fence presentation, directory ownership, and runtime intake in the global
+	// order. Durable tombstoning and subscription callbacks happen after unlock.
+	runtime.presentationMu.Lock()
 	m.activeMu.Lock()
+	runtime.mu.Lock()
+	runtime.accepting = false
+	runtime.acceptanceGeneration++
 	if m.active[key] == runtime {
 		delete(m.active, key)
 	}
@@ -2739,8 +2843,10 @@ func (m *Manager) unregister(key runtimeKey, runtime *sessionRuntime) error {
 		logical.state = logicalTombstoned
 		tombstoneReconnectOwner = m.ReconnectEnabled()
 	}
+	runtime.mu.Unlock()
 	tombstones := m.pruneLogicalLocked(m.now())
 	m.activeMu.Unlock()
+	runtime.presentationMu.Unlock()
 	m.observeReconnectTombstones(tombstones)
 	if tombstoneReconnectOwner {
 		ctx, cancel := context.WithTimeout(context.Background(), internalCloseTimeout)
@@ -2790,52 +2896,78 @@ func (m *Manager) OfferHandoffEvent(ctx context.Context, scope handoff.Scope, ev
 	}
 	offerCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	// This snapshot holds no runtime lock, so the inverse runtime -> directory
+	// edge is impossible. Ownership is revalidated after bounded admission.
 	m.activeMu.RLock()
 	runtime := m.current[scope]
 	m.activeMu.RUnlock()
 	if runtime == nil {
 		return handoff.ErrNoLiveSession
 	}
-	runtime.presentationMu.Lock()
 	select {
 	case <-runtime.inboxSlots:
 	case <-runtime.done:
-		runtime.presentationMu.Unlock()
 		return handoff.ErrNoLiveSession
 	case <-offerCtx.Done():
-		runtime.presentationMu.Unlock()
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		return ErrControlOverflow
 	}
+	if m.cfg.offerRevalidationGate != nil {
+		if gate := m.cfg.offerRevalidationGate(); gate != nil {
+			select {
+			case <-gate:
+			case <-runtime.done:
+				runtime.inboxSlots <- struct{}{}
+				return handoff.ErrNoLiveSession
+			case <-offerCtx.Done():
+				runtime.inboxSlots <- struct{}{}
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return ErrControlOverflow
+			}
+		}
+	}
 	message := reactorMessage{
 		input:        HandoffEventInput{Scope: scope, Event: handoff.CloneEvent(event)},
 		ingressAfter: runtime.state.latestIngressSequence(), done: make(chan error, 1),
 	}
-	runtime.mu.Lock()
+	runtime.presentationMu.Lock()
 	m.activeMu.RLock()
+	runtime.mu.Lock()
 	current := m.current[scope]
-	m.activeMu.RUnlock()
 	if current != runtime || !runtime.accepting {
 		runtime.mu.Unlock()
-		runtime.inboxSlots <- struct{}{}
+		m.activeMu.RUnlock()
 		runtime.presentationMu.Unlock()
+		runtime.inboxSlots <- struct{}{}
 		return handoff.ErrNoLiveSession
 	}
 	select {
 	case <-runtime.done:
 		runtime.mu.Unlock()
-		runtime.inboxSlots <- struct{}{}
+		m.activeMu.RUnlock()
 		runtime.presentationMu.Unlock()
+		runtime.inboxSlots <- struct{}{}
 		return handoff.ErrNoLiveSession
 	default:
 	}
 	runtime.state.acceptControl(&message)
 	message.acceptanceChecked = true
 	message.acceptanceGeneration = runtime.acceptanceGeneration
-	runtime.inbox <- message
+	select {
+	case runtime.inbox <- message:
+	default:
+		runtime.mu.Unlock()
+		m.activeMu.RUnlock()
+		runtime.presentationMu.Unlock()
+		runtime.inboxSlots <- struct{}{}
+		return ErrControlOverflow
+	}
 	runtime.mu.Unlock()
+	m.activeMu.RUnlock()
 	runtime.presentationMu.Unlock()
 	select {
 	case err := <-message.done:

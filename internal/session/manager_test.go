@@ -2163,6 +2163,147 @@ func TestManagerReconnectRetryIsBoundedCancellableAndOnlyAtTurnBoundary(t *testi
 	require.Equal(t, int32(1), connector.calls.Load())
 }
 
+func TestOfferReconnectLockOrderCompletes(t *testing.T) {
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "offer-reconnect-lock-order"}
+	offerAtRevalidation := make(chan struct{})
+	releaseOffer := make(chan struct{})
+	var gateOnce sync.Once
+	store := &blockingRecoveryStore{
+		snapshot: RecoverySnapshot{ConversationID: scope.ConversationID},
+		started:  make(chan struct{}), release: make(chan struct{}),
+	}
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		RecoveryStore: store,
+		offerRevalidationGate: func() <-chan struct{} {
+			gateOnce.Do(func() { close(offerAtRevalidation) })
+			return releaseOffer
+		},
+	}, &failingReconnectConnector{}, managerIDs{})
+	require.NoError(t, manager.validationErr)
+	runtime, _, runtimeDone := currentRuntime(scope, "offer-reconnect-session")
+	t.Cleanup(func() { close(runtimeDone) })
+	require.NoError(t, manager.register(runtime))
+
+	offerDone := make(chan error, 1)
+	go func() {
+		offerDone <- manager.OfferHandoffEvent(context.Background(), scope, handoff.Event{
+			Seq: 1, EventID: "offer-reconnect-event", HandoffID: "handoff", TenantID: scope.TenantID,
+			ConversationID: scope.ConversationID, Kind: "handoff.created", State: handoff.StatePending,
+			Payload: json.RawMessage(`{}`),
+		})
+	}()
+	select {
+	case <-offerAtRevalidation:
+	case <-time.After(time.Second):
+		t.Fatal("offer did not reach ownership revalidation")
+	}
+
+	reconnectCtx, cancelReconnect := context.WithCancel(context.Background())
+	reconnectDone := make(chan error, 1)
+	go func() {
+		reconnectDone <- manager.Reconnect(reconnectCtx, ReconnectRequest{
+			Scope: scope, SessionID: runtime.key.sessionID, LastIncarnation: runtime.key.incarnation,
+		}, newChannelClient(1))
+	}()
+	select {
+	case <-store.started:
+	case <-time.After(time.Second):
+		t.Fatal("reconnect did not enter its recovery preflight")
+	}
+	manager.activeMu.RLock()
+	directoryReadHeld := true
+	defer func() {
+		if directoryReadHeld {
+			manager.activeMu.RUnlock()
+		}
+	}()
+	close(store.release)
+	require.Eventually(t, func() bool {
+		if manager.activeMu.TryRLock() {
+			manager.activeMu.RUnlock()
+			return false
+		}
+		return true
+	}, time.Second, time.Millisecond, "reconnect did not reach the directory ownership boundary")
+
+	cancelReconnect()
+	close(releaseOffer)
+	manager.activeMu.RUnlock()
+	directoryReadHeld = false
+	select {
+	case err := <-offerDone:
+		require.NoError(t, err)
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("offer and reconnect deadlocked across runtime and directory ownership")
+	}
+	select {
+	case err := <-reconnectDone:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("reconnect did not release directory ownership after cancellation")
+	}
+}
+
+func TestShutdownUnregisterLockOrderCompletes(t *testing.T) {
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "shutdown-unregister-lock-order"}
+	offerAtRevalidation := make(chan struct{})
+	releaseOffer := make(chan struct{})
+	var gateOnce sync.Once
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		offerRevalidationGate: func() <-chan struct{} {
+			gateOnce.Do(func() { close(offerAtRevalidation) })
+			return releaseOffer
+		},
+	}, testkit.NewFakeConnector(1), managerIDs{})
+	require.NoError(t, manager.validationErr)
+	runtime, _, runtimeDone := currentRuntime(scope, "shutdown-unregister-session")
+	t.Cleanup(func() { close(runtimeDone) })
+	require.NoError(t, manager.register(runtime))
+
+	offerDone := make(chan error, 1)
+	go func() {
+		offerDone <- manager.OfferHandoffEvent(context.Background(), scope, handoff.Event{
+			Seq: 1, EventID: "shutdown-unregister-event", HandoffID: "handoff", TenantID: scope.TenantID,
+			ConversationID: scope.ConversationID, Kind: "handoff.created", State: handoff.StatePending,
+			Payload: json.RawMessage(`{}`),
+		})
+	}()
+	select {
+	case <-offerAtRevalidation:
+	case <-time.After(time.Second):
+		t.Fatal("offer did not reach ownership revalidation")
+	}
+
+	shutdownStarted := make(chan struct{})
+	shutdownDone := make(chan error, 1)
+	go func() {
+		close(shutdownStarted)
+		runtime.stop()
+		shutdownDone <- manager.unregister(runtime.key, runtime)
+	}()
+	<-shutdownStarted
+	select {
+	case err := <-shutdownDone:
+		require.NoError(t, err)
+	case <-time.After(250 * time.Millisecond):
+		close(releaseOffer)
+		t.Fatal("shutdown unregister deadlocked with offer ownership revalidation")
+	}
+	close(releaseOffer)
+	select {
+	case err := <-offerDone:
+		require.ErrorIs(t, err, handoff.ErrNoLiveSession)
+	case <-time.After(time.Second):
+		t.Fatal("stale offer did not complete after shutdown unregister")
+	}
+	manager.activeMu.RLock()
+	require.Empty(t, manager.active)
+	require.Empty(t, manager.current)
+	manager.activeMu.RUnlock()
+}
+
 func TestManagerReconnectCleanupIsDeadlineBoundedAndNeverPublishesEarly(t *testing.T) {
 	t.Run("client close honors reconnect deadline", func(t *testing.T) {
 		connector := testkit.NewFakeConnector(4)

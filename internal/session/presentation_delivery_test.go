@@ -581,7 +581,8 @@ func TestOfferTimeoutDoesNotHoldDirectoryLockOrQuiesceProvider(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("replacement publication was blocked by the timed-out offer")
 	}
-	require.True(t, waitCurrent("context-replacement"))
+	require.Eventually(t, func() bool { return waitCurrent("context-replacement") }, time.Second, time.Millisecond,
+		"replacement registration callback returned before directory publication completed")
 	oldCancel()
 	select {
 	case <-policy.cancelled:
@@ -967,6 +968,78 @@ func TestFailedReconnectSameScopePublicationRestoresPriorRuntime(t *testing.T) {
 
 	require.NoError(t, manager.registerReplacement(replacement, logical, 1))
 	manager.rollbackReplacementPublication(replacement, logical, 1, 0)
+
+	manager.activeMu.RLock()
+	require.Same(t, previous, manager.current[scope])
+	manager.activeMu.RUnlock()
+	previous.mu.Lock()
+	require.True(t, previous.accepting)
+	require.Equal(t, originalGeneration, previous.acceptanceGeneration)
+	previous.mu.Unlock()
+}
+
+func TestSameScopeReplacementRollbackLockOrderCompletes(t *testing.T) {
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "replacement-rollback-lock-order"}
+	offerAtRevalidation := make(chan struct{})
+	releaseOffer := make(chan struct{})
+	var gateOnce sync.Once
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		offerRevalidationGate: func() <-chan struct{} {
+			gateOnce.Do(func() { close(offerAtRevalidation) })
+			return releaseOffer
+		},
+	}, testkit.NewFakeConnector(1), managerIDs{})
+	require.NoError(t, manager.validationErr)
+	previous, _, previousDone := currentRuntime(scope, "replacement-rollback-previous")
+	t.Cleanup(func() { close(previousDone) })
+	require.NoError(t, manager.register(previous))
+	previous.mu.Lock()
+	originalGeneration := previous.acceptanceGeneration
+	previous.mu.Unlock()
+
+	offerDone := make(chan error, 1)
+	go func() {
+		offerDone <- manager.OfferHandoffEvent(context.Background(), scope, handoff.Event{
+			Seq: 1, EventID: "replacement-rollback-event", HandoffID: "handoff", TenantID: scope.TenantID,
+			ConversationID: scope.ConversationID, Kind: "handoff.created", State: handoff.StatePending,
+			Payload: json.RawMessage(`{}`),
+		})
+	}()
+	select {
+	case <-offerAtRevalidation:
+	case <-time.After(time.Second):
+		t.Fatal("offer did not reach ownership revalidation")
+	}
+
+	replacement, _, replacementDone := currentRuntime(scope, "replacement-rollback-new")
+	t.Cleanup(func() { close(replacementDone) })
+	replacementDonePublishing := make(chan error, 1)
+	go func() {
+		if err := manager.register(replacement); err != nil {
+			replacementDonePublishing <- err
+			return
+		}
+		manager.activeMu.RLock()
+		logical := manager.logical[replacement.key.sessionID]
+		manager.activeMu.RUnlock()
+		manager.rollbackInitialPublication(replacement, logical)
+		replacementDonePublishing <- nil
+	}()
+	select {
+	case err := <-replacementDonePublishing:
+		require.NoError(t, err)
+	case <-time.After(250 * time.Millisecond):
+		close(releaseOffer)
+		t.Fatal("same-scope replacement rollback deadlocked with offer ownership revalidation")
+	}
+	close(releaseOffer)
+	select {
+	case err := <-offerDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("offer did not complete after same-scope replacement rollback")
+	}
 
 	manager.activeMu.RLock()
 	require.Same(t, previous, manager.current[scope])
