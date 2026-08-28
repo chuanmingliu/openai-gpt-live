@@ -22,8 +22,11 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/config"
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
+	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
+	"github.com/chuanmingliu/openai-gpt-live/internal/session"
 	"github.com/chuanmingliu/openai-gpt-live/internal/store/postgres"
 	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
+	"github.com/coder/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -445,6 +448,92 @@ func TestGatewayResolvesAllActiveSecretsBeforeDatabaseOrListenerActivity(t *test
 	}
 }
 
+func TestGatewaySuccessfulConsumerConstructionReleasesStagingSecrets(t *testing.T) {
+	staticStaging := []byte("development-token")
+	retentionStaging := bytes.Repeat([]byte{7}, 32)
+	reconnectStaging := bytes.Repeat([]byte{9}, 32)
+	resolved := gatewayRuntimeSecrets{
+		providerCredential: "provider-token",
+		staticBearer:       staticStaging,
+		databaseURL:        "postgres://live@127.0.0.1:5432/live?sslmode=disable",
+		retentionKey:       retentionStaging,
+		reconnectKey:       reconnectStaging,
+	}
+	cfg := config.Config{
+		Mode: "local",
+		Gateway: config.GatewayConfig{
+			Voice:     config.VoiceConfig{URL: "ws://127.0.0.1:1/v1/realtime", Model: "test"},
+			WebSocket: config.WebSocketConfig{MaxFrameBytes: 1 << 20},
+		},
+		Auth: config.AuthConfig{
+			StaticBearerEnv: "STATIC_TOKEN", StaticTenantID: "tenant", StaticUserID: "user",
+			StaticScopes: []string{"realtime"}, AllowedOrigins: []string{"http://app.example"},
+		},
+		Admission: config.AdmissionConfig{GlobalRate: 10, GlobalBurst: 10, IPRate: 10, IPBurst: 10, IPKeyTTL: time.Minute, MaxIPKeys: 10},
+		Store:     config.StoreConfig{Retention: config.RetentionConfig{ApprovalTTL: 5 * time.Minute, HMACKeyEnv: "RETENTION_KEY", HMACKeyID: "retention-v1"}},
+	}
+
+	controller, closeAdmission, err := composeAdmission(t.Context(), cfg, &resolved)
+	require.NoError(t, err)
+	require.Nil(t, closeAdmission)
+	assert.Nil(t, resolved.staticBearer)
+	assert.Equal(t, make([]byte, len(staticStaging)), staticStaging)
+	request := httptest.NewRequest(http.MethodGet, "http://gateway.example/v1/realtime", nil)
+	request.RemoteAddr = "192.0.2.1:1234"
+	request.Header.Set("Origin", "http://app.example")
+	request.Header.Set("Authorization", "Bearer development-token")
+	_, release, err := controller.Admit(t.Context(), request)
+	require.NoError(t, err, "static authenticator must retain its digest after staging is cleared")
+	release()
+
+	authorization := make(chan string, 1)
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		authorization <- request.Header.Get("Authorization")
+		connection, acceptErr := websocket.Accept(writer, request, nil)
+		if acceptErr != nil {
+			return
+		}
+		defer connection.CloseNow()
+		_, _, _ = connection.Read(context.Background())
+	}))
+	t.Cleanup(provider.Close)
+	cfg.Gateway.Voice.URL = "ws" + strings.TrimPrefix(provider.URL, "http")
+	connector, err := composeGatewayConnector(cfg, &resolved)
+	require.NoError(t, err)
+	assert.Empty(t, resolved.providerCredential)
+	providerSession, err := connector.Connect(t.Context(), realtime.OpenRequest{Model: "test"})
+	require.NoError(t, err)
+	assert.Equal(t, "Bearer provider-token", <-authorization, "provider connector must retain its credential after staging is dropped")
+	closeCtx, cancelClose := context.WithTimeout(context.Background(), time.Second)
+	defer cancelClose()
+	require.NoError(t, providerSession.Close(closeCtx))
+
+	pool, err := newGatewayFeaturePool(t.Context(), &resolved)
+	require.NoError(t, err)
+	defer pool.Close()
+	assert.Empty(t, resolved.databaseURL)
+	assert.Contains(t, pool.Config().ConnString(), "postgres://live@127.0.0.1:5432/live", "pool must retain its parsed database configuration after staging is dropped")
+	repository, err := newGatewayRepository(pool, cfg, &resolved)
+	require.NoError(t, err)
+	defer repository.CloseSensitive()
+	assert.Nil(t, resolved.retentionKey)
+	assert.Equal(t, make([]byte, len(retentionStaging)), retentionStaging)
+	assert.True(t, repository.RetentionConfigured(), "repository must retain its owned retention key copy")
+
+	credentials, err := newGatewayReconnectCredentials(&resolved)
+	require.NoError(t, err)
+	assert.Nil(t, resolved.reconnectKey)
+	assert.Equal(t, make([]byte, len(reconnectStaging)), reconnectStaging)
+	issued, err := credentials.Issue(session.ReconnectClaims{
+		Scope:     handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "conversation"},
+		SessionID: "session", Incarnation: 1, Model: "test", ExpiresAt: time.Now().Add(time.Minute),
+		ProfileID: "profile", ProfileVersion: 1, ProfileSnapshotHash: strings.Repeat("a", 64),
+		ProfileEngineVersion: "jinja-go-v1/minijinja-go/v2.24.0",
+	})
+	require.NoError(t, err, "reconnect authority must retain its owned key copy")
+	assert.NotEmpty(t, issued.Credential)
+}
+
 func reserveGatewayTestAddress(t *testing.T) string {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -692,7 +781,7 @@ func TestGatewayDeliveryShardIsStableAcrossReplicaReplacementAndRegionIsolated(t
 }
 
 func TestComposeGatewayReconnectFailsClosedWithoutProductionRuntime(t *testing.T) {
-	option, err := composeGatewayReconnect(config.Config{Mode: "local"}, nil, gatewayRuntimeSecrets{}, nil)
+	option, err := composeGatewayReconnect(config.Config{Mode: "local"}, nil, &gatewayRuntimeSecrets{}, nil)
 	assert.NoError(t, err)
 	assert.Nil(t, option)
 
@@ -701,7 +790,7 @@ func TestComposeGatewayReconnectFailsClosedWithoutProductionRuntime(t *testing.T
 	cfg.Gateway.Reconnect.HMACKeyID = "reconnect-v1"
 	cfg.Gateway.Reconnect.CredentialTTL = 5 * time.Minute
 	cfg.Admission.InstanceID = "gateway-a"
-	option, err = composeGatewayReconnect(cfg, nil, gatewayRuntimeSecrets{}, func(string) (string, bool) { return "", false })
+	option, err = composeGatewayReconnect(cfg, nil, &gatewayRuntimeSecrets{}, func(string) (string, bool) { return "", false })
 	assert.Nil(t, option)
 	assert.ErrorContains(t, err, "runtime")
 }
@@ -791,7 +880,7 @@ auth:
 
 func TestComposeAdmissionUsesConfiguredStaticDevelopmentIdentity(t *testing.T) {
 	cfg := config.Config{Mode: "local", Auth: config.AuthConfig{StaticBearerEnv: "STATIC_TOKEN", StaticTenantID: "tenant", StaticUserID: "user", StaticScopes: []string{"realtime"}, AllowedOrigins: []string{"http://app.example"}}, Admission: config.AdmissionConfig{GlobalRate: 10, GlobalBurst: 10, IPRate: 10, IPBurst: 10, IPKeyTTL: time.Minute, MaxIPKeys: 10}}
-	controller, closeAdmission, err := composeAdmission(t.Context(), cfg, gatewayRuntimeSecrets{staticBearer: "development-token"})
+	controller, closeAdmission, err := composeAdmission(t.Context(), cfg, &gatewayRuntimeSecrets{staticBearer: []byte("development-token")})
 	require.NoError(t, err)
 	require.Nil(t, closeAdmission)
 	request := httptest.NewRequest(http.MethodGet, "http://gateway.example/v1/realtime", nil)

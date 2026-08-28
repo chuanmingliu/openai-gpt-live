@@ -46,7 +46,7 @@ func TestComposeGatewayFailureAfterRepositoryZeroizesOwnedRetentionKey(t *testin
 	}
 	defer func() { composeGatewayRepositoryHook = previous }()
 	resolved := gatewayRuntimeSecrets{databaseURL: cfg.Store.URL, retentionKey: bytes.Repeat([]byte{8}, 32)}
-	runtime, err := composeGatewayFeatures(t.Context(), cfg, resolved)
+	runtime, err := composeGatewayFeatures(t.Context(), cfg, &resolved)
 	assert.Nil(t, runtime)
 	assert.ErrorIs(t, err, fault)
 	require.NotNil(t, captured)
