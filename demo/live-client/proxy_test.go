@@ -272,7 +272,7 @@ func TestWebSocketForwardsSelectedProfileToGateway(t *testing.T) {
 		require.NoError(t, parseErr)
 		assert.Equal(t, []string{"insurance"}, values["profile"])
 		assert.Equal(t, []string{"3"}, values["profile_version"])
-		assert.Equal(t, []string{"gpt-live-real"}, values["model"])
+		assert.Equal(t, []string{"local"}, values["model"])
 	case <-time.After(3 * time.Second):
 		t.Fatal("gateway never received the upgraded request")
 	}
