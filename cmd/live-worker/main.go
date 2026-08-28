@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"flag"
@@ -25,6 +24,7 @@ import (
 	knowledgeadapter "github.com/chuanmingliu/openai-gpt-live/internal/adapters/knowledge"
 	"github.com/chuanmingliu/openai-gpt-live/internal/admin"
 	"github.com/chuanmingliu/openai-gpt-live/internal/auth"
+	"github.com/chuanmingliu/openai-gpt-live/internal/cliopt"
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
 	"github.com/chuanmingliu/openai-gpt-live/internal/config"
 	"github.com/chuanmingliu/openai-gpt-live/internal/feature"
@@ -36,6 +36,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/reasoner/deepseek"
 	retentioncontrol "github.com/chuanmingliu/openai-gpt-live/internal/retention"
 	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
+	"github.com/chuanmingliu/openai-gpt-live/internal/secretbuf"
 	"github.com/chuanmingliu/openai-gpt-live/internal/store/postgres"
 	"github.com/chuanmingliu/openai-gpt-live/internal/telemetry"
 	"github.com/chuanmingliu/openai-gpt-live/internal/tools/websearch"
@@ -74,6 +75,30 @@ type serviceRuntime interface {
 
 type runtimeBuilder func(context.Context, config.Config, resolvedSecrets) (serviceRuntime, error)
 
+const (
+	workerSecretMaximumBytes     = 16 * 1024
+	workerHMACEncodedMaximumSize = 4 * ((4096 + 2) / 3)
+)
+
+type backendFlag struct {
+	value   string
+	present bool
+}
+
+func (b *backendFlag) Set(value string) error {
+	if b.present {
+		return errors.New("worker backend was provided more than once")
+	}
+	if value != "none" && value != "durable" {
+		return errors.New("worker backend is invalid")
+	}
+	b.value = value
+	b.present = true
+	return nil
+}
+
+func (*backendFlag) String() string { return "" }
+
 var buildRuntimeRepositoryHook func(*postgres.Repository) error
 
 var commandOutput io.Writer = os.Stdout
@@ -82,13 +107,13 @@ func main() {
 	telemetry.InstallDefaultRedactingLogger(nil)
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	if err := runWithBuilder(ctx, os.Args[1:], os.LookupEnv, buildRuntime); err != nil {
+	if err := runWithBuilders(ctx, os.Args[1:], os.LookupEnv, buildRuntime, buildIdleRuntime); err != nil {
 		slog.Error("live worker stopped", "error", err)
 		os.Exit(1)
 	}
 }
 
-func runWithBuilder(ctx context.Context, args []string, lookup func(string) (string, bool), builder runtimeBuilder) error {
+func runWithBuilders(ctx context.Context, args []string, lookup func(string) (string, bool), durableBuilder runtimeBuilder, idleBuilder idleRuntimeBuilder) error {
 	if ctx == nil {
 		return errors.New("worker context is required")
 	}
@@ -97,20 +122,41 @@ func runWithBuilder(ctx context.Context, args []string, lookup func(string) (str
 	}
 	flags := flag.NewFlagSet("live-worker", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	configPath := flags.String("config", "", "path to worker YAML configuration")
+	var configPath cliopt.OptionalPath
+	var backend backendFlag
+	flags.Var(&configPath, "config", "path to worker YAML configuration")
+	flags.Var(&backend, "backend", "worker backend: none or durable")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 {
 		return errors.New("positional arguments are not accepted")
 	}
-	if *configPath == "" {
+	if backend.value == "none" {
+		if configPath.Present() {
+			return errors.New("-config is not accepted with --backend none")
+		}
+		runtime, err := idleBuilder(ctx)
+		if err != nil {
+			return err
+		}
+		if runtime == nil {
+			return errors.New("idle worker runtime builder returned nil")
+		}
+		defer runtime.Close()
+		err = runtime.Run(ctx)
+		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
+			return nil
+		}
+		return err
+	}
+	if !configPath.Present() {
 		return errors.New("-config is required")
 	}
 	if lookup == nil {
 		lookup = os.LookupEnv
 	}
-	cfg, err := config.LoadUnresolved(*configPath)
+	cfg, err := config.LoadUnresolved(configPath.Path())
 	if err != nil {
 		return fmt.Errorf("load worker configuration: %w", err)
 	}
@@ -124,7 +170,7 @@ func runWithBuilder(ctx context.Context, args []string, lookup func(string) (str
 	}
 	redactions := append([]string(nil), secrets.raw...)
 	defer secrets.clear()
-	runtime, err := builder(ctx, cfg, secrets)
+	runtime, err := durableBuilder(ctx, cfg, secrets)
 	// Builders own any copies needed by the runtime. Clear the resolver-owned
 	// byte buffers before Run begins, on both success and error paths.
 	secrets.clear()
@@ -150,14 +196,15 @@ func runCommand(ctx context.Context, args []string, lookup func(string) (string,
 	case "check-config", "config-hash":
 		flags := flag.NewFlagSet(args[0], flag.ContinueOnError)
 		flags.SetOutput(io.Discard)
-		path := flags.String("config", "", "configuration path")
+		var path cliopt.OptionalPath
+		flags.Var(&path, "config", "configuration path")
 		if err := flags.Parse(args[1:]); err != nil {
 			return true, err
 		}
-		if *path == "" || flags.NArg() != 0 {
+		if !path.Present() || flags.NArg() != 0 {
 			return true, errors.New("--config is required and extra arguments are not accepted")
 		}
-		cfg, err := config.LoadUnresolved(*path)
+		cfg, err := config.LoadUnresolved(path.Path())
 		if err != nil {
 			return true, err
 		}
@@ -219,27 +266,27 @@ func resolveSecrets(cfg config.Config, lookup func(string) (string, bool)) (reso
 			return resolvedSecrets{}, err
 		}
 	}
-	require := func(name, label string) (string, error) {
+	require := func(name, label string, maximumBytes int) (string, error) {
 		if name == "" {
 			return "", fmt.Errorf("%s environment variable is not configured", label)
 		}
-		value, ok := lookup(name)
-		if !ok || value == "" {
+		value, err := secretbuf.LookupText(lookup, name, maximumBytes)
+		if err != nil {
 			return "", fmt.Errorf("configured %s %s is unavailable", label, name)
 		}
 		secrets.raw = append(secrets.raw, value)
 		return value, nil
 	}
 	var err error
-	secrets.DatabaseURL, err = require(cfg.Store.DatabaseURLEnv, "database URL")
+	secrets.DatabaseURL, err = require(cfg.Store.DatabaseURLEnv, "database URL", workerSecretMaximumBytes)
 	if err != nil {
 		return resolvedSecrets{}, err
 	}
-	secrets.ProviderAPIKey, err = require(cfg.Worker.Reasoner.APIKeyEnv, "provider credential")
+	secrets.ProviderAPIKey, err = require(cfg.Worker.Reasoner.APIKeyEnv, "provider credential", workerSecretMaximumBytes)
 	if err != nil {
 		return resolvedSecrets{}, err
 	}
-	privacy, err := require(cfg.Safety.PrivacyHMACKeyEnv, "privacy HMAC key")
+	privacy, err := require(cfg.Safety.PrivacyHMACKeyEnv, "privacy HMAC key", workerSecretMaximumBytes)
 	if err != nil {
 		return resolvedSecrets{}, err
 	}
@@ -249,41 +296,45 @@ func resolveSecrets(cfg config.Config, lookup func(string) (string, bool)) (reso
 		return resolvedSecrets{}, errors.New("configured privacy HMAC key is too short")
 	}
 	if name := cfg.Features.ToolEncryptionKeyEnv; name != "" {
-		encoded, err := require(name, "tool encryption key")
+		encoded, err := require(name, "tool encryption key", workerHMACEncodedMaximumSize)
 		if err != nil {
 			secrets.clear()
 			return resolvedSecrets{}, err
 		}
-		key, err := base64.StdEncoding.DecodeString(encoded)
-		if err != nil || len(key) != 32 {
-			clear(key)
+		if err := secretbuf.WithDecodedBase64(encoded, func(key []byte) error {
+			if len(key) != 32 {
+				return errors.New("tool encryption key length is invalid")
+			}
+			secrets.ToolEncryptionKey = append([]byte(nil), key...)
+			return nil
+		}); err != nil {
 			secrets.clear()
 			return resolvedSecrets{}, errors.New("configured tool encryption key is invalid")
 		}
-		secrets.ToolEncryptionKey = append([]byte(nil), key...)
-		clear(key)
 	}
 	if cfg.Admin.ListenAddr != "" && !cfg.IsProduction() && cfg.UsesStaticAuth() {
-		secrets.AdminBearer, err = require(cfg.Auth.StaticBearerEnv, "admin bearer")
+		secrets.AdminBearer, err = require(cfg.Auth.StaticBearerEnv, "admin bearer", workerSecretMaximumBytes)
 		if err != nil {
 			secrets.clear()
 			return resolvedSecrets{}, err
 		}
 	}
 	if cfg.Store.Retention.HMACKeyEnv != "" {
-		encoded, err := require(cfg.Store.Retention.HMACKeyEnv, "retention HMAC key")
+		encoded, err := require(cfg.Store.Retention.HMACKeyEnv, "retention HMAC key", workerHMACEncodedMaximumSize)
 		if err != nil {
 			secrets.clear()
 			return resolvedSecrets{}, err
 		}
-		key, err := base64.StdEncoding.DecodeString(encoded)
-		if err != nil || len(key) < 32 || len(key) > 4096 {
-			clear(key)
+		if err := secretbuf.WithDecodedBase64(encoded, func(key []byte) error {
+			if len(key) < 32 || len(key) > 4096 {
+				return errors.New("retention HMAC key length is invalid")
+			}
+			secrets.RetentionHMACKey = append([]byte(nil), key...)
+			return nil
+		}); err != nil {
 			secrets.clear()
 			return resolvedSecrets{}, errors.New("configured retention HMAC key is invalid")
 		}
-		secrets.RetentionHMACKey = append([]byte(nil), key...)
-		clear(key)
 	}
 	return secrets, nil
 }
