@@ -47,6 +47,7 @@ set -euo pipefail
 printf '%s\n' "live-client $*" >>"${0}.calls"
 if [[ -n "${DEMO_TEST_LIVE_CLIENT_EXIT:-}" ]]; then exit 98; fi
 [[ -n "${LIVE_DEMO_BEARER:-}" ]] || exit 91
+[[ "$*" == *'-bearer-env LIVE_DEMO_BEARER'* ]] || exit 99
 if [[ "$*" != *'-operator'* ]]; then
   for forbidden in POSTGRES_PASSWORD S2S_API_KEY DEEPSEEK_API_KEY LIVE_STATIC_BEARER_TOKEN LIVE_ADMIN_BEARER_TOKEN LIVE_PRIVACY_HMAC_KEY LIVE_RETENTION_HMAC_KEY LIVE_RECONNECT_HMAC_KEY LIVE_TOOL_ENCRYPTION_KEY; do
     [[ -z "${!forbidden:-}" ]] || exit 94

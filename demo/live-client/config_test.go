@@ -10,19 +10,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestParseConfigAcceptsCanonicalLoopbackDefaults(t *testing.T) {
+func TestParseConfigDefaultsToCredentialFreeGateway(t *testing.T) {
 	cfg, err := parseConfig(nil)
 	require.NoError(t, err)
 	assert.Equal(t, "127.0.0.1:3000", cfg.ListenAddr)
-	assert.Equal(t, "ws://127.0.0.1:18080/v1/realtime", cfg.GatewayURL)
-	assert.Equal(t, "gpt-live-real", cfg.Model)
+	assert.Equal(t, "ws://127.0.0.1:8080/v1/realtime", cfg.GatewayURL)
+	assert.Equal(t, "local", cfg.Model)
 	assert.Equal(t, "http://127.0.0.1:3000", cfg.Origin)
-	assert.Equal(t, "LIVE_DEMO_BEARER", cfg.BearerEnv)
+	assert.Empty(t, cfg.BearerEnv)
 	assert.EqualValues(t, 64<<10, cfg.MaxFrameBytes)
 
 	upstream, err := cfg.upstreamURL()
 	require.NoError(t, err)
-	assert.Equal(t, "ws://127.0.0.1:18080/v1/realtime?model=gpt-live-real", upstream.String())
+	assert.Equal(t, "ws://127.0.0.1:8080/v1/realtime?model=local", upstream.String())
 }
 
 func TestParseConfigRejectsUnsafeNetworkAndURLInputs(t *testing.T) {
@@ -66,8 +66,22 @@ func TestParseConfigRequiresLiteralLoopbackGateway(t *testing.T) {
 	}
 }
 
-func TestResolveBearerRequiresNonemptyBoundedValueWithoutEchoingIt(t *testing.T) {
+func TestResolveBearerSkipsLookupWhenUnconfigured(t *testing.T) {
 	cfg, err := parseConfig(nil)
+	require.NoError(t, err)
+
+	lookups := 0
+	bearer, err := resolveBearer(cfg, func(string) (string, bool) {
+		lookups++
+		return "must not be read", true
+	})
+	require.NoError(t, err)
+	assert.Empty(t, bearer)
+	assert.Zero(t, lookups)
+}
+
+func TestResolveBearerKeepsExplicitEnvironmentStrict(t *testing.T) {
+	cfg, err := parseConfig([]string{"-bearer-env", "LIVE_DEMO_BEARER"})
 	require.NoError(t, err)
 
 	_, err = resolveBearer(cfg, func(string) (string, bool) { return "", false })
@@ -85,6 +99,8 @@ func TestResolveBearerRequiresNonemptyBoundedValueWithoutEchoingIt(t *testing.T)
 	_, err = resolveBearer(cfg, func(string) (string, bool) { return "contains whitespace", true })
 	assert.EqualError(t, err, "configured demo bearer is invalid")
 	_, err = resolveBearer(cfg, func(string) (string, bool) { return string(make([]byte, (16<<10)+1)), true })
+	assert.EqualError(t, err, "configured demo bearer is invalid")
+	_, err = resolveBearer(cfg, func(string) (string, bool) { return string([]byte{0xff}), true })
 	assert.EqualError(t, err, "configured demo bearer is invalid")
 }
 

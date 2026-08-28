@@ -19,7 +19,6 @@ demo-wizard:
 	./deploy/scripts/demo-wizard.sh
 
 demo-live-client:
-	@test -n "$$LIVE_DEMO_BEARER"
 	go run ./demo/live-client
 
 test-demo-live-client:

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 const maximumBearerBytes = 16 << 10
@@ -66,10 +67,10 @@ func (cfg profileAdminConfig) validate() error {
 func parseConfig(args []string) (demoConfig, error) {
 	cfg := demoConfig{
 		ListenAddr:    "127.0.0.1:3000",
-		GatewayURL:    "ws://127.0.0.1:18080/v1/realtime",
-		Model:         "gpt-live-real",
+		GatewayURL:    "ws://127.0.0.1:8080/v1/realtime",
+		Model:         "local",
 		Origin:        "http://127.0.0.1:3000",
-		BearerEnv:     "LIVE_DEMO_BEARER",
+		BearerEnv:     "",
 		MaxFrameBytes: 64 << 10,
 		Operator: operatorConfig{Readiness: map[operatorComponent]string{
 			componentSpeech:  "http://127.0.0.1:8766/v1/pool",
@@ -149,7 +150,7 @@ func (cfg demoConfig) validate() error {
 	if !modelPattern.MatchString(cfg.Model) {
 		return errors.New("demo model is invalid")
 	}
-	if !environmentPattern.MatchString(cfg.BearerEnv) {
+	if cfg.BearerEnv != "" && !environmentPattern.MatchString(cfg.BearerEnv) {
 		return errors.New("demo bearer environment name is invalid")
 	}
 	if cfg.MaxFrameBytes < 1024 || cfg.MaxFrameBytes > 1<<20 {
@@ -193,11 +194,14 @@ func (cfg demoConfig) upstreamURL() (*url.URL, error) {
 }
 
 func resolveBearer(cfg demoConfig, lookup func(string) (string, bool)) ([]byte, error) {
+	if cfg.BearerEnv == "" {
+		return nil, nil
+	}
 	value, ok := lookup(cfg.BearerEnv)
 	if !ok || value == "" {
 		return nil, errors.New("configured demo bearer is unavailable")
 	}
-	if len(value) > maximumBearerBytes || strings.IndexFunc(value, unicode.IsSpace) >= 0 || strings.IndexFunc(value, unicode.IsControl) >= 0 {
+	if len(value) > maximumBearerBytes || !utf8.ValidString(value) || strings.IndexFunc(value, unicode.IsSpace) >= 0 || strings.IndexFunc(value, unicode.IsControl) >= 0 {
 		return nil, errors.New("configured demo bearer is invalid")
 	}
 	return []byte(value), nil

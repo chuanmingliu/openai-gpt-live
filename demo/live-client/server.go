@@ -115,7 +115,7 @@ func newHandlerWithToolSearchContext(operatorContext context.Context, cfg demoCo
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
-	if len(bearer) == 0 || len(bearer) > maximumBearerBytes {
+	if len(bearer) > maximumBearerBytes {
 		return nil, errors.New("configured demo bearer is invalid")
 	}
 	upstream, err := cfg.upstreamURL()
@@ -394,7 +394,9 @@ func (handler *demoHandler) serveWebSocket(writer http.ResponseWriter, request *
 	defer browser.CloseNow()
 
 	header := http.Header{}
-	header.Set("Authorization", "Bearer "+string(handler.bearer))
+	if len(handler.bearer) > 0 {
+		header.Set("Authorization", "Bearer "+string(handler.bearer))
+	}
 	header.Set("Origin", handler.cfg.Origin)
 	upstream, err := handler.dial(request.Context(), upstreamURL, header)
 	if err != nil {

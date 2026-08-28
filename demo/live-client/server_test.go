@@ -520,6 +520,34 @@ func TestWebSocketRejectsForeignOriginBeforeDial(t *testing.T) {
 	assert.Zero(t, calls.Load())
 }
 
+func TestHandlerOmitsAuthorizationWithoutBearer(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		connection, err := websocket.Accept(writer, request, &websocket.AcceptOptions{InsecureSkipVerify: true})
+		require.NoError(t, err)
+		defer connection.CloseNow()
+		<-request.Context().Done()
+	}))
+	t.Cleanup(upstream.Close)
+
+	cfg, err := parseConfig(nil)
+	require.NoError(t, err)
+	handler, err := newHandler(cfg, nil, func(ctx context.Context, _ *url.URL, header http.Header) (*websocket.Conn, error) {
+		assert.NotContains(t, header, "Authorization")
+		connection, _, err := websocket.Dial(ctx, wsURL(upstream.URL), nil)
+		return connection, err
+	})
+	require.NoError(t, err)
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	header := http.Header{"Origin": []string{cfg.Origin}}
+	connection, upgraded, err := websocket.Dial(t.Context(), wsURL(server.URL)+"/ws", &websocket.DialOptions{HTTPHeader: header})
+	require.NoError(t, err)
+	require.NotNil(t, upgraded)
+	assert.Equal(t, http.StatusSwitchingProtocols, upgraded.StatusCode)
+	_ = connection.Close(websocket.StatusNormalClosure, "done")
+}
+
 func TestDefaultUpstreamDialRejectsRedirectWithoutContactingTargetOrForwardingBearer(t *testing.T) {
 	var targetCalls atomic.Int32
 	var targetAuthorization string
