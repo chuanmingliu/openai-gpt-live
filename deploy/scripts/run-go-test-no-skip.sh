@@ -91,12 +91,15 @@ terminated = set()
 test_runs = set()
 top_level = set()
 actions = {"start", "run", "pause", "cont", "pass", "bench", "fail", "output", "skip"}
+def reject_json_constant(_value):
+    raise ValueError("non-standard JSON constant")
+
 for line in text.splitlines():
     if not line:
         reject()
     try:
-        event = json.loads(line)
-    except (json.JSONDecodeError, UnicodeError):
+        event = json.loads(line, parse_constant=reject_json_constant)
+    except (json.JSONDecodeError, UnicodeError, ValueError):
         reject()
     if not isinstance(event, dict):
         reject()

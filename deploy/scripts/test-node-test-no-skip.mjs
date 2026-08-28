@@ -27,6 +27,24 @@ case "\${FAKE_NODE_CASE:?}" in
   mismatch)
     printf '%s\\n' 'TAP version 13' 'ok 1 - alpha' '1..1' '# tests 1' '# pass 1' '# fail 0'
     ;;
+  plan_skip)
+    printf '%s\\n' 'TAP version 13' 'ok 1 - alpha' '1..1 # SKIP all' '# tests 1' '# pass 1' '# fail 0' '# skipped 0' '# todo 0'
+    ;;
+  plan_suffix)
+    printf '%s\\n' 'TAP version 13' 'ok 1 - alpha' '1..1 # arbitrary' '# tests 1' '# pass 1' '# fail 0' '# skipped 0' '# todo 0'
+    ;;
+  summary_fail)
+    printf '%s\\n' 'TAP version 13' 'ok 1 - alpha' '1..1' '# tests 1' '# pass 1' '# fail 1' '# skipped 0' '# todo 0'
+    ;;
+  summary_skipped)
+    printf '%s\\n' 'TAP version 13' 'ok 1 - alpha' '1..1' '# tests 1' '# pass 1' '# fail 0' '# skipped 1' '# todo 0'
+    ;;
+  summary_todo)
+    printf '%s\\n' 'TAP version 13' 'ok 1 - alpha' '1..1' '# tests 1' '# pass 1' '# fail 0' '# skipped 0' '# todo 1'
+    ;;
+  summary_disabled)
+    printf '%s\\n' 'TAP version 13' 'ok 1 - alpha' '1..1' '# tests 1' '# pass 1' '# fail 0' '# skipped 0' '# todo 0' '# disabled 1'
+    ;;
   skipped)
     printf '%s\\n' 'TAP version 13' 'ok 1 - alpha # SKIP unavailable' '1..1' '# tests 1' '# pass 0' '# skipped 1'
     ;;
@@ -65,6 +83,12 @@ esac
   for (const [label, caseName, expected] of [
     ['child failure', 'failure', 1],
     ['root-count mismatch', 'mismatch', 2],
+    ['root-plan skip directive', 'plan_skip', 1],
+    ['root-plan arbitrary suffix', 'plan_suffix', 1],
+    ['nonzero fail summary', 'summary_fail', 1],
+    ['nonzero skipped summary', 'summary_skipped', 1],
+    ['nonzero todo summary', 'summary_todo', 1],
+    ['nonzero disabled summary', 'summary_disabled', 1],
     ['skip annotation', 'skipped', 1],
     ['disabled annotation', 'disabled', 1],
     ['truncated TAP', 'truncated', 1],

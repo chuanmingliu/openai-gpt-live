@@ -86,7 +86,7 @@ const plans = [];
 const rootResults = [];
 let invalid = false;
 for (const line of lines) {
-  const plan = /^1\.\.([0-9]+)(?:\s+#.*)?$/.exec(line);
+  const plan = /^1\.\.([0-9]+)$/.exec(line);
   if (plan) plans.push(Number(plan[1]));
   const result = /^(not ok|ok)\s+([0-9]+)(?:\s|$)/.exec(line);
   if (result) {
@@ -95,9 +95,12 @@ for (const line of lines) {
   }
   if (/^\s*not ok(?:\s|$)/.test(line)
       || /^\s*(?:not )?ok\b.*#\s*(?:skip|todo|disabled)\b/i.test(line)
+      || (/^1\.\./.test(line) && !plan)
       || /^Bail out!/i.test(line)) {
     invalid = true;
   }
+  const failureSummary = /^# (?:fail|skipped|todo|disabled) ([0-9]+)$/.exec(line);
+  if (failureSummary && Number(failureSummary[1]) !== 0) invalid = true;
 }
 
 const requiredIds = Array.from({ length: expected }, (_, position) => position + 1);

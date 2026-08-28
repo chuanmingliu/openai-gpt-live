@@ -54,6 +54,27 @@ case "${FAKE_GO_CASE:?}" in
     printf '%s\n' '{"Action":"start","Package":"example/a"}'
     printf '%s' '{"Action":"run","Package":"example/a","Test":"TestAlpha"'
     ;;
+  nan)
+    printf '%s\n' \
+      '{"Action":"start","Package":"example/a"}' \
+      '{"Action":"run","Package":"example/a","Test":"TestAlpha","Elapsed":NaN}' \
+      '{"Action":"pass","Package":"example/a","Test":"TestAlpha"}' \
+      '{"Action":"pass","Package":"example/a"}'
+    ;;
+  infinity)
+    printf '%s\n' \
+      '{"Action":"start","Package":"example/a"}' \
+      '{"Action":"run","Package":"example/a","Test":"TestAlpha"}' \
+      '{"Action":"pass","Package":"example/a","Test":"TestAlpha","Elapsed":Infinity}' \
+      '{"Action":"pass","Package":"example/a"}'
+    ;;
+  negative_infinity)
+    printf '%s\n' \
+      '{"Action":"start","Package":"example/a"}' \
+      '{"Action":"run","Package":"example/a","Test":"TestAlpha"}' \
+      '{"Action":"pass","Package":"example/a","Test":"TestAlpha"}' \
+      '{"Action":"pass","Package":"example/a","Elapsed":-Infinity}'
+    ;;
   zero_tests)
     printf '%s\n' \
       '{"Action":"start","Package":"example/a"}' \
@@ -107,6 +128,9 @@ expect_reject 'package skip' package_skip --expect-minimum 1
 expect_reject 'named-test skip' named_skip --expect-minimum 1
 expect_reject 'malformed JSON' malformed --expect-minimum 1
 expect_reject 'truncated JSON' truncated --expect-minimum 1
+expect_reject 'JSON NaN constant' nan --expect-minimum 1
+expect_reject 'JSON Infinity constant' infinity --expect-minimum 1
+expect_reject 'JSON negative Infinity constant' negative_infinity --expect-minimum 1
 expect_reject 'zero tests' zero_tests --expect-minimum 1
 expect_reject 'missing package terminal' missing_terminal --expect-minimum 1
 expect_reject 'unsorted top-level expectation' pass --expect-minimum 1 --expect-top-level TestBeta,TestAlpha
