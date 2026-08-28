@@ -52,10 +52,13 @@ type ReplayRegistrar interface {
 }
 
 // ReplayAttempt is an exact, one-shot reservation for publishing a replay
-// subscription. Commit and Rollback are infallible, concurrency-safe, and
-// idempotent; the first terminal operation wins.
+// subscription. Commit activates the replay without waking delivery, so the
+// owner can remove any external publication fence before calling Notify.
+// Commit and Rollback are infallible, concurrency-safe, and idempotent; the
+// first terminal operation wins. Notify is idempotent after Commit.
 type ReplayAttempt interface {
 	Commit()
+	Notify()
 	Rollback()
 }
 
@@ -76,19 +79,33 @@ type EventPump struct {
 	Tracer        trace.Tracer
 	Gates         interface{ Enabled(string) bool }
 
-	mu             sync.Mutex
-	subscriptions  map[EventSubscription]struct{}
-	replays        map[EventSubscription]int64
-	replayAttempts map[EventSubscription]*eventPumpReplayAttempt
-	changed        chan struct{}
-	running        bool
+	mu                  sync.Mutex
+	subscriptions       map[EventSubscription]struct{}
+	replays             map[EventSubscription]int64
+	replayAttempts      map[EventSubscription]*eventPumpReplayAttempt
+	deliveryGenerations map[EventSubscription]*eventPumpDeliveryGeneration
+	deliveryCancels     map[EventSubscription]eventPumpDeliveryCancel
+	changed             chan struct{}
+	running             bool
 }
 
 type eventPumpReplayAttempt struct {
 	pump         *EventPump
 	subscription EventSubscription
 	afterSeq     int64
+	notifyOnce   sync.Once
+	activated    bool
+	changed      chan struct{}
 }
+
+type eventPumpDeliveryCancel struct {
+	generation *eventPumpDeliveryGeneration
+	cancel     context.CancelFunc
+}
+
+// Pointer identity is the non-ABA delivery generation. The marker keeps
+// distinct live allocations from being permitted to share an address.
+type eventPumpDeliveryGeneration struct{ marker byte }
 
 type EventPumpMetrics struct {
 	Presentation func(time.Duration, string)
@@ -101,6 +118,7 @@ func (p *EventPump) RegisterReplay(subscription EventSubscription, afterSeq int6
 		return err
 	}
 	attempt.Commit()
+	attempt.Notify()
 	return nil
 }
 
@@ -142,16 +160,36 @@ func (a *eventPumpReplayAttempt) Commit() {
 		return
 	}
 	delete(p.replayAttempts, a.subscription)
+	cancelDelivery := p.takeDeliveryCancelLocked(a.subscription)
 	p.subscriptions[a.subscription] = struct{}{}
+	p.deliveryGenerations[a.subscription] = &eventPumpDeliveryGeneration{}
 	if current, exists := p.replays[a.subscription]; !exists || a.afterSeq < current {
 		p.replays[a.subscription] = a.afterSeq
 	}
-	changed := p.changed
+	a.activated = true
+	a.changed = p.changed
 	p.mu.Unlock()
-	select {
-	case changed <- struct{}{}:
-	default:
+	if cancelDelivery != nil {
+		cancelDelivery()
 	}
+}
+
+func (a *eventPumpReplayAttempt) Notify() {
+	if a == nil || a.pump == nil {
+		return
+	}
+	a.pump.mu.Lock()
+	activated, changed := a.activated, a.changed
+	a.pump.mu.Unlock()
+	if !activated || changed == nil {
+		return
+	}
+	a.notifyOnce.Do(func() {
+		select {
+		case changed <- struct{}{}:
+		default:
+		}
+	})
 }
 
 func (a *eventPumpReplayAttempt) Rollback() {
@@ -183,6 +221,7 @@ func (p *EventPump) Register(subscription EventSubscription) error {
 		return errors.New("event pump subscription limit exceeded")
 	}
 	p.subscriptions[subscription] = struct{}{}
+	p.deliveryGenerations[subscription] = &eventPumpDeliveryGeneration{}
 	select {
 	case p.changed <- struct{}{}:
 	default:
@@ -195,10 +234,15 @@ func (p *EventPump) Unregister(subscription EventSubscription) {
 		return
 	}
 	p.mu.Lock()
+	cancelDelivery := p.takeDeliveryCancelLocked(subscription)
 	delete(p.subscriptions, subscription)
 	delete(p.replays, subscription)
 	delete(p.replayAttempts, subscription)
+	delete(p.deliveryGenerations, subscription)
 	p.mu.Unlock()
+	if cancelDelivery != nil {
+		cancelDelivery()
+	}
 }
 
 func (p *EventPump) initializeRegistrationsLocked() {
@@ -211,9 +255,23 @@ func (p *EventPump) initializeRegistrationsLocked() {
 	if p.replayAttempts == nil {
 		p.replayAttempts = make(map[EventSubscription]*eventPumpReplayAttempt)
 	}
+	if p.deliveryGenerations == nil {
+		p.deliveryGenerations = make(map[EventSubscription]*eventPumpDeliveryGeneration)
+	}
+	if p.deliveryCancels == nil {
+		p.deliveryCancels = make(map[EventSubscription]eventPumpDeliveryCancel)
+	}
 	if p.changed == nil {
 		p.changed = make(chan struct{}, 1)
 	}
+}
+
+func (p *EventPump) takeDeliveryCancelLocked(subscription EventSubscription) context.CancelFunc {
+	if active, ok := p.deliveryCancels[subscription]; ok {
+		delete(p.deliveryCancels, subscription)
+		return active.cancel
+	}
+	return nil
 }
 
 func (p *EventPump) subscriptionCountLocked() int {
@@ -308,15 +366,30 @@ func (p *EventPump) subscriptionSnapshot(notification *EventWakeup) []EventSubsc
 }
 
 func (p *EventPump) deliverSubscription(ctx context.Context, subscription EventSubscription) error {
-	storedCursor, err := p.Cursors.LoadDeliveryCursor(ctx, subscription.ConsumerID, subscription.Scope)
+	deliveryCtx, generation, ok := p.beginDeliveryGeneration(ctx, subscription)
+	if !ok {
+		return nil
+	}
+	defer p.finishDeliveryGeneration(subscription, generation)
+	storedCursor, err := p.Cursors.LoadDeliveryCursor(deliveryCtx, subscription.ConsumerID, subscription.Scope)
 	if err != nil {
+		if !p.deliveryGenerationCurrent(subscription, generation) {
+			return nil
+		}
 		return err
+	}
+	if !p.deliveryGenerationCurrent(subscription, generation) {
+		return nil
 	}
 	if storedCursor < 0 {
 		return errors.New("event pump cursor is negative")
 	}
 	cursor := storedCursor
 	p.mu.Lock()
+	if !p.deliveryGenerationCurrentLocked(subscription, generation) {
+		p.mu.Unlock()
+		return nil
+	}
 	if replay, ok := p.replays[subscription]; ok && replay < cursor {
 		cursor = replay
 	} else if ok {
@@ -324,9 +397,15 @@ func (p *EventPump) deliverSubscription(ctx context.Context, subscription EventS
 	}
 	p.mu.Unlock()
 	for {
-		events, err := p.Reader.ReadEvents(ctx, subscription.Scope, cursor, eventPumpPageSize)
+		events, err := p.Reader.ReadEvents(deliveryCtx, subscription.Scope, cursor, eventPumpPageSize)
 		if err != nil {
+			if !p.deliveryGenerationCurrent(subscription, generation) {
+				return nil
+			}
 			return err
+		}
+		if !p.deliveryGenerationCurrent(subscription, generation) {
+			return nil
 		}
 		if len(events) > eventPumpPageSize {
 			return errors.New("event reader exceeded requested page size")
@@ -345,10 +424,13 @@ func (p *EventPump) deliverSubscription(ctx context.Context, subscription EventS
 			if event.Seq <= storedCursor && p.Metrics.Duplicate != nil {
 				p.Metrics.Duplicate("replay")
 			}
-			offerCtx := ctx
+			if !p.admitDeliveryEffect(subscription, generation) {
+				return nil
+			}
+			offerCtx := deliveryCtx
 			var span trace.Span
 			if p.Tracer != nil {
-				offerCtx, span = p.Tracer.Start(ctx, "gateway.presentation.offer")
+				offerCtx, span = p.Tracer.Start(deliveryCtx, "gateway.presentation.offer")
 			}
 			var offerErr error
 			shadow := p.Gates != nil && p.Gates.Enabled(feature.ShadowMode)
@@ -358,6 +440,12 @@ func (p *EventPump) deliverSubscription(ctx context.Context, subscription EventS
 				// transition is recorded as shadow even when the session's final
 				// visual/speech checks performed the actual suppression.
 				shadow = p.Gates != nil && p.Gates.Enabled(feature.ShadowMode)
+			}
+			if !p.deliveryGenerationCurrent(subscription, generation) {
+				if span != nil {
+					span.End()
+				}
+				return nil
 			}
 			result := "ok"
 			if shadow {
@@ -383,12 +471,25 @@ func (p *EventPump) deliverSubscription(ctx context.Context, subscription EventS
 			}
 			for acknowledged := index; acknowledged < end; acknowledged++ {
 				if events[acknowledged].Seq > storedCursor {
-					if err := p.Cursors.AdvanceDeliveryCursor(ctx, subscription.ConsumerID, subscription.Scope, events[acknowledged].Seq); err != nil {
+					if !p.admitDeliveryEffect(subscription, generation) {
+						return nil
+					}
+					if err := p.Cursors.AdvanceDeliveryCursor(deliveryCtx, subscription.ConsumerID, subscription.Scope, events[acknowledged].Seq); err != nil {
+						if !p.deliveryGenerationCurrent(subscription, generation) {
+							return nil
+						}
 						return err
+					}
+					if !p.deliveryGenerationCurrent(subscription, generation) {
+						return nil
 					}
 				}
 				cursor = events[acknowledged].Seq
 				p.mu.Lock()
+				if !p.deliveryGenerationCurrentLocked(subscription, generation) {
+					p.mu.Unlock()
+					return nil
+				}
 				if replay, ok := p.replays[subscription]; ok && replay <= cursor {
 					if cursor >= storedCursor {
 						delete(p.replays, subscription)
@@ -404,6 +505,56 @@ func (p *EventPump) deliverSubscription(ctx context.Context, subscription EventS
 			return nil
 		}
 	}
+}
+
+func (p *EventPump) beginDeliveryGeneration(ctx context.Context, subscription EventSubscription) (context.Context, *eventPumpDeliveryGeneration, bool) {
+	p.mu.Lock()
+	generation, ok := p.deliveryGenerations[subscription]
+	if !ok {
+		p.mu.Unlock()
+		return nil, nil, false
+	}
+	previousCancel := p.takeDeliveryCancelLocked(subscription)
+	deliveryCtx, cancel := context.WithCancel(ctx)
+	p.deliveryCancels[subscription] = eventPumpDeliveryCancel{generation: generation, cancel: cancel}
+	p.mu.Unlock()
+	if previousCancel != nil {
+		previousCancel()
+	}
+	return deliveryCtx, generation, true
+}
+
+func (p *EventPump) finishDeliveryGeneration(subscription EventSubscription, generation *eventPumpDeliveryGeneration) {
+	p.mu.Lock()
+	active, ok := p.deliveryCancels[subscription]
+	if ok && active.generation == generation {
+		delete(p.deliveryCancels, subscription)
+	}
+	p.mu.Unlock()
+	if ok && active.generation == generation {
+		active.cancel()
+	}
+}
+
+func (p *EventPump) deliveryGenerationCurrent(subscription EventSubscription, generation *eventPumpDeliveryGeneration) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.deliveryGenerationCurrentLocked(subscription, generation)
+}
+
+// admitDeliveryEffect is the linearization point for Sink and cursor effects.
+// Activation and admission are serialized by p.mu. A later activation cancels
+// the generation context; every completion revalidates before any next effect
+// or replay mutation.
+func (p *EventPump) admitDeliveryEffect(subscription EventSubscription, generation *eventPumpDeliveryGeneration) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.deliveryGenerationCurrentLocked(subscription, generation)
+}
+
+func (p *EventPump) deliveryGenerationCurrentLocked(subscription EventSubscription, generation *eventPumpDeliveryGeneration) bool {
+	_, subscribed := p.subscriptions[subscription]
+	return subscribed && generation != nil && p.deliveryGenerations[subscription] == generation
 }
 
 func validateEventSubscription(subscription EventSubscription) error {

@@ -342,6 +342,58 @@ type replayRegistrarProbe struct {
 	installOnce     sync.Once
 }
 
+type gatedCommitReplayRegistrar struct {
+	pump          *handoff.EventPump
+	commitStarted chan struct{}
+	commitRelease <-chan struct{}
+	wakeResults   <-chan error
+	stop          <-chan struct{}
+}
+
+func (r *gatedCommitReplayRegistrar) Register(subscription handoff.EventSubscription) error {
+	return r.pump.Register(subscription)
+}
+
+func (r *gatedCommitReplayRegistrar) Unregister(subscription handoff.EventSubscription) {
+	r.pump.Unregister(subscription)
+}
+
+func (r *gatedCommitReplayRegistrar) BeginReplay(subscription handoff.EventSubscription, after int64) (handoff.ReplayAttempt, error) {
+	attempt, err := r.pump.BeginReplay(subscription, after)
+	if err != nil {
+		return nil, err
+	}
+	return &gatedCommitReplayAttempt{
+		ReplayAttempt: attempt, commitStarted: r.commitStarted, commitRelease: r.commitRelease,
+		wakeResults: r.wakeResults, stop: r.stop,
+	}, nil
+}
+
+type gatedCommitReplayAttempt struct {
+	handoff.ReplayAttempt
+	commitStarted chan struct{}
+	commitRelease <-chan struct{}
+	wakeResults   <-chan error
+	stop          <-chan struct{}
+	startedOnce   sync.Once
+}
+
+func (a *gatedCommitReplayAttempt) Commit() {
+	a.ReplayAttempt.Commit()
+	a.startedOnce.Do(func() { close(a.commitStarted) })
+	<-a.commitRelease
+}
+
+func (a *gatedCommitReplayAttempt) Notify() {
+	a.ReplayAttempt.Notify()
+	if a.wakeResults != nil {
+		select {
+		case <-a.wakeResults:
+		case <-a.stop:
+		}
+	}
+}
+
 func (r *replayRegistrarProbe) Register(subscription handoff.EventSubscription) error {
 	r.mu.Lock()
 	r.registerCalls++
@@ -1466,6 +1518,68 @@ func TestPendingReplayPublicationCannotDeliverThroughActivePreviousOwner(t *test
 		require.Equal(t, event.Seq, input.(HandoffEventInput).Event.Seq, "the unchanged replay must reach the committed replacement")
 	case <-time.After(time.Second):
 		t.Fatal("committed replacement did not receive the replay rejected during publication")
+	}
+}
+
+func TestCommittedReplayWakesPromptlyAfterManagerPublicationFenceClears(t *testing.T) {
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "replay-post-publication-wake"}
+	event := handoff.Event{
+		Seq: 1, EventID: "replay-post-publication-event", HandoffID: "handoff", TenantID: scope.TenantID,
+		ConversationID: scope.ConversationID, Kind: "handoff.completed", State: handoff.StateSucceeded,
+		Payload: json.RawMessage(`{}`),
+	}
+	store := &deliveryStore{event: event, cursor: 1}
+	pump := &handoff.EventPump{Reader: store, Cursors: store, Clock: clock.NewManual(time.Unix(0, 0)), PollInterval: time.Hour}
+	offerResults := make(chan error, 4)
+	commitStarted := make(chan struct{})
+	commitRelease := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(commitRelease) }) }
+	t.Cleanup(release)
+	registrar := &gatedCommitReplayRegistrar{
+		pump: pump, commitStarted: commitStarted, commitRelease: commitRelease,
+		wakeResults: offerResults, stop: t.Context().Done(),
+	}
+	manager := &Manager{
+		cfg:    Config{HandoffConsumerID: "replay-client", HandoffSubscriptions: registrar, EgressBlockTimeout: time.Second},
+		active: make(map[runtimeKey]*sessionRuntime), current: make(map[handoff.Scope]*sessionRuntime),
+		logical: make(map[identity.SessionID]*logicalSession), pendingPublications: make(map[handoff.Scope]*publicationAttempt),
+	}
+	pump.Sink = &deliveryRecordingSink{manager: manager, results: offerResults}
+	previous, _, previousDone := currentRuntime(scope, "replay-wake-previous")
+	replacement, replacementInputs, replacementDone := currentRuntime(scope, "replay-wake-replacement")
+	t.Cleanup(func() { close(previousDone); close(replacementDone) })
+	require.NoError(t, manager.register(previous))
+	startOwnedEventPump(t, pump)
+	require.Eventually(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return store.loads > 0
+	}, time.Second, time.Millisecond, "event pump did not complete its initial stored-cursor poll")
+
+	replacement.key.incarnation = 2
+	replacement.state.ids.Incarnation = 2
+	replayAfter := int64(0)
+	replacement.replayAfter = &replayAfter
+	logical := &logicalSession{scope: scope, highWater: 1, reconnecting: true, turnBoundary: true, state: logicalTombstoned}
+	manager.activeMu.Lock()
+	manager.logical[replacement.key.sessionID] = logical
+	manager.activeMu.Unlock()
+	published := make(chan error, 1)
+	go func() { published <- manager.registerReplacement(replacement, logical, 1) }()
+	select {
+	case <-commitStarted:
+	case <-time.After(time.Second):
+		t.Fatal("replay publication did not reach its activation boundary")
+	}
+	release()
+	require.NoError(t, <-published)
+
+	select {
+	case input := <-replacementInputs:
+		require.Equal(t, event.Seq, input.(HandoffEventInput).Event.Seq)
+	case <-time.After(time.Second):
+		t.Fatal("committed replay waited for periodic polling after the Manager publication fence cleared")
 	}
 }
 

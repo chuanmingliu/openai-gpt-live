@@ -2483,10 +2483,15 @@ func (m *Manager) commitPublicationAttempt(attempt *publicationAttempt) {
 	if attempt == nil {
 		return
 	}
+	// Activate the pump generation first, then remove the exact Manager offer
+	// fence before waking delivery for the newly published owner.
 	if attempt.replay && !isNilInterface(attempt.replayAttempt) {
 		attempt.replayAttempt.Commit()
 	}
 	m.clearPublicationAttempt(attempt)
+	if attempt.replay && !isNilInterface(attempt.replayAttempt) {
+		attempt.replayAttempt.Notify()
+	}
 }
 
 // compensatePublicationAttempt runs after a registrar callback may have

@@ -776,16 +776,30 @@ type replayRegistrarFake struct {
 }
 
 type replayAttemptCallbacks struct {
-	terminal sync.Once
-	commit   func()
-	rollback func()
+	terminal   sync.Once
+	notifyOnce sync.Once
+	committed  atomic.Bool
+	commit     func()
+	notify     func()
+	rollback   func()
 }
 
 func (a *replayAttemptCallbacks) Commit() {
 	if a != nil {
 		a.terminal.Do(func() {
+			a.committed.Store(true)
 			if a.commit != nil {
 				a.commit()
+			}
+		})
+	}
+}
+
+func (a *replayAttemptCallbacks) Notify() {
+	if a != nil && a.committed.Load() {
+		a.notifyOnce.Do(func() {
+			if a.notify != nil {
+				a.notify()
 			}
 		})
 	}

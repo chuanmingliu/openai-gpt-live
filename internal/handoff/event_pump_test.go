@@ -25,15 +25,86 @@ type pumpStore struct {
 	offered    chan handoff.Event
 	offerCalls chan handoff.Event
 	loads      chan handoff.Scope
+	reads      chan handoff.Scope
 	advances   []int64
 	sinkErr    error
 	advanceErr error
 }
 
+type gatedReplayReader struct {
+	store        *pumpStore
+	blockedAfter int64
+	started      chan struct{}
+	release      <-chan struct{}
+	mu           sync.Mutex
+	blocked      bool
+}
+
+type gatedAdvanceStore struct {
+	*pumpStore
+	started chan struct{}
+	release <-chan struct{}
+	mu      sync.Mutex
+	blocked bool
+}
+
+func (s *gatedAdvanceStore) AdvanceDeliveryCursor(_ context.Context, consumer string, scope handoff.Scope, seq int64) error {
+	s.mu.Lock()
+	block := !s.blocked
+	if block {
+		s.blocked = true
+		close(s.started)
+	}
+	s.mu.Unlock()
+	if block {
+		<-s.release
+	}
+	// Model a noncooperative cursor store that completes an already-admitted
+	// advance after generation cancellation. The pump must still retain the
+	// newly activated replay overlay and suppress every later stale stage.
+	s.pumpStore.mu.Lock()
+	defer s.pumpStore.mu.Unlock()
+	if s.advanceErr != nil {
+		return s.advanceErr
+	}
+	s.cursors[pumpKey(consumer, scope)] = seq
+	s.advances = append(s.advances, seq)
+	return nil
+}
+
+func (r *gatedReplayReader) ReadEvents(ctx context.Context, scope handoff.Scope, after int64, limit int) ([]handoff.Event, error) {
+	r.mu.Lock()
+	block := !r.blocked && after == r.blockedAfter
+	if block {
+		r.blocked = true
+		close(r.started)
+	}
+	r.mu.Unlock()
+	if !block {
+		return r.store.ReadEvents(ctx, scope, after, limit)
+	}
+	<-r.release
+	// Return the already-started read even if a newer replay activation has
+	// canceled its generation. This exercises the pump's post-I/O fencing.
+	r.store.mu.Lock()
+	defer r.store.mu.Unlock()
+	var out []handoff.Event
+	for _, event := range r.store.events[scope] {
+		if event.Seq > after {
+			out = append(out, handoff.CloneEvent(event))
+			if len(out) == limit {
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
 func newPumpStore() *pumpStore {
 	return &pumpStore{
 		events: make(map[handoff.Scope][]handoff.Event), cursors: make(map[string]int64),
-		offered: make(chan handoff.Event, 32), offerCalls: make(chan handoff.Event, 32), loads: make(chan handoff.Scope, 32),
+		offered: make(chan handoff.Event, 32), offerCalls: make(chan handoff.Event, 32),
+		loads: make(chan handoff.Scope, 32), reads: make(chan handoff.Scope, 32),
 	}
 }
 
@@ -47,6 +118,12 @@ func (s *pumpStore) ReadEvents(ctx context.Context, scope handoff.Scope, after i
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	defer func() {
+		select {
+		case s.reads <- scope:
+		default:
+		}
+	}()
 	var out []handoff.Event
 	for _, event := range s.events[scope] {
 		if event.Seq > after {
@@ -314,6 +391,8 @@ func TestEventPumpReplayAttemptIsInvisibleUntilCommitAndCommitsOnce(t *testing.T
 
 	replay.Commit()
 	replay.Commit()
+	replay.Notify()
+	replay.Notify()
 	select {
 	case event := <-store.offered:
 		require.Equal(t, int64(1), event.Seq)
@@ -400,6 +479,126 @@ func TestEventPumpReplayAttemptCommitKeepsMinimumOverlay(t *testing.T) {
 	}
 }
 
+func TestEventPumpReplayActivationRestartsDeliveryThatReadOlderGeneration(t *testing.T) {
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "replay-generation-race"}
+	store := newPumpStore()
+	for seq := int64(1); seq <= 6; seq++ {
+		store.events[scope] = append(store.events[scope], pumpEvent(scope, seq, "handoff.completed", handoff.StateSucceeded))
+	}
+	subscription := handoff.EventSubscription{ConsumerID: "client", Scope: scope}
+	store.cursors[pumpKey(subscription.ConsumerID, scope)] = 5
+	readStarted := make(chan struct{})
+	readRelease := make(chan struct{})
+	var readReleaseOnce sync.Once
+	releaseRead := func() { readReleaseOnce.Do(func() { close(readRelease) }) }
+	t.Cleanup(releaseRead)
+	reader := &gatedReplayReader{store: store, blockedAfter: 5, started: readStarted, release: readRelease}
+	pump := &handoff.EventPump{Reader: reader, Cursors: store, Sink: store, Clock: clock.NewManual(time.Unix(0, 0)), PollInterval: time.Hour}
+	require.NoError(t, pump.Register(subscription))
+	runPump(t, pump)
+	select {
+	case <-readStarted:
+	case <-time.After(time.Second):
+		t.Fatal("ordinary delivery did not block after the stored cursor")
+	}
+
+	replay, err := pump.BeginReplay(subscription, 0)
+	require.NoError(t, err)
+	commitDone := make(chan struct{})
+	go func() {
+		replay.Commit()
+		close(commitDone)
+	}()
+	select {
+	case <-commitDone:
+	case <-time.After(time.Second):
+		t.Fatal("replay activation waited for the older-generation Reader")
+	}
+	replay.Notify()
+	releaseRead()
+
+	want := []int64{1, 2, 3, 4, 5, 6}
+	got := make([]int64, 0, len(want))
+	deadline := time.After(time.Second)
+	for len(got) < len(want) {
+		select {
+		case event := <-store.offered:
+			got = append(got, event.Seq)
+		case <-deadline:
+			t.Fatalf("activated replay did not restart from cursor 0: got %v, want %v", got, want)
+		}
+	}
+	require.Equal(t, want, got, "the older-generation read must not offer before the activated replay")
+	require.Eventually(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return assert.Equal(t, []int64{6}, store.advances)
+	}, time.Second, time.Millisecond, "only the restarted replay may advance the durable cursor")
+}
+
+func TestEventPumpLateOlderGenerationAdvanceCannotDeleteActivatedReplay(t *testing.T) {
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "replay-late-advance"}
+	base := newPumpStore()
+	for seq := int64(1); seq <= 6; seq++ {
+		base.events[scope] = append(base.events[scope], pumpEvent(scope, seq, "handoff.completed", handoff.StateSucceeded))
+	}
+	subscription := handoff.EventSubscription{ConsumerID: "client", Scope: scope}
+	base.cursors[pumpKey(subscription.ConsumerID, scope)] = 5
+	advanceStarted := make(chan struct{})
+	advanceRelease := make(chan struct{})
+	var advanceReleaseOnce sync.Once
+	releaseAdvance := func() { advanceReleaseOnce.Do(func() { close(advanceRelease) }) }
+	t.Cleanup(releaseAdvance)
+	store := &gatedAdvanceStore{pumpStore: base, started: advanceStarted, release: advanceRelease}
+	pump := &handoff.EventPump{Reader: store, Cursors: store, Sink: store, Clock: clock.NewManual(time.Unix(0, 0)), PollInterval: time.Hour}
+	require.NoError(t, pump.Register(subscription))
+	runPump(t, pump)
+
+	select {
+	case event := <-store.offered:
+		require.Equal(t, int64(6), event.Seq, "ordinary delivery must reach its admitted cursor effect")
+	case <-time.After(time.Second):
+		t.Fatal("ordinary delivery did not offer sequence 6")
+	}
+	select {
+	case <-advanceStarted:
+	case <-time.After(time.Second):
+		t.Fatal("ordinary delivery did not block in its admitted cursor advance")
+	}
+	replay, err := pump.BeginReplay(subscription, 0)
+	require.NoError(t, err)
+	commitDone := make(chan struct{})
+	go func() {
+		replay.Commit()
+		close(commitDone)
+	}()
+	select {
+	case <-commitDone:
+	case <-time.After(time.Second):
+		t.Fatal("replay activation waited for the older-generation cursor advance")
+	}
+	replay.Notify()
+	releaseAdvance()
+
+	wantReplay := []int64{1, 2, 3, 4, 5, 6}
+	gotReplay := make([]int64, 0, len(wantReplay))
+	deadline := time.After(time.Second)
+	for len(gotReplay) < len(wantReplay) {
+		select {
+		case event := <-store.offered:
+			gotReplay = append(gotReplay, event.Seq)
+		case <-deadline:
+			t.Fatalf("late older-generation cursor completion deleted the activated replay: got %v, want %v", gotReplay, wantReplay)
+		}
+	}
+	require.Equal(t, wantReplay, gotReplay)
+	require.Eventually(t, func() bool {
+		store.pumpStore.mu.Lock()
+		defer store.pumpStore.mu.Unlock()
+		return assert.Equal(t, []int64{6}, store.advances)
+	}, time.Second, time.Millisecond)
+}
+
 func TestEventPumpReplayAttemptRejectsOverlapAndAccountsForPendingCapacity(t *testing.T) {
 	pump := &handoff.EventPump{}
 	subscription := handoff.EventSubscription{
@@ -472,8 +671,8 @@ func TestEventPumpScopesNotificationsAndRepairsLostWakeups(t *testing.T) {
 	require.NoError(t, pump.Register(handoff.EventSubscription{ConsumerID: "client", Scope: one}))
 	require.NoError(t, pump.Register(handoff.EventSubscription{ConsumerID: "client", Scope: two}))
 	runPump(t, pump)
-	<-store.loads
-	<-store.loads
+	<-store.reads
+	<-store.reads
 
 	store.mu.Lock()
 	store.events[one] = []handoff.Event{pumpEvent(one, 1, "handoff.created", handoff.StatePending)}
