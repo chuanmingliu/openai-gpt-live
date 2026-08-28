@@ -260,6 +260,7 @@ type Manager struct {
 	active                        map[runtimeKey]*sessionRuntime
 	current                       map[handoff.Scope]*sessionRuntime
 	logical                       map[identity.SessionID]*logicalSession
+	pendingPublications           map[handoff.Scope]*publicationAttempt
 	metricsMu                     sync.RWMutex
 	metrics                       MetricsHooks
 	reconnectMaintenanceMu        sync.RWMutex
@@ -267,6 +268,12 @@ type Manager struct {
 	reconnectMaintenanceErr       error
 	reconnectMaintenanceSucceeded time.Time
 	reconnectOperationSlots       chan struct{}
+}
+
+type publicationAttempt struct {
+	runtime  *sessionRuntime
+	previous *sessionRuntime
+	replay   bool
 }
 
 type logicalSession struct {
@@ -316,23 +323,26 @@ type sessionRuntime struct {
 	quiesced <-chan struct{}
 	state    *runState
 
-	mu                    sync.Mutex
-	accepting             bool
-	inboxSlots            chan struct{}
-	replayAfter           *int64
-	reconnectMu           sync.Mutex
-	reconnectRotateOnce   sync.Once
-	reconnectRotate       chan struct{}
-	presentationMu        sync.Mutex
-	acceptanceGeneration  uint64
-	publicationPrevious   *sessionRuntime
-	publicationAccepting  bool
-	publicationGeneration uint64
-	reconnect             *IssuedReconnectCredential
-	reconnectDelivered    bool
-	reconnectLossDeadline time.Time
-	profile               profile.Resolved
-	profilePublic         bool
+	mu                        sync.Mutex
+	accepting                 bool
+	inboxSlots                chan struct{}
+	replayAfter               *int64
+	reconnectMu               sync.Mutex
+	reconnectRotateOnce       sync.Once
+	reconnectRotate           chan struct{}
+	presentationMu            sync.Mutex
+	acceptanceGeneration      uint64
+	publicationPrevious       *sessionRuntime
+	publicationAccepting      bool
+	publicationGeneration     uint64
+	publicationPending        bool
+	publicationAttempt        *publicationAttempt
+	publicationRequiresCommit bool
+	reconnect                 *IssuedReconnectCredential
+	reconnectDelivered        bool
+	reconnectLossDeadline     time.Time
+	profile                   profile.Resolved
+	profilePublic             bool
 }
 
 func normalizeBoundProfile(subject Subject, candidate profile.Resolved) (profile.Resolved, bool, error) {
@@ -371,13 +381,32 @@ func profileClaimsMatchResolved(claims ReconnectClaims, resolved profile.Resolve
 		claims.ProfileSnapshotHash == resolved.Snapshot.SnapshotHash && claims.ProfileEngineVersion == resolved.Snapshot.EngineVersion
 }
 
-func (r *sessionRuntime) commitPublication() {
-	if r == nil {
+func (m *Manager) commitPublication(r *sessionRuntime) {
+	if m == nil || r == nil {
 		return
 	}
+	scope := r.handoffScope()
+	r.presentationMu.Lock()
+	m.activeMu.Lock()
+	r.mu.Lock()
+	attempt := r.publicationAttempt
+	if attempt == nil || m.current[scope] != r || (r.publicationPending && m.pendingPublications[scope] != attempt) {
+		r.mu.Unlock()
+		m.activeMu.Unlock()
+		r.presentationMu.Unlock()
+		return
+	}
+	r.publicationPending = false
 	r.publicationPrevious = nil
 	r.publicationAccepting = false
 	r.publicationGeneration = 0
+	r.publicationAttempt = nil
+	if m.pendingPublications[scope] == attempt {
+		delete(m.pendingPublications, scope)
+	}
+	r.mu.Unlock()
+	m.activeMu.Unlock()
+	r.presentationMu.Unlock()
 }
 
 // fenceAtTurnBoundary linearizes the final boundary decision with every
@@ -799,6 +828,7 @@ func NewManager(cfg Config, connector realtime.Connector, ids IDGenerator) *Mana
 		active:                  make(map[runtimeKey]*sessionRuntime),
 		current:                 make(map[handoff.Scope]*sessionRuntime),
 		logical:                 make(map[identity.SessionID]*logicalSession),
+		pendingPublications:     make(map[handoff.Scope]*publicationAttempt),
 		metrics:                 normalizeMetricsHooks(MetricsHooks{}),
 		reconnectOperationSlots: make(chan struct{}, operationCapacity),
 	}
@@ -1231,17 +1261,18 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	state.subject = cloneSubject(subject)
 	state.metrics = m.metricsSnapshot()
 	runtime := &sessionRuntime{
-		key:                   runtimeKey{sessionID: sessionID, incarnation: ids.Incarnation},
-		subject:               subject,
-		inbox:                 state.inbox,
-		done:                  groupCtx.Done(),
-		quiesced:              quiesced,
-		state:                 state,
-		accepting:             true,
-		inboxSlots:            state.inboxSlots,
-		reconnectLossDeadline: reconnectOwnerLossDeadline,
-		profile:               selectedProfile.Clone(),
-		profilePublic:         profilePublic,
+		key:                       runtimeKey{sessionID: sessionID, incarnation: ids.Incarnation},
+		subject:                   subject,
+		inbox:                     state.inbox,
+		done:                      groupCtx.Done(),
+		quiesced:                  quiesced,
+		state:                     state,
+		accepting:                 true,
+		inboxSlots:                state.inboxSlots,
+		reconnectLossDeadline:     reconnectOwnerLossDeadline,
+		profile:                   selectedProfile.Clone(),
+		profilePublic:             profilePublic,
+		publicationRequiresCommit: reconnectOwnerCreated,
 	}
 	if reconnectIssued != nil {
 		copy := *reconnectIssued
@@ -1339,7 +1370,7 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 		runtime.setReconnectLossDeadline(lossDeadline)
 		group.Go(runLoop("reconnect owner heartbeat", func(ctx context.Context) error { return m.maintainReconnectOwner(ctx, runtime, lossDeadline) }))
 	}
-	runtime.commitPublication()
+	m.commitPublication(runtime)
 	hooks := m.metricsSnapshot()
 	hooks.SessionStarted()
 	defer func() {
@@ -1516,7 +1547,7 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 
 	reopenFencedRuntime := func() {
 		m.activeMu.Lock()
-		if m.logical[request.SessionID] == logical && logical.highWater == request.LastIncarnation && logical.runtime == old && logical.reconnecting {
+		if logical != nil && m.logical[request.SessionID] == logical && logical.highWater == request.LastIncarnation && logical.runtime == old && logical.reconnecting {
 			if old != nil {
 				old.mu.Lock()
 				select {
@@ -1547,7 +1578,8 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 	// Intake is already closed. Recheck after the lock-free test boundary so
 	// internal completions cannot make a dirty boundary reconnectable.
 	m.activeMu.Lock()
-	if m.logical[request.SessionID] != logical || logical.highWater != request.LastIncarnation || logical.runtime != old || !logical.reconnecting {
+	if m.logical[request.SessionID] != logical ||
+		(logical != nil && (logical.highWater != request.LastIncarnation || logical.runtime != old || !logical.reconnecting)) {
 		m.activeMu.Unlock()
 		return ErrStaleReconnect
 	}
@@ -2287,6 +2319,7 @@ func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.Canc
 		inbox: state.inbox, done: groupCtx.Done(), quiesced: quiesced, state: state,
 		accepting: true, inboxSlots: state.inboxSlots, reconnectLossDeadline: ownerLossDeadline,
 		profile: selectedProfile.Clone(), profilePublic: profilePublic,
+		publicationRequiresCommit: reconnectIssued != nil,
 	}
 	if reconnectIssued != nil {
 		copy := *reconnectIssued
@@ -2396,7 +2429,7 @@ func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.Canc
 		runtime.setReconnectLossDeadline(lossDeadline)
 		group.Go(runLoop("reconnect owner heartbeat", func(ctx context.Context) error { return m.maintainReconnectOwner(ctx, runtime, lossDeadline) }))
 	}
-	runtime.commitPublication()
+	m.commitPublication(runtime)
 	hooks := m.metricsSnapshot()
 	hooks.SessionStarted()
 	defer func() {
@@ -2427,29 +2460,75 @@ func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.Canc
 	return cleanupErr
 }
 
+func (m *Manager) reservePublicationAttemptLocked(scope handoff.Scope, runtime, previous *sessionRuntime, replay bool) (*publicationAttempt, error) {
+	if m.pendingPublications == nil {
+		m.pendingPublications = make(map[handoff.Scope]*publicationAttempt)
+	}
+	if m.pendingPublications[scope] != nil {
+		return nil, ErrStaleReconnect
+	}
+	attempt := &publicationAttempt{runtime: runtime, previous: previous, replay: replay}
+	m.pendingPublications[scope] = attempt
+	return attempt, nil
+}
+
+func (m *Manager) clearPublicationAttempt(attempt *publicationAttempt) {
+	if m == nil || attempt == nil || attempt.runtime == nil {
+		return
+	}
+	scope := attempt.runtime.handoffScope()
+	m.activeMu.Lock()
+	if m.pendingPublications[scope] == attempt {
+		delete(m.pendingPublications, scope)
+	}
+	m.activeMu.Unlock()
+}
+
+// compensatePublicationAttempt runs after a registrar callback may have
+// mutated state but its exact directory CAS cannot commit. The attempt token
+// stays reserved until all compensation callbacks finish, so they cannot
+// unregister a newer owner.
+func (m *Manager) compensatePublicationAttempt(attempt *publicationAttempt, restorePrevious bool) error {
+	if m == nil || attempt == nil || attempt.runtime == nil || isNilInterface(m.cfg.HandoffSubscriptions) {
+		m.clearPublicationAttempt(attempt)
+		return nil
+	}
+	subscription := attempt.runtime.handoffSubscription(m.cfg.HandoffConsumerID)
+	if attempt.replay || !restorePrevious {
+		m.cfg.HandoffSubscriptions.Unregister(subscription)
+	}
+	var restoreErr error
+	if attempt.replay && restorePrevious && attempt.previous != nil {
+		if err := m.cfg.HandoffSubscriptions.Register(attempt.previous.handoffSubscription(m.cfg.HandoffConsumerID)); err != nil {
+			restoreErr = fmt.Errorf("restore handoff presentation: %w", err)
+		}
+	}
+	m.clearPublicationAttempt(attempt)
+	return restoreErr
+}
+
+func (m *Manager) publicationAttemptCanRestorePrevious(attempt *publicationAttempt) bool {
+	if m == nil || attempt == nil || attempt.runtime == nil || attempt.previous == nil {
+		return false
+	}
+	scope := attempt.runtime.handoffScope()
+	m.activeMu.RLock()
+	restore := m.pendingPublications[scope] == attempt && m.current[scope] == attempt.previous &&
+		m.active[attempt.previous.key] == attempt.previous
+	m.activeMu.RUnlock()
+	return restore
+}
+
 func (m *Manager) registerReplacement(runtime *sessionRuntime, logical *logicalSession, expected identity.Incarnation) error {
 	scope := runtime.handoffScope()
-	// Snapshotting the presentation owner holds no runtime lock; the owner is
-	// revalidated after its presentation lock is acquired.
-	m.activeMu.RLock()
-	previous := m.current[scope]
-	m.activeMu.RUnlock()
-	if previous != nil && previous != runtime {
-		previous.presentationMu.Lock()
-		defer previous.presentationMu.Unlock()
-	}
 	m.activeMu.Lock()
-	if m.logical[runtime.key.sessionID] != logical || !logical.reconnecting || logical.highWater != expected ||
-		logical.scope != runtime.handoffScope() || runtime.key.incarnation != expected+1 ||
-		logical.state == logicalEstablishing {
+	previous := m.current[scope]
+	if m.logical[runtime.key.sessionID] != logical || logical == nil || !logical.reconnecting || logical.highWater != expected ||
+		logical.scope != scope || runtime.key.incarnation != expected+1 || logical.state == logicalEstablishing {
 		m.activeMu.Unlock()
 		return ErrStaleReconnect
 	}
 	if _, exists := m.active[runtime.key]; exists {
-		m.activeMu.Unlock()
-		return ErrStaleReconnect
-	}
-	if m.current[scope] != previous {
 		m.activeMu.Unlock()
 		return ErrStaleReconnect
 	}
@@ -2462,34 +2541,60 @@ func (m *Manager) registerReplacement(runtime *sessionRuntime, logical *logicalS
 			return ErrRecoveryUnavailable
 		}
 	}
+	attempt, err := m.reservePublicationAttemptLocked(scope, runtime, previous, true)
 	m.activeMu.Unlock()
+	if err != nil {
+		return err
+	}
 	if replay != nil {
 		if err := replay.RegisterReplay(runtime.handoffSubscription(m.cfg.HandoffConsumerID), *runtime.replayAfter); err != nil {
-			return ErrRecoveryUnavailable
+			restorePrevious := m.publicationAttemptCanRestorePrevious(attempt)
+			compensationErr := m.compensatePublicationAttempt(attempt, restorePrevious)
+			return errors.Join(ErrRecoveryUnavailable, compensationErr)
 		}
 	}
-	// The previous presentation lock excludes every same-scope publication
-	// while the external registrar runs. Revalidate before committing anyway.
-	m.activeMu.Lock()
-	defer m.activeMu.Unlock()
-	if m.logical[runtime.key.sessionID] != logical || !logical.reconnecting || logical.highWater != expected ||
-		logical.scope != runtime.handoffScope() || runtime.key.incarnation != expected+1 || logical.state == logicalEstablishing ||
-		m.current[scope] != previous {
-		return ErrStaleReconnect
+
+	presentationLocked := previous != nil && previous != runtime
+	if presentationLocked {
+		previous.presentationMu.Lock()
 	}
+	m.activeMu.Lock()
+	valid := m.pendingPublications[scope] == attempt && m.logical[runtime.key.sessionID] == logical && logical.reconnecting &&
+		logical.highWater == expected && logical.scope == scope && runtime.key.incarnation == expected+1 &&
+		logical.state != logicalEstablishing && m.current[scope] == previous
 	if _, exists := m.active[runtime.key]; exists {
+		valid = false
+	}
+	if !valid {
+		restorePrevious := previous != nil && m.current[scope] == previous && m.active[previous.key] == previous
+		m.activeMu.Unlock()
+		if presentationLocked {
+			previous.presentationMu.Unlock()
+		}
+		if err := m.compensatePublicationAttempt(attempt, restorePrevious); err != nil {
+			return errors.Join(ErrStaleReconnect, err)
+		}
 		return ErrStaleReconnect
 	}
 	m.active[runtime.key] = runtime
+	var previousAccepting bool
+	var previousGeneration uint64
 	if previous != nil && previous != runtime {
 		previous.mu.Lock()
-		runtime.publicationPrevious = previous
-		runtime.publicationAccepting = previous.accepting
-		runtime.publicationGeneration = previous.acceptanceGeneration
+		previousAccepting = previous.accepting
+		previousGeneration = previous.acceptanceGeneration
 		previous.accepting = false
 		previous.acceptanceGeneration++
 		previous.mu.Unlock()
 	}
+	pending := runtime.publicationRequiresCommit
+	runtime.mu.Lock()
+	runtime.publicationPrevious = previous
+	runtime.publicationAccepting = previousAccepting
+	runtime.publicationGeneration = previousGeneration
+	runtime.publicationPending = pending
+	runtime.publicationAttempt = attempt
+	runtime.mu.Unlock()
 	m.current[scope] = runtime
 	logical.highWater = runtime.key.incarnation
 	logical.responseEpoch = runtime.state.fence.Current()
@@ -2498,6 +2603,13 @@ func (m *Manager) registerReplacement(runtime *sessionRuntime, logical *logicalS
 	logical.turnBoundary = true
 	logical.tombstonedAt = time.Time{}
 	logical.state = logicalActive
+	if !pending {
+		delete(m.pendingPublications, scope)
+	}
+	m.activeMu.Unlock()
+	if presentationLocked {
+		previous.presentationMu.Unlock()
+	}
 	return nil
 }
 
@@ -2505,22 +2617,32 @@ func (m *Manager) rollbackInitialPublication(runtime *sessionRuntime, logical *l
 	if runtime == nil || logical == nil {
 		return
 	}
-	previous := runtime.publicationPrevious
 	// The failing published runtime is the current presentation owner. Lock it
 	// before the directory and the restored runtime state.
 	runtime.presentationMu.Lock()
-	defer runtime.presentationMu.Unlock()
 	m.activeMu.Lock()
+	runtime.mu.Lock()
+	attempt := runtime.publicationAttempt
+	previous := runtime.publicationPrevious
+	previousAccepting := runtime.publicationAccepting
+	previousGeneration := runtime.publicationGeneration
+	runtime.accepting = false
+	runtime.acceptanceGeneration++
+	runtime.publicationPending = false
+	runtime.publicationAttempt = nil
+	runtime.mu.Unlock()
 	if m.active[runtime.key] == runtime {
 		delete(m.active, runtime.key)
 	}
+	restoredPrevious := false
 	if m.current[runtime.handoffScope()] == runtime {
 		if previous != nil && m.active[previous.key] == previous {
 			previous.mu.Lock()
-			previous.accepting = runtime.publicationAccepting
-			previous.acceptanceGeneration = runtime.publicationGeneration
+			previous.accepting = previousAccepting
+			previous.acceptanceGeneration = previousGeneration
 			previous.mu.Unlock()
 			m.current[runtime.handoffScope()] = previous
+			restoredPrevious = true
 		} else {
 			delete(m.current, runtime.handoffScope())
 		}
@@ -2532,7 +2654,10 @@ func (m *Manager) rollbackInitialPublication(runtime *sessionRuntime, logical *l
 		logical.turnBoundary = false
 	}
 	m.activeMu.Unlock()
-	if previous == nil && !isNilInterface(m.cfg.HandoffSubscriptions) {
+	runtime.presentationMu.Unlock()
+	if attempt != nil {
+		_ = m.compensatePublicationAttempt(attempt, restoredPrevious)
+	} else if previous == nil && !isNilInterface(m.cfg.HandoffSubscriptions) {
 		m.cfg.HandoffSubscriptions.Unregister(runtime.handoffSubscription(m.cfg.HandoffConsumerID))
 	}
 }
@@ -2541,22 +2666,32 @@ func (m *Manager) rollbackReplacementPublication(runtime *sessionRuntime, logica
 	if runtime == nil || logical == nil {
 		return
 	}
-	previous := runtime.publicationPrevious
 	// The failing published runtime is the current presentation owner. Lock it
 	// before the directory and the restored runtime state.
 	runtime.presentationMu.Lock()
-	defer runtime.presentationMu.Unlock()
 	m.activeMu.Lock()
+	runtime.mu.Lock()
+	attempt := runtime.publicationAttempt
+	previous := runtime.publicationPrevious
+	previousAccepting := runtime.publicationAccepting
+	previousGeneration := runtime.publicationGeneration
+	runtime.accepting = false
+	runtime.acceptanceGeneration++
+	runtime.publicationPending = false
+	runtime.publicationAttempt = nil
+	runtime.mu.Unlock()
 	if m.active[runtime.key] == runtime {
 		delete(m.active, runtime.key)
 	}
+	restoredPrevious := false
 	if m.current[runtime.handoffScope()] == runtime {
 		if previous != nil && m.active[previous.key] == previous {
 			previous.mu.Lock()
-			previous.accepting = runtime.publicationAccepting
-			previous.acceptanceGeneration = runtime.publicationGeneration
+			previous.accepting = previousAccepting
+			previous.acceptanceGeneration = previousGeneration
 			previous.mu.Unlock()
 			m.current[runtime.handoffScope()] = previous
+			restoredPrevious = true
 		} else {
 			delete(m.current, runtime.handoffScope())
 		}
@@ -2571,7 +2706,10 @@ func (m *Manager) rollbackReplacementPublication(runtime *sessionRuntime, logica
 		logical.state = logicalTombstoned
 	}
 	m.activeMu.Unlock()
-	if previous == nil && !isNilInterface(m.cfg.HandoffSubscriptions) {
+	runtime.presentationMu.Unlock()
+	if attempt != nil {
+		_ = m.compensatePublicationAttempt(attempt, restoredPrevious)
+	} else if previous == nil && !isNilInterface(m.cfg.HandoffSubscriptions) {
 		m.cfg.HandoffSubscriptions.Unregister(runtime.handoffSubscription(m.cfg.HandoffConsumerID))
 	}
 }
@@ -2732,20 +2870,8 @@ func (m *Manager) Submit(ctx context.Context, sessionID identity.SessionID, inca
 
 func (m *Manager) register(runtime *sessionRuntime) error {
 	scope := runtime.handoffScope()
-	// Snapshotting the presentation owner holds no runtime lock; the owner is
-	// revalidated after its presentation lock is acquired.
-	m.activeMu.RLock()
-	previous := m.current[scope]
-	m.activeMu.RUnlock()
-	if previous != nil && previous != runtime {
-		previous.presentationMu.Lock()
-		defer previous.presentationMu.Unlock()
-	}
 	m.activeMu.Lock()
-	if m.current[scope] != previous {
-		m.activeMu.Unlock()
-		return ErrStaleReconnect
-	}
+	previous := m.current[scope]
 	if _, exists := m.active[runtime.key]; exists {
 		m.activeMu.Unlock()
 		return ErrSessionAlreadyActive
@@ -2769,39 +2895,64 @@ func (m *Manager) register(runtime *sessionRuntime) error {
 		m.activeMu.Unlock()
 		return ErrStaleReconnect
 	}
+	attempt, err := m.reservePublicationAttemptLocked(scope, runtime, previous, false)
 	m.activeMu.Unlock()
+	if err != nil {
+		return err
+	}
 	if !isNilInterface(m.cfg.HandoffSubscriptions) {
 		if err := m.cfg.HandoffSubscriptions.Register(runtime.handoffSubscription(m.cfg.HandoffConsumerID)); err != nil {
-			return fmt.Errorf("register handoff presentation: %w", err)
+			restorePrevious := m.publicationAttemptCanRestorePrevious(attempt)
+			compensationErr := m.compensatePublicationAttempt(attempt, restorePrevious)
+			return errors.Join(fmt.Errorf("register handoff presentation: %w", err), compensationErr)
 		}
 	}
-	// The previous presentation lock excludes every same-scope publication
-	// while the external registrar runs. Revalidate before committing anyway.
-	m.activeMu.Lock()
-	defer m.activeMu.Unlock()
-	if m.current[scope] != previous {
-		return ErrStaleReconnect
+	presentationLocked := previous != nil && previous != runtime
+	if presentationLocked {
+		previous.presentationMu.Lock()
 	}
+	m.activeMu.Lock()
+	valid := m.pendingPublications[scope] == attempt && m.current[scope] == previous
 	if _, exists := m.active[runtime.key]; exists {
-		return ErrSessionAlreadyActive
+		valid = false
 	}
 	if m.logical[runtime.key.sessionID] != logical || logical.scope != scope || logical.highWater != runtime.key.incarnation ||
 		logical.state != logicalEstablishing || logical.runtime != nil || logical.reconnecting {
+		valid = false
+	}
+	if !valid {
+		restorePrevious := previous != nil && m.current[scope] == previous && m.active[previous.key] == previous
+		m.activeMu.Unlock()
+		if presentationLocked {
+			previous.presentationMu.Unlock()
+		}
+		if err := m.compensatePublicationAttempt(attempt, restorePrevious); err != nil {
+			return errors.Join(ErrStaleReconnect, err)
+		}
 		return ErrStaleReconnect
 	}
 	if m.current == nil {
 		m.current = make(map[handoff.Scope]*sessionRuntime)
 	}
 	m.active[runtime.key] = runtime
+	var previousAccepting bool
+	var previousGeneration uint64
 	if previous != nil && previous != runtime {
 		previous.mu.Lock()
-		runtime.publicationPrevious = previous
-		runtime.publicationAccepting = previous.accepting
-		runtime.publicationGeneration = previous.acceptanceGeneration
+		previousAccepting = previous.accepting
+		previousGeneration = previous.acceptanceGeneration
 		previous.accepting = false
 		previous.acceptanceGeneration++
 		previous.mu.Unlock()
 	}
+	pending := runtime.publicationRequiresCommit
+	runtime.mu.Lock()
+	runtime.publicationPrevious = previous
+	runtime.publicationAccepting = previousAccepting
+	runtime.publicationGeneration = previousGeneration
+	runtime.publicationPending = pending
+	runtime.publicationAttempt = attempt
+	runtime.mu.Unlock()
 	m.current[scope] = runtime
 	logical.runtime = runtime
 	logical.responseEpoch = runtime.state.fence.Current()
@@ -2809,6 +2960,13 @@ func (m *Manager) register(runtime *sessionRuntime) error {
 	logical.turnBoundary = true
 	logical.tombstonedAt = time.Time{}
 	logical.state = logicalActive
+	if !pending {
+		delete(m.pendingPublications, scope)
+	}
+	m.activeMu.Unlock()
+	if presentationLocked {
+		previous.presentationMu.Unlock()
+	}
 	return nil
 }
 
@@ -2938,7 +3096,7 @@ func (m *Manager) OfferHandoffEvent(ctx context.Context, scope handoff.Scope, ev
 	m.activeMu.RLock()
 	runtime.mu.Lock()
 	current := m.current[scope]
-	if current != runtime || !runtime.accepting {
+	if current != runtime || !runtime.accepting || runtime.publicationPending {
 		runtime.mu.Unlock()
 		m.activeMu.RUnlock()
 		runtime.presentationMu.Unlock()

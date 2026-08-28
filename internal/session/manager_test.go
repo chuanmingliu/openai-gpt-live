@@ -1188,6 +1188,131 @@ func TestManagerReconnectPublishFailureRollsBackLocalPublicationAndRetainsAdvert
 	require.Error(t, <-retryDone)
 }
 
+func TestManagerRemoteReconnectWithoutLocalLogicalIsNilSafe(t *testing.T) {
+	type reconnectOutcome struct {
+		err      error
+		panicked any
+	}
+	for _, test := range []struct {
+		name       string
+		suffix     string
+		cancelGate bool
+	}{
+		{name: "normal", suffix: "normal"},
+		{name: "cancelled at boundary gate", suffix: "cancelled", cancelGate: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			credentials, err := NewReconnectCredentials([]byte(strings.Repeat("n", 32)), clock.Real{})
+			require.NoError(t, err)
+			owners := NewMemoryReconnectOwners(clock.Real{})
+			scope := handoff.Scope{TenantID: "tenant-remote-nil", UserID: "user-remote-nil", ConversationID: identity.ConversationID("conversation-remote-nil-" + test.suffix)}
+			subject := Subject{TenantID: scope.TenantID, UserID: scope.UserID, ExpiresAt: time.Now().Add(time.Hour)}
+			baseConnector := testkit.NewFakeConnector(2)
+			baseManager := NewManager(Config{
+				IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+				RecoveryStore:        &recoveryStoreFake{snapshot: RecoverySnapshot{ConversationID: scope.ConversationID}},
+				ReconnectCredentials: credentials, ReconnectOwners: owners, ReconnectOwnerID: "remote-nil-origin",
+				ReconnectCredentialTTL: time.Minute,
+			}, baseConnector, managerIDs{session: identity.SessionID("remote-nil-session-" + test.suffix), conversation: scope.ConversationID})
+			require.NoError(t, baseManager.validationErr)
+			baseCtx, baseCancel := context.WithCancel(t.Context())
+			baseClient := newChannelClient(8)
+			baseDone := make(chan error, 1)
+			go func() {
+				baseDone <- baseManager.Run(baseCtx, OpenRequest{Subject: subject, RequestedModel: "provider-model", ConversationID: scope.ConversationID}, baseClient)
+			}()
+			_, err = baseConnector.NextSession(t.Context())
+			require.NoError(t, err)
+			created := (<-baseClient.writes).(protocol.SessionCreatedEvent)
+			require.NotNil(t, created.Reconnect)
+			claims, err := credentials.Verify(created.Reconnect.Credential)
+			require.NoError(t, err)
+			require.Eventually(t, func() bool {
+				owner, found := owners.Read(claims.SessionID)
+				return found && owner.State == ReconnectOwnerActive
+			}, time.Second, time.Millisecond)
+			baseCancel()
+			require.Error(t, <-baseDone)
+			require.Eventually(t, func() bool {
+				owner, found := owners.Read(claims.SessionID)
+				return found && owner.State == ReconnectOwnerTombstoned
+			}, time.Second, time.Millisecond)
+
+			boundaryEntered := make(chan struct{})
+			boundaryRelease := make(chan struct{})
+			var boundaryOnce sync.Once
+			replicaConnector := testkit.NewFakeConnector(2)
+			replicaManager := NewManager(Config{
+				IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+				RecoveryStore:        &recoveryStoreFake{snapshot: RecoverySnapshot{ConversationID: scope.ConversationID}},
+				ReconnectCredentials: credentials, ReconnectOwners: owners, ReconnectOwnerID: "remote-nil-replica",
+				ReconnectCredentialTTL: time.Minute,
+				reconnectBoundaryGate: func() <-chan struct{} {
+					if !test.cancelGate {
+						return nil
+					}
+					boundaryOnce.Do(func() { close(boundaryEntered) })
+					return boundaryRelease
+				},
+			}, replicaConnector, managerIDs{})
+			require.NoError(t, replicaManager.validationErr)
+			replicaManager.activeMu.RLock()
+			require.Nil(t, replicaManager.logical[claims.SessionID], "the reconnecting replica must begin without a local logical cache entry")
+			replicaManager.activeMu.RUnlock()
+
+			reconnectCtx, reconnectCancel := context.WithCancel(t.Context())
+			defer reconnectCancel()
+			outcome := make(chan reconnectOutcome, 1)
+			go func() {
+				result := reconnectOutcome{}
+				defer func() {
+					result.panicked = recover()
+					outcome <- result
+				}()
+				result.err = replicaManager.Reconnect(reconnectCtx, ReconnectRequest{
+					Scope: claims.Scope, SessionID: claims.SessionID, LastIncarnation: claims.Incarnation,
+					LastEventSeq: claims.Cursor, Subject: subject, Credential: claims,
+				}, newChannelClient(8))
+			}()
+
+			if test.cancelGate {
+				select {
+				case <-boundaryEntered:
+				case result := <-outcome:
+					require.Nil(t, result.panicked, "remote reconnect panicked before the cancellation gate")
+					t.Fatalf("remote reconnect returned before the cancellation gate: %v", result.err)
+				case <-time.After(time.Second):
+					t.Fatal("remote reconnect did not reach the cancellation gate")
+				}
+				reconnectCancel()
+				result := <-outcome
+				require.Nil(t, result.panicked, "cancelling an authoritative remote reconnect must not dereference a nil logical cache entry")
+				require.ErrorIs(t, result.err, context.Canceled)
+				return
+			}
+
+			connected := make(chan error, 1)
+			go func() {
+				_, connectErr := replicaConnector.NextSession(t.Context())
+				connected <- connectErr
+			}()
+			select {
+			case result := <-outcome:
+				require.Nil(t, result.panicked, "authoritative remote reconnect must not dereference a nil logical cache entry")
+				t.Fatalf("remote reconnect returned before opening the replacement provider: %v", result.err)
+			case connectErr := <-connected:
+				require.NoError(t, connectErr)
+			case <-time.After(time.Second):
+				t.Fatal("remote reconnect neither opened the replacement provider nor returned")
+			}
+			reconnectCancel()
+			result := <-outcome
+			require.Nil(t, result.panicked, "authoritative remote reconnect must remain nil-safe through shutdown")
+			require.Error(t, result.err)
+		})
+	}
+}
+
 func TestManagerReconnectHeartbeatLossFencesRuntimeAndTombstoneFailureIsReturned(t *testing.T) {
 	manual := clock.NewManual(time.Now().UTC())
 	credentials, err := NewReconnectCredentials([]byte(strings.Repeat("b", 32)), manual)

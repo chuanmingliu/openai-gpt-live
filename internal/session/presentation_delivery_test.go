@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -247,6 +248,126 @@ type signalingSubscriptions struct {
 	registered int
 	second     chan struct{}
 	once       sync.Once
+}
+
+type blockingSecondRegisterSubscriptions struct {
+	mu      sync.Mutex
+	calls   int
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingSecondRegisterSubscriptions) Register(handoff.EventSubscription) error {
+	s.mu.Lock()
+	s.calls++
+	second := s.calls == 2
+	s.mu.Unlock()
+	if !second {
+		return nil
+	}
+	s.once.Do(func() { close(s.started) })
+	<-s.release
+	return nil
+}
+
+func (*blockingSecondRegisterSubscriptions) Unregister(handoff.EventSubscription) {}
+
+type reentrantRegisterSubscriptions struct {
+	mu      sync.Mutex
+	calls   int
+	manager *Manager
+	scope   handoff.Scope
+	event   handoff.Event
+}
+
+func (s *reentrantRegisterSubscriptions) Register(handoff.EventSubscription) error {
+	s.mu.Lock()
+	s.calls++
+	second := s.calls == 2
+	s.mu.Unlock()
+	if !second {
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.manager.OfferHandoffEvent(context.Background(), s.scope, s.event) }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(time.Second):
+		return errors.New("synchronous reentrant offer blocked behind registrar callback")
+	}
+}
+
+func (*reentrantRegisterSubscriptions) Unregister(handoff.EventSubscription) {}
+
+type racingReplaySubscriptions struct {
+	mu            sync.Mutex
+	registered    bool
+	replayOverlay bool
+	replayAfter   int64
+	replayStarted chan struct{}
+	replayRelease chan struct{}
+	once          sync.Once
+}
+
+type blockingUnregisterSubscriptions struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (*blockingUnregisterSubscriptions) Register(handoff.EventSubscription) error { return nil }
+
+func (s *blockingUnregisterSubscriptions) Unregister(handoff.EventSubscription) {
+	s.once.Do(func() { close(s.started) })
+	<-s.release
+}
+
+type reentrantUnregisterSubscriptions struct {
+	manager  *Manager
+	runtime  *sessionRuntime
+	once     sync.Once
+	timedOut atomic.Bool
+}
+
+func (*reentrantUnregisterSubscriptions) Register(handoff.EventSubscription) error { return nil }
+
+func (s *reentrantUnregisterSubscriptions) Unregister(handoff.EventSubscription) {
+	s.once.Do(func() {
+		done := make(chan error, 1)
+		go func() { done <- s.manager.unregister(s.runtime.key, s.runtime) }()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			s.timedOut.Store(true)
+		}
+	})
+}
+
+func (s *racingReplaySubscriptions) Register(handoff.EventSubscription) error {
+	s.mu.Lock()
+	s.registered = true
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *racingReplaySubscriptions) RegisterReplay(_ handoff.EventSubscription, after int64) error {
+	s.mu.Lock()
+	s.registered = true
+	s.replayOverlay = true
+	s.replayAfter = after
+	s.mu.Unlock()
+	s.once.Do(func() { close(s.replayStarted) })
+	<-s.replayRelease
+	return nil
+}
+
+func (s *racingReplaySubscriptions) Unregister(handoff.EventSubscription) {
+	s.mu.Lock()
+	s.registered = false
+	s.replayOverlay = false
+	s.mu.Unlock()
 }
 
 func (s *signalingSubscriptions) Register(handoff.EventSubscription) error {
@@ -787,14 +908,24 @@ func TestExpiredOfferRotationWriteKeepsSessionAndCredentialRetryable(t *testing.
 	_, err = connector.NextSession(t.Context())
 	require.NoError(t, err)
 	<-client.sessionStarted
-	require.Eventually(t, func() bool { return manager.ActiveSessions() == 1 }, time.Second, time.Millisecond)
-	manager.activeMu.RLock()
 	var runtime *sessionRuntime
-	for _, active := range manager.active {
-		runtime = active
-	}
-	manager.activeMu.RUnlock()
-	require.NotNil(t, runtime)
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "rotation-write-conversation"}
+	require.Eventually(t, func() bool {
+		manager.activeMu.RLock()
+		candidate := manager.active[runtimeKey{sessionID: "rotation-write-session", incarnation: 1}]
+		current := manager.current[scope]
+		pendingAttempt := manager.pendingPublications[scope]
+		if candidate == nil || current != candidate || pendingAttempt != nil {
+			manager.activeMu.RUnlock()
+			return false
+		}
+		candidate.mu.Lock()
+		pending := candidate.publicationPending
+		candidate.mu.Unlock()
+		manager.activeMu.RUnlock()
+		runtime = candidate
+		return !pending
+	}, time.Second, time.Millisecond, "runtime must be the durably committed current presentation owner")
 	event := handoff.Event{
 		Seq: 7, EventID: "rotation-write-event", HandoffID: "handoff", TenantID: "tenant",
 		ConversationID: runtime.state.ids.ConversationID, Kind: "tool.approval_required", State: handoff.StateNeedsInput,
@@ -937,6 +1068,220 @@ func TestFailedInitialSameScopePublicationRestoresPriorRuntime(t *testing.T) {
 	require.True(t, previous.accepting)
 	require.Equal(t, originalGeneration, previous.acceptanceGeneration)
 	previous.mu.Unlock()
+}
+
+func TestStagedReplacementOfferIsReplayableAfterPublicationRollback(t *testing.T) {
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "staged-publication-rollback"}
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+	}, testkit.NewFakeConnector(1), managerIDs{})
+	require.NoError(t, manager.validationErr)
+	previous, previousInputs, previousDone := currentRuntime(scope, "staged-publication-previous")
+	t.Cleanup(func() { close(previousDone) })
+	require.NoError(t, manager.register(previous))
+	manager.commitPublication(previous)
+
+	replacement, replacementInputs, replacementDone := currentRuntime(scope, "staged-publication-replacement")
+	t.Cleanup(func() { close(replacementDone) })
+	replacement.publicationRequiresCommit = true
+	require.NoError(t, manager.register(replacement))
+	event := handoff.Event{
+		Seq: 1, EventID: "staged-publication-event", HandoffID: "handoff", TenantID: scope.TenantID,
+		ConversationID: scope.ConversationID, Kind: "handoff.created", State: handoff.StatePending,
+		Payload: json.RawMessage(`{}`),
+	}
+	cursor := int64(0)
+	offerErr := manager.OfferHandoffEvent(t.Context(), scope, event)
+	if offerErr == nil {
+		cursor = event.Seq
+	}
+	assert.ErrorIs(t, offerErr, handoff.ErrNoLiveSession, "an offer cannot become durable while its runtime publication is still staged")
+	manager.activeMu.RLock()
+	logical := manager.logical[replacement.key.sessionID]
+	manager.activeMu.RUnlock()
+	require.NotNil(t, logical)
+	manager.rollbackInitialPublication(replacement, logical)
+	assert.Zero(t, cursor, "a rolled-back staged runtime must not advance the delivery cursor")
+	select {
+	case input := <-replacementInputs:
+		t.Errorf("rolled-back staged runtime applied offer sequence %d", input.(HandoffEventInput).Event.Seq)
+	default:
+	}
+
+	require.NoError(t, manager.OfferHandoffEvent(t.Context(), scope, event), "the same offer must replay to the restored owner")
+	replayed := (<-previousInputs).(HandoffEventInput)
+	require.Equal(t, event.Seq, replayed.Event.Seq)
+}
+
+func TestBlockingRegisterCallbackDoesNotStallCurrentPresentation(t *testing.T) {
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "blocking-register-callback"}
+	registrar := &blockingSecondRegisterSubscriptions{started: make(chan struct{}), release: make(chan struct{})}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(registrar.release) }) }
+	t.Cleanup(release)
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		HandoffConsumerID: "callback-client", HandoffSubscriptions: registrar,
+		PresentationPolicy: presentation.NewPolicy(presentation.Config{}), SafetyPolicy: &presentationSafety{},
+	}, testkit.NewFakeConnector(1), managerIDs{})
+	require.NoError(t, manager.validationErr)
+	previous, previousInputs, previousDone := currentRuntime(scope, "blocking-register-previous")
+	replacement, _, replacementDone := currentRuntime(scope, "blocking-register-replacement")
+	t.Cleanup(func() { close(previousDone); close(replacementDone) })
+	require.NoError(t, manager.register(previous))
+	published := make(chan error, 1)
+	go func() { published <- manager.register(replacement) }()
+	select {
+	case <-registrar.started:
+	case <-time.After(time.Second):
+		t.Fatal("replacement did not reach blocking Register callback")
+	}
+
+	offered := make(chan error, 1)
+	event := handoff.Event{Seq: 1, EventID: "blocking-register-event", HandoffID: "handoff", TenantID: scope.TenantID,
+		ConversationID: scope.ConversationID, Kind: "handoff.created", State: handoff.StatePending, Payload: json.RawMessage(`{}`)}
+	go func() { offered <- manager.OfferHandoffEvent(context.Background(), scope, event) }()
+	select {
+	case offerErr := <-offered:
+		require.NoError(t, offerErr)
+		require.Equal(t, event.Seq, (<-previousInputs).(HandoffEventInput).Event.Seq)
+	case <-time.After(time.Second):
+		release()
+		t.Fatal("blocking Register callback stalled the current presentation owner")
+	}
+	release()
+	require.NoError(t, <-published)
+}
+
+func TestSynchronousReentrantRegisterCallbackDoesNotDeadlock(t *testing.T) {
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "reentrant-register-callback"}
+	event := handoff.Event{Seq: 1, EventID: "reentrant-register-event", HandoffID: "handoff", TenantID: scope.TenantID,
+		ConversationID: scope.ConversationID, Kind: "handoff.created", State: handoff.StatePending, Payload: json.RawMessage(`{}`)}
+	registrar := &reentrantRegisterSubscriptions{scope: scope, event: event}
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		HandoffConsumerID: "callback-client", HandoffSubscriptions: registrar,
+		PresentationPolicy: presentation.NewPolicy(presentation.Config{}), SafetyPolicy: &presentationSafety{},
+	}, testkit.NewFakeConnector(1), managerIDs{})
+	registrar.manager = manager
+	require.NoError(t, manager.validationErr)
+	previous, previousInputs, previousDone := currentRuntime(scope, "reentrant-register-previous")
+	replacement, _, replacementDone := currentRuntime(scope, "reentrant-register-replacement")
+	t.Cleanup(func() { close(previousDone); close(replacementDone) })
+	require.NoError(t, manager.register(previous))
+	require.NoError(t, manager.register(replacement), "Register callback must be able to synchronously reenter the same presentation scope")
+	require.Equal(t, event.Seq, (<-previousInputs).(HandoffEventInput).Event.Seq)
+}
+
+func TestRollbackUnregisterCallbacksRunWithoutPresentationLock(t *testing.T) {
+	t.Run("blocking", func(t *testing.T) {
+		scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "blocking-rollback-unregister"}
+		registrar := &blockingUnregisterSubscriptions{started: make(chan struct{}), release: make(chan struct{})}
+		manager := &Manager{
+			cfg:    Config{HandoffConsumerID: "callback-client", HandoffSubscriptions: registrar},
+			active: make(map[runtimeKey]*sessionRuntime), current: make(map[handoff.Scope]*sessionRuntime),
+			logical: make(map[identity.SessionID]*logicalSession),
+		}
+		runtime, _, runtimeDone := currentRuntime(scope, "blocking-rollback-runtime")
+		t.Cleanup(func() { close(runtimeDone) })
+		require.NoError(t, manager.register(runtime))
+		logical := manager.logical[runtime.key.sessionID]
+		rolledBack := make(chan struct{})
+		go func() {
+			manager.rollbackInitialPublication(runtime, logical)
+			close(rolledBack)
+		}()
+		select {
+		case <-registrar.started:
+		case <-time.After(time.Second):
+			t.Fatal("rollback did not reach blocking Unregister callback")
+		}
+		presentationAvailable := runtime.presentationMu.TryLock()
+		if presentationAvailable {
+			runtime.presentationMu.Unlock()
+		}
+		close(registrar.release)
+		select {
+		case <-rolledBack:
+		case <-time.After(time.Second):
+			t.Fatal("rollback did not finish after Unregister callback released")
+		}
+		require.True(t, presentationAvailable, "blocking Unregister callback retained the rolled-back runtime presentation lock")
+	})
+
+	t.Run("synchronous reentrant same-scope unregister", func(t *testing.T) {
+		scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "reentrant-rollback-unregister"}
+		registrar := &reentrantUnregisterSubscriptions{}
+		manager := &Manager{
+			cfg:    Config{HandoffConsumerID: "callback-client", HandoffSubscriptions: registrar},
+			active: make(map[runtimeKey]*sessionRuntime), current: make(map[handoff.Scope]*sessionRuntime),
+			logical: make(map[identity.SessionID]*logicalSession),
+		}
+		runtime, _, runtimeDone := currentRuntime(scope, "reentrant-rollback-runtime")
+		t.Cleanup(func() { close(runtimeDone) })
+		registrar.manager, registrar.runtime = manager, runtime
+		require.NoError(t, manager.register(runtime))
+		manager.rollbackInitialPublication(runtime, manager.logical[runtime.key.sessionID])
+		require.False(t, registrar.timedOut.Load(), "rollback Unregister callback deadlocked while synchronously reentering the same scope")
+	})
+}
+
+func TestReconnectReplayPublicationCannotLeakOverlayToConcurrentInitialOwner(t *testing.T) {
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "replay-publication-race"}
+	registrar := &racingReplaySubscriptions{replayStarted: make(chan struct{}), replayRelease: make(chan struct{})}
+	manager := &Manager{
+		cfg:    Config{HandoffConsumerID: "replay-client", HandoffSubscriptions: registrar},
+		active: make(map[runtimeKey]*sessionRuntime), current: make(map[handoff.Scope]*sessionRuntime),
+		logical: make(map[identity.SessionID]*logicalSession),
+	}
+	replayAfter := int64(5)
+	replacement, _, replacementDone := currentRuntime(scope, "replay-race-reconnect")
+	t.Cleanup(func() { close(replacementDone) })
+	replacement.key.incarnation = 2
+	replacement.state.ids.Incarnation = 2
+	replacement.replayAfter = &replayAfter
+	logical := &logicalSession{scope: scope, highWater: 1, reconnecting: true, turnBoundary: true, state: logicalTombstoned}
+	manager.logical[replacement.key.sessionID] = logical
+	reconnectPublished := make(chan error, 1)
+	go func() { reconnectPublished <- manager.registerReplacement(replacement, logical, 1) }()
+	select {
+	case <-registrar.replayStarted:
+	case <-time.After(time.Second):
+		t.Fatal("reconnect did not install its attempt-owned replay overlay")
+	}
+
+	initial, _, initialDone := currentRuntime(scope, "replay-race-initial")
+	t.Cleanup(func() { close(initialDone) })
+	initialPublished := make(chan error, 1)
+	go func() { initialPublished <- manager.register(initial) }()
+	var initialErr error
+	select {
+	case initialErr = <-initialPublished:
+	case <-time.After(time.Second):
+		close(registrar.replayRelease)
+		t.Fatal("concurrent initial publication did not resolve against the pending replay attempt")
+	}
+	close(registrar.replayRelease)
+	reconnectErr := <-reconnectPublished
+
+	manager.activeMu.RLock()
+	current := manager.current[scope]
+	manager.activeMu.RUnlock()
+	registrar.mu.Lock()
+	registered, replayOverlay, retainedAfter := registrar.registered, registrar.replayOverlay, registrar.replayAfter
+	registrar.mu.Unlock()
+	require.True(t, registered)
+	if initialErr == nil {
+		require.ErrorIs(t, reconnectErr, ErrStaleReconnect)
+		require.Same(t, initial, current)
+		require.False(t, replayOverlay, "a losing reconnect attempt leaked its lower replay cursor onto the initial owner")
+		return
+	}
+	require.ErrorIs(t, initialErr, ErrStaleReconnect)
+	require.NoError(t, reconnectErr)
+	require.Same(t, replacement, current)
+	require.True(t, replayOverlay)
+	require.Equal(t, replayAfter, retainedAfter)
 }
 
 func TestFailedReconnectSameScopePublicationRestoresPriorRuntime(t *testing.T) {
