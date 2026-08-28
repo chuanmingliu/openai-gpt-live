@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -93,14 +94,184 @@ func TestDevelopmentDurableGatewaySecretResolutionDoesNotRequireWorkerCredential
 		"LIVE_STATIC_BEARER_TOKEN": "local-bearer",
 	}
 
-	err := resolveGatewayConfigSecrets(cfg, func(name string) (string, bool) {
+	lookup := func(name string) (string, bool) {
 		if name == "DEEPSEEK_API_KEY" {
 			t.Fatal("gateway looked up worker-only DeepSeek credential")
 		}
 		value, ok := values[name]
 		return value, ok
+	}
+	_, err := resolveGatewayProviderCredential(cfg.Gateway.Voice.APIKeyEnv, lookup)
+	require.NoError(t, err)
+	_, err = resolveGatewayDatabaseURL(cfg, lookup)
+	require.NoError(t, err)
+	_, err = resolveGatewayStaticBearer(cfg.Auth.StaticBearerEnv, lookup)
+	require.NoError(t, err)
+}
+
+func TestLoadGatewayConfigUsesCredentialFreeDefaultWhenConfigFlagAbsent(t *testing.T) {
+	cfg, err := loadGatewayConfig(gatewayConfigSource{})
+	require.NoError(t, err)
+	assert.Equal(t, "local", cfg.Mode)
+	assert.Empty(t, cfg.Gateway.Voice.APIKeyEnv)
+}
+
+func TestGatewayExplicitEmptyConfigNeverDowngradesToLocal(t *testing.T) {
+	_, err := loadGatewayConfig(gatewayConfigSource{Explicit: true})
+	require.EqualError(t, err, "explicit configuration path is required")
+}
+
+func TestGatewayStartupDoesNotResolveInactiveWorkerSecrets(t *testing.T) {
+	cfg, err := loadGatewayConfig(gatewayConfigSource{})
+	require.NoError(t, err)
+	forbidden := map[string]bool{
+		"DEEPSEEK_API_KEY": true,
+		"PRIVACY_HMAC":     true,
+		"TOOL_ENCRYPTION":  true,
+	}
+	_, err = resolveGatewayProviderCredential(cfg.Gateway.Voice.APIKeyEnv, func(name string) (string, bool) {
+		if forbidden[name] {
+			t.Fatalf("gateway resolved inactive worker secret %q", name)
+		}
+		return "", false
 	})
 	require.NoError(t, err)
+}
+
+func TestGatewayConfiguredVoiceCredentialRemainsStrict(t *testing.T) {
+	_, err := resolveGatewayProviderCredential("SPEECH_KEY", func(string) (string, bool) { return "", false })
+	require.EqualError(t, err, "configured provider credential is unavailable")
+}
+
+func TestGatewayConfiguredStaticBearerRemainsStrict(t *testing.T) {
+	cfg := config.Config{Mode: "local", Auth: config.AuthConfig{StaticBearerEnv: "STATIC_TOKEN"}}
+	_, _, err := composeAdmission(t.Context(), cfg, func(string) (string, bool) { return "", false })
+	require.EqualError(t, err, "configured static credential is unavailable")
+}
+
+func TestGatewayConfiguredDatabaseCredentialRemainsStrict(t *testing.T) {
+	_, err := resolveGatewayDatabaseURL(config.Config{Store: config.StoreConfig{DatabaseURLEnv: "DATABASE_URL"}}, func(string) (string, bool) { return "", false })
+	require.EqualError(t, err, "configured database credential is unavailable")
+}
+
+func TestGatewayProductionDatabaseURLRejectsEnvironmentTLSDisableBeforeDial(t *testing.T) {
+	_, err := resolveGatewayDatabaseURL(config.Config{Mode: "production", Store: config.StoreConfig{DatabaseURLEnv: "DATABASE_URL"}}, func(string) (string, bool) {
+		return "postgres://gateway@postgres/live?sslmode=disable", true
+	})
+	require.EqualError(t, err, "production database URL must not disable SSL")
+}
+
+func TestGatewayTextualCredentialsAreBounded(t *testing.T) {
+	values := []struct {
+		name  string
+		value string
+		ok    bool
+	}{
+		{name: "missing"},
+		{name: "empty", ok: true},
+		{name: "whitespace", value: " adversarial", ok: true},
+		{name: "invalid UTF-8", value: string([]byte{0xff}), ok: true},
+		{name: "control", value: "adversarial\n", ok: true},
+		{name: "too large", value: strings.Repeat("z", gatewaySecretMaximumBytes+1), ok: true},
+	}
+	credentials := []struct {
+		name    string
+		resolve func(func(string) (string, bool)) error
+	}{
+		{name: "speech API key", resolve: func(lookup func(string) (string, bool)) error {
+			_, err := resolveGatewayProviderCredential("SPEECH_KEY", lookup)
+			return err
+		}},
+		{name: "static bearer", resolve: func(lookup func(string) (string, bool)) error {
+			_, err := resolveGatewayStaticBearer("STATIC_BEARER", lookup)
+			return err
+		}},
+		{name: "database URL", resolve: func(lookup func(string) (string, bool)) error {
+			_, err := resolveGatewayDatabaseURL(config.Config{Store: config.StoreConfig{DatabaseURLEnv: "DATABASE_URL"}}, lookup)
+			return err
+		}},
+	}
+	for _, credential := range credentials {
+		for _, value := range values {
+			t.Run(credential.name+"/"+value.name, func(t *testing.T) {
+				err := credential.resolve(func(string) (string, bool) { return value.value, value.ok })
+				require.Error(t, err)
+				if value.value != "" {
+					assert.NotContains(t, err.Error(), value.value)
+				}
+			})
+		}
+	}
+}
+
+func TestGatewayEncodedKeysAreBoundedBeforeDecode(t *testing.T) {
+	tooLarge := strings.Repeat("A", gatewayHMACEncodedMaximumSize+1)
+	_, err := resolveGatewayRetentionKey("RETENTION_KEY", func(string) (string, bool) { return tooLarge, true })
+	require.EqualError(t, err, "retention HMAC key is unavailable")
+	_, err = resolveGatewayReconnectKey("RECONNECT_KEY", func(string) (string, bool) { return tooLarge, true })
+	require.EqualError(t, err, "reconnect HMAC key is unavailable")
+}
+
+func TestLocalDeploymentRegionDoesNotReadAllowedRegionPolicy(t *testing.T) {
+	region, err := deploymentRegion("local", func(name string) (string, bool) {
+		if name == "LIVE_ALLOWED_REGIONS" {
+			t.Fatal("local deployment read allowed-region policy")
+		}
+		return "", false
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "local", region)
+}
+
+func TestLocalGatewayLivenessIsLoopbackHealthOnly(t *testing.T) {
+	server, err := startDefaultGatewayLiveness(t.Context(), gatewayConfigSource{})
+	require.NoError(t, err)
+	defer server.close()
+
+	client := &http.Client{Timeout: time.Second}
+	for _, test := range []struct {
+		method string
+		path   string
+		status int
+		body   string
+	}{
+		{method: http.MethodGet, path: "/health/live", status: http.StatusOK, body: "ok\n"},
+		{method: http.MethodHead, path: "/health/live", status: http.StatusOK},
+		{method: http.MethodPost, path: "/health/live", status: http.StatusMethodNotAllowed},
+		{method: http.MethodGet, path: "/health/ready", status: http.StatusNotFound},
+	} {
+		t.Run(test.method+test.path, func(t *testing.T) {
+			request, err := http.NewRequest(test.method, "http://"+localGatewayLivenessAddress+test.path, nil)
+			require.NoError(t, err)
+			response, err := client.Do(request)
+			require.NoError(t, err)
+			defer response.Body.Close()
+			assert.Equal(t, test.status, response.StatusCode)
+			if test.body != "" {
+				body, err := io.ReadAll(response.Body)
+				require.NoError(t, err)
+				assert.Equal(t, test.body, string(body))
+			}
+		})
+	}
+}
+
+func TestLocalGatewayLivenessJoinsOnShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	server, err := startDefaultGatewayLiveness(ctx, gatewayConfigSource{})
+	require.NoError(t, err)
+	cancel()
+	select {
+	case <-server.done:
+	case <-time.After(time.Second):
+		t.Fatal("local liveness server did not join after shutdown")
+	}
+}
+
+func TestExplicitConfigNeverStartsDefaultLiveness(t *testing.T) {
+	server, err := startDefaultGatewayLiveness(t.Context(), gatewayConfigSource{Explicit: true, Path: "gateway.yaml"})
+	require.NoError(t, err)
+	assert.Nil(t, server)
 }
 
 func TestDevelopmentDurableHandoffSnapshotUsesExactEnabledCatalog(t *testing.T) {

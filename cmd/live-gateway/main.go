@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -25,6 +26,7 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/admin"
 	"github.com/chuanmingliu/openai-gpt-live/internal/admission"
 	"github.com/chuanmingliu/openai-gpt-live/internal/auth"
+	"github.com/chuanmingliu/openai-gpt-live/internal/cliopt"
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
 	"github.com/chuanmingliu/openai-gpt-live/internal/config"
 	"github.com/chuanmingliu/openai-gpt-live/internal/feature"
@@ -50,7 +52,19 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-const providerConnectTimeout = 10 * time.Second
+const (
+	providerConnectTimeout        = 10 * time.Second
+	localGatewayLivenessAddress   = "127.0.0.1:9090"
+	gatewaySecretMaximumBytes     = 16 * 1024
+	gatewayHMACEncodedMaximumSize = 4 * ((4096 + 2) / 3)
+)
+
+var errExplicitConfigPathRequired = errors.New("explicit configuration path is required")
+
+type gatewayConfigSource struct {
+	Path     string
+	Explicit bool
+}
 
 var commandOutput io.Writer = os.Stdout
 
@@ -65,11 +79,11 @@ func main() {
 }
 
 func deploymentRegion(mode string, lookup func(string) (string, bool)) (string, error) {
-	region, regionOK := lookup("LIVE_DEPLOYMENT_REGION")
-	allowed, allowedOK := lookup("LIVE_ALLOWED_REGIONS")
-	if !regionOK && mode != "production" {
+	if mode != "production" {
 		return "local", nil
 	}
+	region, regionOK := lookup("LIVE_DEPLOYMENT_REGION")
+	allowed, allowedOK := lookup("LIVE_ALLOWED_REGIONS")
 	if !regionOK || !allowedOK {
 		return "", errors.New("production requires LIVE_DEPLOYMENT_REGION and LIVE_ALLOWED_REGIONS")
 	}
@@ -124,17 +138,16 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 	}
 	flags := flag.NewFlagSet("live-gateway", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	configPath := flags.String("config", "", "path to gateway YAML configuration")
+	var configPath cliopt.OptionalPath
+	flags.Var(&configPath, "config", "path to gateway YAML configuration")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 {
 		return errors.New("extra arguments are not accepted")
 	}
-	if *configPath == "" {
-		return errors.New("-config is required")
-	}
-	cfg, err := config.LoadUnresolved(*configPath)
+	source := gatewayConfigSource{Path: configPath.Path(), Explicit: configPath.Present()}
+	cfg, err := loadGatewayConfig(source)
 	if err != nil {
 		return fmt.Errorf("load gateway configuration: %w", err)
 	}
@@ -144,9 +157,6 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 	}
 	if err := verifyExpectedHash(cfg, lookup); err != nil {
 		return err
-	}
-	if err := resolveGatewayConfigSecrets(cfg, lookup); err != nil {
-		return fmt.Errorf("load gateway configuration: %w", err)
 	}
 	admissionController, closeAdmission, err := composeAdmission(ctx, cfg, lookup)
 	if err != nil {
@@ -164,13 +174,9 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 	if featureRuntime != nil {
 		defer featureRuntime.close()
 	}
-	apiKey := ""
-	if cfg.Gateway.Voice.APIKeyEnv != "" {
-		value, ok := lookup(cfg.Gateway.Voice.APIKeyEnv)
-		if !ok {
-			return errors.New("configured provider credential is unavailable")
-		}
-		apiKey = value
+	apiKey, err := resolveGatewayProviderCredential(cfg.Gateway.Voice.APIKeyEnv, lookup)
+	if err != nil {
+		return err
 	}
 	connector, err := s2sws.New(s2sws.Config{
 		URL:            cfg.Gateway.Voice.URL,
@@ -290,7 +296,60 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 	if diagnostics != nil {
 		defer diagnostics.close()
 	}
+	liveness, err := startDefaultGatewayLiveness(ctx, source)
+	if err != nil {
+		return err
+	}
+	if liveness != nil {
+		defer liveness.close()
+	}
 	return runGateway(ctx, app, diagnostics)
+}
+
+func loadGatewayConfig(source gatewayConfigSource) (config.Config, error) {
+	if !source.Explicit {
+		return config.DefaultLocalGateway()
+	}
+	if source.Path == "" {
+		return config.Config{}, errExplicitConfigPathRequired
+	}
+	return config.LoadUnresolved(source.Path)
+}
+
+func resolveGatewayProviderCredential(name string, lookup func(string) (string, bool)) (string, error) {
+	if name == "" {
+		return "", nil
+	}
+	value, err := secretbuf.LookupText(lookup, name, gatewaySecretMaximumBytes)
+	if err != nil {
+		return "", errors.New("configured provider credential is unavailable")
+	}
+	return value, nil
+}
+
+func resolveGatewayStaticBearer(name string, lookup func(string) (string, bool)) (string, error) {
+	value, err := secretbuf.LookupText(lookup, name, gatewaySecretMaximumBytes)
+	if err != nil {
+		return "", errors.New("configured static credential is unavailable")
+	}
+	return value, nil
+}
+
+func resolveGatewayDatabaseURL(cfg config.Config, lookup func(string) (string, bool)) (string, error) {
+	if cfg.Store.DatabaseURLEnv == "" {
+		if cfg.IsProduction() && strings.Contains(cfg.Store.URL, "sslmode=disable") {
+			return "", errors.New("production database URL must not disable SSL")
+		}
+		return cfg.Store.URL, nil
+	}
+	value, err := secretbuf.LookupText(lookup, cfg.Store.DatabaseURLEnv, gatewaySecretMaximumBytes)
+	if err != nil {
+		return "", errors.New("configured database credential is unavailable")
+	}
+	if cfg.IsProduction() && strings.Contains(value, "sslmode=disable") {
+		return "", errors.New("production database URL must not disable SSL")
+	}
+	return value, nil
 }
 
 type gatewayFeatureRuntime struct {
@@ -309,13 +368,9 @@ func composeGatewayFeatures(ctx context.Context, cfg config.Config, lookup func(
 	if !requiresRuntimeRepository(cfg) {
 		return nil, nil
 	}
-	databaseURL := cfg.Store.URL
-	if cfg.Store.DatabaseURLEnv != "" {
-		value, ok := lookup(cfg.Store.DatabaseURLEnv)
-		if !ok || value == "" {
-			return nil, errors.New("configured database credential is unavailable")
-		}
-		databaseURL = value
+	databaseURL, err := resolveGatewayDatabaseURL(cfg, lookup)
+	if err != nil {
+		return nil, err
 	}
 	pool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
@@ -336,23 +391,12 @@ func composeGatewayFeatures(ctx context.Context, cfg config.Config, lookup func(
 	}
 	repositoryOptions := []postgres.RepositoryOption{postgres.WithApprovalTTL(cfg.Store.Retention.ApprovalTTL)}
 	var retentionKey []byte
-	defer clear(retentionKey)
+	defer func() { clear(retentionKey) }()
 	if cfg.Store.Retention.HMACKeyEnv != "" {
-		encoded, ok := lookup(cfg.Store.Retention.HMACKeyEnv)
-		if !ok {
+		retentionKey, err = resolveGatewayRetentionKey(cfg.Store.Retention.HMACKeyEnv, lookup)
+		if err != nil {
 			pool.Close()
-			return nil, errors.New("retention HMAC key is unavailable")
-		}
-		decodeErr := secretbuf.WithDecodedBase64(encoded, func(key []byte) error {
-			if len(key) < 32 || len(key) > 4096 {
-				return errors.New("retention HMAC key length is invalid")
-			}
-			retentionKey = append([]byte(nil), key...)
-			return nil
-		})
-		if decodeErr != nil {
-			pool.Close()
-			return nil, errors.New("retention HMAC key is invalid")
+			return nil, err
 		}
 		repositoryOptions = append(repositoryOptions, postgres.WithRetentionHMAC(cfg.Store.Retention.HMACKeyID, retentionKey))
 	}
@@ -381,6 +425,25 @@ func composeGatewayFeatures(ctx context.Context, cfg config.Config, lookup func(
 		runtime.done <- gates.Run(runCtx, store, cfg.Features.RefreshInterval, cfg.Shutdown.CleanupTimeout)
 	}()
 	return runtime, nil
+}
+
+func resolveGatewayRetentionKey(name string, lookup func(string) (string, bool)) ([]byte, error) {
+	encoded, err := secretbuf.LookupText(lookup, name, gatewayHMACEncodedMaximumSize)
+	if err != nil {
+		return nil, errors.New("retention HMAC key is unavailable")
+	}
+	var result []byte
+	if err := secretbuf.WithDecodedBase64(encoded, func(key []byte) error {
+		if len(key) < 32 || len(key) > 4096 {
+			return errors.New("retention HMAC key length is invalid")
+		}
+		result = append([]byte(nil), key...)
+		return nil
+	}); err != nil {
+		clear(result)
+		return nil, errors.New("retention HMAC key is invalid")
+	}
+	return result, nil
 }
 
 func (r *gatewayFeatureRuntime) close() {
@@ -415,6 +478,65 @@ type diagnosticsServer struct {
 	metricsServer   *http.Server
 	metricsListener net.Listener
 	errors          chan error
+}
+
+type localLivenessServer struct {
+	server   *http.Server
+	listener net.Listener
+	done     chan struct{}
+	once     sync.Once
+}
+
+func startDefaultGatewayLiveness(ctx context.Context, source gatewayConfigSource) (*localLivenessServer, error) {
+	if source.Explicit {
+		return nil, nil
+	}
+	listener, err := net.Listen("tcp", localGatewayLivenessAddress)
+	if err != nil {
+		return nil, errors.New("listen local gateway liveness")
+	}
+	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/health/live" {
+			http.NotFound(writer, request)
+			return
+		}
+		switch request.Method {
+		case http.MethodGet:
+			writer.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(writer, "ok\n")
+		case http.MethodHead:
+			writer.WriteHeader(http.StatusOK)
+		default:
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	})
+	runtime := &localLivenessServer{
+		server:   &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second},
+		listener: listener,
+		done:     make(chan struct{}),
+	}
+	go func() {
+		_ = runtime.server.Serve(listener)
+		close(runtime.done)
+	}()
+	go func() {
+		<-ctx.Done()
+		runtime.close()
+	}()
+	return runtime, nil
+}
+
+func (s *localLivenessServer) close() {
+	if s == nil {
+		return
+	}
+	s.once.Do(func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = s.server.Shutdown(closeCtx)
+		_ = s.listener.Close()
+		<-s.done
+	})
 }
 
 func startGatewayDiagnostics(ctx context.Context, cfg config.Config, authenticator auth.Authenticator, app *gateway.App, drainer *lifecycle.Drainer, ready *health.Registry, registry *prometheus.Registry, features *gatewayFeatureRuntime) (*diagnosticsServer, error) {
@@ -513,14 +635,15 @@ func runCommand(ctx context.Context, args []string, lookup func(string) (string,
 	case "check-config", "config-hash":
 		flags := flag.NewFlagSet(args[0], flag.ContinueOnError)
 		flags.SetOutput(io.Discard)
-		path := flags.String("config", "", "configuration path")
+		var path cliopt.OptionalPath
+		flags.Var(&path, "config", "configuration path")
 		if err := flags.Parse(args[1:]); err != nil {
 			return true, err
 		}
-		if *path == "" || flags.NArg() != 0 {
+		if !path.Present() || flags.NArg() != 0 {
 			return true, errors.New("--config is required and extra arguments are not accepted")
 		}
-		cfg, err := config.LoadUnresolved(*path)
+		cfg, err := config.LoadUnresolved(path.Path())
 		if err != nil {
 			return true, err
 		}
@@ -568,15 +691,6 @@ func verifyExpectedHash(cfg config.Config, lookup func(string) (string, bool)) e
 	return config.ValidateExpected(actual, expected)
 }
 
-// resolveGatewayConfigSecrets validates only the references the gateway owns.
-// The worker's reasoner credential remains scoped to the worker process even
-// when both components consume the same immutable configuration document.
-func resolveGatewayConfigSecrets(cfg config.Config, lookup func(string) (string, bool)) error {
-	gatewayConfig := cfg
-	gatewayConfig.Worker.Reasoner.APIKeyEnv = ""
-	return gatewayConfig.ResolveSecrets(lookup)
-}
-
 func finishAdmission(runErr error, closeAdmission func() error) error {
 	if closeAdmission == nil {
 		return runErr
@@ -591,9 +705,9 @@ func composeAdmission(ctx context.Context, cfg config.Config, lookup func(string
 	var authenticator auth.Authenticator
 	requiredScopes := cfg.Auth.OIDCRequiredScopes
 	if allowsStaticAuthenticator(cfg) {
-		token, ok := lookup(cfg.Auth.StaticBearerEnv)
-		if !ok || token == "" {
-			return nil, nil, errors.New("configured static credential is unavailable")
+		token, err := resolveGatewayStaticBearer(cfg.Auth.StaticBearerEnv, lookup)
+		if err != nil {
+			return nil, nil, err
 		}
 		scopes := make(map[string]struct{}, len(cfg.Auth.StaticScopes))
 		for _, scope := range cfg.Auth.StaticScopes {
@@ -622,13 +736,9 @@ func composeAdmission(ctx context.Context, cfg config.Config, lookup func(string
 		}
 		return controller, nil, nil
 	}
-	databaseURL := cfg.Store.URL
-	if cfg.Store.DatabaseURLEnv != "" {
-		value, ok := lookup(cfg.Store.DatabaseURLEnv)
-		if !ok || value == "" {
-			return nil, nil, errors.New("configured database credential is unavailable")
-		}
-		databaseURL = value
+	databaseURL, err := resolveGatewayDatabaseURL(cfg, lookup)
+	if err != nil {
+		return nil, nil, err
 	}
 	pool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
@@ -848,29 +958,41 @@ func composeGatewayReconnect(cfg config.Config, runtime *gatewayFeatureRuntime, 
 	if lookup == nil {
 		return nil, errors.New("reconnect HMAC key is unavailable")
 	}
-	encoded, ok := lookup(cfg.Gateway.Reconnect.HMACKeyEnv)
-	if !ok {
-		return nil, errors.New("reconnect HMAC key is unavailable")
+	key, err := resolveGatewayReconnectKey(cfg.Gateway.Reconnect.HMACKeyEnv, lookup)
+	if err != nil {
+		return nil, err
 	}
+	defer clear(key)
 	var credentials session.ReconnectCredentials
-	if err := secretbuf.WithDecodedBase64(encoded, func(key []byte) error {
-		if len(key) < 32 || len(key) > 4096 {
-			return errors.New("reconnect HMAC key length is invalid")
-		}
-		configured, err := session.NewReconnectCredentials(key, clock.Real{})
-		if err != nil {
-			return err
-		}
-		credentials = configured
-		return nil
-	}); err != nil {
+	configured, err := session.NewReconnectCredentials(key, clock.Real{})
+	if err != nil {
 		return nil, errors.New("reconnect HMAC key is invalid")
 	}
+	credentials = configured
 	owners, err := postgres.NewReconnectOwners(runtime.pool)
 	if err != nil {
 		return nil, fmt.Errorf("configure reconnect owner store: %w", err)
 	}
 	return gateway.WithReconnectAuthority(credentials, owners, ownerID, cfg.Gateway.Reconnect.CredentialTTL), nil
+}
+
+func resolveGatewayReconnectKey(name string, lookup func(string) (string, bool)) ([]byte, error) {
+	encoded, err := secretbuf.LookupText(lookup, name, gatewayHMACEncodedMaximumSize)
+	if err != nil {
+		return nil, errors.New("reconnect HMAC key is unavailable")
+	}
+	var result []byte
+	if err := secretbuf.WithDecodedBase64(encoded, func(key []byte) error {
+		if len(key) < 32 || len(key) > 4096 {
+			return errors.New("reconnect HMAC key length is invalid")
+		}
+		result = append([]byte(nil), key...)
+		return nil
+	}); err != nil {
+		clear(result)
+		return nil, errors.New("reconnect HMAC key is invalid")
+	}
+	return result, nil
 }
 
 func maxDuration(left, right time.Duration) time.Duration {
