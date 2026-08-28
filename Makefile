@@ -1,4 +1,4 @@
-.PHONY: test test-race vet fmt verify-deploy verify-deploy-static smoke-deploy durable-demo-migrate durable-demo-up durable-demo-down test-durable-web-search load-unit chaos capacity barge soak load-smoke load-evidence release-gate release-gate-verify demo-wizard demo-live-client test-demo-live-client test-control-panel-compose-render test-control-panel-port-publish test-control-panel-port-publish-live adapter-scaffold
+.PHONY: test test-race vet fmt verify-deploy verify-deploy-static smoke-deploy test-credential-free-startup durable-demo-migrate durable-demo-up durable-demo-down test-durable-web-search load-unit chaos capacity barge soak load-smoke load-evidence release-gate release-gate-verify demo-wizard demo-live-client test-demo-live-client test-control-panel-compose-render test-control-panel-port-publish test-control-panel-port-publish-live adapter-scaffold
 
 adapter-scaffold:
 	go run ./cmd/live-adapter-scaffold -root . -name "$(NAME)"
@@ -50,6 +50,9 @@ verify-deploy-static:
 
 smoke-deploy:
 	./deploy/scripts/smoke-compose.sh
+
+test-credential-free-startup:
+	./deploy/scripts/test-credential-free-startup.sh
 
 durable-demo-migrate:
 	@test -n "$$POSTGRES_PASSWORD"
