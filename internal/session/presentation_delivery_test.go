@@ -347,7 +347,7 @@ type gatedCommitReplayRegistrar struct {
 	commitStarted chan struct{}
 	commitRelease <-chan struct{}
 	wakeResults   <-chan error
-	stop          <-chan struct{}
+	waitCtx       context.Context
 }
 
 func (r *gatedCommitReplayRegistrar) Register(subscription handoff.EventSubscription) error {
@@ -365,7 +365,7 @@ func (r *gatedCommitReplayRegistrar) BeginReplay(subscription handoff.EventSubsc
 	}
 	return &gatedCommitReplayAttempt{
 		ReplayAttempt: attempt, commitStarted: r.commitStarted, commitRelease: r.commitRelease,
-		wakeResults: r.wakeResults, stop: r.stop,
+		wakeResults: r.wakeResults, waitCtx: r.waitCtx,
 	}, nil
 }
 
@@ -374,14 +374,17 @@ type gatedCommitReplayAttempt struct {
 	commitStarted chan struct{}
 	commitRelease <-chan struct{}
 	wakeResults   <-chan error
-	stop          <-chan struct{}
+	waitCtx       context.Context
 	startedOnce   sync.Once
 }
 
 func (a *gatedCommitReplayAttempt) Commit() {
 	a.ReplayAttempt.Commit()
 	a.startedOnce.Do(func() { close(a.commitStarted) })
-	<-a.commitRelease
+	select {
+	case <-a.commitRelease:
+	case <-a.waitCtx.Done():
+	}
 }
 
 func (a *gatedCommitReplayAttempt) Notify() {
@@ -389,8 +392,50 @@ func (a *gatedCommitReplayAttempt) Notify() {
 	if a.wakeResults != nil {
 		select {
 		case <-a.wakeResults:
-		case <-a.stop:
+		case <-a.waitCtx.Done():
 		}
+	}
+}
+
+type preCommitReplayRegistrar struct {
+	pump          *handoff.EventPump
+	commitStarted chan struct{}
+	commitRelease <-chan struct{}
+	waitCtx       context.Context
+}
+
+func (r *preCommitReplayRegistrar) Register(subscription handoff.EventSubscription) error {
+	return r.pump.Register(subscription)
+}
+
+func (r *preCommitReplayRegistrar) Unregister(subscription handoff.EventSubscription) {
+	r.pump.Unregister(subscription)
+}
+
+func (r *preCommitReplayRegistrar) BeginReplay(subscription handoff.EventSubscription, after int64) (handoff.ReplayAttempt, error) {
+	attempt, err := r.pump.BeginReplay(subscription, after)
+	if err != nil {
+		return nil, err
+	}
+	return &preCommitReplayAttempt{
+		ReplayAttempt: attempt, commitStarted: r.commitStarted, commitRelease: r.commitRelease, waitCtx: r.waitCtx,
+	}, nil
+}
+
+type preCommitReplayAttempt struct {
+	handoff.ReplayAttempt
+	commitStarted chan struct{}
+	commitRelease <-chan struct{}
+	waitCtx       context.Context
+	startedOnce   sync.Once
+}
+
+func (a *preCommitReplayAttempt) Commit() {
+	a.startedOnce.Do(func() { close(a.commitStarted) })
+	select {
+	case <-a.commitRelease:
+		a.ReplayAttempt.Commit()
+	case <-a.waitCtx.Done():
 	}
 }
 
@@ -441,6 +486,94 @@ type observingDeliveryStore struct {
 	readAfter chan int64
 	readDone  chan int64
 	release   <-chan struct{}
+}
+
+type sequenceDeliveryStore struct {
+	mu       sync.Mutex
+	events   []handoff.Event
+	cursor   int64
+	advances []int64
+}
+
+func (s *sequenceDeliveryStore) ReadEvents(ctx context.Context, _ handoff.Scope, after int64, limit int) ([]handoff.Event, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	events := make([]handoff.Event, 0, limit)
+	for _, event := range s.events {
+		if event.Seq <= after {
+			continue
+		}
+		events = append(events, handoff.CloneEvent(event))
+		if len(events) == limit {
+			break
+		}
+	}
+	return events, nil
+}
+
+func (s *sequenceDeliveryStore) LoadDeliveryCursor(ctx context.Context, _ string, _ handoff.Scope) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cursor, nil
+}
+
+func (s *sequenceDeliveryStore) AdvanceDeliveryCursor(ctx context.Context, _ string, _ handoff.Scope, seq int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.cursor = seq
+	s.advances = append(s.advances, seq)
+	s.mu.Unlock()
+	return nil
+}
+
+func bufferedPresentationRuntime(scope handoff.Scope, sessionID identity.SessionID, capacity int) (*sessionRuntime, <-chan Input, chan struct{}) {
+	inbox := make(chan reactorMessage, capacity)
+	slots := make(chan struct{}, capacity)
+	for range capacity {
+		slots <- struct{}{}
+	}
+	done := make(chan struct{})
+	inputs := make(chan Input, capacity)
+	state := &runState{ids: IDs{SessionID: sessionID, ConversationID: scope.ConversationID, Incarnation: 1}}
+	runtime := &sessionRuntime{
+		key: runtimeKey{sessionID: sessionID, incarnation: 1}, subject: Subject{TenantID: scope.TenantID, UserID: scope.UserID},
+		inbox: inbox, done: done, state: state, accepting: true, inboxSlots: slots,
+	}
+	go func() {
+		for {
+			select {
+			case message := <-inbox:
+				select {
+				case inputs <- message.input:
+				case <-done:
+					return
+				}
+				if message.done != nil {
+					select {
+					case message.done <- nil:
+					case <-done:
+						return
+					}
+				}
+				select {
+				case slots <- struct{}{}:
+				case <-done:
+					return
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+	return runtime, inputs, done
 }
 
 func (s *observingDeliveryStore) ReadEvents(ctx context.Context, scope handoff.Scope, after int64, limit int) ([]handoff.Event, error) {
@@ -1536,9 +1669,11 @@ func TestCommittedReplayWakesPromptlyAfterManagerPublicationFenceClears(t *testi
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(commitRelease) }) }
 	t.Cleanup(release)
+	waitCtx, cancelWait := context.WithTimeout(t.Context(), 2*time.Second)
+	t.Cleanup(cancelWait)
 	registrar := &gatedCommitReplayRegistrar{
 		pump: pump, commitStarted: commitStarted, commitRelease: commitRelease,
-		wakeResults: offerResults, stop: t.Context().Done(),
+		wakeResults: offerResults, waitCtx: waitCtx,
 	}
 	manager := &Manager{
 		cfg:    Config{HandoffConsumerID: "replay-client", HandoffSubscriptions: registrar, EgressBlockTimeout: time.Second},
@@ -1573,7 +1708,12 @@ func TestCommittedReplayWakesPromptlyAfterManagerPublicationFenceClears(t *testi
 		t.Fatal("replay publication did not reach its activation boundary")
 	}
 	release()
-	require.NoError(t, <-published)
+	select {
+	case err := <-published:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("replay publication did not finish after activation was released")
+	}
 
 	select {
 	case input := <-replacementInputs:
@@ -1581,6 +1721,130 @@ func TestCommittedReplayWakesPromptlyAfterManagerPublicationFenceClears(t *testi
 	case <-time.After(time.Second):
 		t.Fatal("committed replay waited for periodic polling after the Manager publication fence cleared")
 	}
+	require.NoError(t, waitCtx.Err(), "gated replay helper reached its explicit deadline")
+}
+
+func TestCanceledOlderGenerationOfferCannotEnterReplacementBeforeReplay(t *testing.T) {
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "canceled-generation-offer"}
+	event := func(seq int64, eventID string) handoff.Event {
+		return handoff.Event{
+			Seq: seq, EventID: eventID, HandoffID: "handoff", TenantID: scope.TenantID,
+			ConversationID: scope.ConversationID, Kind: "handoff.completed", State: handoff.StateSucceeded,
+			Payload: json.RawMessage(`{}`),
+		}
+	}
+	store := &sequenceDeliveryStore{
+		cursor: 5,
+		events: []handoff.Event{
+			event(1, "event-1"), event(2, "event-2"), event(3, "event-3"),
+			event(4, "event-4"), event(5, "event-5"), event(6, "event-6"),
+		},
+	}
+	pump := &handoff.EventPump{Reader: store, Cursors: store, Clock: clock.NewManual(time.Unix(0, 0)), PollInterval: time.Hour}
+	commitStarted := make(chan struct{})
+	commitRelease := make(chan struct{})
+	var commitReleaseOnce sync.Once
+	releaseCommit := func() { commitReleaseOnce.Do(func() { close(commitRelease) }) }
+	t.Cleanup(releaseCommit)
+	waitCtx, cancelWait := context.WithTimeout(t.Context(), 3*time.Second)
+	t.Cleanup(cancelWait)
+	registrar := &preCommitReplayRegistrar{
+		pump: pump, commitStarted: commitStarted, commitRelease: commitRelease, waitCtx: waitCtx,
+	}
+	offerPaused := make(chan struct{})
+	var pauseOnce sync.Once
+	manager := &Manager{
+		cfg: Config{
+			HandoffConsumerID: "replay-client", HandoffSubscriptions: registrar, EgressBlockTimeout: time.Second,
+			offerRevalidationGate: func() <-chan struct{} {
+				pauseOnce.Do(func() { close(offerPaused) })
+				return nil
+			},
+		},
+		active: make(map[runtimeKey]*sessionRuntime), current: make(map[handoff.Scope]*sessionRuntime),
+		logical: make(map[identity.SessionID]*logicalSession), pendingPublications: make(map[handoff.Scope]*publicationAttempt),
+	}
+	offerResults := make(chan error, 16)
+	pump.Sink = &deliveryRecordingSink{manager: manager, results: offerResults}
+	previous, previousInputs, previousDone := bufferedPresentationRuntime(scope, "canceled-generation-previous", 16)
+	replacement, replacementInputs, replacementDone := bufferedPresentationRuntime(scope, "canceled-generation-replacement", 16)
+	t.Cleanup(func() { close(previousDone); close(replacementDone) })
+	require.NoError(t, manager.register(previous))
+
+	replacement.key.incarnation = 2
+	replacement.state.ids.Incarnation = 2
+	replayAfter := int64(0)
+	replacement.replayAfter = &replayAfter
+	logical := &logicalSession{scope: scope, highWater: 1, reconnecting: true, turnBoundary: true, state: logicalTombstoned}
+	manager.activeMu.Lock()
+	manager.logical[replacement.key.sessionID] = logical
+	manager.activeMu.Unlock()
+	replacement.presentationMu.Lock()
+	presentationLocked := true
+	defer func() {
+		if presentationLocked {
+			replacement.presentationMu.Unlock()
+		}
+	}()
+	published := make(chan error, 1)
+	go func() { published <- manager.registerReplacement(replacement, logical, 1) }()
+	select {
+	case <-commitStarted:
+	case <-time.After(time.Second):
+		t.Fatal("replacement publication did not pause before replay activation")
+	}
+	manager.activeMu.RLock()
+	current := manager.current[scope]
+	manager.activeMu.RUnlock()
+	require.Same(t, replacement, current, "replacement must be directory-current before replay activation")
+
+	startOwnedEventPump(t, pump)
+	select {
+	case <-offerPaused:
+	case <-time.After(time.Second):
+		t.Fatal("older-generation offer did not pass replacement snapshot and slot reservation")
+	}
+	releaseCommit()
+	select {
+	case err := <-published:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("replacement publication did not clear its replay fence")
+	}
+	replacement.presentationMu.Unlock()
+	presentationLocked = false
+
+	select {
+	case err := <-offerResults:
+		assert.ErrorIs(t, err, context.Canceled,
+			"the canceled older-generation sequence 6 must be rejected before canonical replacement acceptance")
+	case <-time.After(time.Second):
+		t.Fatal("canceled older-generation offer did not resolve")
+	}
+	require.Eventually(t, func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return store.cursor == 6 && assert.Equal(t, []int64{6}, store.advances)
+	}, time.Second, time.Millisecond, "the replacement replay did not finish at sequence 6")
+
+	var got []int64
+	for {
+		select {
+		case input := <-replacementInputs:
+			got = append(got, input.(HandoffEventInput).Event.Seq)
+		default:
+			goto drained
+		}
+	}
+drained:
+	require.Equal(t, []int64{1, 2, 3, 4, 5, 6}, got,
+		"replacement must observe only the activated replay in durable sequence order")
+	select {
+	case input := <-previousInputs:
+		t.Fatalf("older-generation event reached previous runtime: sequence %d", input.(HandoffEventInput).Event.Seq)
+	default:
+	}
+	require.NoError(t, waitCtx.Err(), "pre-commit replay helper reached its explicit deadline")
 }
 
 func TestReplayCompensationPreservesPreviousSubscriptionAndExactOverlay(t *testing.T) {

@@ -671,8 +671,13 @@ func TestEventPumpScopesNotificationsAndRepairsLostWakeups(t *testing.T) {
 	require.NoError(t, pump.Register(handoff.EventSubscription{ConsumerID: "client", Scope: one}))
 	require.NoError(t, pump.Register(handoff.EventSubscription{ConsumerID: "client", Scope: two}))
 	runPump(t, pump)
-	<-store.reads
-	<-store.reads
+	for completed := 0; completed < 2; completed++ {
+		select {
+		case <-store.reads:
+		case <-time.After(time.Second):
+			t.Fatalf("initial full poll completed only %d of 2 Reader snapshots", completed)
+		}
+	}
 
 	store.mu.Lock()
 	store.events[one] = []handoff.Event{pumpEvent(one, 1, "handoff.created", handoff.StatePending)}

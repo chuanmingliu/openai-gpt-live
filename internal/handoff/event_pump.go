@@ -424,7 +424,9 @@ func (p *EventPump) deliverSubscription(ctx context.Context, subscription EventS
 			if event.Seq <= storedCursor && p.Metrics.Duplicate != nil {
 				p.Metrics.Duplicate("replay")
 			}
-			if !p.admitDeliveryEffect(subscription, generation) {
+			// This exact-generation observation is the Sink effect admission
+			// linearization point against replay activation.
+			if !p.deliveryGenerationCurrent(subscription, generation) {
 				return nil
 			}
 			offerCtx := deliveryCtx
@@ -471,7 +473,9 @@ func (p *EventPump) deliverSubscription(ctx context.Context, subscription EventS
 			}
 			for acknowledged := index; acknowledged < end; acknowledged++ {
 				if events[acknowledged].Seq > storedCursor {
-					if !p.admitDeliveryEffect(subscription, generation) {
+					// This exact-generation observation is the cursor effect
+					// admission linearization point against replay activation.
+					if !p.deliveryGenerationCurrent(subscription, generation) {
 						return nil
 					}
 					if err := p.Cursors.AdvanceDeliveryCursor(deliveryCtx, subscription.ConsumerID, subscription.Scope, events[acknowledged].Seq); err != nil {
@@ -536,17 +540,11 @@ func (p *EventPump) finishDeliveryGeneration(subscription EventSubscription, gen
 	}
 }
 
+// deliveryGenerationCurrent serializes exact-generation observation with
+// replay activation. Calls immediately before Sink or cursor I/O are the
+// admission point for that external effect; completion is revalidated before
+// any later effect or replay mutation.
 func (p *EventPump) deliveryGenerationCurrent(subscription EventSubscription, generation *eventPumpDeliveryGeneration) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.deliveryGenerationCurrentLocked(subscription, generation)
-}
-
-// admitDeliveryEffect is the linearization point for Sink and cursor effects.
-// Activation and admission are serialized by p.mu. A later activation cancels
-// the generation context; every completion revalidates before any next effect
-// or replay mutation.
-func (p *EventPump) admitDeliveryEffect(subscription EventSubscription, generation *eventPumpDeliveryGeneration) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.deliveryGenerationCurrentLocked(subscription, generation)

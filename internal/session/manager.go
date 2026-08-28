@@ -3128,6 +3128,19 @@ func (m *Manager) OfferHandoffEvent(ctx context.Context, scope handoff.Scope, ev
 		return handoff.ErrNoLiveSession
 	default:
 	}
+	// Replay activation cancels the old pump generation before clearing its
+	// publication fence. Under activeMu the fence either remains visible above,
+	// or this final context check rejects that generation before acceptance.
+	if offerCtx.Err() != nil {
+		runtime.mu.Unlock()
+		m.activeMu.RUnlock()
+		runtime.presentationMu.Unlock()
+		runtime.inboxSlots <- struct{}{}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return ErrControlOverflow
+	}
 	runtime.state.acceptControl(&message)
 	message.acceptanceChecked = true
 	message.acceptanceGeneration = runtime.acceptanceGeneration
