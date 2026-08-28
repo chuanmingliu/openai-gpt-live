@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -122,20 +123,20 @@ func TestGatewayExplicitEmptyConfigNeverDowngradesToLocal(t *testing.T) {
 }
 
 func TestGatewayStartupDoesNotResolveInactiveWorkerSecrets(t *testing.T) {
-	cfg, err := loadGatewayConfig(gatewayConfigSource{})
-	require.NoError(t, err)
 	forbidden := map[string]bool{
 		"DEEPSEEK_API_KEY": true,
 		"PRIVACY_HMAC":     true,
 		"TOOL_ENCRYPTION":  true,
 	}
-	_, err = resolveGatewayProviderCredential(cfg.Gateway.Voice.APIKeyEnv, func(name string) (string, bool) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	err := run(ctx, nil, func(name string) (string, bool) {
 		if forbidden[name] {
 			t.Fatalf("gateway resolved inactive worker secret %q", name)
 		}
 		return "", false
 	})
-	require.NoError(t, err)
+	require.ErrorIs(t, err, context.Canceled)
 }
 
 func TestGatewayConfiguredVoiceCredentialRemainsStrict(t *testing.T) {
@@ -155,10 +156,24 @@ func TestGatewayConfiguredDatabaseCredentialRemainsStrict(t *testing.T) {
 }
 
 func TestGatewayProductionDatabaseURLRejectsEnvironmentTLSDisableBeforeDial(t *testing.T) {
-	_, err := resolveGatewayDatabaseURL(config.Config{Mode: "production", Store: config.StoreConfig{DatabaseURLEnv: "DATABASE_URL"}}, func(string) (string, bool) {
-		return "postgres://gateway@postgres/live?sslmode=disable", true
-	})
-	require.EqualError(t, err, "production database URL must not disable SSL")
+	for _, test := range []struct {
+		name  string
+		value string
+		want  string
+	}{
+		{name: "literal", value: "postgres://gateway@postgres/live?sslmode=disable", want: "production database URL must not disable SSL"},
+		{name: "percent encoded", value: "postgres://gateway@postgres/live?sslmode=dis%61ble", want: "production database URL must not disable SSL"},
+		{name: "duplicate effective first", value: "postgres://gateway@postgres/live?sslmode=disable&sslmode=require", want: "production database URL must not disable SSL"},
+		{name: "case variant", value: "postgres://gateway@postgres/live?sslmode=DISABLE", want: "production database URL is invalid"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := resolveGatewayDatabaseURL(config.Config{Mode: "production", Store: config.StoreConfig{DatabaseURLEnv: "DATABASE_URL"}}, func(string) (string, bool) {
+				return test.value, true
+			})
+			require.EqualError(t, err, test.want)
+			assert.NotContains(t, err.Error(), test.value)
+		})
+	}
 }
 
 func TestGatewayTextualCredentialsAreBounded(t *testing.T) {
@@ -175,18 +190,19 @@ func TestGatewayTextualCredentialsAreBounded(t *testing.T) {
 		{name: "too large", value: strings.Repeat("z", gatewaySecretMaximumBytes+1), ok: true},
 	}
 	credentials := []struct {
-		name    string
-		resolve func(func(string) (string, bool)) error
+		name      string
+		wantError string
+		resolve   func(func(string) (string, bool)) error
 	}{
-		{name: "speech API key", resolve: func(lookup func(string) (string, bool)) error {
+		{name: "speech API key", wantError: "configured provider credential is unavailable", resolve: func(lookup func(string) (string, bool)) error {
 			_, err := resolveGatewayProviderCredential("SPEECH_KEY", lookup)
 			return err
 		}},
-		{name: "static bearer", resolve: func(lookup func(string) (string, bool)) error {
+		{name: "static bearer", wantError: "configured static credential is unavailable", resolve: func(lookup func(string) (string, bool)) error {
 			_, err := resolveGatewayStaticBearer("STATIC_BEARER", lookup)
 			return err
 		}},
-		{name: "database URL", resolve: func(lookup func(string) (string, bool)) error {
+		{name: "database URL", wantError: "configured database credential is unavailable", resolve: func(lookup func(string) (string, bool)) error {
 			_, err := resolveGatewayDatabaseURL(config.Config{Store: config.StoreConfig{DatabaseURLEnv: "DATABASE_URL"}}, lookup)
 			return err
 		}},
@@ -195,12 +211,38 @@ func TestGatewayTextualCredentialsAreBounded(t *testing.T) {
 		for _, value := range values {
 			t.Run(credential.name+"/"+value.name, func(t *testing.T) {
 				err := credential.resolve(func(string) (string, bool) { return value.value, value.ok })
-				require.Error(t, err)
+				require.EqualError(t, err, credential.wantError)
 				if value.value != "" {
 					assert.NotContains(t, err.Error(), value.value)
 				}
 			})
 		}
+	}
+}
+
+func TestGatewayConfigFlagFailuresAreContentFree(t *testing.T) {
+	const sentinel = "path-MUST-NOT-LEAK"
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "empty", args: []string{"-config="}},
+		{name: "invalid UTF-8", args: []string{"-config=" + string([]byte{0xff})}},
+		{name: "control", args: []string{"-config=" + sentinel + "\n"}},
+		{name: "oversized", args: []string{"-config=" + strings.Repeat("x", 4097)}},
+		{name: "duplicate", args: []string{"-config=" + sentinel, "--config=" + sentinel + "-again"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := run(t.Context(), test.args, func(string) (string, bool) {
+				t.Fatal("configuration flag failure performed environment lookup")
+				return "", false
+			})
+			require.EqualError(t, err, "gateway configuration flags are invalid")
+			for _, arg := range test.args {
+				assert.NotContains(t, err.Error(), arg)
+			}
+		})
 	}
 }
 
@@ -224,7 +266,7 @@ func TestLocalDeploymentRegionDoesNotReadAllowedRegionPolicy(t *testing.T) {
 }
 
 func TestLocalGatewayLivenessIsLoopbackHealthOnly(t *testing.T) {
-	server, err := startDefaultGatewayLiveness(t.Context(), gatewayConfigSource{})
+	server, err := startDefaultGatewayLiveness(t.Context(), gatewayConfigSource{}, time.Second)
 	require.NoError(t, err)
 	defer server.close()
 
@@ -258,7 +300,7 @@ func TestLocalGatewayLivenessIsLoopbackHealthOnly(t *testing.T) {
 
 func TestLocalGatewayLivenessJoinsOnShutdown(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
-	server, err := startDefaultGatewayLiveness(ctx, gatewayConfigSource{})
+	server, err := startDefaultGatewayLiveness(ctx, gatewayConfigSource{}, time.Second)
 	require.NoError(t, err)
 	cancel()
 	select {
@@ -268,8 +310,53 @@ func TestLocalGatewayLivenessJoinsOnShutdown(t *testing.T) {
 	}
 }
 
+func TestLocalGatewayLivenessReportsUnexpectedServeFailure(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	require.NoError(t, listener.Close())
+	server := startGatewayLiveness(t.Context(), listener, time.Second)
+	select {
+	case err := <-server.errors:
+		require.EqualError(t, err, "local gateway liveness stopped")
+	case <-time.After(time.Second):
+		t.Fatal("liveness server failure was not reported")
+	}
+	server.close()
+}
+
+func TestLocalGatewayLivenessUsesConfiguredShutdownBound(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	server := startGatewayLivenessWithHandler(t.Context(), listener, 20*time.Millisecond, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		close(entered)
+		<-release
+	}))
+	go func() {
+		response, _ := http.Get("http://" + listener.Addr().String())
+		if response != nil {
+			_ = response.Body.Close()
+		}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("liveness handler did not start")
+	}
+	started := time.Now()
+	server.close()
+	assert.Less(t, time.Since(started), 250*time.Millisecond)
+	select {
+	case <-server.done:
+	default:
+		t.Fatal("liveness server did not join within the configured shutdown bound")
+	}
+	close(release)
+}
+
 func TestExplicitConfigNeverStartsDefaultLiveness(t *testing.T) {
-	server, err := startDefaultGatewayLiveness(t.Context(), gatewayConfigSource{Explicit: true, Path: "gateway.yaml"})
+	server, err := startDefaultGatewayLiveness(t.Context(), gatewayConfigSource{Explicit: true, Path: "gateway.yaml"}, time.Second)
 	require.NoError(t, err)
 	assert.Nil(t, server)
 }

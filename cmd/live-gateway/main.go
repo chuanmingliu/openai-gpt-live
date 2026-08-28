@@ -136,17 +136,13 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 	if handled, err := runCommand(ctx, args, lookup); handled {
 		return err
 	}
-	flags := flag.NewFlagSet("live-gateway", flag.ContinueOnError)
-	flags.SetOutput(io.Discard)
-	var configPath cliopt.OptionalPath
-	flags.Var(&configPath, "config", "path to gateway YAML configuration")
-	if err := flags.Parse(args); err != nil {
+	source, extra, err := parseGatewayConfigSource(args)
+	if err != nil {
 		return err
 	}
-	if flags.NArg() != 0 {
+	if extra != 0 {
 		return errors.New("extra arguments are not accepted")
 	}
-	source := gatewayConfigSource{Path: configPath.Path(), Explicit: configPath.Present()}
 	cfg, err := loadGatewayConfig(source)
 	if err != nil {
 		return fmt.Errorf("load gateway configuration: %w", err)
@@ -296,14 +292,25 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 	if diagnostics != nil {
 		defer diagnostics.close()
 	}
-	liveness, err := startDefaultGatewayLiveness(ctx, source)
+	liveness, err := startDefaultGatewayLiveness(ctx, source, cfg.Shutdown.CleanupTimeout)
 	if err != nil {
 		return err
 	}
 	if liveness != nil {
 		defer liveness.close()
 	}
-	return runGateway(ctx, app, diagnostics)
+	return runGateway(ctx, app, diagnostics, liveness)
+}
+
+func parseGatewayConfigSource(args []string) (gatewayConfigSource, int, error) {
+	flags := flag.NewFlagSet("live-gateway", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	var configPath cliopt.OptionalPath
+	flags.Var(&configPath, "config", "path to gateway YAML configuration")
+	if err := flags.Parse(args); err != nil {
+		return gatewayConfigSource{}, 0, errors.New("gateway configuration flags are invalid")
+	}
+	return gatewayConfigSource{Path: configPath.Path(), Explicit: configPath.Present()}, flags.NArg(), nil
 }
 
 func loadGatewayConfig(source gatewayConfigSource) (config.Config, error) {
@@ -337,8 +344,8 @@ func resolveGatewayStaticBearer(name string, lookup func(string) (string, bool))
 
 func resolveGatewayDatabaseURL(cfg config.Config, lookup func(string) (string, bool)) (string, error) {
 	if cfg.Store.DatabaseURLEnv == "" {
-		if cfg.IsProduction() && strings.Contains(cfg.Store.URL, "sslmode=disable") {
-			return "", errors.New("production database URL must not disable SSL")
+		if err := validateGatewayDatabaseTransport(cfg, cfg.Store.URL); err != nil {
+			return "", err
 		}
 		return cfg.Store.URL, nil
 	}
@@ -346,10 +353,29 @@ func resolveGatewayDatabaseURL(cfg config.Config, lookup func(string) (string, b
 	if err != nil {
 		return "", errors.New("configured database credential is unavailable")
 	}
-	if cfg.IsProduction() && strings.Contains(value, "sslmode=disable") {
-		return "", errors.New("production database URL must not disable SSL")
+	if err := validateGatewayDatabaseTransport(cfg, value); err != nil {
+		return "", err
 	}
 	return value, nil
+}
+
+func validateGatewayDatabaseTransport(cfg config.Config, databaseURL string) error {
+	if !cfg.IsProduction() {
+		return nil
+	}
+	parsed, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return errors.New("production database URL is invalid")
+	}
+	if parsed.ConnConfig.TLSConfig == nil {
+		return errors.New("production database URL must not disable SSL")
+	}
+	for _, fallback := range parsed.ConnConfig.Fallbacks {
+		if fallback.TLSConfig == nil {
+			return errors.New("production database URL must not disable SSL")
+		}
+	}
+	return nil
 }
 
 type gatewayFeatureRuntime struct {
@@ -481,13 +507,15 @@ type diagnosticsServer struct {
 }
 
 type localLivenessServer struct {
-	server   *http.Server
-	listener net.Listener
-	done     chan struct{}
-	once     sync.Once
+	server          *http.Server
+	listener        net.Listener
+	done            chan struct{}
+	errors          chan error
+	shutdownTimeout time.Duration
+	once            sync.Once
 }
 
-func startDefaultGatewayLiveness(ctx context.Context, source gatewayConfigSource) (*localLivenessServer, error) {
+func startDefaultGatewayLiveness(ctx context.Context, source gatewayConfigSource, shutdownTimeout time.Duration) (*localLivenessServer, error) {
 	if source.Explicit {
 		return nil, nil
 	}
@@ -495,7 +523,11 @@ func startDefaultGatewayLiveness(ctx context.Context, source gatewayConfigSource
 	if err != nil {
 		return nil, errors.New("listen local gateway liveness")
 	}
-	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	return startGatewayLivenessWithHandler(ctx, listener, shutdownTimeout, localGatewayLivenessHandler()), nil
+}
+
+func localGatewayLivenessHandler() http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/health/live" {
 			http.NotFound(writer, request)
 			return
@@ -510,20 +542,32 @@ func startDefaultGatewayLiveness(ctx context.Context, source gatewayConfigSource
 			writer.WriteHeader(http.StatusMethodNotAllowed)
 		}
 	})
+}
+
+func startGatewayLiveness(ctx context.Context, listener net.Listener, shutdownTimeout time.Duration) *localLivenessServer {
+	return startGatewayLivenessWithHandler(ctx, listener, shutdownTimeout, localGatewayLivenessHandler())
+}
+
+func startGatewayLivenessWithHandler(ctx context.Context, listener net.Listener, shutdownTimeout time.Duration, handler http.Handler) *localLivenessServer {
 	runtime := &localLivenessServer{
-		server:   &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second},
-		listener: listener,
-		done:     make(chan struct{}),
+		server:          &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second},
+		listener:        listener,
+		done:            make(chan struct{}),
+		errors:          make(chan error, 1),
+		shutdownTimeout: shutdownTimeout,
 	}
 	go func() {
-		_ = runtime.server.Serve(listener)
+		err := runtime.server.Serve(listener)
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			runtime.errors <- errors.New("local gateway liveness stopped")
+		}
 		close(runtime.done)
 	}()
 	go func() {
 		<-ctx.Done()
 		runtime.close()
 	}()
-	return runtime, nil
+	return runtime
 }
 
 func (s *localLivenessServer) close() {
@@ -531,9 +575,15 @@ func (s *localLivenessServer) close() {
 		return
 	}
 	s.once.Do(func() {
-		closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdownTimeout := s.shutdownTimeout
+		if shutdownTimeout <= 0 {
+			shutdownTimeout = 5 * time.Second
+		}
+		closeCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
-		_ = s.server.Shutdown(closeCtx)
+		if s.server.Shutdown(closeCtx) != nil {
+			_ = s.server.Close()
+		}
 		_ = s.listener.Close()
 		<-s.done
 	})
@@ -610,18 +660,26 @@ func (d *diagnosticsServer) close() {
 		_ = d.metricsListener.Close()
 	}
 }
-func runGateway(ctx context.Context, app *gateway.App, d *diagnosticsServer) error {
-	if d == nil {
-		return app.Run(ctx)
-	}
+func runGateway(ctx context.Context, app *gateway.App, d *diagnosticsServer, liveness *localLivenessServer) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	appDone := make(chan error, 1)
 	go func() { appDone <- app.Run(runCtx) }()
+	var diagnosticErrors <-chan error
+	if d != nil {
+		diagnosticErrors = d.errors
+	}
+	var livenessErrors <-chan error
+	if liveness != nil {
+		livenessErrors = liveness.errors
+	}
 	select {
 	case err := <-appDone:
 		return err
-	case err := <-d.errors:
+	case err := <-diagnosticErrors:
+		cancel()
+		return errors.Join(err, <-appDone)
+	case err := <-livenessErrors:
 		cancel()
 		return errors.Join(err, <-appDone)
 	}
@@ -638,7 +696,7 @@ func runCommand(ctx context.Context, args []string, lookup func(string) (string,
 		var path cliopt.OptionalPath
 		flags.Var(&path, "config", "configuration path")
 		if err := flags.Parse(args[1:]); err != nil {
-			return true, err
+			return true, errors.New("gateway configuration flags are invalid")
 		}
 		if !path.Present() || flags.NArg() != 0 {
 			return true, errors.New("--config is required and extra arguments are not accepted")
