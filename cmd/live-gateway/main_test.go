@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -13,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -122,6 +125,97 @@ func TestGatewayExplicitEmptyConfigNeverDowngradesToLocal(t *testing.T) {
 	require.EqualError(t, err, "explicit configuration path is required")
 }
 
+func TestLoadGatewayConfigRequiresProviderCredentialAndAuthentication(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{
+			name: "provider credential",
+			yaml: `mode: local
+gateway:
+  listen_addr: 127.0.0.1:8080
+  voice:
+    url: ws://127.0.0.1:8765/v1/realtime
+auth:
+  static_bearer_env: STATIC_TOKEN
+  static_tenant_id: tenant
+  static_user_id: user
+  static_scopes: [realtime]
+`,
+			want: "explicit gateway configuration requires a provider credential reference",
+		},
+		{
+			name: "loopback authentication",
+			yaml: `mode: local
+gateway:
+  listen_addr: 127.0.0.1:8080
+  voice:
+    url: ws://127.0.0.1:8765/v1/realtime
+    api_key_env: PROVIDER_TOKEN
+`,
+			want: "explicit gateway configuration requires authentication",
+		},
+		{
+			name: "non-loopback authentication",
+			yaml: `mode: local
+gateway:
+  listen_addr: :8080
+  voice:
+    url: ws://127.0.0.1:8765/v1/realtime
+    api_key_env: PROVIDER_TOKEN
+`,
+			want: "explicit gateway configuration requires authentication",
+		},
+		{
+			name: "complete OIDC authentication",
+			yaml: `mode: local
+gateway:
+  listen_addr: :8080
+  voice:
+    url: ws://127.0.0.1:8765/v1/realtime
+    api_key_env: PROVIDER_TOKEN
+auth:
+  oidc_issuer: http://127.0.0.1:9099
+`,
+			want: "explicit gateway OIDC authentication is incomplete",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "gateway.yaml")
+			require.NoError(t, os.WriteFile(path, []byte(test.yaml), 0o600))
+
+			_, err := loadGatewayConfig(gatewayConfigSource{Path: path, Explicit: true})
+			require.EqualError(t, err, test.want)
+		})
+	}
+}
+
+func TestGatewayRuntimeRejectsExplicitCredentialFreeConfig(t *testing.T) {
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	listenAddress := probe.Addr().String()
+	require.NoError(t, probe.Close())
+
+	path := filepath.Join(t.TempDir(), "gateway.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(fmt.Sprintf(`mode: local
+gateway:
+  advertised_model: local
+  listen_addr: %s
+  voice:
+    role: realtime_voice
+    provider: speech_to_speech
+    url: ws://127.0.0.1:8765/v1/realtime
+    model: local
+`, listenAddress)), 0o600))
+
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	err = run(ctx, []string{"-config", path}, func(string) (string, bool) { return "", false })
+	require.EqualError(t, err, "load gateway configuration: explicit gateway configuration requires a provider credential reference")
+}
+
 func TestGatewayStartupDoesNotResolveInactiveWorkerSecrets(t *testing.T) {
 	forbidden := map[string]bool{
 		"DEEPSEEK_API_KEY": true,
@@ -146,7 +240,7 @@ func TestGatewayConfiguredVoiceCredentialRemainsStrict(t *testing.T) {
 
 func TestGatewayConfiguredStaticBearerRemainsStrict(t *testing.T) {
 	cfg := config.Config{Mode: "local", Auth: config.AuthConfig{StaticBearerEnv: "STATIC_TOKEN"}}
-	_, _, err := composeAdmission(t.Context(), cfg, func(string) (string, bool) { return "", false })
+	_, err := resolveGatewayRuntimeSecrets(cfg, func(string) (string, bool) { return "", false })
 	require.EqualError(t, err, "configured static credential is unavailable")
 }
 
@@ -170,7 +264,7 @@ func TestGatewayProductionDatabaseURLRejectsEnvironmentTLSDisableBeforeDial(t *t
 			_, err := resolveGatewayDatabaseURL(config.Config{Mode: "production", Store: config.StoreConfig{DatabaseURLEnv: "DATABASE_URL"}}, func(string) (string, bool) {
 				return test.value, true
 			})
-			require.EqualError(t, err, test.want)
+			assert.EqualError(t, err, test.want)
 			assert.NotContains(t, err.Error(), test.value)
 		})
 	}
@@ -252,6 +346,155 @@ func TestGatewayEncodedKeysAreBoundedBeforeDecode(t *testing.T) {
 	require.EqualError(t, err, "retention HMAC key is unavailable")
 	_, err = resolveGatewayReconnectKey("RECONNECT_KEY", func(string) (string, bool) { return tooLarge, true })
 	require.EqualError(t, err, "reconnect HMAC key is unavailable")
+}
+
+func TestGatewayResolvesActiveSecretsBeforeOIDCActivity(t *testing.T) {
+	var oidcRequests atomic.Int32
+	oidc := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		oidcRequests.Add(1)
+		http.Error(response, "unavailable", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(oidc.Close)
+
+	listenAddress := reserveGatewayTestAddress(t)
+	path := filepath.Join(t.TempDir(), "gateway.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(fmt.Sprintf(`mode: local
+gateway:
+  advertised_model: local
+  listen_addr: %s
+  voice:
+    role: realtime_voice
+    provider: speech_to_speech
+    url: ws://127.0.0.1:8765/v1/realtime
+    model: local
+    api_key_env: PROVIDER_TOKEN
+auth:
+  oidc_issuer: %s
+  oidc_audience: live
+  oidc_required_scopes: [realtime]
+`, listenAddress, oidc.URL)), 0o600))
+
+	err := run(t.Context(), []string{"-config", path}, func(name string) (string, bool) {
+		if name == "PROVIDER_TOKEN" {
+			return "", false
+		}
+		return "", false
+	})
+	assert.EqualError(t, err, "configured provider credential is unavailable")
+	assert.Zero(t, oidcRequests.Load(), "invalid provider credential contacted OIDC")
+	assertGatewayTestAddressRemainsFree(t, listenAddress)
+}
+
+func TestGatewayResolvesAllActiveSecretsBeforeDatabaseOrListenerActivity(t *testing.T) {
+	validHMAC := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
+	for _, test := range []struct {
+		name       string
+		secretName string
+		invalid    string
+		present    bool
+		want       string
+	}{
+		{name: "provider", secretName: "PROVIDER_TOKEN", present: false, want: "configured provider credential is unavailable"},
+		{name: "static bearer", secretName: "STATIC_TOKEN", invalid: "bad\nvalue", present: true, want: "configured static credential is unavailable"},
+		{name: "database", secretName: "DATABASE_URL", invalid: "bad\nvalue", present: true, want: "configured database credential is unavailable"},
+		{name: "retention", secretName: "RETENTION_KEY", invalid: "not-base64", present: true, want: "retention HMAC key is invalid"},
+		{name: "reconnect", secretName: "RECONNECT_KEY", invalid: "not-base64", present: true, want: "reconnect HMAC key is invalid"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			databaseListener, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = databaseListener.Close() })
+			var databaseConnections atomic.Int32
+			go func() {
+				for {
+					connection, err := databaseListener.Accept()
+					if err != nil {
+						return
+					}
+					databaseConnections.Add(1)
+					_ = connection.Close()
+				}
+			}()
+
+			listenAddress := reserveGatewayTestAddress(t)
+			path := writeDurableGatewayTestConfig(t, listenAddress)
+			values := map[string]string{
+				"PROVIDER_TOKEN": "provider-token",
+				"STATIC_TOKEN":   "static-token",
+				"DATABASE_URL": fmt.Sprintf(
+					"postgres://live@%s/live?sslmode=disable&connect_timeout=1",
+					databaseListener.Addr().String(),
+				),
+				"RETENTION_KEY": validHMAC,
+				"RECONNECT_KEY": validHMAC,
+			}
+			if test.present {
+				values[test.secretName] = test.invalid
+			} else {
+				delete(values, test.secretName)
+			}
+
+			err = run(t.Context(), []string{"-config", path}, func(name string) (string, bool) {
+				value, ok := values[name]
+				return value, ok
+			})
+			assert.EqualError(t, err, test.want)
+			assert.Zero(t, databaseConnections.Load(), "invalid active secret contacted PostgreSQL")
+			assertGatewayTestAddressRemainsFree(t, listenAddress)
+		})
+	}
+}
+
+func reserveGatewayTestAddress(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	address := listener.Addr().String()
+	require.NoError(t, listener.Close())
+	return address
+}
+
+func assertGatewayTestAddressRemainsFree(t *testing.T, address string) {
+	t.Helper()
+	listener, err := net.Listen("tcp", address)
+	require.NoError(t, err, "gateway listener was created before secret validation completed")
+	require.NoError(t, listener.Close())
+}
+
+func writeDurableGatewayTestConfig(t *testing.T, listenAddress string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "gateway.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(fmt.Sprintf(`mode: development_durable
+gateway:
+  advertised_model: durable-test
+  listen_addr: %s
+  voice:
+    role: realtime_voice
+    provider: speech_to_speech
+    url: ws://127.0.0.1:8765/v1/realtime
+    model: durable-test
+    api_key_env: PROVIDER_TOKEN
+  reconnect:
+    hmac_key_env: RECONNECT_KEY
+    hmac_key_id: reconnect-v1
+store:
+  database_url_env: DATABASE_URL
+  retention:
+    hmac_key_env: RETENTION_KEY
+    hmac_key_id: retention-v1
+auth:
+  static_bearer_env: STATIC_TOKEN
+  static_tenant_id: tenant
+  static_user_id: user
+  static_scopes: [realtime]
+features:
+  handoffs: true
+  tool_encryption_key_id: tool-v1
+tools:
+  web_search:
+    enabled: true
+`, listenAddress)), 0o600))
+	return path
 }
 
 func TestLocalDeploymentRegionDoesNotReadAllowedRegionPolicy(t *testing.T) {
@@ -449,7 +692,7 @@ func TestGatewayDeliveryShardIsStableAcrossReplicaReplacementAndRegionIsolated(t
 }
 
 func TestComposeGatewayReconnectFailsClosedWithoutProductionRuntime(t *testing.T) {
-	option, err := composeGatewayReconnect(config.Config{Mode: "local"}, nil, nil)
+	option, err := composeGatewayReconnect(config.Config{Mode: "local"}, nil, gatewayRuntimeSecrets{}, nil)
 	assert.NoError(t, err)
 	assert.Nil(t, option)
 
@@ -458,7 +701,7 @@ func TestComposeGatewayReconnectFailsClosedWithoutProductionRuntime(t *testing.T
 	cfg.Gateway.Reconnect.HMACKeyID = "reconnect-v1"
 	cfg.Gateway.Reconnect.CredentialTTL = 5 * time.Minute
 	cfg.Admission.InstanceID = "gateway-a"
-	option, err = composeGatewayReconnect(cfg, nil, func(string) (string, bool) { return "", false })
+	option, err = composeGatewayReconnect(cfg, nil, gatewayRuntimeSecrets{}, func(string) (string, bool) { return "", false })
 	assert.Nil(t, option)
 	assert.ErrorContains(t, err, "runtime")
 }
@@ -531,6 +774,11 @@ features:
 gateway:
   voice:
     api_key_env: PROVIDER_SECRET
+auth:
+  static_bearer_env: STATIC_TOKEN
+  static_tenant_id: tenant
+  static_user_id: user
+  static_scopes: [realtime]
 `), 0o600))
 	lookups := 0
 	err := run(context.Background(), []string{"-config", path}, func(string) (string, bool) {
@@ -543,7 +791,7 @@ gateway:
 
 func TestComposeAdmissionUsesConfiguredStaticDevelopmentIdentity(t *testing.T) {
 	cfg := config.Config{Mode: "local", Auth: config.AuthConfig{StaticBearerEnv: "STATIC_TOKEN", StaticTenantID: "tenant", StaticUserID: "user", StaticScopes: []string{"realtime"}, AllowedOrigins: []string{"http://app.example"}}, Admission: config.AdmissionConfig{GlobalRate: 10, GlobalBurst: 10, IPRate: 10, IPBurst: 10, IPKeyTTL: time.Minute, MaxIPKeys: 10}}
-	controller, closeAdmission, err := composeAdmission(t.Context(), cfg, func(name string) (string, bool) { return "development-token", name == "STATIC_TOKEN" })
+	controller, closeAdmission, err := composeAdmission(t.Context(), cfg, gatewayRuntimeSecrets{staticBearer: "development-token"})
 	require.NoError(t, err)
 	require.Nil(t, closeAdmission)
 	request := httptest.NewRequest(http.MethodGet, "http://gateway.example/v1/realtime", nil)
@@ -570,7 +818,7 @@ func TestFinishAdmissionReportsStoreCloseFailure(t *testing.T) {
 
 func TestGatewayConfigCommandsDoNotLookupSecrets(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gateway.yaml")
-	require.NoError(t, os.WriteFile(path, []byte("mode: local\ngateway:\n  voice:\n    api_key_env: PROVIDER_SECRET\n"), 0600))
+	require.NoError(t, os.WriteFile(path, []byte("mode: local\ngateway:\n  voice:\n    api_key_env: PROVIDER_SECRET\nauth:\n  static_bearer_env: STATIC_TOKEN\n  static_tenant_id: tenant\n  static_user_id: user\n  static_scopes: [realtime]\n"), 0600))
 	old := commandOutput
 	defer func() { commandOutput = old }()
 	var output bytes.Buffer

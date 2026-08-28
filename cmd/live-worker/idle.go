@@ -11,14 +11,18 @@ import (
 
 const idleWorkerListenAddress = "127.0.0.1:9091"
 
-const idleWorkerShutdownTimeout = 5 * time.Second
+const (
+	idleWorkerShutdownTimeout   = 5 * time.Second
+	idleWorkerReadHeaderTimeout = 5 * time.Second
+)
 
 type idleRuntimeBuilder func(context.Context) (serviceRuntime, error)
 
 type idleRuntime struct {
-	listener  net.Listener
-	server    *http.Server
-	closeOnce sync.Once
+	listener        net.Listener
+	server          *http.Server
+	shutdownTimeout time.Duration
+	closeOnce       sync.Once
 }
 
 func idleWorkerHandler() http.Handler {
@@ -47,8 +51,9 @@ func idleWorkerHandler() http.Handler {
 
 func newIdleRuntime(listener net.Listener) *idleRuntime {
 	return &idleRuntime{
-		listener: listener,
-		server:   &http.Server{Handler: idleWorkerHandler()},
+		listener:        listener,
+		server:          &http.Server{Handler: idleWorkerHandler(), ReadHeaderTimeout: idleWorkerReadHeaderTimeout},
+		shutdownTimeout: idleWorkerShutdownTimeout,
 	}
 }
 
@@ -82,10 +87,16 @@ func (r *idleRuntime) Close() {
 		return
 	}
 	r.closeOnce.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), idleWorkerShutdownTimeout)
+		shutdownTimeout := r.shutdownTimeout
+		if shutdownTimeout <= 0 {
+			shutdownTimeout = idleWorkerShutdownTimeout
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer cancel()
 		if r.server != nil {
-			_ = r.server.Shutdown(ctx)
+			if r.server.Shutdown(ctx) != nil {
+				_ = r.server.Close()
+			}
 		}
 		if r.listener != nil {
 			_ = r.listener.Close()

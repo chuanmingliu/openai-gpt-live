@@ -154,7 +154,12 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 	if err := verifyExpectedHash(cfg, lookup); err != nil {
 		return err
 	}
-	admissionController, closeAdmission, err := composeAdmission(ctx, cfg, lookup)
+	resolved, err := resolveGatewayRuntimeSecrets(cfg, lookup)
+	if err != nil {
+		return err
+	}
+	defer resolved.clear()
+	admissionController, closeAdmission, err := composeAdmission(ctx, cfg, resolved)
 	if err != nil {
 		return err
 	}
@@ -163,20 +168,16 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 			runErr = finishAdmission(runErr, closeAdmission)
 		}()
 	}
-	featureRuntime, err := composeGatewayFeatures(ctx, cfg, lookup)
+	featureRuntime, err := composeGatewayFeatures(ctx, cfg, resolved)
 	if err != nil {
 		return err
 	}
 	if featureRuntime != nil {
 		defer featureRuntime.close()
 	}
-	apiKey, err := resolveGatewayProviderCredential(cfg.Gateway.Voice.APIKeyEnv, lookup)
-	if err != nil {
-		return err
-	}
 	connector, err := s2sws.New(s2sws.Config{
 		URL:            cfg.Gateway.Voice.URL,
-		APIKey:         apiKey,
+		APIKey:         resolved.providerCredential,
 		Model:          cfg.Gateway.Voice.Model,
 		ConnectTimeout: providerConnectTimeout,
 		MaxFrameBytes:  int64(cfg.Gateway.WebSocket.MaxFrameBytes),
@@ -267,7 +268,7 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool))
 		return err
 	}
 	appOptions = append(appOptions, durableOptions...)
-	reconnectOption, err := composeGatewayReconnect(cfg, featureRuntime, lookup)
+	reconnectOption, err := composeGatewayReconnect(cfg, featureRuntime, resolved, lookup)
 	if err != nil {
 		return err
 	}
@@ -320,7 +321,30 @@ func loadGatewayConfig(source gatewayConfigSource) (config.Config, error) {
 	if source.Path == "" {
 		return config.Config{}, errExplicitConfigPathRequired
 	}
-	return config.LoadUnresolved(source.Path)
+	cfg, err := config.LoadUnresolved(source.Path)
+	if err != nil {
+		return config.Config{}, err
+	}
+	if err := validateExplicitGatewayConfig(cfg); err != nil {
+		return config.Config{}, err
+	}
+	return cfg, nil
+}
+
+func validateExplicitGatewayConfig(cfg config.Config) error {
+	if cfg.Gateway.Voice.APIKeyEnv == "" {
+		return errors.New("explicit gateway configuration requires a provider credential reference")
+	}
+	if cfg.UsesStaticAuth() {
+		return nil
+	}
+	if cfg.Auth.OIDCIssuer == "" && cfg.Auth.OIDCAudience == "" && len(cfg.Auth.OIDCRequiredScopes) == 0 {
+		return errors.New("explicit gateway configuration requires authentication")
+	}
+	if cfg.Auth.OIDCIssuer == "" || cfg.Auth.OIDCAudience == "" || len(cfg.Auth.OIDCRequiredScopes) == 0 {
+		return errors.New("explicit gateway OIDC authentication is incomplete")
+	}
+	return nil
 }
 
 func resolveGatewayProviderCredential(name string, lookup func(string) (string, bool)) (string, error) {
@@ -378,6 +402,62 @@ func validateGatewayDatabaseTransport(cfg config.Config, databaseURL string) err
 	return nil
 }
 
+type gatewayRuntimeSecrets struct {
+	providerCredential string
+	staticBearer       string
+	databaseURL        string
+	retentionKey       []byte
+	reconnectKey       []byte
+}
+
+func resolveGatewayRuntimeSecrets(cfg config.Config, lookup func(string) (string, bool)) (gatewayRuntimeSecrets, error) {
+	var resolved gatewayRuntimeSecrets
+	var err error
+	resolved.providerCredential, err = resolveGatewayProviderCredential(cfg.Gateway.Voice.APIKeyEnv, lookup)
+	if err != nil {
+		return gatewayRuntimeSecrets{}, err
+	}
+	if allowsStaticAuthenticator(cfg) {
+		resolved.staticBearer, err = resolveGatewayStaticBearer(cfg.Auth.StaticBearerEnv, lookup)
+		if err != nil {
+			resolved.clear()
+			return gatewayRuntimeSecrets{}, err
+		}
+	}
+	if !requiresRuntimeRepository(cfg) {
+		return resolved, nil
+	}
+	resolved.databaseURL, err = resolveGatewayDatabaseURL(cfg, lookup)
+	if err != nil {
+		resolved.clear()
+		return gatewayRuntimeSecrets{}, err
+	}
+	resolved.retentionKey, err = resolveGatewayRetentionKey(cfg.Store.Retention.HMACKeyEnv, lookup)
+	if err != nil {
+		resolved.clear()
+		return gatewayRuntimeSecrets{}, err
+	}
+	resolved.reconnectKey, err = resolveGatewayReconnectKey(cfg.Gateway.Reconnect.HMACKeyEnv, lookup)
+	if err != nil {
+		resolved.clear()
+		return gatewayRuntimeSecrets{}, err
+	}
+	return resolved, nil
+}
+
+func (s *gatewayRuntimeSecrets) clear() {
+	if s == nil {
+		return
+	}
+	s.providerCredential = ""
+	s.staticBearer = ""
+	s.databaseURL = ""
+	clear(s.retentionKey)
+	clear(s.reconnectKey)
+	s.retentionKey = nil
+	s.reconnectKey = nil
+}
+
 type gatewayFeatureRuntime struct {
 	pool            *pgxpool.Pool
 	store           *feature.PostgresStore
@@ -390,15 +470,11 @@ type gatewayFeatureRuntime struct {
 
 var composeGatewayRepositoryHook func(*postgres.Repository) error
 
-func composeGatewayFeatures(ctx context.Context, cfg config.Config, lookup func(string) (string, bool)) (*gatewayFeatureRuntime, error) {
+func composeGatewayFeatures(ctx context.Context, cfg config.Config, resolved gatewayRuntimeSecrets) (*gatewayFeatureRuntime, error) {
 	if !requiresRuntimeRepository(cfg) {
 		return nil, nil
 	}
-	databaseURL, err := resolveGatewayDatabaseURL(cfg, lookup)
-	if err != nil {
-		return nil, err
-	}
-	pool, err := pgxpool.New(ctx, databaseURL)
+	pool, err := pgxpool.New(ctx, resolved.databaseURL)
 	if err != nil {
 		return nil, errors.New("configure runtime feature storage")
 	}
@@ -416,15 +492,8 @@ func composeGatewayFeatures(ctx context.Context, cfg config.Config, lookup func(
 		return nil, err
 	}
 	repositoryOptions := []postgres.RepositoryOption{postgres.WithApprovalTTL(cfg.Store.Retention.ApprovalTTL)}
-	var retentionKey []byte
-	defer func() { clear(retentionKey) }()
 	if cfg.Store.Retention.HMACKeyEnv != "" {
-		retentionKey, err = resolveGatewayRetentionKey(cfg.Store.Retention.HMACKeyEnv, lookup)
-		if err != nil {
-			pool.Close()
-			return nil, err
-		}
-		repositoryOptions = append(repositoryOptions, postgres.WithRetentionHMAC(cfg.Store.Retention.HMACKeyID, retentionKey))
+		repositoryOptions = append(repositoryOptions, postgres.WithRetentionHMAC(cfg.Store.Retention.HMACKeyID, resolved.retentionKey))
 	}
 	repo, err := postgres.NewRepository(pool, clock.Real{}, repositoryOptions...)
 	if err != nil {
@@ -701,7 +770,7 @@ func runCommand(ctx context.Context, args []string, lookup func(string) (string,
 		if !path.Present() || flags.NArg() != 0 {
 			return true, errors.New("--config is required and extra arguments are not accepted")
 		}
-		cfg, err := config.LoadUnresolved(path.Path())
+		cfg, err := loadGatewayConfig(gatewayConfigSource{Path: path.Path(), Explicit: true})
 		if err != nil {
 			return true, err
 		}
@@ -759,19 +828,15 @@ func finishAdmission(runErr error, closeAdmission func() error) error {
 	return runErr
 }
 
-func composeAdmission(ctx context.Context, cfg config.Config, lookup func(string) (string, bool)) (*admission.Controller, func() error, error) {
+func composeAdmission(ctx context.Context, cfg config.Config, resolved gatewayRuntimeSecrets) (*admission.Controller, func() error, error) {
 	var authenticator auth.Authenticator
 	requiredScopes := cfg.Auth.OIDCRequiredScopes
 	if allowsStaticAuthenticator(cfg) {
-		token, err := resolveGatewayStaticBearer(cfg.Auth.StaticBearerEnv, lookup)
-		if err != nil {
-			return nil, nil, err
-		}
 		scopes := make(map[string]struct{}, len(cfg.Auth.StaticScopes))
 		for _, scope := range cfg.Auth.StaticScopes {
 			scopes[scope] = struct{}{}
 		}
-		authenticator = auth.NewStatic([]byte(token), auth.Principal{TenantID: cfg.Auth.StaticTenantID, UserID: cfg.Auth.StaticUserID, Scopes: scopes})
+		authenticator = auth.NewStatic([]byte(resolved.staticBearer), auth.Principal{TenantID: cfg.Auth.StaticTenantID, UserID: cfg.Auth.StaticUserID, Scopes: scopes})
 		if len(requiredScopes) == 0 {
 			requiredScopes = []string{"realtime"}
 		}
@@ -794,11 +859,7 @@ func composeAdmission(ctx context.Context, cfg config.Config, lookup func(string
 		}
 		return controller, nil, nil
 	}
-	databaseURL, err := resolveGatewayDatabaseURL(cfg, lookup)
-	if err != nil {
-		return nil, nil, err
-	}
-	pool, err := pgxpool.New(ctx, databaseURL)
+	pool, err := pgxpool.New(ctx, resolved.databaseURL)
 	if err != nil {
 		return nil, nil, errors.New("configure admission storage")
 	}
@@ -1002,7 +1063,7 @@ func gatewayDeliveryShard(region string) (string, error) {
 	return "gateway-shard-" + hex.EncodeToString(digest[:16]), nil
 }
 
-func composeGatewayReconnect(cfg config.Config, runtime *gatewayFeatureRuntime, lookup func(string) (string, bool)) (gateway.Option, error) {
+func composeGatewayReconnect(cfg config.Config, runtime *gatewayFeatureRuntime, resolved gatewayRuntimeSecrets, lookup func(string) (string, bool)) (gateway.Option, error) {
 	if !requiresRuntimeRepository(cfg) {
 		return nil, nil
 	}
@@ -1013,16 +1074,8 @@ func composeGatewayReconnect(cfg config.Config, runtime *gatewayFeatureRuntime, 
 	if err != nil {
 		return nil, fmt.Errorf("configure reconnect owner identity: %w", err)
 	}
-	if lookup == nil {
-		return nil, errors.New("reconnect HMAC key is unavailable")
-	}
-	key, err := resolveGatewayReconnectKey(cfg.Gateway.Reconnect.HMACKeyEnv, lookup)
-	if err != nil {
-		return nil, err
-	}
-	defer clear(key)
 	var credentials session.ReconnectCredentials
-	configured, err := session.NewReconnectCredentials(key, clock.Real{})
+	configured, err := session.NewReconnectCredentials(resolved.reconnectKey, clock.Real{})
 	if err != nil {
 		return nil, errors.New("reconnect HMAC key is invalid")
 	}

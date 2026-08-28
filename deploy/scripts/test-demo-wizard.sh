@@ -327,9 +327,14 @@ if DEMO_WIZARD_STATE_DIR="$preserve_state" bash -c '
   kill() { return 0; }
   sleep() { :; }
   stop_current_bff
-' bash "$scratch/wizard-functions.sh"; then
+' bash "$scratch/wizard-functions.sh" >"$scratch/preserve.out" 2>"$scratch/preserve.err"; then
   fail "wizard replaced a BFF whose cleanup proof was still live"
 fi
+grep -Fx '  ⚠ browser BFF cleanup is still in progress; preserving ownership proof' "$scratch/preserve.out" >/dev/null || {
+  fail "failed replacement omitted its intentional cleanup warning"
+}
+[[ "$(wc -l <"$scratch/preserve.out" | tr -d ' ')" -eq 1 ]] || fail "failed replacement emitted unexpected stdout"
+[[ ! -s "$scratch/preserve.err" ]] || fail "failed replacement emitted unexpected stderr"
 [[ -f "$preserve_state/bff.pid" && -f "$preserve_state/live-client" ]] || fail "failed replacement deleted the prior BFF proof"
 
 printf '%s\n' 'interactive demo wizard boundary tests passed'

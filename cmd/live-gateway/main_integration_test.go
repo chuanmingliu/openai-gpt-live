@@ -4,7 +4,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/base64"
 	"errors"
 	"net/url"
 	"testing"
@@ -46,10 +45,8 @@ func TestComposeGatewayFailureAfterRepositoryZeroizesOwnedRetentionKey(t *testin
 		return fault
 	}
 	defer func() { composeGatewayRepositoryHook = previous }()
-	lookup := func(name string) (string, bool) {
-		return base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{8}, 32)), name == "RETENTION_KEY"
-	}
-	runtime, err := composeGatewayFeatures(t.Context(), cfg, lookup)
+	resolved := gatewayRuntimeSecrets{databaseURL: cfg.Store.URL, retentionKey: bytes.Repeat([]byte{8}, 32)}
+	runtime, err := composeGatewayFeatures(t.Context(), cfg, resolved)
 	assert.Nil(t, runtime)
 	assert.ErrorIs(t, err, fault)
 	require.NotNil(t, captured)

@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -83,4 +84,56 @@ func TestBuildIdleRuntimeBindsLoopbackDiagnostics(t *testing.T) {
 	runtime, ok := built.(*idleRuntime)
 	require.True(t, ok)
 	assert.Equal(t, idleWorkerListenAddress, runtime.listener.Addr().String())
+}
+
+func TestIdleRuntimeForcesPartialHeaderConnectionClosedAtShutdownBound(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	observed := &idleObservedAcceptListener{Listener: listener, accepted: make(chan struct{})}
+	runtime := newIdleRuntime(observed)
+	assert.Greater(t, runtime.server.ReadHeaderTimeout, time.Duration(0))
+	assert.LessOrEqual(t, runtime.server.ReadHeaderTimeout, idleWorkerShutdownTimeout)
+	runtime.shutdownTimeout = 20 * time.Millisecond
+	runtime.server.ReadHeaderTimeout = time.Second
+
+	done := make(chan error, 1)
+	go func() { done <- runtime.Run(t.Context()) }()
+	connection, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = connection.Close() })
+	_, err = io.WriteString(connection, "GET /health/live HTTP/1.1\r\nHost:")
+	require.NoError(t, err)
+	select {
+	case <-observed.accepted:
+	case <-time.After(time.Second):
+		t.Fatal("idle HTTP server did not accept the partial-header connection")
+	}
+
+	started := time.Now()
+	runtime.Close()
+	assert.Less(t, time.Since(started), 250*time.Millisecond)
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("idle runtime did not join after forced server close")
+	}
+	require.NoError(t, connection.SetReadDeadline(time.Now().Add(100*time.Millisecond)))
+	buffer := make([]byte, 1)
+	_, err = connection.Read(buffer)
+	require.Error(t, err, "accepted partial-header connection remained open after shutdown")
+}
+
+type idleObservedAcceptListener struct {
+	net.Listener
+	accepted chan struct{}
+	once     sync.Once
+}
+
+func (l *idleObservedAcceptListener) Accept() (net.Conn, error) {
+	connection, err := l.Listener.Accept()
+	if err == nil {
+		l.once.Do(func() { close(l.accepted) })
+	}
+	return connection, err
 }
