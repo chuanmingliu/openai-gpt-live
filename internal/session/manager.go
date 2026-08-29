@@ -267,10 +267,11 @@ type Manager struct {
 }
 
 type publicationAttempt struct {
-	runtime       *sessionRuntime
-	previous      *sessionRuntime
-	replay        bool
-	replayAttempt handoff.ReplayAttempt
+	runtime             *sessionRuntime
+	previous            *sessionRuntime
+	replay              bool
+	subscriptionAttempt handoff.SubscriptionAttempt
+	replayAttempt       handoff.ReplayAttempt
 }
 
 type logicalSession struct {
@@ -335,6 +336,7 @@ type sessionRuntime struct {
 	publicationPending        bool
 	publicationAttempt        *publicationAttempt
 	publicationRequiresCommit bool
+	handoffSubscriptionLease  handoff.SubscriptionLease
 	reconnect                 *IssuedReconnectCredential
 	reconnectDelivered        bool
 	reconnectLossDeadline     time.Time
@@ -378,30 +380,74 @@ func profileClaimsMatchResolved(claims ReconnectClaims, resolved profile.Resolve
 		claims.ProfileSnapshotHash == resolved.Snapshot.SnapshotHash && claims.ProfileEngineVersion == resolved.Snapshot.EngineVersion
 }
 
-func (m *Manager) commitPublication(r *sessionRuntime) {
+func (m *Manager) commitPublication(r *sessionRuntime) error {
 	if m == nil || r == nil {
-		return
+		return nil
 	}
 	scope := r.handoffScope()
-	r.presentationMu.Lock()
+	// Commit only observes directory/runtime publication ownership. It avoids
+	// presentationMu so replay activation is not blocked by an in-flight
+	// presentation that is itself serialized by activeMu.
 	m.activeMu.Lock()
 	r.mu.Lock()
 	attempt := r.publicationAttempt
-	if attempt == nil || m.current[scope] != r || (r.publicationPending && m.pendingPublications[scope] != attempt) {
+	if attempt == nil {
 		r.mu.Unlock()
 		m.activeMu.Unlock()
-		r.presentationMu.Unlock()
-		return
+		return nil
 	}
-	r.publicationPending = false
-	r.publicationPrevious = nil
-	r.publicationAccepting = false
-	r.publicationGeneration = 0
-	r.publicationAttempt = nil
+	valid := m.current[scope] == r && m.pendingPublications[scope] == attempt
 	r.mu.Unlock()
 	m.activeMu.Unlock()
-	r.presentationMu.Unlock()
-	m.commitPublicationAttempt(attempt)
+	if !valid {
+		return ErrStaleReconnect
+	}
+
+	lease, err := attempt.commit()
+	if err != nil {
+		return errors.Join(ErrRecoveryUnavailable, err)
+	}
+
+	m.activeMu.Lock()
+	r.mu.Lock()
+	valid = r.publicationAttempt == attempt && m.current[scope] == r && m.pendingPublications[scope] == attempt
+	if valid {
+		r.publicationPending = false
+		r.publicationPrevious = nil
+		r.publicationAccepting = false
+		r.publicationGeneration = 0
+		r.publicationAttempt = nil
+		r.handoffSubscriptionLease = lease
+		delete(m.pendingPublications, scope)
+	}
+	r.mu.Unlock()
+	m.activeMu.Unlock()
+	if !valid {
+		if !isNilInterface(lease) {
+			lease.Release()
+		}
+		return ErrStaleReconnect
+	}
+	if attempt.replay && !isNilInterface(attempt.replayAttempt) {
+		attempt.replayAttempt.Notify()
+	}
+	return nil
+}
+
+func (a *publicationAttempt) commit() (handoff.SubscriptionLease, error) {
+	if a == nil {
+		return nil, nil
+	}
+	if a.replay {
+		if isNilInterface(a.replayAttempt) {
+			return nil, nil
+		}
+		return a.replayAttempt.Commit()
+	}
+	if isNilInterface(a.subscriptionAttempt) {
+		return nil, nil
+	}
+	return a.subscriptionAttempt.Commit()
 }
 
 // fenceAtTurnBoundary linearizes the final boundary decision with every
@@ -1102,6 +1148,9 @@ func normalizeManagerConfig(cfg Config) (Config, error) {
 			isNilInterface(cfg.HandoffSubscriptions) || isNilInterface(cfg.PresentationPolicy) || isNilInterface(cfg.SafetyPolicy) {
 			return cfg, fmt.Errorf("%w: handoff presentation dependencies are incomplete", ErrInvalidManagerConfig)
 		}
+		if registrar, ok := cfg.HandoffSubscriptions.(handoff.TransactionalSubscriptionRegistrar); !ok || isNilInterface(registrar) {
+			return cfg, fmt.Errorf("%w: handoff presentation subscriptions require exact ownership", ErrInvalidManagerConfig)
+		}
 	}
 	return cfg, nil
 }
@@ -1365,7 +1414,10 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 		runtime.setReconnectLossDeadline(lossDeadline)
 		group.Go(runLoop("reconnect owner heartbeat", func(ctx context.Context) error { return m.maintainReconnectOwner(ctx, runtime, lossDeadline) }))
 	}
-	m.commitPublication(runtime)
+	if err := m.commitPublication(runtime); err != nil {
+		m.rollbackInitialPublication(runtime, logical)
+		return abortBeforePublication(err)
+	}
 	hooks := m.metricsSnapshot()
 	hooks.SessionStarted()
 	defer func() {
@@ -2424,7 +2476,10 @@ func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.Canc
 		runtime.setReconnectLossDeadline(lossDeadline)
 		group.Go(runLoop("reconnect owner heartbeat", func(ctx context.Context) error { return m.maintainReconnectOwner(ctx, runtime, lossDeadline) }))
 	}
-	m.commitPublication(runtime)
+	if err := m.commitPublication(runtime); err != nil {
+		m.rollbackReplacementPublication(runtime, logical, expected, initialEpoch-1)
+		return abort(err)
+	}
 	hooks := m.metricsSnapshot()
 	hooks.SessionStarted()
 	defer func() {
@@ -2467,6 +2522,17 @@ func (m *Manager) reservePublicationAttemptLocked(scope handoff.Scope, runtime, 
 	return attempt, nil
 }
 
+func (m *Manager) transactionalHandoffSubscriptions() (handoff.TransactionalSubscriptionRegistrar, error) {
+	if m == nil || isNilInterface(m.cfg.HandoffSubscriptions) {
+		return nil, nil
+	}
+	registrar, ok := m.cfg.HandoffSubscriptions.(handoff.TransactionalSubscriptionRegistrar)
+	if !ok || isNilInterface(registrar) {
+		return nil, ErrRecoveryUnavailable
+	}
+	return registrar, nil
+}
+
 func (m *Manager) clearPublicationAttempt(attempt *publicationAttempt) {
 	if m == nil || attempt == nil || attempt.runtime == nil {
 		return
@@ -2479,43 +2545,21 @@ func (m *Manager) clearPublicationAttempt(attempt *publicationAttempt) {
 	m.activeMu.Unlock()
 }
 
-func (m *Manager) commitPublicationAttempt(attempt *publicationAttempt) {
-	if attempt == nil {
-		return
-	}
-	// Activate the pump generation first, then remove the exact Manager offer
-	// fence before waking delivery for the newly published owner.
-	if attempt.replay && !isNilInterface(attempt.replayAttempt) {
-		attempt.replayAttempt.Commit()
-	}
-	m.clearPublicationAttempt(attempt)
-	if attempt.replay && !isNilInterface(attempt.replayAttempt) {
-		attempt.replayAttempt.Notify()
-	}
-}
-
 // compensatePublicationAttempt runs after a registrar callback may have
 // mutated state but its exact directory CAS cannot commit. The attempt token
-// stays reserved until all compensation callbacks finish, so they cannot
-// unregister a newer owner.
+// stays reserved until exact rollback finishes, so it cannot affect a newer
+// owner.
 func (m *Manager) compensatePublicationAttempt(attempt *publicationAttempt, restorePrevious bool) error {
 	if m == nil || attempt == nil || attempt.runtime == nil {
 		return nil
 	}
+	_ = restorePrevious
 	if attempt.replay {
 		if !isNilInterface(attempt.replayAttempt) {
 			attempt.replayAttempt.Rollback()
 		}
-		m.clearPublicationAttempt(attempt)
-		return nil
-	}
-	if isNilInterface(m.cfg.HandoffSubscriptions) {
-		m.clearPublicationAttempt(attempt)
-		return nil
-	}
-	subscription := attempt.runtime.handoffSubscription(m.cfg.HandoffConsumerID)
-	if !restorePrevious {
-		m.cfg.HandoffSubscriptions.Unregister(subscription)
+	} else if !isNilInterface(attempt.subscriptionAttempt) {
+		attempt.subscriptionAttempt.Rollback()
 	}
 	m.clearPublicationAttempt(attempt)
 	return nil
@@ -2535,6 +2579,10 @@ func (m *Manager) publicationAttemptCanRestorePrevious(attempt *publicationAttem
 
 func (m *Manager) registerReplacement(runtime *sessionRuntime, logical *logicalSession, expected identity.Incarnation) error {
 	scope := runtime.handoffScope()
+	registrar, registrarErr := m.transactionalHandoffSubscriptions()
+	if registrarErr != nil {
+		return registrarErr
+	}
 	m.activeMu.Lock()
 	previous := m.current[scope]
 	if m.logical[runtime.key.sessionID] != logical || logical == nil || !logical.reconnecting || logical.highWater != expected ||
@@ -2546,23 +2594,17 @@ func (m *Manager) registerReplacement(runtime *sessionRuntime, logical *logicalS
 		m.activeMu.Unlock()
 		return ErrStaleReconnect
 	}
-	var replay handoff.TransactionalReplayRegistrar
-	if !isNilInterface(m.cfg.HandoffSubscriptions) {
-		var ok bool
-		replay, ok = m.cfg.HandoffSubscriptions.(handoff.TransactionalReplayRegistrar)
-		if !ok || isNilInterface(replay) {
-			m.activeMu.Unlock()
-			return ErrRecoveryUnavailable
-		}
-	}
 	attempt, err := m.reservePublicationAttemptLocked(scope, runtime, previous, true)
 	m.activeMu.Unlock()
 	if err != nil {
 		return err
 	}
-	if replay != nil {
-		replayAttempt, replayErr := replay.BeginReplay(runtime.handoffSubscription(m.cfg.HandoffConsumerID), *runtime.replayAfter)
+	if registrar != nil {
+		replayAttempt, replayErr := registrar.BeginReplay(runtime.handoffSubscription(m.cfg.HandoffConsumerID), *runtime.replayAfter)
 		attempt.replayAttempt = replayAttempt
+		if replayErr == nil && isNilInterface(replayAttempt) {
+			replayErr = errors.New("handoff replay registrar returned nil attempt")
+		}
 		if replayErr != nil || isNilInterface(replayAttempt) {
 			compensationErr := m.compensatePublicationAttempt(attempt, false)
 			return errors.Join(ErrRecoveryUnavailable, replayErr, compensationErr)
@@ -2623,7 +2665,10 @@ func (m *Manager) registerReplacement(runtime *sessionRuntime, logical *logicalS
 		previous.presentationMu.Unlock()
 	}
 	if !pending {
-		m.commitPublicationAttempt(attempt)
+		if err := m.commitPublication(runtime); err != nil {
+			m.rollbackReplacementPublication(runtime, logical, expected, 0)
+			return err
+		}
 	}
 	return nil
 }
@@ -2641,6 +2686,8 @@ func (m *Manager) rollbackInitialPublication(runtime *sessionRuntime, logical *l
 	previous := runtime.publicationPrevious
 	previousAccepting := runtime.publicationAccepting
 	previousGeneration := runtime.publicationGeneration
+	lease := runtime.handoffSubscriptionLease
+	runtime.handoffSubscriptionLease = nil
 	runtime.accepting = false
 	runtime.acceptanceGeneration++
 	runtime.publicationPending = false
@@ -2670,10 +2717,11 @@ func (m *Manager) rollbackInitialPublication(runtime *sessionRuntime, logical *l
 	}
 	m.activeMu.Unlock()
 	runtime.presentationMu.Unlock()
+	if !isNilInterface(lease) {
+		lease.Release()
+	}
 	if attempt != nil {
 		_ = m.compensatePublicationAttempt(attempt, restoredPrevious)
-	} else if previous == nil && !isNilInterface(m.cfg.HandoffSubscriptions) {
-		m.cfg.HandoffSubscriptions.Unregister(runtime.handoffSubscription(m.cfg.HandoffConsumerID))
 	}
 }
 
@@ -2690,6 +2738,8 @@ func (m *Manager) rollbackReplacementPublication(runtime *sessionRuntime, logica
 	previous := runtime.publicationPrevious
 	previousAccepting := runtime.publicationAccepting
 	previousGeneration := runtime.publicationGeneration
+	lease := runtime.handoffSubscriptionLease
+	runtime.handoffSubscriptionLease = nil
 	runtime.accepting = false
 	runtime.acceptanceGeneration++
 	runtime.publicationPending = false
@@ -2722,10 +2772,11 @@ func (m *Manager) rollbackReplacementPublication(runtime *sessionRuntime, logica
 	}
 	m.activeMu.Unlock()
 	runtime.presentationMu.Unlock()
+	if !isNilInterface(lease) {
+		lease.Release()
+	}
 	if attempt != nil {
 		_ = m.compensatePublicationAttempt(attempt, restoredPrevious)
-	} else if previous == nil && !isNilInterface(m.cfg.HandoffSubscriptions) {
-		m.cfg.HandoffSubscriptions.Unregister(runtime.handoffSubscription(m.cfg.HandoffConsumerID))
 	}
 }
 
@@ -2885,6 +2936,10 @@ func (m *Manager) Submit(ctx context.Context, sessionID identity.SessionID, inca
 
 func (m *Manager) register(runtime *sessionRuntime) error {
 	scope := runtime.handoffScope()
+	registrar, registrarErr := m.transactionalHandoffSubscriptions()
+	if registrarErr != nil {
+		return registrarErr
+	}
 	m.activeMu.Lock()
 	previous := m.current[scope]
 	if _, exists := m.active[runtime.key]; exists {
@@ -2915,11 +2970,16 @@ func (m *Manager) register(runtime *sessionRuntime) error {
 	if err != nil {
 		return err
 	}
-	if !isNilInterface(m.cfg.HandoffSubscriptions) {
-		if err := m.cfg.HandoffSubscriptions.Register(runtime.handoffSubscription(m.cfg.HandoffConsumerID)); err != nil {
+	if registrar != nil {
+		subscriptionAttempt, subscriptionErr := registrar.BeginSubscription(runtime.handoffSubscription(m.cfg.HandoffConsumerID))
+		attempt.subscriptionAttempt = subscriptionAttempt
+		if subscriptionErr == nil && isNilInterface(subscriptionAttempt) {
+			subscriptionErr = errors.New("handoff subscription registrar returned nil attempt")
+		}
+		if subscriptionErr != nil || isNilInterface(subscriptionAttempt) {
 			restorePrevious := m.publicationAttemptCanRestorePrevious(attempt)
 			compensationErr := m.compensatePublicationAttempt(attempt, restorePrevious)
-			return errors.Join(fmt.Errorf("register handoff presentation: %w", err), compensationErr)
+			return errors.Join(fmt.Errorf("register handoff presentation: %w", subscriptionErr), compensationErr)
 		}
 	}
 	presentationLocked := previous != nil && previous != runtime
@@ -2975,12 +3035,15 @@ func (m *Manager) register(runtime *sessionRuntime) error {
 	logical.turnBoundary = true
 	logical.tombstonedAt = time.Time{}
 	logical.state = logicalActive
-	if !pending {
-		delete(m.pendingPublications, scope)
-	}
 	m.activeMu.Unlock()
 	if presentationLocked {
 		previous.presentationMu.Unlock()
+	}
+	if !pending {
+		if err := m.commitPublication(runtime); err != nil {
+			m.rollbackInitialPublication(runtime, logical)
+			return err
+		}
 	}
 	return nil
 }
@@ -2989,6 +3052,7 @@ func (m *Manager) unregister(key runtimeKey, runtime *sessionRuntime) error {
 	var unregisterErr error
 	var reconnectEpoch identity.ResponseEpoch
 	var reconnectBoundary bool
+	var lease handoff.SubscriptionLease
 	tombstoneReconnectOwner := false
 	// Fence presentation, directory ownership, and runtime intake in the global
 	// order. Durable tombstoning and subscription callbacks happen after unlock.
@@ -3004,6 +3068,8 @@ func (m *Manager) unregister(key runtimeKey, runtime *sessionRuntime) error {
 	unregisterPresentation := m.current[scope] == runtime
 	if unregisterPresentation {
 		delete(m.current, scope)
+		lease = runtime.handoffSubscriptionLease
+		runtime.handoffSubscriptionLease = nil
 	}
 	if logical := m.logical[key.sessionID]; logical != nil && logical.runtime == runtime {
 		logical.runtime = nil
@@ -3029,8 +3095,8 @@ func (m *Manager) unregister(key runtimeKey, runtime *sessionRuntime) error {
 			unregisterErr = fmt.Errorf("tombstone reconnect owner: %w", err)
 		}
 	}
-	if unregisterPresentation && !isNilInterface(m.cfg.HandoffSubscriptions) {
-		m.cfg.HandoffSubscriptions.Unregister(runtime.handoffSubscription(m.cfg.HandoffConsumerID))
+	if unregisterPresentation && !isNilInterface(lease) {
+		lease.Release()
 	}
 	return unregisterErr
 }

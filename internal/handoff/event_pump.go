@@ -51,13 +51,29 @@ type ReplayRegistrar interface {
 	RegisterReplay(EventSubscription, int64) error
 }
 
+// SubscriptionLease is exact ownership of one committed subscription
+// generation. Release removes state only while this lease is still current.
+type SubscriptionLease interface {
+	Release()
+}
+
+// SubscriptionAttempt is a hidden, exact reservation for publishing a base
+// subscription. Commit returns the lease that owns the activated generation.
+// A rolled-back or otherwise lost reservation returns an error from Commit.
+type SubscriptionAttempt interface {
+	Commit() (SubscriptionLease, error)
+	Rollback()
+}
+
 // ReplayAttempt is an exact, one-shot reservation for publishing a replay
 // subscription. Commit activates the replay without waking delivery, so the
 // owner can remove any external publication fence before calling Notify.
-// Commit and Rollback are infallible, concurrency-safe, and idempotent; the
-// first terminal operation wins. Notify is idempotent after Commit.
+// Commit and Rollback are concurrency-safe and idempotent; the first terminal
+// operation wins. Commit reports a lost reservation instead of allowing its
+// caller to publish without an active subscription. Notify is idempotent after
+// a successful Commit.
 type ReplayAttempt interface {
-	Commit()
+	Commit() (SubscriptionLease, error)
 	Notify()
 	Rollback()
 }
@@ -66,6 +82,13 @@ type ReplayAttempt interface {
 // session publication that owns it commits.
 type TransactionalReplayRegistrar interface {
 	BeginReplay(EventSubscription, int64) (ReplayAttempt, error)
+}
+
+// TransactionalSubscriptionRegistrar owns both initial and replay
+// registration as hidden attempts with exact teardown leases.
+type TransactionalSubscriptionRegistrar interface {
+	TransactionalReplayRegistrar
+	BeginSubscription(EventSubscription) (SubscriptionAttempt, error)
 }
 
 type EventPump struct {
@@ -79,23 +102,40 @@ type EventPump struct {
 	Tracer        trace.Tracer
 	Gates         interface{ Enabled(string) bool }
 
-	mu                  sync.Mutex
-	subscriptions       map[EventSubscription]struct{}
-	replays             map[EventSubscription]int64
-	replayAttempts      map[EventSubscription]*eventPumpReplayAttempt
-	deliveryGenerations map[EventSubscription]*eventPumpDeliveryGeneration
-	deliveryCancels     map[EventSubscription]eventPumpDeliveryCancel
-	changed             chan struct{}
-	running             bool
+	mu                   sync.Mutex
+	subscriptions        map[EventSubscription]struct{}
+	replays              map[EventSubscription]int64
+	subscriptionAttempts map[EventSubscription]*eventPumpSubscriptionAttempt
+	replayAttempts       map[EventSubscription]*eventPumpReplayAttempt
+	subscriptionLeases   map[EventSubscription]*eventPumpSubscriptionLease
+	deliveryGenerations  map[EventSubscription]*eventPumpDeliveryGeneration
+	deliveryCancels      map[EventSubscription]eventPumpDeliveryCancel
+	changed              chan struct{}
+	running              bool
+}
+
+type eventPumpSubscriptionAttempt struct {
+	pump         *EventPump
+	subscription EventSubscription
+	lease        *eventPumpSubscriptionLease
+	rolledBack   bool
 }
 
 type eventPumpReplayAttempt struct {
 	pump         *EventPump
 	subscription EventSubscription
 	afterSeq     int64
+	legacy       bool
 	notifyOnce   sync.Once
-	activated    bool
+	lease        *eventPumpSubscriptionLease
+	rolledBack   bool
 	changed      chan struct{}
+}
+
+type eventPumpSubscriptionLease struct {
+	pump         *EventPump
+	subscription EventSubscription
+	legacy       bool
 }
 
 type eventPumpDeliveryCancel struct {
@@ -113,19 +153,48 @@ type EventPumpMetrics struct {
 }
 
 func (p *EventPump) RegisterReplay(subscription EventSubscription, afterSeq int64) error {
-	attempt, err := p.BeginReplay(subscription, afterSeq)
+	attempt, err := p.beginReplay(subscription, afterSeq, true)
 	if err != nil {
 		return err
 	}
-	attempt.Commit()
+	if _, err := attempt.Commit(); err != nil {
+		return err
+	}
 	attempt.Notify()
 	return nil
+}
+
+// BeginSubscription reserves capacity and exact ownership while leaving the
+// currently committed base subscription and replay overlay untouched.
+func (p *EventPump) BeginSubscription(subscription EventSubscription) (SubscriptionAttempt, error) {
+	if p == nil {
+		return nil, errors.New("event pump is nil")
+	}
+	if err := validateEventSubscription(subscription); err != nil {
+		return nil, err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.initializeRegistrationsLocked()
+	if p.subscriptionAttempts[subscription] != nil || p.replayAttempts[subscription] != nil {
+		return nil, errors.New("event pump subscription attempt is already pending")
+	}
+	if _, committed := p.subscriptions[subscription]; !committed && p.subscriptionCountLocked() >= maximumEventSubscriptions {
+		return nil, errors.New("event pump subscription limit exceeded")
+	}
+	attempt := &eventPumpSubscriptionAttempt{pump: p, subscription: subscription}
+	p.subscriptionAttempts[subscription] = attempt
+	return attempt, nil
 }
 
 // BeginReplay reserves capacity and exact ownership of a replay publication.
 // The tentative base subscription and replay cursor stay outside the committed
 // maps, so Run and polling cannot observe either before Commit.
 func (p *EventPump) BeginReplay(subscription EventSubscription, afterSeq int64) (ReplayAttempt, error) {
+	return p.beginReplay(subscription, afterSeq, false)
+}
+
+func (p *EventPump) beginReplay(subscription EventSubscription, afterSeq int64, legacy bool) (ReplayAttempt, error) {
 	if p == nil {
 		return nil, errors.New("event pump is nil")
 	}
@@ -138,40 +207,87 @@ func (p *EventPump) BeginReplay(subscription EventSubscription, afterSeq int64) 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.initializeRegistrationsLocked()
-	if p.replayAttempts[subscription] != nil {
+	if p.subscriptionAttempts[subscription] != nil || p.replayAttempts[subscription] != nil {
 		return nil, errors.New("event pump replay attempt is already pending")
+	}
+	if current := p.subscriptionLeases[subscription]; legacy && current != nil && !current.legacy {
+		return nil, errors.New("event pump exact subscription is already active")
 	}
 	if _, committed := p.subscriptions[subscription]; !committed && p.subscriptionCountLocked() >= maximumEventSubscriptions {
 		return nil, errors.New("event pump subscription limit exceeded")
 	}
-	attempt := &eventPumpReplayAttempt{pump: p, subscription: subscription, afterSeq: afterSeq}
+	attempt := &eventPumpReplayAttempt{pump: p, subscription: subscription, afterSeq: afterSeq, legacy: legacy}
 	p.replayAttempts[subscription] = attempt
 	return attempt, nil
 }
 
-func (a *eventPumpReplayAttempt) Commit() {
+func (a *eventPumpSubscriptionAttempt) Commit() (SubscriptionLease, error) {
+	if a == nil || a.pump == nil {
+		return nil, errors.New("event pump subscription attempt is nil")
+	}
+	p := a.pump
+	p.mu.Lock()
+	if a.lease != nil {
+		lease := a.lease
+		p.mu.Unlock()
+		return lease, nil
+	}
+	if a.rolledBack || p.subscriptionAttempts[a.subscription] != a {
+		p.mu.Unlock()
+		return nil, errors.New("event pump subscription attempt is no longer pending")
+	}
+	delete(p.subscriptionAttempts, a.subscription)
+	lease, cancelDelivery := p.activateSubscriptionLocked(a.subscription, false, nil)
+	a.lease = lease
+	changed := p.changed
+	p.mu.Unlock()
+	if cancelDelivery != nil {
+		cancelDelivery()
+	}
+	select {
+	case changed <- struct{}{}:
+	default:
+	}
+	return lease, nil
+}
+
+func (a *eventPumpSubscriptionAttempt) Rollback() {
 	if a == nil || a.pump == nil {
 		return
 	}
 	p := a.pump
 	p.mu.Lock()
-	if p.replayAttempts[a.subscription] != a {
+	if p.subscriptionAttempts[a.subscription] == a {
+		delete(p.subscriptionAttempts, a.subscription)
+		a.rolledBack = true
+	}
+	p.mu.Unlock()
+}
+
+func (a *eventPumpReplayAttempt) Commit() (SubscriptionLease, error) {
+	if a == nil || a.pump == nil {
+		return nil, errors.New("event pump replay attempt is nil")
+	}
+	p := a.pump
+	p.mu.Lock()
+	if a.lease != nil {
+		lease := a.lease
 		p.mu.Unlock()
-		return
+		return lease, nil
+	}
+	if a.rolledBack || p.replayAttempts[a.subscription] != a {
+		p.mu.Unlock()
+		return nil, errors.New("event pump replay attempt is no longer pending")
 	}
 	delete(p.replayAttempts, a.subscription)
-	cancelDelivery := p.takeDeliveryCancelLocked(a.subscription)
-	p.subscriptions[a.subscription] = struct{}{}
-	p.deliveryGenerations[a.subscription] = &eventPumpDeliveryGeneration{}
-	if current, exists := p.replays[a.subscription]; !exists || a.afterSeq < current {
-		p.replays[a.subscription] = a.afterSeq
-	}
-	a.activated = true
+	lease, cancelDelivery := p.activateSubscriptionLocked(a.subscription, a.legacy, &a.afterSeq)
+	a.lease = lease
 	a.changed = p.changed
 	p.mu.Unlock()
 	if cancelDelivery != nil {
 		cancelDelivery()
 	}
+	return lease, nil
 }
 
 func (a *eventPumpReplayAttempt) Notify() {
@@ -179,7 +295,7 @@ func (a *eventPumpReplayAttempt) Notify() {
 		return
 	}
 	a.pump.mu.Lock()
-	activated, changed := a.activated, a.changed
+	activated, changed := a.lease != nil, a.changed
 	a.pump.mu.Unlock()
 	if !activated || changed == nil {
 		return
@@ -200,8 +316,48 @@ func (a *eventPumpReplayAttempt) Rollback() {
 	p.mu.Lock()
 	if p.replayAttempts[a.subscription] == a {
 		delete(p.replayAttempts, a.subscription)
+		a.rolledBack = true
 	}
 	p.mu.Unlock()
+}
+
+func (l *eventPumpSubscriptionLease) Release() {
+	if l == nil || l.pump == nil {
+		return
+	}
+	p := l.pump
+	p.mu.Lock()
+	if p.subscriptionLeases[l.subscription] != l {
+		p.mu.Unlock()
+		return
+	}
+	cancelDelivery := p.takeDeliveryCancelLocked(l.subscription)
+	delete(p.subscriptionLeases, l.subscription)
+	delete(p.subscriptions, l.subscription)
+	delete(p.replays, l.subscription)
+	delete(p.deliveryGenerations, l.subscription)
+	p.mu.Unlock()
+	if cancelDelivery != nil {
+		cancelDelivery()
+	}
+}
+
+func (p *EventPump) activateSubscriptionLocked(
+	subscription EventSubscription,
+	legacy bool,
+	replayAfter *int64,
+) (*eventPumpSubscriptionLease, context.CancelFunc) {
+	cancelDelivery := p.takeDeliveryCancelLocked(subscription)
+	lease := &eventPumpSubscriptionLease{pump: p, subscription: subscription, legacy: legacy}
+	p.subscriptions[subscription] = struct{}{}
+	p.subscriptionLeases[subscription] = lease
+	p.deliveryGenerations[subscription] = &eventPumpDeliveryGeneration{}
+	if replayAfter == nil {
+		delete(p.replays, subscription)
+	} else if current, exists := p.replays[subscription]; !exists || *replayAfter < current {
+		p.replays[subscription] = *replayAfter
+	}
+	return lease, cancelDelivery
 }
 
 func (p *EventPump) Register(subscription EventSubscription) error {
@@ -214,13 +370,18 @@ func (p *EventPump) Register(subscription EventSubscription) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.initializeRegistrationsLocked()
+	if p.subscriptionAttempts[subscription] != nil || p.replayAttempts[subscription] != nil {
+		return errors.New("event pump subscription attempt is already pending")
+	}
 	if _, exists := p.subscriptions[subscription]; exists {
 		return nil
 	}
 	if p.subscriptionCountLocked() >= maximumEventSubscriptions {
 		return errors.New("event pump subscription limit exceeded")
 	}
+	lease := &eventPumpSubscriptionLease{pump: p, subscription: subscription, legacy: true}
 	p.subscriptions[subscription] = struct{}{}
+	p.subscriptionLeases[subscription] = lease
 	p.deliveryGenerations[subscription] = &eventPumpDeliveryGeneration{}
 	select {
 	case p.changed <- struct{}{}:
@@ -234,10 +395,15 @@ func (p *EventPump) Unregister(subscription EventSubscription) {
 		return
 	}
 	p.mu.Lock()
+	lease := p.subscriptionLeases[subscription]
+	if lease == nil || !lease.legacy {
+		p.mu.Unlock()
+		return
+	}
 	cancelDelivery := p.takeDeliveryCancelLocked(subscription)
+	delete(p.subscriptionLeases, subscription)
 	delete(p.subscriptions, subscription)
 	delete(p.replays, subscription)
-	delete(p.replayAttempts, subscription)
 	delete(p.deliveryGenerations, subscription)
 	p.mu.Unlock()
 	if cancelDelivery != nil {
@@ -252,8 +418,14 @@ func (p *EventPump) initializeRegistrationsLocked() {
 	if p.replays == nil {
 		p.replays = make(map[EventSubscription]int64)
 	}
+	if p.subscriptionAttempts == nil {
+		p.subscriptionAttempts = make(map[EventSubscription]*eventPumpSubscriptionAttempt)
+	}
 	if p.replayAttempts == nil {
 		p.replayAttempts = make(map[EventSubscription]*eventPumpReplayAttempt)
+	}
+	if p.subscriptionLeases == nil {
+		p.subscriptionLeases = make(map[EventSubscription]*eventPumpSubscriptionLease)
 	}
 	if p.deliveryGenerations == nil {
 		p.deliveryGenerations = make(map[EventSubscription]*eventPumpDeliveryGeneration)
@@ -276,6 +448,11 @@ func (p *EventPump) takeDeliveryCancelLocked(subscription EventSubscription) con
 
 func (p *EventPump) subscriptionCountLocked() int {
 	count := len(p.subscriptions)
+	for subscription := range p.subscriptionAttempts {
+		if _, committed := p.subscriptions[subscription]; !committed {
+			count++
+		}
+	}
 	for subscription := range p.replayAttempts {
 		if _, committed := p.subscriptions[subscription]; !committed {
 			count++

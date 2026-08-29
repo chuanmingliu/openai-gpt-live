@@ -479,6 +479,123 @@ func TestEventPumpReplayAttemptCommitKeepsMinimumOverlay(t *testing.T) {
 	}
 }
 
+func TestEventPumpSubscriptionLeaseReleaseIsExactAcrossReplayCommit(t *testing.T) {
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "lease-exact-replay"}
+	store := newPumpStore()
+	store.events[scope] = []handoff.Event{pumpEvent(scope, 1, "handoff.completed", handoff.StateSucceeded)}
+	subscription := handoff.EventSubscription{ConsumerID: "client", Scope: scope}
+	manual := clock.NewManual(time.Unix(0, 0))
+	pump := &handoff.EventPump{Reader: store, Cursors: store, Sink: store, Clock: manual, PollInterval: time.Second}
+
+	baseAttempt, err := pump.BeginSubscription(subscription)
+	require.NoError(t, err)
+	oldLease, err := baseAttempt.Commit()
+	require.NoError(t, err)
+	replay, err := pump.BeginReplay(subscription, 0)
+	require.NoError(t, err)
+	newLease, err := replay.Commit()
+	require.NoError(t, err)
+	require.NotNil(t, newLease)
+	replay.Notify()
+
+	oldLease.Release()
+	runPump(t, pump)
+	select {
+	case event := <-store.offered:
+		require.Equal(t, int64(1), event.Seq, "old lease release deleted the committed replacement replay subscription")
+	case <-time.After(time.Second):
+		t.Fatal("old lease release deleted the committed replacement replay subscription")
+	}
+
+	newLease.Release()
+	store.mu.Lock()
+	store.events[scope] = append(store.events[scope], pumpEvent(scope, 2, "handoff.completed", handoff.StateSucceeded))
+	store.mu.Unlock()
+	manual.Advance(time.Second)
+	select {
+	case event := <-store.offered:
+		t.Fatalf("new lease release left the replacement subscription active at sequence %d", event.Seq)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestEventPumpSubscriptionAttemptCapacityAndRollbackPreserveActiveReplay(t *testing.T) {
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "subscription-attempt-active"}
+	subscription := handoff.EventSubscription{ConsumerID: "client", Scope: scope}
+	pump := &handoff.EventPump{}
+	require.NoError(t, pump.RegisterReplay(subscription, 2))
+	for index := 0; index < 9_999; index++ {
+		sub := handoff.EventSubscription{
+			ConsumerID: "client",
+			Scope: handoff.Scope{
+				TenantID:       "tenant",
+				UserID:         "user",
+				ConversationID: identity.ConversationID(fmt.Sprintf("capacity-active-%d", index)),
+			},
+		}
+		require.NoError(t, pump.Register(sub))
+	}
+	sameAttempt, err := pump.BeginSubscription(subscription)
+	require.NoError(t, err, "pending replacement of an active identical subscription must not consume unique capacity")
+	distinctAttempt, err := pump.BeginSubscription(handoff.EventSubscription{
+		ConsumerID: "client",
+		Scope:      handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "capacity-distinct"},
+	})
+	require.Error(t, err, "a distinct pending subscription must consume unique capacity")
+	require.Nil(t, distinctAttempt)
+	sameAttempt.Rollback()
+
+	deliveryPump := &handoff.EventPump{}
+	require.NoError(t, deliveryPump.RegisterReplay(subscription, 2))
+	rollbackAttempt, err := deliveryPump.BeginSubscription(subscription)
+	require.NoError(t, err)
+	rollbackAttempt.Rollback()
+	store := newPumpStore()
+	for seq := int64(1); seq <= 5; seq++ {
+		store.events[scope] = append(store.events[scope], pumpEvent(scope, seq, "handoff.completed", handoff.StateSucceeded))
+	}
+	store.cursors[pumpKey(subscription.ConsumerID, scope)] = 5
+	deliveryPump.Reader = store
+	deliveryPump.Cursors = store
+	deliveryPump.Sink = store
+	deliveryPump.Clock = clock.NewManual(time.Unix(0, 0))
+	deliveryPump.PollInterval = time.Second
+	runPump(t, deliveryPump)
+
+	for _, seq := range []int64{3, 4, 5} {
+		select {
+		case event := <-store.offered:
+			require.Equal(t, seq, event.Seq, "rollback must preserve the active replay overlay")
+		case <-time.After(time.Second):
+			t.Fatalf("rollback lost active replay delivery at sequence %d", seq)
+		}
+	}
+}
+
+func TestEventPumpReplayAttemptCommitAfterRollbackIsObservableAndCannotNotify(t *testing.T) {
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "lost-replay-commit"}
+	store := newPumpStore()
+	store.events[scope] = []handoff.Event{pumpEvent(scope, 1, "handoff.completed", handoff.StateSucceeded)}
+	subscription := handoff.EventSubscription{ConsumerID: "client", Scope: scope}
+	pump := &handoff.EventPump{
+		Reader: store, Cursors: store, Sink: store, Clock: clock.NewManual(time.Unix(0, 0)), PollInterval: time.Second,
+	}
+	replay, err := pump.BeginReplay(subscription, 0)
+	require.NoError(t, err)
+	replay.Rollback()
+	lease, err := replay.Commit()
+	require.Error(t, err, "commit after rollback must report the lost reservation")
+	require.Nil(t, lease)
+	replay.Notify()
+	runPump(t, pump)
+
+	select {
+	case event := <-store.offered:
+		t.Fatalf("rolled-back replay attempt activated after failed commit: %#v", event)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 func TestEventPumpReplayActivationRestartsDeliveryThatReadOlderGeneration(t *testing.T) {
 	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "replay-generation-race"}
 	store := newPumpStore()

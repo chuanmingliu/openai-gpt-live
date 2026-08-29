@@ -243,6 +243,30 @@ type cleanupConnector struct {
 	next   int
 }
 
+type blockingTombstoneOwners struct {
+	*MemoryReconnectOwners
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingTombstoneOwners) Tombstone(
+	ctx context.Context,
+	_ identity.SessionID,
+	_ identity.Incarnation,
+	_ string,
+	_ identity.ResponseEpoch,
+	_ bool,
+) error {
+	s.once.Do(func() { close(s.started) })
+	select {
+	case <-s.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 type signalingSubscriptions struct {
 	mu         sync.Mutex
 	registered int
@@ -272,6 +296,15 @@ func (s *blockingSecondRegisterSubscriptions) Register(handoff.EventSubscription
 }
 
 func (*blockingSecondRegisterSubscriptions) Unregister(handoff.EventSubscription) {}
+func (s *blockingSecondRegisterSubscriptions) BeginSubscription(subscription handoff.EventSubscription) (handoff.SubscriptionAttempt, error) {
+	if err := s.Register(subscription); err != nil {
+		return nil, err
+	}
+	return &callbackSubscriptionAttempt{}, nil
+}
+func (*blockingSecondRegisterSubscriptions) BeginReplay(handoff.EventSubscription, int64) (handoff.ReplayAttempt, error) {
+	return &replayAttemptCallbacks{}, nil
+}
 
 type reentrantRegisterSubscriptions struct {
 	mu      sync.Mutex
@@ -300,6 +333,15 @@ func (s *reentrantRegisterSubscriptions) Register(handoff.EventSubscription) err
 }
 
 func (*reentrantRegisterSubscriptions) Unregister(handoff.EventSubscription) {}
+func (s *reentrantRegisterSubscriptions) BeginSubscription(subscription handoff.EventSubscription) (handoff.SubscriptionAttempt, error) {
+	if err := s.Register(subscription); err != nil {
+		return nil, err
+	}
+	return &callbackSubscriptionAttempt{}, nil
+}
+func (*reentrantRegisterSubscriptions) BeginReplay(handoff.EventSubscription, int64) (handoff.ReplayAttempt, error) {
+	return &replayAttemptCallbacks{}, nil
+}
 
 type racingReplaySubscriptions struct {
 	mu            sync.Mutex
@@ -322,6 +364,14 @@ func (*blockingUnregisterSubscriptions) Register(handoff.EventSubscription) erro
 func (s *blockingUnregisterSubscriptions) Unregister(handoff.EventSubscription) {
 	s.once.Do(func() { close(s.started) })
 	<-s.release
+}
+func (s *blockingUnregisterSubscriptions) BeginSubscription(handoff.EventSubscription) (handoff.SubscriptionAttempt, error) {
+	return &callbackSubscriptionAttempt{commit: func() (handoff.SubscriptionLease, error) {
+		return &callbackSubscriptionLease{release: func() { s.Unregister(handoff.EventSubscription{}) }}, nil
+	}}, nil
+}
+func (*blockingUnregisterSubscriptions) BeginReplay(handoff.EventSubscription, int64) (handoff.ReplayAttempt, error) {
+	return &replayAttemptCallbacks{}, nil
 }
 
 type reentrantUnregisterSubscriptions struct {
@@ -358,6 +408,10 @@ func (r *gatedCommitReplayRegistrar) Unregister(subscription handoff.EventSubscr
 	r.pump.Unregister(subscription)
 }
 
+func (r *gatedCommitReplayRegistrar) BeginSubscription(subscription handoff.EventSubscription) (handoff.SubscriptionAttempt, error) {
+	return r.pump.BeginSubscription(subscription)
+}
+
 func (r *gatedCommitReplayRegistrar) BeginReplay(subscription handoff.EventSubscription, after int64) (handoff.ReplayAttempt, error) {
 	attempt, err := r.pump.BeginReplay(subscription, after)
 	if err != nil {
@@ -378,13 +432,14 @@ type gatedCommitReplayAttempt struct {
 	startedOnce   sync.Once
 }
 
-func (a *gatedCommitReplayAttempt) Commit() {
-	a.ReplayAttempt.Commit()
+func (a *gatedCommitReplayAttempt) Commit() (handoff.SubscriptionLease, error) {
+	lease, err := a.ReplayAttempt.Commit()
 	a.startedOnce.Do(func() { close(a.commitStarted) })
 	select {
 	case <-a.commitRelease:
 	case <-a.waitCtx.Done():
 	}
+	return lease, err
 }
 
 func (a *gatedCommitReplayAttempt) Notify() {
@@ -412,6 +467,10 @@ func (r *preCommitReplayRegistrar) Unregister(subscription handoff.EventSubscrip
 	r.pump.Unregister(subscription)
 }
 
+func (r *preCommitReplayRegistrar) BeginSubscription(subscription handoff.EventSubscription) (handoff.SubscriptionAttempt, error) {
+	return r.pump.BeginSubscription(subscription)
+}
+
 func (r *preCommitReplayRegistrar) BeginReplay(subscription handoff.EventSubscription, after int64) (handoff.ReplayAttempt, error) {
 	attempt, err := r.pump.BeginReplay(subscription, after)
 	if err != nil {
@@ -430,12 +489,13 @@ type preCommitReplayAttempt struct {
 	startedOnce   sync.Once
 }
 
-func (a *preCommitReplayAttempt) Commit() {
+func (a *preCommitReplayAttempt) Commit() (handoff.SubscriptionLease, error) {
 	a.startedOnce.Do(func() { close(a.commitStarted) })
 	select {
 	case <-a.commitRelease:
-		a.ReplayAttempt.Commit()
+		return a.ReplayAttempt.Commit()
 	case <-a.waitCtx.Done():
+		return nil, a.waitCtx.Err()
 	}
 }
 
@@ -479,6 +539,22 @@ func (r *replayRegistrarProbe) BeginReplay(subscription handoff.EventSubscriptio
 
 func (r *replayRegistrarProbe) Unregister(subscription handoff.EventSubscription) {
 	r.pump.Unregister(subscription)
+}
+
+func (r *replayRegistrarProbe) BeginSubscription(subscription handoff.EventSubscription) (handoff.SubscriptionAttempt, error) {
+	attempt, err := r.pump.BeginSubscription(subscription)
+	if err != nil {
+		return nil, err
+	}
+	return &callbackSubscriptionAttempt{
+		commit: func() (handoff.SubscriptionLease, error) {
+			r.mu.Lock()
+			r.registerCalls++
+			r.mu.Unlock()
+			return attempt.Commit()
+		},
+		rollback: attempt.Rollback,
+	}, nil
 }
 
 type observingDeliveryStore struct {
@@ -571,6 +647,14 @@ func (s *reentrantUnregisterSubscriptions) Unregister(handoff.EventSubscription)
 		}
 	})
 }
+func (s *reentrantUnregisterSubscriptions) BeginSubscription(handoff.EventSubscription) (handoff.SubscriptionAttempt, error) {
+	return &callbackSubscriptionAttempt{commit: func() (handoff.SubscriptionLease, error) {
+		return &callbackSubscriptionLease{release: func() { s.Unregister(handoff.EventSubscription{}) }}, nil
+	}}, nil
+}
+func (*reentrantUnregisterSubscriptions) BeginReplay(handoff.EventSubscription, int64) (handoff.ReplayAttempt, error) {
+	return &replayAttemptCallbacks{}, nil
+}
 
 func (s *racingReplaySubscriptions) Register(handoff.EventSubscription) error {
 	s.mu.Lock()
@@ -606,6 +690,13 @@ func (s *racingReplaySubscriptions) BeginReplay(_ handoff.EventSubscription, aft
 	}}, nil
 }
 
+func (s *racingReplaySubscriptions) BeginSubscription(subscription handoff.EventSubscription) (handoff.SubscriptionAttempt, error) {
+	if err := s.Register(subscription); err != nil {
+		return nil, err
+	}
+	return &callbackSubscriptionAttempt{}, nil
+}
+
 func (s *racingReplaySubscriptions) Unregister(handoff.EventSubscription) {
 	s.mu.Lock()
 	s.registered = false
@@ -625,6 +716,17 @@ func (s *signalingSubscriptions) Register(handoff.EventSubscription) error {
 }
 
 func (*signalingSubscriptions) Unregister(handoff.EventSubscription) {}
+
+func (s *signalingSubscriptions) BeginSubscription(subscription handoff.EventSubscription) (handoff.SubscriptionAttempt, error) {
+	if err := s.Register(subscription); err != nil {
+		return nil, err
+	}
+	return &callbackSubscriptionAttempt{}, nil
+}
+
+func (*signalingSubscriptions) BeginReplay(handoff.EventSubscription, int64) (handoff.ReplayAttempt, error) {
+	return &replayAttemptCallbacks{}, nil
+}
 
 func (c *cleanupConnector) Connect(ctx context.Context, _ realtime.OpenRequest) (realtime.Session, error) {
 	if err := ctx.Err(); err != nil {
@@ -1064,6 +1166,7 @@ func TestReplacementFencesTimedOutAcceptedOfferBeforeOldEffects(t *testing.T) {
 
 	replacement, _, replacementDone := currentRuntime(scope, "replacement")
 	defer close(replacementDone)
+	replacement.publicationRequiresCommit = true
 	require.NoError(t, manager.register(replacement))
 	close(applyRelease)
 	time.Sleep(20 * time.Millisecond)
@@ -1313,6 +1416,7 @@ func TestFailedInitialSameScopePublicationRestoresPriorRuntime(t *testing.T) {
 
 	replacement, _, replacementDone := currentRuntime(scope, "replacement")
 	defer close(replacementDone)
+	replacement.publicationRequiresCommit = true
 	require.NoError(t, manager.register(replacement))
 	manager.activeMu.RLock()
 	logical := manager.logical[replacement.key.sessionID]
@@ -1805,6 +1909,172 @@ drained:
 	require.NoError(t, waitCtx.Err(), "pre-commit replay helper reached its explicit deadline")
 }
 
+func TestStaleManagerUnregisterCannotDeleteCommittedReconnectSubscription(t *testing.T) {
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "stale-unregister-reconnect"}
+	event := handoff.Event{
+		Seq: 1, EventID: "replacement-event", HandoffID: "handoff", TenantID: scope.TenantID,
+		ConversationID: scope.ConversationID, Kind: "handoff.created", State: handoff.StatePending,
+		Payload: json.RawMessage(`{}`),
+	}
+	store := &deliveryStore{event: event}
+	manual := clock.NewManual(time.Unix(0, 0))
+	pump := &handoff.EventPump{Reader: store, Cursors: store, Clock: manual, PollInterval: time.Second}
+	credentials, err := NewReconnectCredentials([]byte(strings.Repeat("u", 32)), clock.Real{})
+	require.NoError(t, err)
+	owners := &blockingTombstoneOwners{
+		MemoryReconnectOwners: NewMemoryReconnectOwners(clock.Real{}),
+		started:               make(chan struct{}),
+		release:               make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	releaseTombstone := func() { releaseOnce.Do(func() { close(owners.release) }) }
+	t.Cleanup(releaseTombstone)
+	manager := &Manager{
+		cfg: Config{
+			HandoffConsumerID: "replay-client", HandoffSubscriptions: pump, EgressBlockTimeout: time.Second,
+			ReconnectCredentials: credentials, ReconnectOwners: owners, ReconnectOwnerID: "stale-unregister-owner",
+		},
+		active: make(map[runtimeKey]*sessionRuntime), current: make(map[handoff.Scope]*sessionRuntime),
+		logical: make(map[identity.SessionID]*logicalSession), pendingPublications: make(map[handoff.Scope]*publicationAttempt),
+	}
+	pump.Sink = manager
+
+	previous, _, previousDone := currentRuntime(scope, "stale-unregister-session")
+	replacement, replacementInputs, replacementDone := currentRuntime(scope, "stale-unregister-session")
+	t.Cleanup(func() { close(previousDone); close(replacementDone) })
+	require.NoError(t, manager.register(previous))
+	manager.commitPublication(previous)
+
+	unregistered := make(chan error, 1)
+	go func() { unregistered <- manager.unregister(previous.key, previous) }()
+	select {
+	case <-owners.started:
+	case <-time.After(time.Second):
+		t.Fatal("stale unregister did not pause after removing directory ownership")
+	}
+	manager.activeMu.Lock()
+	logical := manager.logical[previous.key.sessionID]
+	require.NotNil(t, logical)
+	logical.reconnecting = true
+	manager.activeMu.Unlock()
+	replacement.key.incarnation = 2
+	replacement.state.ids.Incarnation = 2
+	replacement.publicationRequiresCommit = true
+	replayAfter := int64(0)
+	replacement.replayAfter = &replayAfter
+	require.NoError(t, manager.registerReplacement(replacement, logical, 1))
+	manager.commitPublication(replacement)
+
+	releaseTombstone()
+	select {
+	case err := <-unregistered:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("stale unregister did not finish after owner I/O resumed")
+	}
+	startOwnedEventPump(t, pump)
+	select {
+	case input := <-replacementInputs:
+		require.Equal(t, event.Seq, input.(HandoffEventInput).Event.Seq)
+	case <-time.After(time.Second):
+		t.Fatal("stale unregister deleted the committed replacement subscription")
+	}
+}
+
+func TestManagerReplayCommitFailureStaysPendingAndDoesNotNotify(t *testing.T) {
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "replay-commit-failure"}
+	commitErr := errors.New("commit reservation lost")
+	registrar := &replayCommitProbeRegistrar{commitErr: commitErr}
+	manager := &Manager{
+		cfg:    Config{HandoffConsumerID: "replay-client", HandoffSubscriptions: registrar, EgressBlockTimeout: time.Second},
+		active: make(map[runtimeKey]*sessionRuntime), current: make(map[handoff.Scope]*sessionRuntime),
+		logical: make(map[identity.SessionID]*logicalSession), pendingPublications: make(map[handoff.Scope]*publicationAttempt),
+	}
+	previous, _, previousDone := currentRuntime(scope, "replay-commit-failure-session")
+	replacement, _, replacementDone := currentRuntime(scope, "replay-commit-failure-session")
+	t.Cleanup(func() { close(previousDone); close(replacementDone) })
+	require.NoError(t, manager.register(previous))
+	replacement.key.incarnation = 2
+	replacement.state.ids.Incarnation = 2
+	replacement.publicationRequiresCommit = true
+	replayAfter := int64(0)
+	replacement.replayAfter = &replayAfter
+	logical := &logicalSession{scope: scope, highWater: 1, reconnecting: true, turnBoundary: true, state: logicalTombstoned}
+	manager.activeMu.Lock()
+	manager.logical[replacement.key.sessionID] = logical
+	manager.activeMu.Unlock()
+	require.NoError(t, manager.registerReplacement(replacement, logical, 1))
+
+	err := manager.commitPublication(replacement)
+	require.ErrorIs(t, err, ErrRecoveryUnavailable)
+	require.ErrorIs(t, err, commitErr)
+	require.Zero(t, registrar.notifyCount.Load(), "failed replay commit must not notify delivery as if activation succeeded")
+	manager.activeMu.RLock()
+	require.NotNil(t, manager.pendingPublications[scope], "failed replay commit must leave the publication fence visible")
+	require.Same(t, replacement, manager.current[scope])
+	manager.activeMu.RUnlock()
+	replacement.mu.Lock()
+	require.True(t, replacement.publicationPending)
+	require.NotNil(t, replacement.publicationAttempt)
+	require.Nil(t, replacement.handoffSubscriptionLease)
+	replacement.mu.Unlock()
+	manager.rollbackReplacementPublication(replacement, logical, 1, 0)
+}
+
+func TestManagerPostCommitOwnershipLossReleasesLeaseWithoutNotify(t *testing.T) {
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "replay-post-commit-loss"}
+	commitRelease := make(chan struct{})
+	var commitReleaseOnce sync.Once
+	releaseCommit := func() { commitReleaseOnce.Do(func() { close(commitRelease) }) }
+	t.Cleanup(releaseCommit)
+	registrar := &replayCommitProbeRegistrar{commitStarted: make(chan struct{}), commitRelease: commitRelease}
+	manager := &Manager{
+		cfg:    Config{HandoffConsumerID: "replay-client", HandoffSubscriptions: registrar, EgressBlockTimeout: time.Second},
+		active: make(map[runtimeKey]*sessionRuntime), current: make(map[handoff.Scope]*sessionRuntime),
+		logical: make(map[identity.SessionID]*logicalSession), pendingPublications: make(map[handoff.Scope]*publicationAttempt),
+	}
+	previous, _, previousDone := currentRuntime(scope, "replay-post-commit-loss-session")
+	replacement, _, replacementDone := currentRuntime(scope, "replay-post-commit-loss-session")
+	t.Cleanup(func() { close(previousDone); close(replacementDone) })
+	require.NoError(t, manager.register(previous))
+	replacement.key.incarnation = 2
+	replacement.state.ids.Incarnation = 2
+	replacement.publicationRequiresCommit = true
+	replayAfter := int64(0)
+	replacement.replayAfter = &replayAfter
+	logical := &logicalSession{scope: scope, highWater: 1, reconnecting: true, turnBoundary: true, state: logicalTombstoned}
+	manager.activeMu.Lock()
+	manager.logical[replacement.key.sessionID] = logical
+	manager.activeMu.Unlock()
+	require.NoError(t, manager.registerReplacement(replacement, logical, 1))
+
+	committed := make(chan error, 1)
+	go func() { committed <- manager.commitPublication(replacement) }()
+	select {
+	case <-registrar.commitStarted:
+	case <-time.After(time.Second):
+		t.Fatal("replay commit did not reach the external commit boundary")
+	}
+	manager.activeMu.Lock()
+	manager.current[scope] = previous
+	manager.activeMu.Unlock()
+	releaseCommit()
+	select {
+	case err := <-committed:
+		require.ErrorIs(t, err, ErrStaleReconnect)
+	case <-time.After(time.Second):
+		t.Fatal("post-commit ownership-loss cleanup did not finish")
+	}
+	require.Equal(t, int32(1), registrar.releaseCount.Load(), "lost ownership after commit must release the exact committed lease")
+	require.Zero(t, registrar.notifyCount.Load(), "lost ownership after commit must not notify delivery as if publication succeeded")
+	replacement.mu.Lock()
+	require.True(t, replacement.publicationPending)
+	require.NotNil(t, replacement.publicationAttempt)
+	require.Nil(t, replacement.handoffSubscriptionLease)
+	replacement.mu.Unlock()
+	manager.rollbackReplacementPublication(replacement, logical, 1, 0)
+}
+
 func TestReplayCompensationPreservesPreviousSubscriptionAndExactOverlay(t *testing.T) {
 	partialErr := errors.New("replay callback failed after mutation")
 	restoreErr := errors.New("base subscription restore failed")
@@ -1928,6 +2198,7 @@ func TestFailedReconnectSameScopePublicationRestoresPriorRuntime(t *testing.T) {
 	replacement.key.incarnation = 2
 	replacement.state.ids.Incarnation = 2
 	replacement.replayAfter = &replayAfter
+	replacement.publicationRequiresCommit = true
 	logical := &logicalSession{
 		scope: scope, subject: cloneSubject(previous.subject), highWater: 1,
 		state: logicalTombstoned, reconnecting: true, turnBoundary: true,
@@ -1989,6 +2260,7 @@ func TestSameScopeReplacementRollbackLockOrderCompletes(t *testing.T) {
 
 	replacement, _, replacementDone := currentRuntime(scope, "replacement-rollback-new")
 	t.Cleanup(func() { close(replacementDone) })
+	replacement.publicationRequiresCommit = true
 	replacementDonePublishing := make(chan error, 1)
 	go func() {
 		if err := manager.register(replacement); err != nil {

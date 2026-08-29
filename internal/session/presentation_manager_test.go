@@ -17,10 +17,15 @@ type subscriptionRecorder struct {
 	mu           sync.Mutex
 	registered   map[handoff.EventSubscription]int
 	unregistered map[handoff.EventSubscription]int
+	leases       map[handoff.EventSubscription]*recordingSubscriptionLease
 }
 
 func newSubscriptionRecorder() *subscriptionRecorder {
-	return &subscriptionRecorder{registered: make(map[handoff.EventSubscription]int), unregistered: make(map[handoff.EventSubscription]int)}
+	return &subscriptionRecorder{
+		registered:   make(map[handoff.EventSubscription]int),
+		unregistered: make(map[handoff.EventSubscription]int),
+		leases:       make(map[handoff.EventSubscription]*recordingSubscriptionLease),
+	}
 }
 
 func (r *subscriptionRecorder) Register(subscription handoff.EventSubscription) error {
@@ -34,6 +39,44 @@ func (r *subscriptionRecorder) Unregister(subscription handoff.EventSubscription
 	r.mu.Lock()
 	r.unregistered[subscription]++
 	r.mu.Unlock()
+}
+
+func (r *subscriptionRecorder) BeginSubscription(subscription handoff.EventSubscription) (handoff.SubscriptionAttempt, error) {
+	return &callbackSubscriptionAttempt{commit: func() (handoff.SubscriptionLease, error) {
+		lease := &recordingSubscriptionLease{recorder: r, subscription: subscription}
+		r.mu.Lock()
+		r.registered[subscription]++
+		r.leases[subscription] = lease
+		r.mu.Unlock()
+		return lease, nil
+	}}, nil
+}
+
+func (r *subscriptionRecorder) BeginReplay(subscription handoff.EventSubscription, _ int64) (handoff.ReplayAttempt, error) {
+	lease := &recordingSubscriptionLease{recorder: r, subscription: subscription}
+	return &replayAttemptCallbacks{commit: func() {
+		r.mu.Lock()
+		r.registered[subscription]++
+		r.leases[subscription] = lease
+		r.mu.Unlock()
+	}, lease: lease}, nil
+}
+
+type recordingSubscriptionLease struct {
+	recorder     *subscriptionRecorder
+	subscription handoff.EventSubscription
+}
+
+func (l *recordingSubscriptionLease) Release() {
+	if l == nil || l.recorder == nil {
+		return
+	}
+	l.recorder.mu.Lock()
+	if l.recorder.leases[l.subscription] == l {
+		delete(l.recorder.leases, l.subscription)
+		l.recorder.unregistered[l.subscription]++
+	}
+	l.recorder.mu.Unlock()
 }
 
 func currentRuntime(scope handoff.Scope, sessionID identity.SessionID) (*sessionRuntime, chan Input, chan struct{}) {
@@ -215,3 +258,4 @@ func TestCurrentSessionRegistrationAndUnregistrationAreRaceSafe(t *testing.T) {
 }
 
 var _ HandoffSubscriptionRegistrar = (*subscriptionRecorder)(nil)
+var _ handoff.TransactionalSubscriptionRegistrar = (*subscriptionRecorder)(nil)

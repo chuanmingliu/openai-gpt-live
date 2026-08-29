@@ -775,24 +775,159 @@ type replayRegistrarFake struct {
 	sub   handoff.EventSubscription
 }
 
+type legacyOnlyHandoffSubscriptions struct{}
+
+func (legacyOnlyHandoffSubscriptions) Register(handoff.EventSubscription) error { return nil }
+func (legacyOnlyHandoffSubscriptions) Unregister(handoff.EventSubscription)     {}
+
+type replayCommitProbeRegistrar struct {
+	commitErr         error
+	commitStarted     chan struct{}
+	commitRelease     <-chan struct{}
+	commitStartedOnce sync.Once
+	notifyCount       atomic.Int32
+	releaseCount      atomic.Int32
+}
+
+func (*replayCommitProbeRegistrar) Register(handoff.EventSubscription) error { return nil }
+func (*replayCommitProbeRegistrar) Unregister(handoff.EventSubscription)     {}
+func (*replayCommitProbeRegistrar) BeginSubscription(handoff.EventSubscription) (handoff.SubscriptionAttempt, error) {
+	return &callbackSubscriptionAttempt{}, nil
+}
+func (r *replayCommitProbeRegistrar) BeginReplay(handoff.EventSubscription, int64) (handoff.ReplayAttempt, error) {
+	return &replayAttemptCallbacks{
+		lease:     &callbackSubscriptionLease{release: func() { r.releaseCount.Add(1) }},
+		commitErr: r.commitErr,
+		commit: func() {
+			if r.commitStarted != nil {
+				r.commitStartedOnce.Do(func() { close(r.commitStarted) })
+			}
+			if r.commitRelease != nil {
+				<-r.commitRelease
+			}
+		},
+		notify: func() { r.notifyCount.Add(1) },
+	}, nil
+}
+
+type callbackSubscriptionLease struct {
+	release func()
+	once    sync.Once
+}
+
+func (l *callbackSubscriptionLease) Release() {
+	if l == nil {
+		return
+	}
+	l.once.Do(func() {
+		if l.release != nil {
+			l.release()
+		}
+	})
+}
+
+type callbackSubscriptionAttempt struct {
+	mu        sync.Mutex
+	terminal  sync.Once
+	lease     handoff.SubscriptionLease
+	commitErr error
+	committed bool
+	rolled    bool
+	commit    func() (handoff.SubscriptionLease, error)
+	rollback  func()
+}
+
+func (a *callbackSubscriptionAttempt) Commit() (handoff.SubscriptionLease, error) {
+	if a == nil {
+		return nil, errors.New("subscription attempt is nil")
+	}
+	a.mu.Lock()
+	if a.committed {
+		lease := a.lease
+		a.mu.Unlock()
+		return lease, nil
+	}
+	if a.rolled {
+		a.mu.Unlock()
+		return nil, errors.New("subscription attempt was rolled back")
+	}
+	a.mu.Unlock()
+
+	a.terminal.Do(func() {
+		lease := handoff.SubscriptionLease(&callbackSubscriptionLease{})
+		var err error
+		if a.commit != nil {
+			lease, err = a.commit()
+		}
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if err != nil {
+			a.commitErr = err
+			return
+		}
+		a.lease = lease
+		a.committed = true
+	})
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.committed {
+		return a.lease, nil
+	}
+	if a.commitErr != nil {
+		return nil, a.commitErr
+	}
+	return nil, errors.New("subscription attempt is no longer pending")
+}
+
+func (a *callbackSubscriptionAttempt) Rollback() {
+	if a == nil {
+		return
+	}
+	a.terminal.Do(func() {
+		a.mu.Lock()
+		a.rolled = true
+		a.mu.Unlock()
+		if a.rollback != nil {
+			a.rollback()
+		}
+	})
+}
+
 type replayAttemptCallbacks struct {
 	terminal   sync.Once
 	notifyOnce sync.Once
 	committed  atomic.Bool
+	lease      handoff.SubscriptionLease
+	commitErr  error
 	commit     func()
 	notify     func()
 	rollback   func()
 }
 
-func (a *replayAttemptCallbacks) Commit() {
-	if a != nil {
-		a.terminal.Do(func() {
-			a.committed.Store(true)
-			if a.commit != nil {
-				a.commit()
-			}
-		})
+func (a *replayAttemptCallbacks) Commit() (handoff.SubscriptionLease, error) {
+	if a == nil {
+		return nil, errors.New("replay attempt is nil")
 	}
+	a.terminal.Do(func() {
+		if a.commitErr != nil {
+			return
+		}
+		a.committed.Store(true)
+		if a.lease == nil {
+			a.lease = &callbackSubscriptionLease{}
+		}
+		if a.commit != nil {
+			a.commit()
+		}
+	})
+	if !a.committed.Load() {
+		if a.commitErr != nil {
+			return nil, a.commitErr
+		}
+		return nil, errors.New("replay attempt is no longer pending")
+	}
+	return a.lease, nil
 }
 
 func (a *replayAttemptCallbacks) Notify() {
@@ -817,6 +952,9 @@ func (a *replayAttemptCallbacks) Rollback() {
 
 func (*replayRegistrarFake) Register(handoff.EventSubscription) error { return nil }
 func (*replayRegistrarFake) Unregister(handoff.EventSubscription)     {}
+func (*replayRegistrarFake) BeginSubscription(handoff.EventSubscription) (handoff.SubscriptionAttempt, error) {
+	return &callbackSubscriptionAttempt{}, nil
+}
 func (r *replayRegistrarFake) RegisterReplay(sub handoff.EventSubscription, after int64) error {
 	r.sub, r.after = sub, after
 	return nil
@@ -3693,6 +3831,15 @@ func TestManagerConfigDefaultsAndBounds(t *testing.T) {
 		EgressBlockTimeout:  time.Second,
 	}, connector, ids)
 	require.ErrorIs(t, tooLarge.validationErr, ErrInvalidManagerConfig)
+}
+
+func TestManagerConfigRejectsLegacyOnlyHandoffSubscriptionRegistrar(t *testing.T) {
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		HandoffConsumerID: "legacy-client", HandoffSubscriptions: legacyOnlyHandoffSubscriptions{},
+		PresentationPolicy: presentation.NewPolicy(presentation.Config{}), SafetyPolicy: &presentationSafety{},
+	}, testkit.NewFakeConnector(1), managerIDs{})
+	require.ErrorIs(t, manager.validationErr, ErrInvalidManagerConfig)
 }
 
 func TestManagerReconnectRefreshCadenceIsBoundedByCredentialTTL(t *testing.T) {
