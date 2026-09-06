@@ -3131,6 +3131,93 @@ func TestManagerVoiceControlAcceptsCapacityAndFailsOnFirstExcessControl(t *testi
 	require.ErrorIs(t, <-runResult, ErrControlOverflow)
 }
 
+func TestManagerWaitsForProviderSessionUpdateAndAcceptsCommittedAudio(t *testing.T) {
+	connector := testkit.NewFakeConnector(16)
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second,
+		EgressBlockTimeout:  time.Second,
+	}, connector, managerIDs{session: "session-provider-acks", conversation: "conversation-provider-acks"})
+	client := newChannelClient(16)
+	ctx, cancel := context.WithCancel(t.Context())
+	runResult := make(chan error, 1)
+	go func() {
+		runResult <- manager.Run(ctx, OpenRequest{Subject: Subject{
+			TenantID: "tenant", UserID: "user", ExpiresAt: time.Now().Add(time.Hour),
+		}}, client)
+	}()
+
+	voice, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, "session.created", (<-client.writes).EventType())
+	runtime := waitForActiveRuntime(t, manager, "session-provider-acks", 1)
+	require.NoError(t, manager.Submit(t.Context(), "session-provider-acks", 1, ClientInput{Event: protocol.SessionUpdateEvent{
+		Type: "session.update", Session: protocol.SessionUpdate{Type: "realtime"},
+	}}))
+	command, err := voice.NextCommand(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, realtime.CommandSessionUpdate, command.Kind)
+	require.NotZero(t, command.Sequence)
+	require.Eventually(t, func() bool { return runtime.state.pendingVoice.Load() == 0 }, time.Second, time.Millisecond,
+		"the transport send completion was not applied")
+	select {
+	case event := <-client.writes:
+		t.Fatalf("transport send completion published %s before provider acceptance", event.EventType())
+	default:
+	}
+
+	assertNoSessionUpdatedThrough := func(providerEvent realtime.Event) {
+		t.Helper()
+		require.NoError(t, voice.Emit(t.Context(), providerEvent))
+		require.NoError(t, voice.Emit(t.Context(), realtime.Event{
+			Kind: realtime.EventError, ProviderEventID: providerEvent.ProviderEventID + "-barrier", Reason: "barrier",
+		}))
+		for {
+			select {
+			case event := <-client.writes:
+				require.NotEqual(t, "session.updated", event.EventType())
+				if event.EventType() == "error" {
+					return
+				}
+			case err := <-runResult:
+				t.Fatalf("manager stopped before barrier: %v", err)
+			case <-time.After(time.Second):
+				t.Fatal("provider barrier was not observed")
+			}
+		}
+	}
+	assertNoSessionUpdatedThrough(realtime.Event{
+		Kind: realtime.EventSessionUpdated, ProviderEventID: "unsolicited-provider-update",
+	})
+	assertNoSessionUpdatedThrough(realtime.Event{
+		Kind: realtime.EventSessionUpdated, ProviderEventID: "mismatched-provider-update",
+		SessionUpdateAcknowledgement: true, SessionUpdateSequence: command.Sequence + 1,
+	})
+
+	require.NoError(t, voice.Emit(t.Context(), realtime.Event{
+		Kind: realtime.EventSessionUpdated, ProviderEventID: "matching-provider-update",
+		SessionUpdateAcknowledgement: true, SessionUpdateSequence: command.Sequence,
+	}))
+	select {
+	case event := <-client.writes:
+		require.Equal(t, "session.updated", event.EventType())
+	case err := <-runResult:
+		t.Fatalf("manager stopped before publishing provider acknowledgement: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("matching provider acknowledgement was not published")
+	}
+
+	assertNoSessionUpdatedThrough(realtime.Event{
+		Kind: realtime.EventInputAudioCommitted, ProviderEventID: "provider-commit", ItemID: "input-item",
+	})
+	select {
+	case err := <-runResult:
+		t.Fatalf("committed audio ended the live session: %v", err)
+	default:
+	}
+	cancel()
+	require.ErrorIs(t, <-runResult, context.Canceled)
+}
+
 func TestManagerClientControlAcceptsCapacityAndFailsOnFirstExcessControl(t *testing.T) {
 	connector := testkit.NewFakeConnector(8)
 	manager := NewManager(Config{

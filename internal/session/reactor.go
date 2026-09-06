@@ -1363,7 +1363,11 @@ func (r *Reactor) applyVoice(input VoiceInput) ([]Effect, error) {
 		return nil, err
 	}
 	switch input.Event.Kind {
-	case realtime.EventSessionCreated, realtime.EventSessionUpdated:
+	case realtime.EventSessionCreated:
+		return nil, nil
+	case realtime.EventSessionUpdated:
+		return r.applyProviderSessionUpdated(input.Event)
+	case realtime.EventInputAudioCommitted:
 		return nil, nil
 	case realtime.EventSpeechStarted:
 		return r.applySpeechStarted(input.Event)
@@ -1415,6 +1419,24 @@ func (r *Reactor) applyVoice(input VoiceInput) ([]Effect, error) {
 	default:
 		return nil, fmt.Errorf("%w: voice event kind %d", ErrUnsupportedInput, input.Event.Kind)
 	}
+}
+
+func (r *Reactor) applyProviderSessionUpdated(event realtime.Event) ([]Effect, error) {
+	if !event.SessionUpdateAcknowledgement || event.SessionUpdateSequence == 0 {
+		return nil, nil
+	}
+	pending, ok := r.pendingSessionUpdates[event.SessionUpdateSequence]
+	if !ok {
+		return nil, nil
+	}
+	delete(r.pendingSessionUpdates, event.SessionUpdateSequence)
+	r.pendingSessionUpdateBytes -= pending.retainedBytes
+	updated := protocol.SessionUpdatedEvent{
+		Type:    "session.updated",
+		EventID: r.providerOrSynthEventID(event.ProviderEventID),
+		Session: cloneRaw(pending.session),
+	}
+	return []Effect{{ClientEvent: updated}}, nil
 }
 
 func (r *Reactor) applySpeechStarted(event realtime.Event) ([]Effect, error) {
@@ -1872,18 +1894,7 @@ func (r *Reactor) rememberTerminalResponse(responseID string) {
 
 func (r *Reactor) applyVoiceCommandCompleted(input VoiceCommandCompletedInput) ([]Effect, error) {
 	if input.Kind == realtime.CommandSessionUpdate {
-		pending, ok := r.pendingSessionUpdates[input.Sequence]
-		if !ok {
-			return nil, nil
-		}
-		delete(r.pendingSessionUpdates, input.Sequence)
-		r.pendingSessionUpdateBytes -= pending.retainedBytes
-		updated := protocol.SessionUpdatedEvent{
-			Type:    "session.updated",
-			EventID: r.providerOrSynthEventID(""),
-			Session: cloneRaw(pending.session),
-		}
-		return []Effect{{ClientEvent: updated}}, nil
+		return nil, nil
 	}
 	if input.Kind == realtime.CommandCreateResponse {
 		if input.Sequence == 0 || input.Sequence != r.pendingCreateSequence {

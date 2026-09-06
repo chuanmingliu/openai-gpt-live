@@ -812,7 +812,7 @@ func TestConnectedInputSynthesizesSessionCreatedAndOnlyReconnectAdvances(t *test
 	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventSessionCreated, ProviderEventID: "upstream-created"})))
 }
 
-func TestSessionUpdatedIsSynthesizedOnlyForMatchingCommandCompletion(t *testing.T) {
+func TestSessionUpdatedIsPublishedOnlyForMatchingProviderAcknowledgement(t *testing.T) {
 	reactor, fence := testReactor(1)
 	toolParams := json.RawMessage(`{"type":"object","properties":{"q":{"type":"string"}}}`)
 	tools := json.RawMessage(`[{"type":"function","name":"lookup","description":"find it","parameters":` + string(toolParams) + `}]`)
@@ -863,17 +863,39 @@ func TestSessionUpdatedIsSynthesizedOnlyForMatchingCommandCompletion(t *testing.
 	assert.JSONEq(t, `{"type":"server_vad","threshold":0.5}`, string(command.Session.TurnDetection))
 	assert.JSONEq(t, `{"type":"object","properties":{"q":{"type":"string"}}}`, string(command.Session.Tools[0].Parameters))
 
-	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventSessionUpdated, ProviderEventID: "provider-ack"})))
+	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventSessionUpdated, ProviderEventID: "unsolicited"})))
 	assert.Empty(t, applyOK(t, reactor, VoiceCommandCompletedInput{Sequence: command.Sequence + 1, Kind: realtime.CommandSessionUpdate}))
 	assert.Empty(t, applyOK(t, reactor, VoiceCommandCompletedInput{Sequence: command.Sequence, Kind: realtime.CommandCommitAudio}))
+	assert.Empty(t, applyOK(t, reactor, VoiceCommandCompletedInput{Sequence: command.Sequence, Kind: realtime.CommandSessionUpdate}))
+	require.Contains(t, reactor.pendingSessionUpdates, command.Sequence, "transport send completion must not acknowledge provider acceptance")
+	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventSessionUpdated, ProviderEventID: "mismatched-provider-ack",
+		SessionUpdateAcknowledgement: true, SessionUpdateSequence: command.Sequence + 1,
+	})))
 
-	effects = applyOK(t, reactor, VoiceCommandCompletedInput{Sequence: command.Sequence, Kind: realtime.CommandSessionUpdate})
+	effects = applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventSessionUpdated, ProviderEventID: "provider-ack",
+		SessionUpdateAcknowledgement: true, SessionUpdateSequence: command.Sequence,
+	}))
 	require.Len(t, effects, 1)
 	updated := effects[0].ClientEvent.(protocol.SessionUpdatedEvent)
-	assert.NotEmpty(t, updated.EventID)
+	assert.Equal(t, "provider-ack", updated.EventID)
 	assert.JSONEq(t, `{"type":"realtime","instructions":"be concise","audio":{"input":{"format":{"type":"audio/pcm","rate":24000},"turn_detection":{"type":"server_vad","threshold":0.5}},"output":{"format":{"type":"audio/pcm","rate":24000},"voice":"alloy"}},"tools":[{"type":"function","name":"lookup","description":"find it","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}],"tool_choice":"auto"}`, string(updated.Session))
-	assert.Empty(t, applyOK(t, reactor, VoiceCommandCompletedInput{Sequence: command.Sequence, Kind: realtime.CommandSessionUpdate}))
+	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventSessionUpdated, ProviderEventID: "duplicate-provider-ack",
+		SessionUpdateAcknowledgement: true, SessionUpdateSequence: command.Sequence,
+	})))
 	assert.Equal(t, identity.ResponseEpoch(1), fence.Current(), "session updates and completions never advance")
+}
+
+func TestInputAudioCommittedIsAcceptedWithoutEndingTheSession(t *testing.T) {
+	reactor, _ := testReactor(1)
+	before := mutationView(reactor)
+	effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventInputAudioCommitted, ProviderEventID: "commit-ack", ItemID: "input-item",
+	}))
+	assert.Empty(t, effects)
+	assert.Equal(t, before, mutationView(reactor))
 }
 
 func TestInvalidSessionUpdateDoesNotAllocateSequenceOrPendingAck(t *testing.T) {
@@ -1177,10 +1199,14 @@ func TestPendingSessionUpdateCountLimitPrecedesNormalizationAndRecovers(t *testi
 	assert.Empty(t, effects)
 	assert.Equal(t, beforeOverflow, mutationView(reactor))
 
-	effects = applyOK(t, reactor, VoiceCommandCompletedInput{
+	assert.Empty(t, applyOK(t, reactor, VoiceCommandCompletedInput{
 		Sequence: firstSequence,
 		Kind:     realtime.CommandSessionUpdate,
-	})
+	}))
+	effects = applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventSessionUpdated, ProviderEventID: "provider-ack",
+		SessionUpdateAcknowledgement: true, SessionUpdateSequence: firstSequence,
+	}))
 	require.Len(t, effects, 1)
 	assert.IsType(t, protocol.SessionUpdatedEvent{}, effects[0].ClientEvent)
 
@@ -1227,10 +1253,14 @@ func TestPendingSessionUpdateByteBoundaryNoMutationAndRecovery(t *testing.T) {
 	assert.Empty(t, effects)
 	assert.Equal(t, beforeOverflow, mutationView(reactor))
 
-	effects = applyOK(t, reactor, VoiceCommandCompletedInput{
+	assert.Empty(t, applyOK(t, reactor, VoiceCommandCompletedInput{
 		Sequence: firstSequence,
 		Kind:     realtime.CommandSessionUpdate,
-	})
+	}))
+	effects = applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventSessionUpdated, ProviderEventID: "provider-ack",
+		SessionUpdateAcknowledgement: true, SessionUpdateSequence: firstSequence,
+	}))
 	require.Len(t, effects, 1)
 	updated := effects[0].ClientEvent.(protocol.SessionUpdatedEvent)
 	assert.Len(t, updated.Session, byteLimit/2)
@@ -1266,12 +1296,12 @@ func TestReconnectClearsPendingSessionUpdateSnapshots(t *testing.T) {
 	assert.Empty(t, reactor.pendingSessionUpdates)
 
 	for sequence := uint64(1); sequence <= countLimit; sequence++ {
-		beforeLateCompletion := mutationView(reactor)
-		assert.Empty(t, applyOK(t, reactor, VoiceCommandCompletedInput{
-			Sequence: sequence,
-			Kind:     realtime.CommandSessionUpdate,
-		}))
-		assert.Equal(t, beforeLateCompletion, mutationView(reactor))
+		beforeLateAck := mutationView(reactor)
+		assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+			Kind: realtime.EventSessionUpdated, ProviderEventID: "late-provider-ack",
+			SessionUpdateAcknowledgement: true, SessionUpdateSequence: sequence,
+		})))
+		assert.Equal(t, beforeLateAck, mutationView(reactor))
 	}
 
 	exactBoundary := exactSizeSessionUpdate(t, byteLimit)
@@ -1279,10 +1309,14 @@ func TestReconnectClearsPendingSessionUpdateSnapshots(t *testing.T) {
 	require.Len(t, effects, 1)
 	boundarySequence := effects[0].VoiceCommand.Sequence
 	assert.Equal(t, uint64(countLimit+1), boundarySequence)
-	applyOK(t, reactor, VoiceCommandCompletedInput{
+	assert.Empty(t, applyOK(t, reactor, VoiceCommandCompletedInput{
 		Sequence: boundarySequence,
 		Kind:     realtime.CommandSessionUpdate,
-	})
+	}))
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventSessionUpdated, ProviderEventID: "provider-ack",
+		SessionUpdateAcknowledgement: true, SessionUpdateSequence: boundarySequence,
+	}))
 
 	for index := 0; index < countLimit; index++ {
 		applyOK(t, reactor, ClientInput{Event: minimal})
