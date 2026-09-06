@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/stretchr/testify/assert"
@@ -173,4 +174,65 @@ func TestWebSocketFailureNeverExposesUpstreamBodyOrBearer(t *testing.T) {
 	assert.Equal(t, websocket.StatusTryAgainLater, websocket.CloseStatus(err))
 	assert.NotContains(t, err.Error(), secret)
 	assert.NotContains(t, strings.ToLower(err.Error()), "upstream response body")
+}
+
+func TestWebSocketStalledHandshakeTimesOutAndCleansUp(t *testing.T) {
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+		close(finished)
+	}))
+	defer upstream.Close()
+	defer upstream.CloseClientConnections()
+	demo := newDemoTestServer(t, upstream.URL, nil)
+	defer demo.Close()
+	conn := dialDemo(t, demo.URL, defaultConfig().Origin)
+	defer conn.CloseNow()
+	<-started
+	ctx, cancel := context.WithTimeout(t.Context(), 7*time.Second)
+	defer cancel()
+	_, _, err := conn.Read(ctx)
+	require.Error(t, err)
+	require.Equal(t, websocket.StatusTryAgainLater, websocket.CloseStatus(err))
+	assert.Contains(t, err.Error(), "upstream unavailable")
+	select {
+	case <-finished:
+	case <-ctx.Done():
+		t.Fatal("stalled upstream handshake did not release its request")
+	}
+}
+
+func TestWebSocketStopCancelsStalledHandshake(t *testing.T) {
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+		close(finished)
+	}))
+	defer upstream.Close()
+	defer upstream.CloseClientConnections()
+	demo := newDemoTestServer(t, upstream.URL, nil)
+	defer demo.Close()
+	conn := dialDemo(t, demo.URL, defaultConfig().Origin)
+	defer conn.CloseNow()
+	<-started
+	// The browser's Stop action closes its already accepted WebSocket.
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- conn.Close(websocket.StatusNormalClosure, "") }()
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		_ = conn.CloseNow()
+		upstream.CloseClientConnections()
+		t.Fatal("Stop did not cancel the upstream handshake promptly")
+	}
+	select {
+	case err := <-closeDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("browser close handshake did not finish promptly")
+	}
 }

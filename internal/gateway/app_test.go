@@ -934,6 +934,10 @@ func TestGatewayFeatureOffKeepsSessionUpdatesTranscriptsAndReservedLookingProvid
 	require.Equal(t, realtime.CommandSessionUpdate, update.Kind)
 	require.Len(t, update.Session.Tools, 1)
 	assert.Equal(t, "lookup", update.Session.Tools[0].Name)
+	emit(t, voice, realtime.Event{
+		Kind: realtime.EventSessionUpdated, ProviderEventID: "provider-session-updated-disabled",
+		SessionUpdateAcknowledgement: true, SessionUpdateSequence: update.Sequence,
+	})
 	client.expectType("session.updated")
 
 	emit(t, voice, realtime.Event{

@@ -13,13 +13,55 @@ var (
 	errFrameTooLarge      = errors.New("frame too large")
 )
 
-func proxyWebSocket(ctx context.Context, browser, upstream *websocket.Conn, maxBytes int64) error {
+type frameReader func(context.Context) (websocket.MessageType, []byte, error)
+
+// bufferedBrowserReader retains at most two bounded frames (one queued and one
+// being read) while dialing. The same reader feeds the relay after connection.
+func bufferedBrowserReader(ctx context.Context, browser *websocket.Conn, maxBytes int64, cancelDial context.CancelFunc) frameReader {
+	type frame struct {
+		kind    websocket.MessageType
+		payload []byte
+		err     error
+	}
+	frames := make(chan frame, 1)
+	browser.SetReadLimit(maxBytes)
+	go func() {
+		defer close(frames)
+		for {
+			kind, payload, err := browser.Read(ctx)
+			if err != nil {
+				cancelDial()
+			}
+			select {
+			case frames <- frame{kind, payload, err}:
+			case <-ctx.Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return func(readCtx context.Context) (websocket.MessageType, []byte, error) {
+		select {
+		case frame, ok := <-frames:
+			if !ok {
+				return 0, nil, context.Canceled
+			}
+			return frame.kind, frame.payload, frame.err
+		case <-readCtx.Done():
+			return 0, nil, readCtx.Err()
+		}
+	}
+}
+
+func proxyWebSocket(ctx context.Context, browser, upstream *websocket.Conn, maxBytes int64, readBrowser frameReader) error {
 	group, groupContext := errgroup.WithContext(ctx)
 	copyContext, cancel := context.WithCancel(groupContext)
 	defer cancel()
 	errors := make(chan error, 2)
 	group.Go(func() error {
-		errors <- copyText(copyContext, upstream, browser, maxBytes)
+		errors <- copyTextFrom(copyContext, upstream, readBrowser, maxBytes)
 		return nil
 	})
 	group.Go(func() error {
@@ -35,8 +77,12 @@ func proxyWebSocket(ctx context.Context, browser, upstream *websocket.Conn, maxB
 
 func copyText(ctx context.Context, destination, source *websocket.Conn, max int64) error {
 	source.SetReadLimit(max)
+	return copyTextFrom(ctx, destination, source.Read, max)
+}
+
+func copyTextFrom(ctx context.Context, destination *websocket.Conn, read frameReader, max int64) error {
 	for {
-		kind, payload, err := source.Read(ctx)
+		kind, payload, err := read(ctx)
 		if err != nil {
 			if errors.Is(err, websocket.ErrMessageTooBig) || websocket.CloseStatus(err) == websocket.StatusMessageTooBig {
 				return errFrameTooLarge

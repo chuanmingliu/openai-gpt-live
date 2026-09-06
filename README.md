@@ -3,8 +3,10 @@
 ## What it is
 
 GPT Live Go is a Go **backend only** framework: an OpenAI Realtime-compatible
-WebSocket gateway plus an optional durable asynchronous worker. It includes no
-frontend, browser server, or static assets. The gateway owns the realtime
+WebSocket gateway plus an optional durable asynchronous worker. The production
+`live-gateway` and `live-worker` services include no frontend, browser server, or
+static assets. A separate development demo lives under `demo/live-client`.
+The gateway owns the realtime
 protocol boundary; the worker is used only when a durable backend is selected.
 
 ## Requirements

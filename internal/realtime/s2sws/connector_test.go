@@ -453,6 +453,52 @@ func TestSessionUpdateAcknowledgementCarriesExactOutstandingSequence(t *testing.
 	require.Zero(t, unsolicited.SessionUpdateSequence)
 }
 
+func TestSessionUpdateAcknowledgementsPreserveOverlappingWireOrder(t *testing.T) {
+	for _, sequences := range [][]uint64{{41, 42}, {0, 41, 42}} {
+		t.Run(fmt.Sprint(sequences), func(t *testing.T) {
+			server := newTestVoiceServer(t)
+			session := connectTestSession(t, server.URL, nil, realtime.OpenRequest{Model: "model"})
+			for _, sequence := range sequences {
+				require.NoError(t, session.Send(t.Context(), realtime.Command{
+					Kind: realtime.CommandSessionUpdate, Sequence: sequence,
+				}))
+				server.nextClientFrame(t)
+			}
+			for _, sequence := range sequences {
+				ack := sendAndReceiveEvent(t, server, session, map[string]any{
+					"type": "session.updated", "session": map[string]any{"type": "realtime"},
+				})
+				require.True(t, ack.SessionUpdateAcknowledgement)
+				require.Equal(t, sequence, ack.SessionUpdateSequence)
+			}
+		})
+	}
+}
+
+func TestSessionUpdatePendingQueueIsBoundedAndReleasesAcknowledgedSlots(t *testing.T) {
+	server := newTestVoiceServer(t)
+	session := connectTestSession(t, server.URL, nil, realtime.OpenRequest{Model: "model"})
+	// One initial handoff update is separate from the reactor's 16-client limit.
+	for sequence := uint64(0); sequence <= 16; sequence++ {
+		require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandSessionUpdate, Sequence: sequence}))
+		server.nextClientFrame(t)
+	}
+	for _, sequence := range []uint64{0, 17} {
+		require.ErrorIs(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandSessionUpdate, Sequence: sequence}), s2sws.ErrPendingSessionUpdate)
+	}
+	for sequence := uint64(0); sequence <= 1; sequence++ {
+		ack := sendAndReceiveEvent(t, server, session, map[string]any{"type": "session.updated"})
+		require.True(t, ack.SessionUpdateAcknowledgement)
+		require.Equal(t, sequence, ack.SessionUpdateSequence)
+	}
+	require.NoError(t, session.Send(t.Context(), realtime.Command{Kind: realtime.CommandSessionUpdate, Sequence: 17}))
+	server.nextClientFrame(t)
+	for sequence := uint64(2); sequence <= 17; sequence++ {
+		ack := sendAndReceiveEvent(t, server, session, map[string]any{"type": "session.updated"})
+		require.Equal(t, sequence, ack.SessionUpdateSequence)
+	}
+}
+
 // TestConnectRequiresAnEffectiveModel catches dials without a trusted model
 // source when both the request and connector model are empty.
 func TestConnectRequiresAnEffectiveModel(t *testing.T) {

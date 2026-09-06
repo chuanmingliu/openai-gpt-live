@@ -14,8 +14,9 @@ import (
 )
 
 const (
-	capabilitiesTimeout = 5 * time.Second
-	capabilitiesMaxBody = 64 << 10
+	capabilitiesTimeout      = 5 * time.Second
+	capabilitiesMaxBody      = 64 << 10
+	upstreamHandshakeTimeout = 5 * time.Second
 )
 
 //go:embed web/*
@@ -98,14 +99,22 @@ func newHandler(cfg demoConfig, bearer []byte, dependencies upstreamDependencies
 				_ = browser.CloseNow()
 			}
 		}()
-		upstreamConn, dialErr := dependencies.Dial(r.Context(), upstream, authorizationHeader(bearer))
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+		dialCtx, cancelDial := context.WithTimeout(ctx, upstreamHandshakeTimeout)
+		defer cancelDial()
+		// Read immediately: an accepted WebSocket's request context alone does
+		// not observe the browser's Stop/close while the upstream dial stalls.
+		readBrowser := bufferedBrowserReader(ctx, browser, cfg.MaxFrameBytes, cancelDial)
+		upstreamConn, dialErr := dependencies.Dial(dialCtx, upstream, authorizationHeader(bearer))
+		cancelDial()
 		if dialErr != nil {
 			closeBrowser(browser, errors.New("upstream unavailable"))
 			browserClosed = true
 			return
 		}
 		defer upstreamConn.CloseNow()
-		closeBrowser(browser, proxyWebSocket(r.Context(), browser, upstreamConn, cfg.MaxFrameBytes))
+		closeBrowser(browser, proxyWebSocket(ctx, browser, upstreamConn, cfg.MaxFrameBytes, readBrowser))
 		browserClosed = true
 	})
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {

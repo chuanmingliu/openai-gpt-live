@@ -17,7 +17,7 @@ demo-live-client:
 
 test-demo-live-client:
 	go test -count=1 ./demo/live-client
-	node --test demo/live-client/web/audio-core.test.mjs demo/live-client/web/protocol-state.test.mjs
+	node --test demo/live-client/web/*.test.mjs
 
 # Builds and validates every deployable artifact. Tool absence is an explicit
 # prerequisite failure; the validator never silently skips a deployment gate.

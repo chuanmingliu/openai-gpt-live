@@ -6,11 +6,14 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     this.queue = new Int16Array(MAX_SAMPLES);
     this.head = 0;
     this.length = 0;
+    // Phase is in hardware-rate units to avoid fractional accumulation drift.
+    this.phase = 0;
 
     this.port.onmessage = ({ data }) => {
       if (data?.type === 'clear') {
         this.head = 0;
         this.length = 0;
+        this.phase = 0;
       } else if (data?.type === 'append' && data.pcm instanceof ArrayBuffer && data.pcm.byteLength % 2 === 0) {
         this.append(data.pcm);
       }
@@ -22,6 +25,7 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     const incoming = bytes.length / 2;
     const dropped = Math.max(0, this.length + incoming - MAX_SAMPLES);
     if (dropped > 0) {
+      this.phase = 0;
       const discard = Math.min(dropped, this.length);
       this.head = (this.head + discard) % MAX_SAMPLES;
       this.length -= discard;
@@ -45,9 +49,15 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     if (this.length === 0) {
       return 0;
     }
-    const sample = this.queue[this.head];
-    this.head = (this.head + 1) % MAX_SAMPLES;
-    this.length -= 1;
+    const first = this.queue[this.head];
+    const next = this.length > 1 ? this.queue[(this.head + 1) % MAX_SAMPLES] : first;
+    const sample = first + (next - first) * this.phase / sampleRate;
+    this.phase += 24_000;
+    const consumed = Math.min(this.length, Math.floor(this.phase / sampleRate));
+    this.phase %= sampleRate;
+    this.head = (this.head + consumed) % MAX_SAMPLES;
+    this.length -= consumed;
+    if (this.length === 0) this.phase = 0;
     return sample / 32768;
   }
 

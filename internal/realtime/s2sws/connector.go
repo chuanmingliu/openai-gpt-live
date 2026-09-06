@@ -23,6 +23,7 @@ const (
 	writeQueueCapacity       = 64
 	correlationQueueCapacity = 64
 	explicitPendingLimit     = 64
+	sessionUpdateLimit       = 16
 	responseHistoryLimit     = 1024
 	implicitEventLimit       = 16
 	implicitByteLimit        = 2 << 20
@@ -37,7 +38,7 @@ var (
 	ErrImplicitAggregateFull = errors.New("implicit response aggregate buffer limit exceeded")
 	ErrImplicitResponseLimit = errors.New("implicit unbound response limit exceeded")
 	ErrPendingResponseLimit  = errors.New("pending explicit response limit exceeded")
-	ErrPendingSessionUpdate  = errors.New("session update acknowledgement is already pending")
+	ErrPendingSessionUpdate  = errors.New("pending session update limit exceeded")
 	ErrSessionClosed         = errors.New("realtime WebSocket session closed")
 )
 
@@ -192,11 +193,10 @@ type voiceSession struct {
 	closeDone    chan struct{}
 	done         chan struct{}
 
-	responses             map[string]*responseCorrelation
-	responseOrder         []string
-	pending               map[identity.ResponseEpoch]struct{}
-	sessionUpdatePending  bool
-	sessionUpdateSequence uint64
+	responses      map[string]*responseCorrelation
+	responseOrder  []string
+	pending        map[identity.ResponseEpoch]struct{}
+	sessionUpdates []uint64
 
 	implicitUnbound        int
 	implicitBufferedEvents int
@@ -597,11 +597,20 @@ func (s *voiceSession) registerExplicit(epoch identity.ResponseEpoch) error {
 }
 
 func (s *voiceSession) registerSessionUpdate(sequence uint64) error {
-	if s.sessionUpdatePending {
+	clients, initial := 0, false
+	for _, pending := range s.sessionUpdates {
+		if pending == 0 {
+			initial = true
+		} else {
+			clients++
+		}
+	}
+	// Match the reactor's client admission bound, with one separate slot for
+	// the sequence-zero handoff configuration sent before the reactor starts.
+	if (sequence == 0 && initial) || (sequence != 0 && clients >= sessionUpdateLimit) {
 		return ErrPendingSessionUpdate
 	}
-	s.sessionUpdatePending = true
-	s.sessionUpdateSequence = sequence
+	s.sessionUpdates = append(s.sessionUpdates, sequence)
 	return nil
 }
 
@@ -623,11 +632,13 @@ func (s *voiceSession) resolvePendingExplicit(epoch identity.ResponseEpoch, hasE
 }
 
 func (s *voiceSession) handleMapped(mapped mappedServerEvent) error {
-	if mapped.event.Kind == realtime.EventSessionUpdated && s.sessionUpdatePending {
+	if mapped.event.Kind == realtime.EventSessionUpdated && len(s.sessionUpdates) > 0 {
+		// The single writer and ordered WebSocket stream preserve update/ack
+		// order; provider event IDs do not echo the client command sequence.
 		mapped.event.SessionUpdateAcknowledgement = true
-		mapped.event.SessionUpdateSequence = s.sessionUpdateSequence
-		s.sessionUpdatePending = false
-		s.sessionUpdateSequence = 0
+		mapped.event.SessionUpdateSequence = s.sessionUpdates[0]
+		copy(s.sessionUpdates, s.sessionUpdates[1:])
+		s.sessionUpdates = s.sessionUpdates[:len(s.sessionUpdates)-1]
 	}
 	if mapped.created != nil {
 		return s.handleResponseCreated(mapped)
