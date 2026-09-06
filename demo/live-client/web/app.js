@@ -178,17 +178,7 @@ function handleSocketMessage(session, payload) {
 
   const readiness = sessionReadinessAfter(session, event.type);
   if (readiness.sendUpdate && session.socket?.readyState === WebSocket.OPEN) {
-    session.socket.send(JSON.stringify({
-      type: 'session.update',
-      session: {
-        type: 'realtime',
-        audio: {
-          input: { format: { type: 'audio/pcm', rate: 24000 }, turn_detection: { type: 'server_vad' } },
-          output: { format: { type: 'audio/pcm', rate: 24000 } },
-        },
-        output_modalities: ['audio'],
-      },
-    }));
+    session.socket.send(JSON.stringify(buildSessionUpdateMessage()));
     session.updateSent = true;
     setGatewayMessage('Awaiting local gateway session acknowledgement…');
   }
@@ -198,6 +188,19 @@ function handleSocketMessage(session, payload) {
     setGatewayMessage('Connected with verified PCM16 audio. Speak when ready.');
   }
   render();
+}
+
+export function buildSessionUpdateMessage() {
+  return {
+      type: 'session.update',
+      session: {
+        type: 'realtime',
+        audio: {
+          input: { format: { type: 'audio/pcm', rate: 24000 }, turn_detection: { type: 'server_vad' } },
+          output: { format: { type: 'audio/pcm', rate: 24000 } },
+        },
+      },
+    };
 }
 
 function appendOutputAudio(session, encoded) {

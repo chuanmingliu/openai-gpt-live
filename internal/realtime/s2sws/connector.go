@@ -37,6 +37,7 @@ var (
 	ErrImplicitAggregateFull = errors.New("implicit response aggregate buffer limit exceeded")
 	ErrImplicitResponseLimit = errors.New("implicit unbound response limit exceeded")
 	ErrPendingResponseLimit  = errors.New("pending explicit response limit exceeded")
+	ErrPendingSessionUpdate  = errors.New("session update acknowledgement is already pending")
 	ErrSessionClosed         = errors.New("realtime WebSocket session closed")
 )
 
@@ -145,6 +146,7 @@ const (
 	correlationRegister correlationKind = iota + 1
 	correlationBind
 	correlationCancel
+	correlationRegisterSessionUpdate
 )
 
 type correlationRequest struct {
@@ -190,9 +192,11 @@ type voiceSession struct {
 	closeDone    chan struct{}
 	done         chan struct{}
 
-	responses     map[string]*responseCorrelation
-	responseOrder []string
-	pending       map[identity.ResponseEpoch]struct{}
+	responses             map[string]*responseCorrelation
+	responseOrder         []string
+	pending               map[identity.ResponseEpoch]struct{}
+	sessionUpdatePending  bool
+	sessionUpdateSequence uint64
 
 	implicitUnbound        int
 	implicitBufferedEvents int
@@ -382,6 +386,11 @@ func (s *voiceSession) writeLoop() {
 			if err == nil && request.command.Kind == realtime.CommandCreateResponse {
 				err = s.correlate(request.ctx, correlationRequest{kind: correlationRegister, epoch: request.command.Epoch})
 			}
+			if err == nil && request.command.Kind == realtime.CommandSessionUpdate {
+				err = s.correlate(request.ctx, correlationRequest{
+					kind: correlationRegisterSessionUpdate, epoch: identity.ResponseEpoch(request.command.Sequence),
+				})
+			}
 			if err == nil && request.command.Kind == realtime.CommandCancelResponse && request.command.ResponseID != "" {
 				err = s.correlate(request.ctx, correlationRequest{
 					kind: correlationCancel, epoch: request.command.Epoch, responseID: request.command.ResponseID,
@@ -561,6 +570,8 @@ func (s *voiceSession) mappingLoop() {
 				err = s.bindImplicit(request)
 			case correlationCancel:
 				err = s.markCancelled(request)
+			case correlationRegisterSessionUpdate:
+				err = s.registerSessionUpdate(uint64(request.epoch))
 			default:
 				err = errors.New("unknown correlation request")
 			}
@@ -585,6 +596,15 @@ func (s *voiceSession) registerExplicit(epoch identity.ResponseEpoch) error {
 	return nil
 }
 
+func (s *voiceSession) registerSessionUpdate(sequence uint64) error {
+	if s.sessionUpdatePending {
+		return ErrPendingSessionUpdate
+	}
+	s.sessionUpdatePending = true
+	s.sessionUpdateSequence = sequence
+	return nil
+}
+
 func (s *voiceSession) resolvePendingExplicit(epoch identity.ResponseEpoch, hasEpoch bool) (bool, error) {
 	if len(s.pending) == 0 {
 		if hasEpoch {
@@ -603,6 +623,12 @@ func (s *voiceSession) resolvePendingExplicit(epoch identity.ResponseEpoch, hasE
 }
 
 func (s *voiceSession) handleMapped(mapped mappedServerEvent) error {
+	if mapped.event.Kind == realtime.EventSessionUpdated && s.sessionUpdatePending {
+		mapped.event.SessionUpdateAcknowledgement = true
+		mapped.event.SessionUpdateSequence = s.sessionUpdateSequence
+		s.sessionUpdatePending = false
+		s.sessionUpdateSequence = 0
+	}
 	if mapped.created != nil {
 		return s.handleResponseCreated(mapped)
 	}

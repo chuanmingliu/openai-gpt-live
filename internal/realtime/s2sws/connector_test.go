@@ -415,6 +415,44 @@ func TestReservedToolRegistrationUsesActualUpstreamSessionUpdateWireEvent(t *tes
 	}
 }
 
+// TestSessionUpdateAcknowledgementCarriesExactOutstandingSequence catches
+// provider acknowledgements that reach the reactor without the command
+// sequence needed to release the pending browser session update.
+func TestSessionUpdateAcknowledgementCarriesExactOutstandingSequence(t *testing.T) {
+	server := newTestVoiceServer(t)
+	session := connectTestSession(t, server.URL, nil, realtime.OpenRequest{Model: "model"})
+
+	require.NoError(t, session.Send(t.Context(), realtime.Command{
+		Kind:     realtime.CommandSessionUpdate,
+		Sequence: 41,
+		Session: realtime.SessionConfig{
+			InputFormat:   realtime.AudioFormat{Encoding: "pcm16le", SampleRate: 24_000, Channels: 1},
+			OutputFormat:  realtime.AudioFormat{Encoding: "pcm16le", SampleRate: 24_000, Channels: 1},
+			TurnDetection: json.RawMessage(`{"type":"server_vad"}`),
+		},
+	}))
+	server.nextClientFrame(t)
+
+	acknowledged := sendAndReceiveEvent(t, server, session, map[string]any{
+		"type":     "session.updated",
+		"event_id": "ack-41",
+		"session": map[string]any{
+			"type":  "realtime",
+			"audio": map[string]any{"input": map[string]any{"turn_detection": map[string]any{"type": "server_vad"}}},
+		},
+	})
+	require.True(t, acknowledged.SessionUpdateAcknowledgement)
+	require.Equal(t, uint64(41), acknowledged.SessionUpdateSequence)
+
+	unsolicited := sendAndReceiveEvent(t, server, session, map[string]any{
+		"type":     "session.updated",
+		"event_id": "unsolicited",
+		"session":  map[string]any{"type": "realtime"},
+	})
+	require.False(t, unsolicited.SessionUpdateAcknowledgement)
+	require.Zero(t, unsolicited.SessionUpdateSequence)
+}
+
 // TestConnectRequiresAnEffectiveModel catches dials without a trusted model
 // source when both the request and connector model are empty.
 func TestConnectRequiresAnEffectiveModel(t *testing.T) {
@@ -626,6 +664,7 @@ func sendAndReceiveEvent(t *testing.T, server *testVoiceServer, session realtime
 func TestReceiveMapsEveryProviderEvent(t *testing.T) {
 	server := newTestVoiceServer(t)
 	session := connectTestSession(t, server.URL, nil, realtime.OpenRequest{Model: "model"})
+	previousItemID := "prior"
 
 	tests := []struct {
 		wire map[string]any
@@ -638,6 +677,10 @@ func TestReceiveMapsEveryProviderEvent(t *testing.T) {
 		{
 			wire: map[string]any{"type": "session.updated", "event_id": "evt-session-updated", "session": map[string]any{"id": "s1"}},
 			want: realtime.Event{Kind: realtime.EventSessionUpdated, ProviderEventID: "evt-session-updated"},
+		},
+		{
+			wire: map[string]any{"type": "input_audio_buffer.committed", "event_id": "evt-committed", "item_id": "utterance", "previous_item_id": "prior"},
+			want: realtime.Event{Kind: realtime.EventInputAudioCommitted, ProviderEventID: "evt-committed", ItemID: "utterance", PreviousItemID: &previousItemID},
 		},
 		{
 			wire: map[string]any{"type": "input_audio_buffer.speech_started", "event_id": "evt-start", "item_id": "utterance", "audio_start_ms": 17},
@@ -662,6 +705,7 @@ func TestReceiveMapsEveryProviderEvent(t *testing.T) {
 		assert.Equal(t, test.want.Kind, got.Kind)
 		assert.Equal(t, test.want.ProviderEventID, got.ProviderEventID)
 		assert.Equal(t, test.want.ItemID, got.ItemID)
+		assert.Equal(t, test.want.PreviousItemID, got.PreviousItemID)
 		assert.Equal(t, test.want.Text, got.Text)
 	}
 

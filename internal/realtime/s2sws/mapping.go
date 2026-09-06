@@ -308,6 +308,20 @@ func mapServerEvent(raw []byte, maxFrameBytes int64) (mappedServerEvent, error) 
 		mapped.event.Kind = realtime.EventSessionCreated
 	case "session.updated":
 		mapped.event.Kind = realtime.EventSessionUpdated
+	case "input_audio_buffer.committed":
+		var event struct {
+			ItemID         string  `json:"item_id"`
+			PreviousItemID *string `json:"previous_item_id"`
+		}
+		if err := json.Unmarshal(raw, &event); err != nil {
+			return mappedServerEvent{}, err
+		}
+		mapped.event.Kind = realtime.EventInputAudioCommitted
+		mapped.event.ItemID = event.ItemID
+		if event.PreviousItemID != nil {
+			previous := strings.Clone(*event.PreviousItemID)
+			mapped.event.PreviousItemID = &previous
+		}
 	case "conversation.item.created":
 		mapped.ignore = true
 	case "input_audio_buffer.speech_started":

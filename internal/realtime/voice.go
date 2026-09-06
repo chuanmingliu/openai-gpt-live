@@ -85,23 +85,32 @@ const (
 	EventFunctionCallDone
 	EventResponseDone
 	EventError
+	EventInputAudioCommitted
 )
 
 type Event struct {
-	Kind              EventKind
-	Epoch             identity.ResponseEpoch
-	ProviderEventID   string
-	ResponseID        string
-	ItemID            string
-	CallID            string
-	Name              string
-	Audio             []byte
-	Text              string
-	Arguments         json.RawMessage
-	Status            string
-	Reason            string
-	Payload           json.RawMessage
-	NeedsEpochBinding bool
+	Kind                   EventKind
+	Epoch                  identity.ResponseEpoch
+	ProviderEventID        string
+	ResponseID             string
+	ItemID                 string
+	PreviousItemID         *string
+	// SessionUpdateAcknowledgement is true only when the adapter observed this
+	// provider event while one local session.update was outstanding.
+	SessionUpdateAcknowledgement bool
+	// SessionUpdateSequence identifies the sole local session.update whose
+	// provider acknowledgement produced this event. Sequence zero is reserved
+	// for manager-owned initial configuration or unsolicited provider updates.
+	SessionUpdateSequence uint64
+	CallID                string
+	Name                  string
+	Audio                 []byte
+	Text                  string
+	Arguments             json.RawMessage
+	Status                string
+	Reason                string
+	Payload               json.RawMessage
+	NeedsEpochBinding     bool
 }
 
 type Session interface {

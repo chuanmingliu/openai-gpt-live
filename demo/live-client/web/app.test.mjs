@@ -1,6 +1,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { canSendCaptureFrame, sessionReadinessAfter, socketTerminationReason, statusLabel } from './app.js';
+import * as app from './app.js';
+
+const { canSendCaptureFrame, sessionReadinessAfter, socketTerminationReason, statusLabel } = app;
+
+test('session update uses only fields supported by the gateway', () => {
+  assert.equal(typeof app.buildSessionUpdateMessage, 'function');
+  assert.deepEqual(app.buildSessionUpdateMessage(), {
+    type: 'session.update',
+    session: {
+      type: 'realtime',
+      audio: {
+        input: { format: { type: 'audio/pcm', rate: 24000 }, turn_detection: { type: 'server_vad' } },
+        output: { format: { type: 'audio/pcm', rate: 24000 } },
+      },
+    },
+  });
+});
 
 test('session readiness waits for an acknowledgement after the update is sent', () => {
   const initial = { updateSent: false, configured: false };
