@@ -89,17 +89,21 @@ const (
 )
 
 type Event struct {
-	Kind                   EventKind
-	Epoch                  identity.ResponseEpoch
-	ProviderEventID        string
-	ResponseID             string
-	ItemID                 string
-	PreviousItemID         *string
+	Kind            EventKind
+	Epoch           identity.ResponseEpoch
+	ProviderEventID string
+	ResponseID      string
+	ItemID          string
+	PreviousItemID  *string
 	// SessionUpdateAcknowledgement is true only when the adapter observed this
 	// provider event while one local session.update was outstanding.
 	SessionUpdateAcknowledgement bool
+	// SessionUpdateRejected is true only for a provider error that retired
+	// the matching outstanding update, including sequence-zero initialization.
+	// This internal correlation must never be serialized into a client event.
+	SessionUpdateRejected bool
 	// SessionUpdateSequence identifies the sole local session.update whose
-	// provider acknowledgement produced this event. Sequence zero is reserved
+	// provider acknowledgement or rejection produced this event. Zero is reserved
 	// for manager-owned initial configuration or unsolicited provider updates.
 	SessionUpdateSequence uint64
 	CallID                string

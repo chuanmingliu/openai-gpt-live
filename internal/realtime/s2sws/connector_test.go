@@ -562,7 +562,7 @@ func TestSendMapsEveryCommandToGoldenJSON(t *testing.T) {
 	}
 
 	want := []string{
-		`{"type":"session.update","session":{"type":"realtime","instructions":"be concise","audio":{"input":{"format":{"type":"audio/pcm","rate":24000},"turn_detection":{"type":"server_vad","threshold":0.5}},"output":{"format":{"type":"audio/pcm","rate":24000},"voice":"alloy"}},"tools":[{"type":"function","name":"lookup","description":"look it up","parameters":{"type":"object","required":["q"]}}],"tool_choice":{"type":"function","name":"lookup"}}}`,
+		`{"type":"session.update","event_id":"live-session-update-0","session":{"type":"realtime","instructions":"be concise","audio":{"input":{"format":{"type":"audio/pcm","rate":24000},"turn_detection":{"type":"server_vad","threshold":0.5}},"output":{"format":{"type":"audio/pcm","rate":24000},"voice":"alloy"}},"tools":[{"type":"function","name":"lookup","description":"look it up","parameters":{"type":"object","required":["q"]}}],"tool_choice":{"type":"function","name":"lookup"}}}`,
 		`{"type":"input_audio_buffer.append","audio":"AQI="}`,
 		`{"type":"input_audio_buffer.commit"}`,
 		`{"type":"conversation.item.create","item":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}`,

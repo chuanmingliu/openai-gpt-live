@@ -1407,6 +1407,12 @@ func (r *Reactor) applyVoice(input VoiceInput) ([]Effect, error) {
 		}
 		return effects, err
 	case realtime.EventError:
+		if input.Event.SessionUpdateRejected {
+			if pending, exists := r.pendingSessionUpdates[input.Event.SessionUpdateSequence]; exists {
+				delete(r.pendingSessionUpdates, input.Event.SessionUpdateSequence)
+				r.pendingSessionUpdateBytes -= pending.retainedBytes
+			}
+		}
 		if r.presentationEpoch != 0 && input.Event.Epoch == r.presentationEpoch {
 			return r.applyPresentationProviderError(input.Event)
 		}

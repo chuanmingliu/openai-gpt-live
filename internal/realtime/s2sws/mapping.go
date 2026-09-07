@@ -73,9 +73,10 @@ func marshalCommand(command realtime.Command) ([]byte, error) {
 		format := wireAudioFormat{Type: "audio/pcm", Rate: 24_000}
 		return json.Marshal(struct {
 			Type    string      `json:"type"`
+			EventID string      `json:"event_id"`
 			Session wireSession `json:"session"`
 		}{
-			Type: "session.update",
+			Type: "session.update", EventID: sessionUpdateEventPrefix + strconv.FormatUint(command.Sequence, 10),
 			Session: wireSession{
 				Type:         "realtime",
 				Instructions: command.Session.Instructions,
@@ -162,6 +163,17 @@ func marshalCommand(command realtime.Command) ([]byte, error) {
 	default:
 		return nil, fmt.Errorf("unsupported realtime command kind %d", command.Kind)
 	}
+}
+
+const sessionUpdateEventPrefix = "live-session-update-"
+
+func sessionUpdateSequence(eventID string) (uint64, bool) {
+	if len(eventID) > len(sessionUpdateEventPrefix)+20 || !strings.HasPrefix(eventID, sessionUpdateEventPrefix) {
+		return 0, false
+	}
+	raw := strings.TrimPrefix(eventID, sessionUpdateEventPrefix)
+	sequence, err := strconv.ParseUint(raw, 10, 64)
+	return sequence, err == nil && strconv.FormatUint(sequence, 10) == raw
 }
 
 const responseCreateEventPrefix = "live-response-create-"
@@ -275,11 +287,12 @@ type responseCreatedDetails struct {
 }
 
 type mappedServerEvent struct {
-	event            realtime.Event
-	created          *responseCreatedDetails
-	responseSpecific bool
-	ignore           bool
-	frameBytes       int
+	rejectedSessionUpdate *uint64
+	event                 realtime.Event
+	created               *responseCreatedDetails
+	responseSpecific      bool
+	ignore                bool
+	frameBytes            int
 }
 
 type eventEnvelope struct {
@@ -484,6 +497,13 @@ func mapServerEvent(raw []byte, maxFrameBytes int64) (mappedServerEvent, error) 
 		}
 		mapped.event.Kind, mapped.event.Reason = realtime.EventError, event.Error.Message
 		mapped.event.Epoch = responseCommandEpoch(event.Error.EventID)
+		if sequence, ok := sessionUpdateSequence(event.Error.EventID); ok {
+			mapped.rejectedSessionUpdate = &sequence
+			// Retain only typed correlation, never the session payload or the
+			// provider's error text and echoed command identity.
+			mapped.event.Reason = "Realtime provider request failed."
+			mapped.event.Payload = nil
+		}
 	default:
 		return mappedServerEvent{}, fmt.Errorf("unsupported provider event type %q", envelope.Type)
 	}

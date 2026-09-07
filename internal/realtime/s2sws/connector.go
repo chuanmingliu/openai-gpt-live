@@ -632,6 +632,18 @@ func (s *voiceSession) resolvePendingExplicit(epoch identity.ResponseEpoch, hasE
 }
 
 func (s *voiceSession) handleMapped(mapped mappedServerEvent) error {
+	if mapped.rejectedSessionUpdate != nil {
+		for index, sequence := range s.sessionUpdates {
+			if sequence != *mapped.rejectedSessionUpdate {
+				continue
+			}
+			mapped.event.SessionUpdateRejected = true
+			mapped.event.SessionUpdateSequence = sequence
+			copy(s.sessionUpdates[index:], s.sessionUpdates[index+1:])
+			s.sessionUpdates = s.sessionUpdates[:len(s.sessionUpdates)-1]
+			break
+		}
+	}
 	if mapped.event.Kind == realtime.EventSessionUpdated && len(s.sessionUpdates) > 0 {
 		// The single writer and ordered WebSocket stream preserve update/ack
 		// order; provider event IDs do not echo the client command sequence.
