@@ -12,6 +12,7 @@ import (
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
+	"github.com/chuanmingliu/openai-gpt-live/internal/profile"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
 )
@@ -93,6 +94,7 @@ type ReconnectRequest struct {
 	LastEventSeq    int64
 	Subject         Subject
 	Credential      ReconnectClaims
+	Profile         profile.Resolved
 }
 
 // BoundCommittedItems returns the newest chronological suffix that fits both

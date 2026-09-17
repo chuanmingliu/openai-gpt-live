@@ -7,8 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"strings"
 	"sync"
@@ -46,7 +46,8 @@ type testVoiceServer struct {
 	peerClose chan error
 	actions   chan serverAction
 	cancel    context.CancelFunc
-	server    *httptest.Server
+	http      *http.Server
+	listener  net.Listener
 }
 
 type observedContext struct {
@@ -117,7 +118,13 @@ func newTestVoiceServerWithReadGate(t *testing.T, readGate <-chan struct{}) *tes
 		actions:   make(chan serverAction),
 		cancel:    cancel,
 	}
-	voice.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		cancel()
+		t.Skip("listener unavailable in this environment: ", err)
+	}
+	voice.listener = ln
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			select {
@@ -184,11 +191,24 @@ func newTestVoiceServerWithReadGate(t *testing.T, readGate <-chan struct{}) *tes
 				return
 			}
 		}
-	}))
-	voice.URL = "ws" + strings.TrimPrefix(voice.server.URL, "http") + "/v1/realtime"
+	})}
+	voice.http = server
+	go func() {
+		serverErr := server.Serve(ln)
+		if serverErr != nil && serverErr != http.ErrServerClosed {
+			select {
+			case voice.peerClose <- serverErr:
+			default:
+			}
+		}
+	}()
+	voice.URL = "ws://" + ln.Addr().String() + "/v1/realtime"
 	t.Cleanup(func() {
 		cancel()
-		voice.server.Close()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer shutdownCancel()
+		_ = voice.http.Shutdown(shutdownCtx)
+		_ = voice.listener.Close()
 	})
 	return voice
 }

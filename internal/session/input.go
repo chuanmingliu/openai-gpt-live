@@ -14,6 +14,7 @@ type Input interface{ isSessionInput() }
 type ConnectedInput struct {
 	ProviderSession json.RawMessage
 	Reconnect       *protocol.ReconnectMetadata
+	Profile         *protocol.SelectedProfile
 }
 
 type ClientInput struct {

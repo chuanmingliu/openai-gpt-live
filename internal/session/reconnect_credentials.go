@@ -18,6 +18,8 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/clock"
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
+	profilepkg "github.com/chuanmingliu/openai-gpt-live/internal/profile"
+	"github.com/chuanmingliu/openai-gpt-live/internal/prompttmpl"
 )
 
 const MaximumReconnectCredentialBytes = 2_048
@@ -28,13 +30,17 @@ var (
 )
 
 type ReconnectClaims struct {
-	Scope        handoff.Scope
-	SessionID    identity.SessionID
-	Incarnation  identity.Incarnation
-	Cursor       int64
-	Model        string
-	ExpiresAt    time.Time
-	CredentialID string
+	Scope                handoff.Scope
+	SessionID            identity.SessionID
+	Incarnation          identity.Incarnation
+	Cursor               int64
+	Model                string
+	ExpiresAt            time.Time
+	CredentialID         string
+	ProfileID            string
+	ProfileVersion       uint64
+	ProfileSnapshotHash  string
+	ProfileEngineVersion string
 }
 
 type IssuedReconnectCredential struct {
@@ -53,15 +59,19 @@ type reconnectCredentials struct {
 }
 
 type reconnectCredentialPayload struct {
-	TenantID      string                  `json:"tenant_id"`
-	UserID        string                  `json:"user_id"`
-	Conversation  identity.ConversationID `json:"conversation_id"`
-	SessionID     identity.SessionID      `json:"session_id"`
-	Incarnation   identity.Incarnation    `json:"incarnation"`
-	Cursor        int64                   `json:"cursor"`
-	Model         string                  `json:"model"`
-	ExpiresUnixMS int64                   `json:"expires_unix_ms"`
-	CredentialID  string                  `json:"credential_id"`
+	TenantID             string                  `json:"tenant_id"`
+	UserID               string                  `json:"user_id"`
+	Conversation         identity.ConversationID `json:"conversation_id"`
+	SessionID            identity.SessionID      `json:"session_id"`
+	Incarnation          identity.Incarnation    `json:"incarnation"`
+	Cursor               int64                   `json:"cursor"`
+	Model                string                  `json:"model"`
+	ExpiresUnixMS        int64                   `json:"expires_unix_ms"`
+	CredentialID         string                  `json:"credential_id"`
+	ProfileID            string                  `json:"profile_id"`
+	ProfileVersion       uint64                  `json:"profile_version"`
+	ProfileSnapshotHash  string                  `json:"profile_snapshot_hash"`
+	ProfileEngineVersion string                  `json:"profile_engine_version"`
 }
 
 func NewReconnectCredentials(key []byte, source clock.Clock) (ReconnectCredentials, error) {
@@ -136,18 +146,34 @@ func (c *reconnectCredentials) Verify(credential string) (ReconnectClaims, error
 }
 
 func payloadFromReconnectClaims(claims ReconnectClaims) reconnectCredentialPayload {
-	return reconnectCredentialPayload{TenantID: claims.Scope.TenantID, UserID: claims.Scope.UserID, Conversation: claims.Scope.ConversationID,
+	result := reconnectCredentialPayload{TenantID: claims.Scope.TenantID, UserID: claims.Scope.UserID, Conversation: claims.Scope.ConversationID,
 		SessionID: claims.SessionID, Incarnation: claims.Incarnation, Cursor: claims.Cursor, Model: claims.Model,
 		ExpiresUnixMS: claims.ExpiresAt.UTC().UnixMilli(), CredentialID: claims.CredentialID}
+	result.ProfileID, result.ProfileVersion = claims.ProfileID, claims.ProfileVersion
+	result.ProfileSnapshotHash, result.ProfileEngineVersion = claims.ProfileSnapshotHash, claims.ProfileEngineVersion
+	return result
 }
 
 func (p reconnectCredentialPayload) claims() ReconnectClaims {
 	return ReconnectClaims{Scope: handoff.Scope{TenantID: p.TenantID, UserID: p.UserID, ConversationID: p.Conversation},
 		SessionID: p.SessionID, Incarnation: p.Incarnation, Cursor: p.Cursor, Model: p.Model,
-		ExpiresAt: time.UnixMilli(p.ExpiresUnixMS).UTC(), CredentialID: p.CredentialID}
+		ExpiresAt: time.UnixMilli(p.ExpiresUnixMS).UTC(), CredentialID: p.CredentialID,
+		ProfileID: p.ProfileID, ProfileVersion: p.ProfileVersion, ProfileSnapshotHash: p.ProfileSnapshotHash,
+		ProfileEngineVersion: p.ProfileEngineVersion}
 }
 
 func validateReconnectClaims(claims ReconnectClaims, now time.Time, checkingExpiry bool) error {
+	if err := validateReconnectCoreClaims(claims, now, checkingExpiry); err != nil {
+		return err
+	}
+	if (profilepkg.VersionRef{ID: profilepkg.ID(claims.ProfileID), Version: claims.ProfileVersion}).Validate() != nil ||
+		!isLowerHexReconnectHash(claims.ProfileSnapshotHash) || prompttmpl.ValidateEngineIdentity(claims.ProfileEngineVersion) != nil {
+		return ErrInvalidReconnectCredential
+	}
+	return nil
+}
+
+func validateReconnectCoreClaims(claims ReconnectClaims, now time.Time, checkingExpiry bool) error {
 	for _, value := range []string{claims.Scope.TenantID, claims.Scope.UserID, string(claims.Scope.ConversationID), string(claims.SessionID), claims.Model, claims.CredentialID} {
 		if !boundedReconnectValue(value) {
 			return ErrInvalidReconnectCredential
@@ -163,6 +189,18 @@ func validateReconnectClaims(claims ReconnectClaims, now time.Time, checkingExpi
 		return ErrInvalidReconnectCredential
 	}
 	return nil
+}
+
+func isLowerHexReconnectHash(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, character := range value {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func boundedReconnectValue(value string) bool {
@@ -283,8 +321,8 @@ func (s *MemoryReconnectOwners) Claim(ctx context.Context, claims ReconnectClaim
 	defer s.mu.Unlock()
 	current, exists := s.owners[claims.SessionID]
 	now := s.clock.Now().UTC()
-	currentToken := current.Claims() == claims && now.Before(current.ExpiresAt)
-	previousToken := reconnectPreviousClaims(current) == claims && now.Before(current.PreviousExpiresAt) && now.Before(current.PreviousAcceptUntil)
+	currentToken := sameReconnectCore(current.Claims(), claims) && now.Before(current.ExpiresAt)
+	previousToken := sameReconnectCore(reconnectPreviousClaims(current), claims) && now.Before(current.PreviousExpiresAt) && now.Before(current.PreviousAcceptUntil)
 	if !exists || (!currentToken && !previousToken) || !current.TurnBoundary ||
 		next.Scope != current.Scope || next.SessionID != current.SessionID || uint64(claims.Incarnation) == ^uint64(0) || next.Incarnation != claims.Incarnation+1 ||
 		next.Cursor != claims.Cursor || next.Model != current.Model ||
@@ -399,8 +437,9 @@ func (s *MemoryReconnectOwners) Rotate(ctx context.Context, key ReconnectOwnerKe
 	owner, exists := s.owners[key.SessionID]
 	now := s.clock.Now().UTC()
 	if !exists || owner.Key() != key || owner.State != ReconnectOwnerActive || !now.Before(owner.OwnerLeaseExpiresAt) ||
-		owner.Claims() != current || validateReconnectClaims(next, now, false) != nil || next.Scope != current.Scope ||
+		!sameReconnectCore(owner.Claims(), current) || validateReconnectCoreClaims(next, now, false) != nil || next.Scope != current.Scope ||
 		next.SessionID != current.SessionID || next.Incarnation != current.Incarnation || next.Model != current.Model ||
+		!compatibleReconnectProfiles(current, next) ||
 		next.Cursor < current.Cursor || !overlapUntil.After(now) || overlapUntil.After(current.ExpiresAt) {
 		return ErrStaleReconnect
 	}
@@ -481,13 +520,33 @@ func (s *MemoryReconnectOwners) Read(sessionID identity.SessionID) (ReconnectOwn
 }
 
 func validReconnectOwner(owner ReconnectOwner) bool {
-	if owner.Claims().CredentialID == "" || validateReconnectClaims(owner.Claims(), time.Time{}, false) != nil || !boundedReconnectValue(owner.OwnerID) {
+	if owner.Claims().CredentialID == "" || validateReconnectCoreClaims(owner.Claims(), time.Time{}, false) != nil || !boundedReconnectValue(owner.OwnerID) {
 		return false
 	}
 	if !validPreviousReconnectOwner(owner) {
 		return false
 	}
 	return owner.State == ReconnectOwnerEstablishing || owner.State == ReconnectOwnerActive || owner.State == ReconnectOwnerTombstoned || owner.State == ReconnectOwnerClaiming
+}
+
+func sameReconnectCore(left, right ReconnectClaims) bool {
+	return left.Scope == right.Scope && left.SessionID == right.SessionID && left.Incarnation == right.Incarnation &&
+		left.Cursor == right.Cursor && left.Model == right.Model && left.ExpiresAt.Equal(right.ExpiresAt) && left.CredentialID == right.CredentialID
+}
+
+func sameReconnectProfile(left, right ReconnectClaims) bool {
+	return left.ProfileID == right.ProfileID && left.ProfileVersion == right.ProfileVersion &&
+		left.ProfileSnapshotHash == right.ProfileSnapshotHash && left.ProfileEngineVersion == right.ProfileEngineVersion
+}
+
+func compatibleReconnectProfiles(left, right ReconnectClaims) bool {
+	leftEmpty := left.ProfileID == "" && left.ProfileVersion == 0 && left.ProfileSnapshotHash == "" && left.ProfileEngineVersion == ""
+	rightEmpty := right.ProfileID == "" && right.ProfileVersion == 0 && right.ProfileSnapshotHash == "" && right.ProfileEngineVersion == ""
+	if leftEmpty && rightEmpty {
+		return true
+	}
+	return validateReconnectClaims(left, time.Time{}, false) == nil && validateReconnectClaims(right, time.Time{}, false) == nil &&
+		sameReconnectProfile(left, right)
 }
 
 func validStoredReconnectOwner(owner ReconnectOwner) bool {

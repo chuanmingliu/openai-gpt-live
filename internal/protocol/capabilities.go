@@ -28,6 +28,7 @@ var clientEventTypes = [...]string{
 	"response.create",
 	"response.cancel",
 	"live.tool.approval.resolve",
+	"live.tool_policy.update",
 }
 
 var serverEventTypes = [...]string{
@@ -35,6 +36,7 @@ var serverEventTypes = [...]string{
 	"session.reconnect.updated",
 	"session.updated",
 	"error",
+	"input_audio_buffer.committed",
 	"input_audio_buffer.speech_started",
 	"input_audio_buffer.speech_stopped",
 	"conversation.item.input_audio_transcription.delta",
@@ -61,20 +63,29 @@ var extensionEventTypes = [...]string{
 	"live.session.degraded",
 	"live.session.resumed",
 	"live.tool.approval.required",
+	"live.tool_policy.updated",
+}
+
+var verticalProfileExtensionEventTypes = [...]string{
+	"live.profile.selected",
 }
 
 type CapabilityFeatures struct {
-	Handoffs bool
+	Handoffs         bool
+	VerticalProfiles bool
 }
 
 func Capabilities(limits Limits) CapabilityDocument {
-	return CapabilitiesForFeatures(limits, CapabilityFeatures{Handoffs: true})
+	return CapabilitiesForFeatures(limits, CapabilityFeatures{Handoffs: true, VerticalProfiles: true})
 }
 
 func CapabilitiesForFeatures(limits Limits, features CapabilityFeatures) CapabilityDocument {
 	extensions := make([]string, 0, len(handoffExtensionEventTypes)+len(extensionEventTypes))
 	if features.Handoffs {
 		extensions = append(extensions, handoffExtensionEventTypes[:]...)
+	}
+	if features.VerticalProfiles {
+		extensions = append(extensions, verticalProfileExtensionEventTypes[:]...)
 	}
 	extensions = append(extensions, extensionEventTypes[:]...)
 	return CapabilityDocument{

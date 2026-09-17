@@ -21,9 +21,11 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
 	"github.com/chuanmingliu/openai-gpt-live/internal/presentation"
+	"github.com/chuanmingliu/openai-gpt-live/internal/profile"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
 	"github.com/chuanmingliu/openai-gpt-live/internal/safety"
+	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -102,11 +104,14 @@ type Config struct {
 	ReconnectCleanupInterval        time.Duration
 	ReconnectCleanupBatch           int
 	InitialSession                  realtime.SessionConfig
+	ToolCatalog                     toolpolicy.Catalog
+	AsyncModel                      string
 	HandoffToolsEnabled             bool
 	Clock                           clock.Clock
 	Jitter                          clock.JitterSource
 	FeatureGates                    interface{ Enabled(string) bool }
 	ApprovalStore                   handoff.ApprovalStore
+	ApprovalDispatcher              ApprovalResolutionDispatcher
 	ConversationProvisioner         ConversationProvisioner
 	ConversationTTL                 time.Duration
 	reactorApplyGate                func(Input) <-chan struct{}
@@ -136,6 +141,19 @@ type TrustedSessionContext struct {
 type DurableEffectDispatcher interface {
 	DispatchTranscript(context.Context, TrustedSessionContext, TranscriptRequestedEffect) error
 	DispatchHandoff(context.Context, TrustedSessionContext, HandoffRequestedEffect) error
+}
+
+type ApprovalResolutionRequestedEffect struct {
+	ExternalSequence uint64
+	InvocationID     string
+	Decision         handoff.ApprovalDecision
+	Reason           string
+	IdempotencyKey   string
+	ResolvedAt       time.Time
+}
+
+type ApprovalResolutionDispatcher interface {
+	DispatchApproval(TrustedSessionContext, ApprovalResolutionRequestedEffect) error
 }
 
 type MetricsHooks struct {
@@ -220,6 +238,7 @@ type OpenRequest struct {
 	Subject        Subject
 	RequestedModel string
 	ConversationID identity.ConversationID
+	Profile        profile.Resolved
 }
 
 type IDGenerator interface {
@@ -257,6 +276,8 @@ type logicalSession struct {
 	turnBoundary  bool
 	tombstonedAt  time.Time
 	state         logicalSessionState
+	profile       profile.Resolved
+	profilePublic bool
 }
 
 type logicalSessionState uint8
@@ -294,9 +315,63 @@ type sessionRuntime struct {
 	inboxSlots            chan struct{}
 	replayAfter           *int64
 	reconnectMu           sync.Mutex
-	reconnectRotateMu     sync.Mutex
+	reconnectRotateOnce   sync.Once
+	reconnectRotate       chan struct{}
+	presentationMu        sync.Mutex
+	acceptanceGeneration  uint64
+	publicationPrevious   *sessionRuntime
+	publicationAccepting  bool
+	publicationGeneration uint64
 	reconnect             *IssuedReconnectCredential
+	reconnectDelivered    bool
 	reconnectLossDeadline time.Time
+	profile               profile.Resolved
+	profilePublic         bool
+}
+
+func normalizeBoundProfile(subject Subject, candidate profile.Resolved) (profile.Resolved, bool, error) {
+	provided := !candidate.IsZero()
+	if !provided {
+		return profile.Builtin(), false, nil
+	}
+	owned := candidate.Clone()
+	if owned.Validate() != nil {
+		return profile.Resolved{}, false, profile.ErrInvalidProfile
+	}
+	if owned.Snapshot.Ref.ID == "builtin" {
+		builtin := profile.Builtin()
+		if !sameProfileIdentity(owned, builtin) {
+			return profile.Resolved{}, false, profile.ErrInvalidProfile
+		}
+		owned = builtin
+	} else if owned.Snapshot.TenantID != subject.TenantID {
+		return profile.Resolved{}, false, profile.ErrInvalidProfile
+	}
+	return owned, true, nil
+}
+
+func sameProfileIdentity(left, right profile.Resolved) bool {
+	return left.Snapshot.TenantID == right.Snapshot.TenantID && left.Snapshot.Ref == right.Snapshot.Ref &&
+		left.Snapshot.SnapshotHash == right.Snapshot.SnapshotHash && left.Snapshot.EngineVersion == right.Snapshot.EngineVersion
+}
+
+func profileSelection(resolved profile.Resolved) *protocol.SelectedProfile {
+	return &protocol.SelectedProfile{ID: string(resolved.Snapshot.Ref.ID), Version: resolved.Snapshot.Ref.Version,
+		SnapshotHash: resolved.Snapshot.SnapshotHash}
+}
+
+func profileClaimsMatchResolved(claims ReconnectClaims, resolved profile.Resolved) bool {
+	return claims.ProfileID == string(resolved.Snapshot.Ref.ID) && claims.ProfileVersion == resolved.Snapshot.Ref.Version &&
+		claims.ProfileSnapshotHash == resolved.Snapshot.SnapshotHash && claims.ProfileEngineVersion == resolved.Snapshot.EngineVersion
+}
+
+func (r *sessionRuntime) commitPublication() {
+	if r == nil {
+		return
+	}
+	r.publicationPrevious = nil
+	r.publicationAccepting = false
+	r.publicationGeneration = 0
 }
 
 // fenceAtTurnBoundary linearizes the final boundary decision with every
@@ -374,17 +449,24 @@ func (r *sessionRuntime) atTurnBoundary() bool {
 	if snapshot.UserSpeaking {
 		return false
 	}
+	if snapshot.InputAudioCommitPending {
+		return false
+	}
 	return snapshot.Response == ResponseIdle || snapshot.Response == ResponseTerminal
 }
 
 type reactorMessage struct {
-	input               Input
-	ingressAfter        uint64
-	egressAfter         uint64
-	done                chan error
-	requireClientWrites bool
-	offerCtx            context.Context
-	controlSequence     uint64
+	input                Input
+	ingressAfter         uint64
+	egressAfter          uint64
+	done                 chan error
+	requireClientWrites  bool
+	offerCtx             context.Context
+	controlSequence      uint64
+	completion           bool
+	acceptanceChecked    bool
+	acceptanceGeneration uint64
+	clientAudioCommit    bool
 }
 
 type ingressFrame struct {
@@ -461,23 +543,75 @@ type egressFrame struct {
 type voiceControl struct {
 	command             realtime.Command
 	sent                chan error
+	barrier             *voiceSendBarrier
 	handoffPresentation bool
 }
 
-type clientControl struct {
-	order       uint64
-	afterSeq    uint64
-	event       protocol.ServerEvent
-	close       *CloseEffect
-	written     chan error
-	writeCtx    context.Context
-	epoch       identity.ResponseEpoch
-	incarnation identity.Incarnation
+// voiceSendBarrier lets client-writer work depend on an exact provider write
+// without making the sole reactor wait for either writer. Closing done
+// broadcasts the result to every later client effect in the same composition.
+type voiceSendBarrier struct {
+	done chan struct{}
+	err  error
 }
 
-type approvalResolutionWork struct {
-	event    protocol.LiveToolApprovalResolveEvent
-	sequence uint64
+func newVoiceSendBarrier() *voiceSendBarrier {
+	return &voiceSendBarrier{done: make(chan struct{})}
+}
+
+func (b *voiceSendBarrier) complete(err error) {
+	if b == nil {
+		return
+	}
+	b.err = err
+	close(b.done)
+}
+
+func (b *voiceSendBarrier) wait(ctx context.Context) error {
+	if b == nil {
+		return nil
+	}
+	select {
+	case <-b.done:
+		return b.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+type clientControl struct {
+	order                 uint64
+	afterSeq              uint64
+	afterVoice            *voiceSendBarrier
+	event                 protocol.ServerEvent
+	inputTurnModeBoundary realtime.InputTurnMode
+	close                 *CloseEffect
+	completionSequence    uint64
+	writeCtx              context.Context
+	epoch                 identity.ResponseEpoch
+	incarnation           identity.Incarnation
+}
+
+type durableEffectControl struct {
+	trusted    TrustedSessionContext
+	transcript *TranscriptRequestedEffect
+	handoff    *HandoffRequestedEffect
+	sequence   uint64
+	kind       string
+}
+
+type clientEffectWaiter struct {
+	done             chan error
+	policySuppressed bool
+	onSuccess        func()
+}
+
+type presentationSafetyWork struct {
+	sequence             uint64
+	request              presentationSafetyRequest
+	done                 chan error
+	acceptanceChecked    bool
+	acceptanceGeneration uint64
 }
 
 type sequenceProgress struct {
@@ -573,6 +707,14 @@ func (a *activeAudioWrite) cancelAndWait() error {
 	}
 }
 
+func (a *activeAudioWrite) cancelActive() {
+	a.mu.Lock()
+	if a.cancel != nil {
+		a.cancel()
+	}
+	a.mu.Unlock()
+}
+
 type runState struct {
 	cfg                Config
 	ids                IDs
@@ -581,6 +723,7 @@ type runState struct {
 	client             ClientConn
 	fence              *EpochFence
 	inbox              chan reactorMessage
+	completions        chan reactorMessage
 	ingress            chan ingressFrame
 	ingressSlots       chan struct{}
 	voiceCtl           chan voiceControl
@@ -596,12 +739,18 @@ type runState struct {
 	metrics            MetricsHooks
 	subject            Subject
 	dispatcher         DurableEffectDispatcher
-	approvalWork       chan approvalResolutionWork
+	safetyWork         chan presentationSafetyWork
+	durableCtl         chan durableEffectControl
+	durableSlots       chan struct{}
+	voiceReadReady     chan struct{}
+	voiceReadReadyOnce sync.Once
 
 	ingressSequence uint64
 	egressSequence  uint64
 	eventSequence   uint64
 	sequenceMu      sync.Mutex
+	toolPolicyMu    sync.RWMutex
+	toolPolicy      toolpolicy.Policy
 
 	outputMu    sync.Mutex
 	outputOrder uint64
@@ -617,6 +766,7 @@ type runState struct {
 	boundaryMu       sync.RWMutex
 	boundary         Snapshot
 	partialInput     atomic.Bool
+	commitPending    atomic.Bool
 	ingressCompleted atomic.Uint64
 	controlAccepted  atomic.Uint64
 	controlApplied   atomic.Uint64
@@ -624,6 +774,13 @@ type runState struct {
 	externalApplied  atomic.Uint64
 	externalProgress *sequenceProgress
 	pendingVoice     atomic.Int64
+	pendingVoiceMu   sync.Mutex
+	pendingVoiceByID map[uint64]realtime.CommandKind
+	effectSequence   atomic.Uint64
+	clientEffectMu   sync.Mutex
+	clientWaiters    map[uint64]clientEffectWaiter
+	durableEffectMu  sync.Mutex
+	pendingDurable   map[uint64]string
 	handoffEpoch     atomic.Uint64
 }
 
@@ -767,6 +924,13 @@ func minimalReconnectSubject(subject Subject) Subject {
 
 func normalizeManagerConfig(cfg Config) (Config, error) {
 	cfg.InitialSession = cloneRealtimeSessionConfig(cfg.InitialSession)
+	if emptyToolCatalog(cfg.ToolCatalog) {
+		cfg.ToolCatalog = toolpolicy.DefaultCatalog()
+	}
+	cfg.ToolCatalog.WebSearch.Regions = append([]string(nil), cfg.ToolCatalog.WebSearch.Regions...)
+	if _, err := defaultToolPolicy(cfg.ToolCatalog); err != nil {
+		return cfg, fmt.Errorf("%w: tool catalog: %v", ErrInvalidManagerConfig, err)
+	}
 	defaults := []struct {
 		value *int
 		name  string
@@ -933,6 +1097,10 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 		return err
 	}
 	subject := cloneSubject(request.Subject)
+	selectedProfile, profilePublic, err := normalizeBoundProfile(subject, request.Profile)
+	if err != nil {
+		return err
+	}
 
 	sessionID := m.ids.NewSessionID()
 	if sessionID == "" {
@@ -962,7 +1130,7 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	}
 	logical := &logicalSession{
 		scope: scope, subject: cloneSubject(subject), model: request.RequestedModel, highWater: ids.Incarnation, turnBoundary: false,
-		state: logicalEstablishing,
+		state: logicalEstablishing, profile: selectedProfile.Clone(), profilePublic: profilePublic,
 	}
 	m.logical[sessionID] = logical
 	m.activeMu.Unlock()
@@ -1001,7 +1169,7 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	reconnectAdvertisementAttempted := false
 	var reconnectOwnerLossDeadline time.Time
 	if m.ReconnectEnabled() {
-		issued, owner, issueErr := m.issueReconnectCredential(subject, scope, sessionID, ids.Incarnation, 0, request.RequestedModel, ReconnectOwnerEstablishing)
+		issued, owner, issueErr := m.issueReconnectCredentialForProfile(subject, scope, sessionID, ids.Incarnation, 0, request.RequestedModel, selectedProfile, ReconnectOwnerEstablishing)
 		if issueErr != nil {
 			closeCtx, closeCancel := context.WithTimeout(context.Background(), internalCloseTimeout)
 			_ = voice.Close(closeCtx)
@@ -1054,10 +1222,13 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 		accepting:             true,
 		inboxSlots:            state.inboxSlots,
 		reconnectLossDeadline: reconnectOwnerLossDeadline,
+		profile:               selectedProfile.Clone(),
+		profilePublic:         profilePublic,
 	}
 	if reconnectIssued != nil {
 		copy := *reconnectIssued
 		runtime.reconnect = &copy
+		runtime.reconnectDelivered = true
 	}
 	state.runtime = runtime
 	var firstErr error
@@ -1080,7 +1251,8 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	group.Go(runLoop("voice reader", state.voiceReader))
 	group.Go(runLoop("client writer", state.clientWriter))
 	group.Go(runLoop("reactor", state.reactorLoop))
-	group.Go(runLoop("approval resolver", state.approvalLoop))
+	group.Go(runLoop("presentation safety", state.presentationSafetyLoop))
+	group.Go(runLoop("durable dispatcher", state.durableWriter))
 	abortBeforePublication := func(cause error) error {
 		cancel()
 		_ = group.Wait()
@@ -1100,7 +1272,11 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 	// This prevents the durable pump from overtaking session establishment.
 	reconnectAdvertisementAttempted = reconnectMetadata != nil
 	<-state.inboxSlots
-	connected := reactorMessage{input: ConnectedInput{ProviderSession: json.RawMessage(`{}`), Reconnect: reconnectMetadata}, done: make(chan error, 1), requireClientWrites: true}
+	connectedInput := ConnectedInput{ProviderSession: json.RawMessage(`{}`), Reconnect: reconnectMetadata}
+	if profilePublic {
+		connectedInput.Profile = profileSelection(selectedProfile)
+	}
+	connected := reactorMessage{input: connectedInput, done: make(chan error, 1), requireClientWrites: true}
 	state.acceptControl(&connected)
 	state.inbox <- connected
 	select {
@@ -1108,6 +1284,7 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 		if err != nil {
 			return abortBeforePublication(fmt.Errorf("establish client session: %w", err))
 		}
+		state.voiceReadReadyOnce.Do(func() { close(state.voiceReadReady) })
 	case <-groupCtx.Done():
 		return abortBeforePublication(groupCtx.Err())
 	}
@@ -1144,6 +1321,7 @@ func (m *Manager) Run(parent context.Context, request OpenRequest, client Client
 		runtime.setReconnectLossDeadline(lossDeadline)
 		group.Go(runLoop("reconnect owner heartbeat", func(ctx context.Context) error { return m.maintainReconnectOwner(ctx, runtime, lossDeadline) }))
 	}
+	runtime.commitPublication()
 	hooks := m.metricsSnapshot()
 	hooks.SessionStarted()
 	defer func() {
@@ -1207,6 +1385,10 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 	if err := validateReconnectRequest(request); err != nil {
 		return err
 	}
+	selectedProfile, profilePublic, err := normalizeBoundProfile(request.Subject, request.Profile)
+	if err != nil {
+		return ErrInvalidReconnectCredential
+	}
 	if uint64(request.LastIncarnation) == math.MaxUint64 {
 		return ErrStaleReconnect
 	}
@@ -1216,6 +1398,9 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 			request.Credential.SessionID != request.SessionID || request.Credential.Incarnation != request.LastIncarnation ||
 			request.Credential.Cursor != request.LastEventSeq || validateReconnectClaims(request.Credential, m.now(), true) != nil {
 			return ErrStaleReconnect
+		}
+		if !profileClaimsMatchResolved(request.Credential, selectedProfile) {
+			return ErrInvalidReconnectCredential
 		}
 	}
 	m.activeMu.Lock()
@@ -1282,6 +1467,8 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 		logical.reconnecting = true
 		subject = cloneSubject(logical.subject)
 		model = logical.model
+		selectedProfile, _, _ = normalizeBoundProfile(logical.subject, logical.profile)
+		profilePublic = logical.profilePublic
 	} else {
 		if !authoritativeOwners {
 			m.activeMu.Unlock()
@@ -1342,8 +1529,8 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 	var reconnectMetadata *protocol.ReconnectMetadata
 	var reconnectIssued *IssuedReconnectCredential
 	if authoritativeOwners {
-		issued, nextOwner, issueErr := m.issueReconnectCredential(subject, request.Scope, request.SessionID, newIncarnation,
-			request.LastEventSeq, model, ReconnectOwnerClaiming)
+		issued, nextOwner, issueErr := m.issueReconnectCredentialForProfile(subject, request.Scope, request.SessionID, newIncarnation,
+			request.LastEventSeq, model, selectedProfile, ReconnectOwnerClaiming)
 		if issueErr != nil {
 			return ErrRecoveryUnavailable
 		}
@@ -1366,9 +1553,12 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 			return ErrRecoveryUnavailable
 		}
 		restagedExisting := (claimedOwner.State == ReconnectOwnerClaiming || claimedOwner.State == ReconnectOwnerActive) && claimedOwner.Incarnation == newIncarnation &&
-			reconnectPreviousClaims(claimedOwner) == request.Credential
+			sameReconnectCore(reconnectPreviousClaims(claimedOwner), request.Credential)
 		if restagedExisting {
-			issued, issueErr = m.cfg.ReconnectCredentials.Issue(claimedOwner.Claims())
+			restagedClaims := claimedOwner.Claims()
+			restagedClaims.ProfileID, restagedClaims.ProfileVersion = request.Credential.ProfileID, request.Credential.ProfileVersion
+			restagedClaims.ProfileSnapshotHash, restagedClaims.ProfileEngineVersion = request.Credential.ProfileSnapshotHash, request.Credential.ProfileEngineVersion
+			issued, issueErr = m.cfg.ReconnectCredentials.Issue(restagedClaims)
 			if issueErr != nil {
 				return ErrRecoveryUnavailable
 			}
@@ -1389,7 +1579,8 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 		if logical == nil {
 			logical = &logicalSession{scope: request.Scope, subject: minimalReconnectSubject(subject), model: model,
 				highWater: request.LastIncarnation, responseEpoch: claimedOwner.ResponseEpoch, reconnecting: true,
-				turnBoundary: true, tombstonedAt: m.now(), state: logicalTombstoned}
+				turnBoundary: true, tombstonedAt: m.now(), state: logicalTombstoned,
+				profile: selectedProfile.Clone(), profilePublic: profilePublic}
 			m.activeMu.Lock()
 			if m.logical[request.SessionID] != nil {
 				m.activeMu.Unlock()
@@ -1502,7 +1693,7 @@ func (m *Manager) Reconnect(parent context.Context, request ReconnectRequest, cl
 	ids := IDs{SessionID: request.SessionID, ConversationID: request.Scope.ConversationID, Incarnation: newIncarnation}
 	err = m.runReplacement(sessionCtx, cancel, subject, ids, client, voice, initialEpoch, logical, request.LastIncarnation,
 		request.LastEventSeq, reconnectIssued, reconnectMetadata, activeEvents, snapshot.PendingApprovals,
-		claimedLossDeadline, advertisementAttempted.Store, durablyPublished.Store)
+		claimedLossDeadline, selectedProfile, profilePublic, advertisementAttempted.Store, durablyPublished.Store)
 	result := "ok"
 	if err != nil {
 		result = "error"
@@ -1524,6 +1715,12 @@ func (m *Manager) sendInitialSession(ctx context.Context, voice realtime.Session
 func (m *Manager) issueReconnectCredential(subject Subject, scope handoff.Scope, sessionID identity.SessionID, incarnation identity.Incarnation,
 	cursor int64, model string, state ReconnectOwnerState,
 ) (IssuedReconnectCredential, ReconnectOwner, error) {
+	return m.issueReconnectCredentialForProfile(subject, scope, sessionID, incarnation, cursor, model, profile.Builtin(), state)
+}
+
+func (m *Manager) issueReconnectCredentialForProfile(subject Subject, scope handoff.Scope, sessionID identity.SessionID, incarnation identity.Incarnation,
+	cursor int64, model string, selected profile.Resolved, state ReconnectOwnerState,
+) (IssuedReconnectCredential, ReconnectOwner, error) {
 	if !m.ReconnectEnabled() {
 		return IssuedReconnectCredential{}, ReconnectOwner{}, ErrRecoveryUnavailable
 	}
@@ -1532,7 +1729,9 @@ func (m *Manager) issueReconnectCredential(subject Subject, scope handoff.Scope,
 		expiresAt = subject.ExpiresAt
 	}
 	issued, err := m.cfg.ReconnectCredentials.Issue(ReconnectClaims{Scope: scope, SessionID: sessionID, Incarnation: incarnation,
-		Cursor: cursor, Model: model, ExpiresAt: expiresAt})
+		Cursor: cursor, Model: model, ExpiresAt: expiresAt, ProfileID: string(selected.Snapshot.Ref.ID),
+		ProfileVersion: selected.Snapshot.Ref.Version, ProfileSnapshotHash: selected.Snapshot.SnapshotHash,
+		ProfileEngineVersion: selected.Snapshot.EngineVersion})
 	if err != nil {
 		return IssuedReconnectCredential{}, ReconnectOwner{}, err
 	}
@@ -1737,14 +1936,23 @@ func (m *Manager) rotateReconnectCredential(ctx context.Context, runtime *sessio
 	if !m.ReconnectEnabled() || runtime == nil {
 		return nil
 	}
-	runtime.reconnectRotateMu.Lock()
-	defer runtime.reconnectRotateMu.Unlock()
+	runtime.reconnectRotateOnce.Do(func() {
+		runtime.reconnectRotate = make(chan struct{}, 1)
+		runtime.reconnectRotate <- struct{}{}
+	})
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-runtime.reconnectRotate:
+	}
+	defer func() { runtime.reconnectRotate <- struct{}{} }()
 	runtime.reconnectMu.Lock()
 	if runtime.reconnect == nil {
 		runtime.reconnectMu.Unlock()
 		return ErrRecoveryUnavailable
 	}
 	current := *runtime.reconnect
+	delivered := runtime.reconnectDelivered
 	lossDeadline := runtime.reconnectLossDeadline
 	runtime.reconnectMu.Unlock()
 	if cursor < 0 {
@@ -1753,38 +1961,56 @@ func (m *Manager) rotateReconnectCredential(ctx context.Context, runtime *sessio
 	if cursor < current.Claims.Cursor {
 		return ErrStaleReconnect
 	}
-	if !force && cursor == current.Claims.Cursor {
+	if !force && cursor == current.Claims.Cursor && delivered {
 		return nil
 	}
-	scope := runtime.handoffScope()
-	issued, _, err := m.issueReconnectCredential(runtime.subject, scope, runtime.key.sessionID, runtime.key.incarnation,
-		cursor, current.Claims.Model, ReconnectOwnerActive)
-	if err != nil {
-		return ErrRecoveryUnavailable
-	}
-	overlapUntil := earlierTime(current.Claims.ExpiresAt, m.now().Add(m.cfg.ReconnectCredentialOverlap))
-	if !overlapUntil.After(m.now()) {
-		return ErrRecoveryUnavailable
-	}
-	key := ReconnectOwnerKey{SessionID: runtime.key.sessionID, Incarnation: runtime.key.incarnation,
-		OwnerID: m.cfg.ReconnectOwnerID, CredentialID: current.Claims.CredentialID}
-	if err := m.runReconnectOwnerOperation(ctx, lossDeadline, func(operationCtx context.Context) error {
-		return m.cfg.ReconnectOwners.Rotate(operationCtx, key, current.Claims, issued.Claims, overlapUntil)
-	}); err != nil {
-		return ErrRecoveryUnavailable
-	}
-	runtime.reconnectMu.Lock()
-	if runtime.reconnect == nil || runtime.reconnect.Claims != current.Claims {
+	issued := current
+	if force || cursor != current.Claims.Cursor {
+		scope := runtime.handoffScope()
+		var err error
+		selected, _, profileErr := normalizeBoundProfile(runtime.subject, runtime.profile)
+		if profileErr != nil {
+			return ErrRecoveryUnavailable
+		}
+		issued, _, err = m.issueReconnectCredentialForProfile(runtime.subject, scope, runtime.key.sessionID, runtime.key.incarnation,
+			cursor, current.Claims.Model, selected, ReconnectOwnerActive)
+		if err != nil {
+			return ErrRecoveryUnavailable
+		}
+		overlapUntil := earlierTime(current.Claims.ExpiresAt, m.now().Add(m.cfg.ReconnectCredentialOverlap))
+		if !overlapUntil.After(m.now()) {
+			return ErrRecoveryUnavailable
+		}
+		key := ReconnectOwnerKey{SessionID: runtime.key.sessionID, Incarnation: runtime.key.incarnation,
+			OwnerID: m.cfg.ReconnectOwnerID, CredentialID: current.Claims.CredentialID}
+		if err := m.runReconnectOwnerOperation(ctx, lossDeadline, func(operationCtx context.Context) error {
+			return m.cfg.ReconnectOwners.Rotate(operationCtx, key, current.Claims, issued.Claims, overlapUntil)
+		}); err != nil {
+			return ErrRecoveryUnavailable
+		}
+		runtime.reconnectMu.Lock()
+		if runtime.reconnect == nil || runtime.reconnect.Claims != current.Claims {
+			runtime.reconnectMu.Unlock()
+			return ErrStaleReconnect
+		}
+		copy := issued
+		runtime.reconnect = &copy
+		runtime.reconnectDelivered = false
 		runtime.reconnectMu.Unlock()
-		return ErrStaleReconnect
 	}
-	copy := issued
-	runtime.reconnect = &copy
-	runtime.reconnectMu.Unlock()
 	event := protocol.SessionReconnectUpdatedEvent{Type: "session.reconnect.updated",
 		EventID: "reconnect-" + issued.Claims.CredentialID, Reconnect: *reconnectMetadataFromIssued(issued)}
 	written := make(chan error, 1)
-	if err := runtime.state.enqueueClientControl(clientControl{event: event, writeCtx: ctx, written: written}); err != nil {
+	sequence := runtime.state.nextEffectSequence()
+	runtime.state.registerClientWaiter(sequence, clientEffectWaiter{done: written, onSuccess: func() {
+		runtime.reconnectMu.Lock()
+		if runtime.reconnect != nil && runtime.reconnect.Claims == issued.Claims {
+			runtime.reconnectDelivered = true
+		}
+		runtime.reconnectMu.Unlock()
+	}})
+	if err := runtime.state.enqueueClientControl(clientControl{event: event, completionSequence: sequence}); err != nil {
+		runtime.state.completeClientEffect(ClientEffectCompletedInput{Sequence: sequence})
 		return err
 	}
 	select {
@@ -1888,6 +2114,14 @@ func (m *Manager) checkReconnectLocked(request ReconnectRequest, logical *logica
 	if logical.runtime != nil && !logical.runtime.atTurnBoundary() || logical.runtime == nil && !logical.turnBoundary {
 		return ErrReconnectNotAtBoundary
 	}
+	selected, _, err := normalizeBoundProfile(request.Subject, request.Profile)
+	retained, _, retainedErr := normalizeBoundProfile(logical.subject, logical.profile)
+	if err != nil || retainedErr != nil || !sameProfileIdentity(selected, retained) {
+		return ErrInvalidReconnectCredential
+	}
+	if m.ReconnectEnabled() && !profileClaimsMatchResolved(request.Credential, retained) {
+		return ErrInvalidReconnectCredential
+	}
 	return nil
 }
 
@@ -1931,7 +2165,8 @@ func (m *Manager) connectReplacement(ctx context.Context, request realtime.OpenR
 func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.CancelFunc, subject Subject, ids IDs, client ClientConn,
 	voice realtime.Session, initialEpoch identity.ResponseEpoch, logical *logicalSession, expected identity.Incarnation, replayAfter int64,
 	reconnectIssued *IssuedReconnectCredential, reconnectMetadata *protocol.ReconnectMetadata, activeHandoffs []protocol.ServerEvent,
-	pendingApprovals []RecoveryApproval, ownerLossDeadline time.Time, markAdvertisement func(bool), markPublished func(bool),
+	pendingApprovals []RecoveryApproval, ownerLossDeadline time.Time, selectedProfile profile.Resolved, profilePublic bool,
+	markAdvertisement func(bool), markPublished func(bool),
 ) (runErr error) {
 	group, groupCtx := errgroup.WithContext(sessionCtx)
 	quiesced := make(chan struct{})
@@ -1946,10 +2181,12 @@ func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.Canc
 		key: runtimeKey{sessionID: ids.SessionID, incarnation: ids.Incarnation}, subject: subject,
 		inbox: state.inbox, done: groupCtx.Done(), quiesced: quiesced, state: state,
 		accepting: true, inboxSlots: state.inboxSlots, reconnectLossDeadline: ownerLossDeadline,
+		profile: selectedProfile.Clone(), profilePublic: profilePublic,
 	}
 	if reconnectIssued != nil {
 		copy := *reconnectIssued
 		runtime.reconnect = &copy
+		runtime.reconnectDelivered = true
 	}
 	state.runtime = runtime
 	runtime.replayAfter = &replayAfter
@@ -1971,7 +2208,8 @@ func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.Canc
 	group.Go(runLoop("voice reader", state.voiceReader))
 	group.Go(runLoop("client writer", state.clientWriter))
 	group.Go(runLoop("reactor", state.reactorLoop))
-	group.Go(runLoop("approval resolver", state.approvalLoop))
+	group.Go(runLoop("presentation safety", state.presentationSafetyLoop))
+	group.Go(runLoop("durable dispatcher", state.durableWriter))
 	abort := func(cause error) error {
 		cancel()
 		_ = group.Wait()
@@ -1989,7 +2227,11 @@ func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.Canc
 		markAdvertisement(true)
 	}
 	<-state.inboxSlots
-	connected := reactorMessage{input: ConnectedInput{ProviderSession: json.RawMessage(`{}`), Reconnect: reconnectMetadata}, done: make(chan error, 1), requireClientWrites: true}
+	connectedInput := ConnectedInput{ProviderSession: json.RawMessage(`{}`), Reconnect: reconnectMetadata}
+	if profilePublic {
+		connectedInput.Profile = profileSelection(selectedProfile)
+	}
+	connected := reactorMessage{input: connectedInput, done: make(chan error, 1), requireClientWrites: true}
 	state.acceptControl(&connected)
 	state.inbox <- connected
 	select {
@@ -1997,12 +2239,16 @@ func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.Canc
 		if err != nil {
 			return abort(ErrRecoveryUnavailable)
 		}
+		state.voiceReadReadyOnce.Do(func() { close(state.voiceReadReady) })
 	case <-groupCtx.Done():
 		return abort(groupCtx.Err())
 	}
 	for _, event := range activeHandoffs {
 		written := make(chan error, 1)
-		if err := state.enqueueClientControl(clientControl{event: event, written: written}); err != nil {
+		sequence := state.nextEffectSequence()
+		state.registerClientWaiter(sequence, clientEffectWaiter{done: written})
+		if err := state.enqueueClientControl(clientControl{event: event, completionSequence: sequence}); err != nil {
+			state.completeClientEffect(ClientEffectCompletedInput{Sequence: sequence})
 			return abort(err)
 		}
 		select {
@@ -2045,6 +2291,7 @@ func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.Canc
 		runtime.setReconnectLossDeadline(lossDeadline)
 		group.Go(runLoop("reconnect owner heartbeat", func(ctx context.Context) error { return m.maintainReconnectOwner(ctx, runtime, lossDeadline) }))
 	}
+	runtime.commitPublication()
 	hooks := m.metricsSnapshot()
 	hooks.SessionStarted()
 	defer func() {
@@ -2076,6 +2323,14 @@ func (m *Manager) runReplacement(sessionCtx context.Context, cancel context.Canc
 }
 
 func (m *Manager) registerReplacement(runtime *sessionRuntime, logical *logicalSession, expected identity.Incarnation) error {
+	scope := runtime.handoffScope()
+	m.activeMu.RLock()
+	previous := m.current[scope]
+	m.activeMu.RUnlock()
+	if previous != nil && previous != runtime {
+		previous.presentationMu.Lock()
+		defer previous.presentationMu.Unlock()
+	}
 	m.activeMu.Lock()
 	defer m.activeMu.Unlock()
 	if m.logical[runtime.key.sessionID] != logical || !logical.reconnecting || logical.highWater != expected ||
@@ -2086,7 +2341,9 @@ func (m *Manager) registerReplacement(runtime *sessionRuntime, logical *logicalS
 	if _, exists := m.active[runtime.key]; exists {
 		return ErrStaleReconnect
 	}
-	scope := runtime.handoffScope()
+	if m.current[scope] != previous {
+		return ErrStaleReconnect
+	}
 	if !isNilInterface(m.cfg.HandoffSubscriptions) {
 		replay, ok := m.cfg.HandoffSubscriptions.(HandoffReplayRegistrar)
 		if !ok || isNilInterface(replay) {
@@ -2097,6 +2354,15 @@ func (m *Manager) registerReplacement(runtime *sessionRuntime, logical *logicalS
 		}
 	}
 	m.active[runtime.key] = runtime
+	if previous != nil && previous != runtime {
+		previous.mu.Lock()
+		runtime.publicationPrevious = previous
+		runtime.publicationAccepting = previous.accepting
+		runtime.publicationGeneration = previous.acceptanceGeneration
+		previous.accepting = false
+		previous.acceptanceGeneration++
+		previous.mu.Unlock()
+	}
 	m.current[scope] = runtime
 	logical.highWater = runtime.key.incarnation
 	logical.responseEpoch = runtime.state.fence.Current()
@@ -2112,12 +2378,25 @@ func (m *Manager) rollbackInitialPublication(runtime *sessionRuntime, logical *l
 	if runtime == nil || logical == nil {
 		return
 	}
+	previous := runtime.publicationPrevious
+	if previous != nil {
+		previous.presentationMu.Lock()
+		defer previous.presentationMu.Unlock()
+	}
 	m.activeMu.Lock()
 	if m.active[runtime.key] == runtime {
 		delete(m.active, runtime.key)
 	}
 	if m.current[runtime.handoffScope()] == runtime {
-		delete(m.current, runtime.handoffScope())
+		if previous != nil && m.active[previous.key] == previous {
+			previous.mu.Lock()
+			previous.accepting = runtime.publicationAccepting
+			previous.acceptanceGeneration = runtime.publicationGeneration
+			previous.mu.Unlock()
+			m.current[runtime.handoffScope()] = previous
+		} else {
+			delete(m.current, runtime.handoffScope())
+		}
 	}
 	if m.logical[runtime.key.sessionID] == logical && logical.runtime == runtime {
 		logical.runtime = nil
@@ -2126,7 +2405,7 @@ func (m *Manager) rollbackInitialPublication(runtime *sessionRuntime, logical *l
 		logical.turnBoundary = false
 	}
 	m.activeMu.Unlock()
-	if !isNilInterface(m.cfg.HandoffSubscriptions) {
+	if previous == nil && !isNilInterface(m.cfg.HandoffSubscriptions) {
 		m.cfg.HandoffSubscriptions.Unregister(runtime.handoffSubscription(m.cfg.HandoffConsumerID))
 	}
 }
@@ -2135,12 +2414,25 @@ func (m *Manager) rollbackReplacementPublication(runtime *sessionRuntime, logica
 	if runtime == nil || logical == nil {
 		return
 	}
+	previous := runtime.publicationPrevious
+	if previous != nil {
+		previous.presentationMu.Lock()
+		defer previous.presentationMu.Unlock()
+	}
 	m.activeMu.Lock()
 	if m.active[runtime.key] == runtime {
 		delete(m.active, runtime.key)
 	}
 	if m.current[runtime.handoffScope()] == runtime {
-		delete(m.current, runtime.handoffScope())
+		if previous != nil && m.active[previous.key] == previous {
+			previous.mu.Lock()
+			previous.accepting = runtime.publicationAccepting
+			previous.acceptanceGeneration = runtime.publicationGeneration
+			previous.mu.Unlock()
+			m.current[runtime.handoffScope()] = previous
+		} else {
+			delete(m.current, runtime.handoffScope())
+		}
 	}
 	if m.logical[runtime.key.sessionID] == logical && logical.runtime == runtime && logical.highWater == runtime.key.incarnation {
 		logical.highWater = expected
@@ -2152,12 +2444,13 @@ func (m *Manager) rollbackReplacementPublication(runtime *sessionRuntime, logica
 		logical.state = logicalTombstoned
 	}
 	m.activeMu.Unlock()
-	if !isNilInterface(m.cfg.HandoffSubscriptions) {
+	if previous == nil && !isNilInterface(m.cfg.HandoffSubscriptions) {
 		m.cfg.HandoffSubscriptions.Unregister(runtime.handoffSubscription(m.cfg.HandoffConsumerID))
 	}
 }
 
 func newRunState(cfg Config, ids IDs, voice realtime.Session, client ClientConn, cancel context.CancelFunc) *runState {
+	policy, _ := defaultToolPolicy(cfg.ToolCatalog)
 	state := &runState{
 		cfg:                cfg,
 		ids:                ids,
@@ -2165,12 +2458,16 @@ func newRunState(cfg Config, ids IDs, voice realtime.Session, client ClientConn,
 		client:             client,
 		fence:              NewEpochFence(0),
 		inbox:              make(chan reactorMessage, cfg.ControlEvents),
+		completions:        make(chan reactorMessage, cfg.ControlEvents+3*cfg.WriterControlEvents),
 		ingress:            make(chan ingressFrame, cfg.IngressFrames),
 		ingressSlots:       make(chan struct{}, cfg.IngressFrames),
 		voiceCtl:           make(chan voiceControl, cfg.WriterControlEvents),
 		egress:             make(chan egressFrame, cfg.EgressFrames),
 		clientCtl:          make(chan clientControl, cfg.WriterControlEvents),
-		approvalWork:       make(chan approvalResolutionWork, cfg.ControlEvents),
+		safetyWork:         make(chan presentationSafetyWork, cfg.ControlEvents),
+		durableCtl:         make(chan durableEffectControl, cfg.WriterControlEvents),
+		durableSlots:       make(chan struct{}, cfg.WriterControlEvents),
+		voiceReadReady:     make(chan struct{}),
 		inboxSlots:         make(chan struct{}, cfg.ControlEvents),
 		voiceSlots:         make(chan struct{}, cfg.WriterControlEvents),
 		clientSlots:        make(chan struct{}, cfg.WriterControlEvents),
@@ -2184,6 +2481,10 @@ func newRunState(cfg Config, ids IDs, voice realtime.Session, client ClientConn,
 		dispatcher:         cfg.DurableDispatcher,
 		cancel:             cancel,
 		boundary:           Snapshot{IDs: ids, Response: ResponseIdle},
+		toolPolicy:         policy,
+		pendingVoiceByID:   make(map[uint64]realtime.CommandKind),
+		clientWaiters:      make(map[uint64]clientEffectWaiter),
+		pendingDurable:     make(map[uint64]string),
 	}
 	for range cfg.ControlEvents {
 		state.inboxSlots <- struct{}{}
@@ -2194,11 +2495,33 @@ func newRunState(cfg Config, ids IDs, voice realtime.Session, client ClientConn,
 	for range cfg.WriterControlEvents {
 		state.voiceSlots <- struct{}{}
 		state.clientSlots <- struct{}{}
+		state.durableSlots <- struct{}{}
 	}
 	for range cfg.EgressFrames {
 		state.egressSlots <- struct{}{}
 	}
 	return state
+}
+
+func emptyToolCatalog(catalog toolpolicy.Catalog) bool {
+	web := catalog.WebSearch
+	return !web.Enabled && !web.ForceStrict && len(web.Regions) == 0 && web.MaximumResults == 0 && web.MaximumTimeoutMS == 0
+}
+
+func defaultToolPolicy(catalog toolpolicy.Catalog) (toolpolicy.Policy, error) {
+	return toolpolicy.DefaultPolicyForCatalog(catalog)
+}
+
+func (s *runState) replaceToolPolicy(policy toolpolicy.Policy) {
+	s.toolPolicyMu.Lock()
+	s.toolPolicy = policy
+	s.toolPolicyMu.Unlock()
+}
+
+func (s *runState) toolPolicySnapshot() toolpolicy.Policy {
+	s.toolPolicyMu.RLock()
+	defer s.toolPolicyMu.RUnlock()
+	return s.toolPolicy
 }
 
 func (m *Manager) Submit(ctx context.Context, sessionID identity.SessionID, incarnation identity.Incarnation, input Input) error {
@@ -2281,12 +2604,22 @@ func (m *Manager) Submit(ctx context.Context, sessionID identity.SessionID, inca
 }
 
 func (m *Manager) register(runtime *sessionRuntime) error {
+	scope := runtime.handoffScope()
+	m.activeMu.RLock()
+	previous := m.current[scope]
+	m.activeMu.RUnlock()
+	if previous != nil && previous != runtime {
+		previous.presentationMu.Lock()
+		defer previous.presentationMu.Unlock()
+	}
 	m.activeMu.Lock()
 	defer m.activeMu.Unlock()
+	if m.current[scope] != previous {
+		return ErrStaleReconnect
+	}
 	if _, exists := m.active[runtime.key]; exists {
 		return ErrSessionAlreadyActive
 	}
-	scope := runtime.handoffScope()
 	if m.logical == nil {
 		m.logical = make(map[identity.SessionID]*logicalSession)
 	}
@@ -2314,6 +2647,15 @@ func (m *Manager) register(runtime *sessionRuntime) error {
 		m.current = make(map[handoff.Scope]*sessionRuntime)
 	}
 	m.active[runtime.key] = runtime
+	if previous != nil && previous != runtime {
+		previous.mu.Lock()
+		runtime.publicationPrevious = previous
+		runtime.publicationAccepting = previous.accepting
+		runtime.publicationGeneration = previous.acceptanceGeneration
+		previous.accepting = false
+		previous.acceptanceGeneration++
+		previous.mu.Unlock()
+	}
 	m.current[scope] = runtime
 	logical.runtime = runtime
 	logical.responseEpoch = runtime.state.fence.Current()
@@ -2402,16 +2744,18 @@ func (m *Manager) OfferHandoffEvent(ctx context.Context, scope handoff.Scope, ev
 	defer cancel()
 	m.activeMu.RLock()
 	runtime := m.current[scope]
+	m.activeMu.RUnlock()
 	if runtime == nil {
-		m.activeMu.RUnlock()
 		return handoff.ErrNoLiveSession
 	}
-	defer m.activeMu.RUnlock()
+	runtime.presentationMu.Lock()
 	select {
 	case <-runtime.inboxSlots:
 	case <-runtime.done:
+		runtime.presentationMu.Unlock()
 		return handoff.ErrNoLiveSession
 	case <-offerCtx.Done():
+		runtime.presentationMu.Unlock()
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -2420,38 +2764,43 @@ func (m *Manager) OfferHandoffEvent(ctx context.Context, scope handoff.Scope, ev
 	message := reactorMessage{
 		input:        HandoffEventInput{Scope: scope, Event: handoff.CloneEvent(event)},
 		ingressAfter: runtime.state.latestIngressSequence(), done: make(chan error, 1),
-		offerCtx: offerCtx,
 	}
 	runtime.mu.Lock()
-	if !runtime.accepting {
+	m.activeMu.RLock()
+	current := m.current[scope]
+	m.activeMu.RUnlock()
+	if current != runtime || !runtime.accepting {
 		runtime.mu.Unlock()
 		runtime.inboxSlots <- struct{}{}
+		runtime.presentationMu.Unlock()
 		return handoff.ErrNoLiveSession
 	}
 	select {
 	case <-runtime.done:
 		runtime.mu.Unlock()
 		runtime.inboxSlots <- struct{}{}
+		runtime.presentationMu.Unlock()
 		return handoff.ErrNoLiveSession
 	default:
 	}
 	runtime.state.acceptControl(&message)
+	message.acceptanceChecked = true
+	message.acceptanceGeneration = runtime.acceptanceGeneration
 	runtime.inbox <- message
 	runtime.mu.Unlock()
+	runtime.presentationMu.Unlock()
 	select {
 	case err := <-message.done:
-		if err != nil && offerCtx.Err() != nil {
-			m.stopAndQuiesceRuntime(runtime)
-		}
 		if (err == nil || err == handoff.ErrPresentationSuppressed) && event.Seq > 0 && m.ReconnectEnabled() {
 			if rotateErr := m.rotateReconnectCredential(offerCtx, runtime, event.Seq, false); rotateErr != nil {
-				m.stopAndQuiesceRuntime(runtime)
+				if offerCtx.Err() != nil && ctx.Err() == nil {
+					return ErrControlOverflow
+				}
 				return rotateErr
 			}
 		}
 		return err
 	case <-runtime.done:
-		m.stopAndQuiesceRuntime(runtime)
 		select {
 		case err := <-message.done:
 			return err
@@ -2461,22 +2810,14 @@ func (m *Manager) OfferHandoffEvent(ctx context.Context, scope handoff.Scope, ev
 	case <-offerCtx.Done():
 		select {
 		case err := <-message.done:
-			if err != nil {
-				m.stopAndQuiesceRuntime(runtime)
-			}
 			return err
 		default:
-			m.stopAndQuiesceRuntime(runtime)
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			return ErrControlOverflow
 		}
 	}
-}
-
-func (m *Manager) stopAndQuiesceRuntime(runtime *sessionRuntime) {
-	_ = m.stopAndQuiesceRuntimeReason(context.Background(), runtime, 1011, "handoff presentation delivery timed out")
 }
 
 func (m *Manager) stopAndQuiesceRuntimeReason(parent context.Context, runtime *sessionRuntime, code int, reason string) error {
@@ -2527,14 +2868,41 @@ func (s *runState) clientReader(ctx context.Context) error {
 		}
 		err = s.runtime.acceptClientEvent(ctx, func(sequence uint64) (bool, error) {
 			switch typed := event.(type) {
+			case protocol.LiveToolPolicyUpdateEvent:
+				canonical, canonicalErr := toolpolicy.Canonicalize(typed.Tools, s.cfg.ToolCatalog)
+				if canonicalErr != nil {
+					return false, canonicalErr
+				}
+				s.replaceToolPolicy(canonical)
+				return true, s.enqueueClientControl(clientControl{event: protocol.LiveToolPolicyUpdatedEvent{
+					Type: "live.tool_policy.updated", EventID: typed.EventID, Tools: canonical, Model: s.cfg.AsyncModel,
+				}})
 			case protocol.LiveToolApprovalResolveEvent:
-				select {
-				case s.approvalWork <- approvalResolutionWork{event: typed, sequence: sequence}:
-					return false, nil
-				default:
+				if isNilInterface(s.cfg.ApprovalDispatcher) {
+					return true, s.enqueueClientControl(clientControl{event: s.approvalProtocolError("approval_unavailable")})
+				}
+				request := ApprovalResolutionRequestedEffect{
+					ExternalSequence: sequence,
+					InvocationID:     typed.InvocationID,
+					Decision:         handoff.ApprovalDecision(typed.Decision),
+					Reason:           typed.Reason,
+					IdempotencyKey:   typed.IdempotencyKey,
+					ResolvedAt:       s.cfg.Clock.Now().UTC(),
+				}
+				trusted := TrustedSessionContext{IDs: s.ids, Subject: cloneSubject(s.subject)}
+				if dispatchErr := s.cfg.ApprovalDispatcher.DispatchApproval(trusted, request); dispatchErr != nil {
 					return true, s.enqueueClientControl(clientControl{event: s.approvalProtocolError("approval_backpressure")})
 				}
+				// The durable boundary is the app-owned queue admission. Store
+				// resolution and optional live UX completion no longer belong to
+				// this session incarnation.
+				return true, nil
 			case protocol.InputAudioBufferAppendEvent:
+				if s.currentInputTurnMode() == realtime.InputTurnModeUnspecified {
+					return true, s.enqueueClientControl(clientControl{event: s.inputAudioModeError(
+						"input_turn_mode_unconfirmed", "input turn mode is awaiting provider confirmation",
+					)})
+				}
 				pcm, decodeErr := protocol.DecodePCM24k(typed, s.cfg.IngressFrames*pcmFrameBytes)
 				if decodeErr != nil {
 					return false, decodeErr
@@ -2553,8 +2921,30 @@ func (s *runState) clientReader(ctx context.Context) error {
 					}
 				}
 			case protocol.InputAudioBufferCommitEvent:
+				mode := s.currentInputTurnMode()
+				if mode == realtime.InputTurnModeUnspecified {
+					return true, s.enqueueClientControl(clientControl{event: s.inputAudioModeError(
+						"input_turn_mode_unconfirmed", "input turn mode is awaiting provider confirmation",
+					)})
+				}
+				if mode != realtime.InputTurnModeManual {
+					return true, s.enqueueClientControl(clientControl{event: s.inputAudioModeError(
+						"manual_audio_commit_disabled", "manual input audio commit is disabled by provider VAD",
+					)})
+				}
+				if !s.commitPending.CompareAndSwap(false, true) {
+					return true, s.enqueueClientControl(clientControl{event: protocol.ErrorEvent{
+						Type:    "error",
+						EventID: s.nextManagerEventID(),
+						Error: protocol.ProtocolError{
+							Type: "invalid_request_error", Code: "input_audio_buffer_commit_in_flight",
+							Message: "input audio commit acknowledgement is pending",
+						},
+					}})
+				}
 				tail, flushErr := framer.Flush()
 				if flushErr != nil {
+					s.commitPending.Store(false)
 					return true, s.enqueueClientControl(clientControl{event: protocol.ErrorEvent{
 						Type:    "error",
 						EventID: s.nextManagerEventID(),
@@ -2569,7 +2959,10 @@ func (s *runState) clientReader(ctx context.Context) error {
 						return false, enqueueErr
 					}
 				}
-				if enqueueErr := s.enqueueReactor(reactorMessage{input: ClientInput{Event: typed}, ingressAfter: latestSequence}); enqueueErr != nil {
+				if enqueueErr := s.enqueueReactor(reactorMessage{
+					input: ClientInput{Event: typed}, ingressAfter: latestSequence, clientAudioCommit: true,
+				}); enqueueErr != nil {
+					s.commitPending.Store(false)
 					return false, enqueueErr
 				}
 				s.partialInput.Store(false)
@@ -2584,35 +2977,20 @@ func (s *runState) clientReader(ctx context.Context) error {
 	}
 }
 
-func (s *runState) approvalLoop(ctx context.Context) error {
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case work := <-s.approvalWork:
-			event := work.event
-			if isNilInterface(s.cfg.ApprovalStore) {
-				if err := s.enqueueClientControl(clientControl{event: s.approvalProtocolError("approval_unavailable")}); err != nil {
-					return err
-				}
-				s.markExternalApplied(work.sequence)
-				continue
-			}
-			decision := handoff.ApprovalDecision(event.Decision)
-			resolution := handoff.ApprovalResolution{
-				InvocationID: event.InvocationID, Decision: decision,
-				ActorTenantID: s.subject.TenantID, ActorUserID: s.subject.UserID,
-				Reason: event.Reason, IdempotencyKey: event.IdempotencyKey,
-				ResolvedAt: s.cfg.Clock.Now().UTC(),
-			}
-			scope := handoff.Scope{TenantID: s.subject.TenantID, UserID: s.subject.UserID, ConversationID: s.ids.ConversationID}
-			if err := s.cfg.ApprovalStore.ResolveApproval(ctx, scope, resolution); err != nil {
-				if enqueueErr := s.enqueueClientControl(clientControl{event: s.approvalProtocolError("approval_rejected")}); enqueueErr != nil {
-					return enqueueErr
-				}
-			}
-			s.markExternalApplied(work.sequence)
-		}
+func (s *runState) currentInputTurnMode() realtime.InputTurnMode {
+	s.boundaryMu.RLock()
+	mode := s.boundary.InputTurnMode
+	s.boundaryMu.RUnlock()
+	return mode
+}
+
+func (s *runState) inputAudioModeError(code, message string) protocol.ErrorEvent {
+	return protocol.ErrorEvent{
+		Type:    "error",
+		EventID: s.nextManagerEventID(),
+		Error: protocol.ProtocolError{
+			Type: "invalid_request_error", Code: code, Message: message,
+		},
 	}
 }
 
@@ -2694,6 +3072,79 @@ func (s *runState) enqueueReactor(message reactorMessage) error {
 	return nil
 }
 
+func (s *runState) enqueueCompletion(ctx context.Context, input Input) error {
+	return s.enqueueCompletionMessage(ctx, reactorMessage{input: input, completion: true})
+}
+
+func (s *runState) enqueueCompletionMessage(ctx context.Context, message reactorMessage) error {
+	message.completion = true
+	select {
+	case s.completions <- message:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *runState) trackVoice(command realtime.Command) {
+	s.pendingVoiceMu.Lock()
+	if _, exists := s.pendingVoiceByID[command.Sequence]; !exists {
+		s.pendingVoiceByID[command.Sequence] = command.Kind
+		s.pendingVoice.Add(1)
+	}
+	s.pendingVoiceMu.Unlock()
+}
+
+func (s *runState) completeVoice(input VoiceCommandCompletedInput) bool {
+	s.pendingVoiceMu.Lock()
+	kind, exists := s.pendingVoiceByID[input.Sequence]
+	if exists && kind == input.Kind {
+		delete(s.pendingVoiceByID, input.Sequence)
+		s.pendingVoice.Add(-1)
+	}
+	s.pendingVoiceMu.Unlock()
+	return exists && kind == input.Kind
+}
+
+func (s *runState) nextEffectSequence() uint64 {
+	return s.effectSequence.Add(1)
+}
+
+func (s *runState) registerClientWaiter(sequence uint64, waiter clientEffectWaiter) {
+	if sequence == 0 || (waiter.done == nil && waiter.onSuccess == nil) {
+		return
+	}
+	s.clientEffectMu.Lock()
+	s.clientWaiters[sequence] = waiter
+	s.clientEffectMu.Unlock()
+}
+
+func (s *runState) completeClientEffect(input ClientEffectCompletedInput) (clientEffectWaiter, bool) {
+	s.clientEffectMu.Lock()
+	waiter, ok := s.clientWaiters[input.Sequence]
+	if ok {
+		delete(s.clientWaiters, input.Sequence)
+	}
+	s.clientEffectMu.Unlock()
+	return waiter, ok
+}
+
+func (s *runState) trackDurableEffect(sequence uint64, kind string) {
+	s.durableEffectMu.Lock()
+	s.pendingDurable[sequence] = kind
+	s.durableEffectMu.Unlock()
+}
+
+func (s *runState) completeDurableEffect(input DurableEffectCompletedInput) bool {
+	s.durableEffectMu.Lock()
+	kind, ok := s.pendingDurable[input.Sequence]
+	if ok && kind == input.Kind {
+		delete(s.pendingDurable, input.Sequence)
+	}
+	s.durableEffectMu.Unlock()
+	return ok && kind == input.Kind
+}
+
 func (s *runState) acceptControl(message *reactorMessage) {
 	message.controlSequence = s.controlAccepted.Add(1)
 }
@@ -2740,27 +3191,34 @@ func (s *runState) voiceWriter(ctx context.Context) error {
 			pending = append(pending[:selected], pending[selected+1:]...)
 			if (control.handoffPresentation && s.cfg.FeatureGates != nil && s.cfg.FeatureGates.Enabled(feature.ShadowMode)) || s.shadowHandoffEpoch(control.command.Epoch) {
 				s.releaseVoiceSlot()
+				control.barrier.complete(nil)
 				if control.sent != nil {
 					control.sent <- nil
 				}
-				if err := s.enqueueReactor(reactorMessage{input: VoiceCommandCompletedInput{
+				if err := s.enqueueCompletion(ctx, VoiceCommandCompletedInput{
 					Sequence: control.command.Sequence, Kind: control.command.Kind, Suppressed: true,
-				}}); err != nil {
+				}); err != nil {
 					return err
 				}
 				continue
 			}
 			err := s.voice.Send(ctx, control.command)
 			s.releaseVoiceSlot()
+			if err == nil && control.command.Kind == realtime.CommandAcknowledgeAudioCommit {
+				// Open client admission only after the exact semantic release has
+				// completed at the transport, and before its client-write barrier.
+				s.commitPending.Store(false)
+			}
+			control.barrier.complete(err)
 			if control.sent != nil {
 				control.sent <- err
 			}
 			if err != nil {
 				return err
 			}
-			if err := s.enqueueReactor(reactorMessage{input: VoiceCommandCompletedInput{
+			if err := s.enqueueCompletion(ctx, VoiceCommandCompletedInput{
 				Sequence: control.command.Sequence, Kind: control.command.Kind,
-			}}); err != nil {
+			}); err != nil {
 				return err
 			}
 			continue
@@ -2786,6 +3244,11 @@ func (s *runState) voiceWriter(ctx context.Context) error {
 }
 
 func (s *runState) voiceReader(ctx context.Context) error {
+	select {
+	case <-s.voiceReadReady:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	framer := &outputPCMFramer{}
 	var streamResponse string
 	var streamItem string
@@ -2864,10 +3327,21 @@ func (s *runState) voiceReader(ctx context.Context) error {
 		}
 
 		latest := s.latestEgressSequence()
-		if err := s.enqueueReactorSync(ctx, reactorMessage{
+		message := reactorMessage{
 			input: VoiceInput{Incarnation: s.ids.Incarnation, Event: event}, egressAfter: latest,
-		}); err != nil {
-			return err
+		}
+		var enqueueErr error
+		if event.Kind == realtime.EventResponseCreated || event.Kind == realtime.EventSpeechStarted || event.Kind == realtime.EventInputAudioCommitted {
+			// Establish a new stream or speech fence before accepting later
+			// provider media into the output order. This waits only for pure
+			// reactor apply and bounded effect admission, never for provider or
+			// client I/O completion.
+			enqueueErr = s.enqueueReactorSync(ctx, message)
+		} else {
+			enqueueErr = s.enqueueReactor(message)
+		}
+		if enqueueErr != nil {
+			return enqueueErr
 		}
 	}
 }
@@ -2917,11 +3391,47 @@ func (s *runState) enqueueEgress(ctx context.Context, event realtime.Event, audi
 
 func (s *runState) reactorLoop(ctx context.Context) error {
 	reactor := newReactorWithPresentationAndHandoffTools(s.ids, s.fence, s.cfg.PresentationPolicy, s.cfg.SafetyPolicy, s.cfg.HandoffToolsEnabled)
+	if err := reactor.expectInitialInputTurnMode(s.cfg.InitialSession.TurnDetection); err != nil {
+		return fmt.Errorf("initial input turn mode: %w", err)
+	}
+	reactor.deferPresentationSafety = s.runtime != nil
+	var deferredCreate *reactorMessage
 	for {
+		var message reactorMessage
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case message := <-s.inbox:
+		case message = <-s.completions:
+		default:
+		}
+		if message.input != nil {
+			// Reserved completions always take priority over ordinary intake.
+		} else if deferredCreate != nil && s.pendingVoice.Load() == 0 {
+			message = *deferredCreate
+			deferredCreate = nil
+		} else if deferredCreate != nil {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case message = <-s.completions:
+			}
+		} else {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case message = <-s.completions:
+			case message = <-s.inbox:
+			}
+		}
+		if deferredCreate == nil && s.pendingVoice.Load() != 0 && reactor.Snapshot().Response == ResponseCancelRequested {
+			if client, ok := message.input.(ClientInput); ok {
+				if _, create := client.Event.(protocol.ResponseCreateEvent); create {
+					copy := message
+					deferredCreate = &copy
+					continue
+				}
+			}
+		}
+		{
+			presentationLocked := false
 			if s.cfg.reactorApplyGate != nil {
 				if gate := s.cfg.reactorApplyGate(message.input); gate != nil {
 					select {
@@ -2931,8 +3441,65 @@ func (s *runState) reactorLoop(ctx context.Context) error {
 					}
 				}
 			}
-			dispatchCtx, finishDispatch := offerDispatchContext(ctx, message.offerCtx)
-			effects, err := reactor.ApplyContext(dispatchCtx, message.input)
+			if message.acceptanceChecked && s.runtime != nil {
+				s.runtime.presentationMu.Lock()
+				presentationLocked = true
+				s.runtime.mu.Lock()
+				accepted := s.runtime.accepting && s.runtime.acceptanceGeneration == message.acceptanceGeneration
+				s.runtime.mu.Unlock()
+				if !accepted {
+					s.runtime.presentationMu.Unlock()
+					if !message.completion {
+						s.controlApplied.Store(message.controlSequence)
+						s.inboxSlots <- struct{}{}
+					}
+					if message.done != nil {
+						message.done <- handoff.ErrNoLiveSession
+					}
+					continue
+				}
+			}
+			effects, err := reactor.ApplyContext(ctx, message.input)
+			recoverableCommitError := errors.Is(err, ErrAudioCommitInFlight) ||
+				errors.Is(err, ErrInputTurnModeUnconfirmed) || errors.Is(err, ErrManualAudioCommitDisabled)
+			if recoverableCommitError && message.clientAudioCommit {
+				effects = []Effect{{ClientEvent: protocol.ErrorEvent{
+					Type:    "error",
+					EventID: s.nextManagerEventID(),
+					Error: protocol.ProtocolError{
+						Type: "invalid_request_error", Code: "input_audio_buffer_commit_in_flight",
+						Message: "input audio commit acknowledgement is pending",
+					},
+				}}}
+				err = nil
+				recoverableCommitError = false
+			}
+			if err == nil {
+				for index := range effects {
+					async := effects[index].Async
+					if async == nil || async.Kind != asyncKindPresentationSafety {
+						continue
+					}
+					var request presentationSafetyRequest
+					if decodeErr := json.Unmarshal(async.Payload, &request); decodeErr != nil {
+						err = decodeErr
+						break
+					}
+					work := presentationSafetyWork{
+						sequence: async.Sequence, request: request, done: message.done,
+						acceptanceChecked: message.acceptanceChecked, acceptanceGeneration: message.acceptanceGeneration,
+					}
+					select {
+					case s.safetyWork <- work:
+						message.done = nil
+						effects[index].Async = nil
+					default:
+						s.metrics.queueOverflow("presentation_safety")
+						err = ErrControlOverflow
+					}
+					break
+				}
+			}
 			markHandoffPresentationEffects(message.input, effects, s.handoffEpoch.Load())
 			policySuppressed := false
 			for index := range effects {
@@ -2946,28 +3513,49 @@ func (s *runState) reactorLoop(ctx context.Context) error {
 						}
 					}
 				}
-				err = s.dispatchEffectsReconciled(dispatchCtx, effects, message.ingressAfter, message.egressAfter, func(completed VoiceCommandCompletedInput) error {
-					reconciled, reconcileErr := reactor.ApplyContext(dispatchCtx, completed)
-					if reconcileErr != nil {
-						return reconcileErr
-					}
-					if len(reconciled) != 0 {
-						return errors.New("suppressed voice command produced unexpected effects")
-					}
-					return nil
-				})
-			}
-			if err == nil {
-				s.boundaryMu.Lock()
-				s.boundary = reactor.Snapshot()
-				s.boundaryMu.Unlock()
-				if _, ok := message.input.(VoiceCommandCompletedInput); ok {
-					s.pendingVoice.Add(-1)
+				var clientCompletion uint64
+				clientCompletion, err = s.dispatchEffectsQueued(ctx, effects, message.ingressAfter, message.egressAfter, true)
+				if err == nil && message.done != nil && clientCompletion != 0 {
+					s.registerClientWaiter(clientCompletion, clientEffectWaiter{done: message.done, policySuppressed: policySuppressed})
+					message.done = nil
 				}
 			}
-			finishDispatch()
-			s.controlApplied.Store(message.controlSequence)
-			s.inboxSlots <- struct{}{}
+			if err == nil {
+				snapshot := reactor.Snapshot()
+				s.boundaryMu.Lock()
+				s.boundary = snapshot
+				s.boundaryMu.Unlock()
+				if snapshot.InputAudioCommitPending {
+					s.commitPending.Store(true)
+				}
+				if completed, ok := message.input.(VoiceCommandCompletedInput); ok {
+					s.completeVoice(completed)
+				}
+			}
+			if completed, ok := message.input.(DurableEffectCompletedInput); ok {
+				s.completeDurableEffect(completed)
+			}
+			if completed, ok := message.input.(ApprovalResolutionCompletedInput); ok && err == nil {
+				s.markExternalApplied(completed.ExternalSequence)
+			}
+			if completed, ok := message.input.(ClientEffectCompletedInput); ok {
+				if waiter, found := s.completeClientEffect(completed); found {
+					completionErr := completed.Err
+					if completionErr == nil && waiter.policySuppressed {
+						completionErr = handoff.ErrPresentationSuppressed
+					}
+					if completionErr == nil && waiter.onSuccess != nil {
+						waiter.onSuccess()
+					}
+					if waiter.done != nil {
+						waiter.done <- completionErr
+					}
+				}
+			}
+			if !message.completion {
+				s.controlApplied.Store(message.controlSequence)
+				s.inboxSlots <- struct{}{}
+			}
 			if message.done != nil {
 				resultErr := err
 				if resultErr == nil && policySuppressed {
@@ -2975,7 +3563,10 @@ func (s *runState) reactorLoop(ctx context.Context) error {
 				}
 				message.done <- resultErr
 			}
-			if err != nil {
+			if presentationLocked {
+				s.runtime.presentationMu.Unlock()
+			}
+			if err != nil && !recoverableCommitError {
 				return err
 			}
 		}
@@ -2985,7 +3576,7 @@ func (s *runState) reactorLoop(ctx context.Context) error {
 func markHandoffPresentationEffects(input Input, effects []Effect, handoffEpoch uint64) {
 	handoffPresentation := false
 	switch typed := input.(type) {
-	case HandoffEventInput, HandoffAcceptedInput:
+	case HandoffEventInput, HandoffAcceptedInput, HandoffSafetyCompletedInput:
 		handoffPresentation = true
 	case VoiceInput:
 		handoffPresentation = handoffEpoch != 0 && handoffEpoch == uint64(typed.Event.Epoch)
@@ -2998,72 +3589,48 @@ func markHandoffPresentationEffects(input Input, effects []Effect, handoffEpoch 
 	}
 }
 
-func offerDispatchContext(sessionCtx, offerCtx context.Context) (context.Context, func()) {
-	if offerCtx == nil {
-		return sessionCtx, func() {}
-	}
-	ctx, cancel := context.WithCancel(offerCtx)
-	stop := context.AfterFunc(sessionCtx, cancel)
-	return ctx, func() {
-		stop()
-		cancel()
-	}
-}
-
 func (s *runState) dispatchEffects(ctx context.Context, effects []Effect, ingressAfter, egressAfter uint64) error {
-	return s.dispatchEffectsReconciled(ctx, effects, ingressAfter, egressAfter, nil)
+	_, err := s.dispatchEffectsQueued(ctx, effects, ingressAfter, egressAfter, false)
+	return err
 }
 
-func (s *runState) dispatchEffectsReconciled(ctx context.Context, effects []Effect, ingressAfter, egressAfter uint64, reconcile func(VoiceCommandCompletedInput) error) error {
-	requireVoiceAcks := false
-	for index := range effects {
-		requireVoiceAcks = requireVoiceAcks || effects[index].PolicySuppressed
-	}
+func (s *runState) dispatchEffectsQueued(ctx context.Context, effects []Effect, ingressAfter, egressAfter uint64, queueDurable bool) (uint64, error) {
+	var clientCompletion uint64
+	var voiceBarrier *voiceSendBarrier
 	for _, effect := range effects {
 		if err := ctx.Err(); err != nil {
-			return err
+			return 0, err
 		}
 		// These are the final visual and speech side-effect boundaries. Each
 		// effect re-reads the gate so a transition during dispatch cannot leak.
 		if effect.HandoffPresentation && s.cfg.FeatureGates != nil && s.cfg.FeatureGates.Enabled(feature.ShadowMode) {
-			if effect.VoiceCommand != nil && effect.VoiceCommand.Kind == realtime.CommandCreateResponse && reconcile != nil {
-				if err := reconcile(VoiceCommandCompletedInput{Sequence: effect.VoiceCommand.Sequence, Kind: effect.VoiceCommand.Kind, Suppressed: true}); err != nil {
-					return err
+			if effect.VoiceCommand != nil && effect.VoiceCommand.Kind == realtime.CommandCreateResponse {
+				if err := s.enqueueCompletion(ctx, VoiceCommandCompletedInput{Sequence: effect.VoiceCommand.Sequence, Kind: effect.VoiceCommand.Kind, Suppressed: true}); err != nil {
+					return 0, err
 				}
 			}
 			continue
 		}
 		if effect.FlushBefore != 0 {
-			if err := s.activeWrite.cancelAndWait(); err != nil {
-				return err
-			}
-			if err := s.activeControlWrite.cancelAndWait(); err != nil {
-				return err
-			}
+			s.activeWrite.cancelActive()
+			s.activeControlWrite.cancelActive()
 		}
 		if effect.ClientEvent != nil {
-			control := clientControl{afterSeq: egressAfter, event: effect.ClientEvent, writeCtx: ctx, epoch: effect.ResponseEpoch, incarnation: effect.Incarnation}
+			control := clientControl{afterSeq: egressAfter, afterVoice: voiceBarrier, event: effect.ClientEvent,
+				inputTurnModeBoundary: effect.InputTurnModeBoundary,
+				writeCtx:              ctx, epoch: effect.ResponseEpoch, incarnation: effect.Incarnation,
+				completionSequence: s.nextEffectSequence()}
 			if effect.RequireClientWrite {
-				control.written = make(chan error, 1)
+				clientCompletion = control.completionSequence
 			}
 			if err := s.enqueueClientControl(control); err != nil {
-				return err
-			}
-			if control.written != nil {
-				select {
-				case err := <-control.written:
-					if err != nil {
-						return err
-					}
-				case <-ctx.Done():
-					return ctx.Err()
-				}
+				return 0, err
 			}
 		}
 		if effect.Close != nil {
 			closeCopy := *effect.Close
 			if err := s.enqueueClientControl(clientControl{afterSeq: egressAfter, close: &closeCopy}); err != nil {
-				return err
+				return 0, err
 			}
 		}
 		if effect.VoiceCommand != nil {
@@ -3078,49 +3645,123 @@ func (s *runState) dispatchEffectsReconciled(ctx context.Context, effects []Effe
 			case <-s.voiceSlots:
 			default:
 				s.metrics.queueOverflow("voice_control")
-				return ErrControlOverflow
+				return 0, ErrControlOverflow
 			}
-			control := voiceControl{command: command, handoffPresentation: effect.HandoffPresentation}
-			if requireVoiceAcks || command.Kind == realtime.CommandCancelResponse {
-				control.sent = make(chan error, 1)
-			}
-			s.pendingVoice.Add(1)
+			voiceBarrier = newVoiceSendBarrier()
+			control := voiceControl{command: command, barrier: voiceBarrier, handoffPresentation: effect.HandoffPresentation}
+			s.trackVoice(command)
 			s.voiceCtl <- control
-			if control.sent != nil {
-				select {
-				case err := <-control.sent:
-					if err != nil {
-						return err
-					}
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-			}
 		}
 		if effect.Transcript != nil || effect.Handoff != nil {
 			trusted := TrustedSessionContext{IDs: s.ids, Subject: cloneSubject(s.subject)}
+			if queueDurable {
+				select {
+				case <-s.durableSlots:
+				default:
+					s.metrics.queueOverflow("durable_effect")
+					return 0, ErrControlOverflow
+				}
+				control := durableEffectControl{trusted: trusted, sequence: s.nextEffectSequence()}
+				if effect.Transcript != nil {
+					owned := *effect.Transcript
+					control.transcript = &owned
+					control.kind = "transcript"
+				}
+				if effect.Handoff != nil {
+					if isNilInterface(s.dispatcher) {
+						s.durableSlots <- struct{}{}
+						return 0, fmt.Errorf("%w: durable handoff effect", ErrUnsupportedAsync)
+					}
+					owned := *effect.Handoff
+					owned.Arguments = append(json.RawMessage(nil), effect.Handoff.Arguments...)
+					owned.ToolPolicy = s.toolPolicySnapshot()
+					control.handoff = &owned
+					if control.kind == "" {
+						control.kind = "handoff"
+					} else {
+						control.kind = "transcript+handoff"
+					}
+				}
+				s.trackDurableEffect(control.sequence, control.kind)
+				s.durableCtl <- control
+				continue
+			}
 			if effect.Transcript != nil && !isNilInterface(s.dispatcher) {
 				owned := *effect.Transcript
 				if err := s.dispatcher.DispatchTranscript(ctx, trusted, owned); err != nil {
-					return err
+					return 0, err
 				}
 			}
 			if effect.Handoff != nil {
 				if isNilInterface(s.dispatcher) {
-					return fmt.Errorf("%w: durable handoff effect", ErrUnsupportedAsync)
+					return 0, fmt.Errorf("%w: durable handoff effect", ErrUnsupportedAsync)
 				}
 				owned := *effect.Handoff
 				owned.Arguments = append(json.RawMessage(nil), effect.Handoff.Arguments...)
+				owned.ToolPolicy = s.toolPolicySnapshot()
 				if err := s.dispatcher.DispatchHandoff(ctx, trusted, owned); err != nil {
-					return err
+					return 0, err
 				}
 			}
 		}
 		if effect.Async != nil && effect.Handoff == nil {
-			return fmt.Errorf("%w: %s", ErrUnsupportedAsync, effect.Async.Kind)
+			return 0, fmt.Errorf("%w: %s", ErrUnsupportedAsync, effect.Async.Kind)
 		}
 	}
-	return nil
+	return clientCompletion, nil
+}
+
+func (s *runState) durableWriter(ctx context.Context) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case control := <-s.durableCtl:
+			var dispatchErr error
+			if control.transcript != nil && !isNilInterface(s.dispatcher) {
+				dispatchErr = s.dispatcher.DispatchTranscript(ctx, control.trusted, *control.transcript)
+			}
+			if dispatchErr == nil && control.handoff != nil {
+				dispatchErr = s.dispatcher.DispatchHandoff(ctx, control.trusted, *control.handoff)
+			}
+			s.durableSlots <- struct{}{}
+			if err := s.enqueueCompletion(ctx, DurableEffectCompletedInput{
+				Sequence: control.sequence, Kind: control.kind, Err: dispatchErr,
+			}); err != nil {
+				return err
+			}
+			if dispatchErr != nil {
+				return nil
+			}
+		}
+	}
+}
+
+func (s *runState) presentationSafetyLoop(ctx context.Context) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case work := <-s.safetyWork:
+			visual := safety.EvaluateOrSuppress(ctx, s.cfg.SafetyPolicy, work.request.Visual)
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			var speech safety.Decision
+			if work.request.Speech != nil {
+				speech = safety.EvaluateOrSuppress(ctx, s.cfg.SafetyPolicy, *work.request.Speech)
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+			}
+			if err := s.enqueueCompletionMessage(ctx, reactorMessage{
+				input: HandoffSafetyCompletedInput{Sequence: work.sequence, Visual: visual, Speech: speech},
+				done:  work.done, acceptanceChecked: work.acceptanceChecked, acceptanceGeneration: work.acceptanceGeneration,
+			}); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 func (s *runState) enqueueClientControl(control clientControl) error {
@@ -3145,6 +3786,13 @@ func (s *runState) enqueueClientControl(control clientControl) error {
 	}
 }
 
+func (s *runState) enqueueClientEffectCompletion(ctx context.Context, control clientControl, effectErr error) error {
+	if control.completionSequence == 0 {
+		return nil
+	}
+	return s.enqueueCompletion(ctx, ClientEffectCompletedInput{Sequence: control.completionSequence, Err: effectErr})
+}
+
 func (s *runState) clientWriter(ctx context.Context) error {
 	defer s.closeClient(1000, "session ended")
 	var pendingControl *clientControl
@@ -3157,22 +3805,29 @@ func (s *runState) clientWriter(ctx context.Context) error {
 			nextOrder++
 			if control.event != nil {
 				if control.epoch != 0 && (control.incarnation != s.ids.Incarnation || !s.fence.Accept(control.epoch)) {
-					if control.written != nil {
-						control.written <- nil
-					}
 					s.releaseClientSlot()
+					if err := s.enqueueClientEffectCompletion(ctx, control, nil); err != nil {
+						return err
+					}
 					continue
 				}
 				writeCtx := ctx
 				if control.writeCtx != nil {
 					writeCtx = control.writeCtx
 				}
-				if err := writeCtx.Err(); err != nil {
-					if control.written != nil {
-						control.written <- err
-					}
+				if err := control.afterVoice.wait(writeCtx); err != nil {
 					s.releaseClientSlot()
-					return err
+					if completionErr := s.enqueueClientEffectCompletion(ctx, control, err); completionErr != nil {
+						return completionErr
+					}
+					return nil
+				}
+				if err := writeCtx.Err(); err != nil {
+					s.releaseClientSlot()
+					if completionErr := s.enqueueClientEffectCompletion(ctx, control, err); completionErr != nil {
+						return completionErr
+					}
+					return nil
 				}
 				finish := func() {}
 				if control.epoch != 0 {
@@ -3180,33 +3835,48 @@ func (s *runState) clientWriter(ctx context.Context) error {
 				}
 				if control.epoch != 0 && (control.incarnation != s.ids.Incarnation || !s.fence.Accept(control.epoch)) {
 					finish()
-					if control.written != nil {
-						control.written <- nil
-					}
 					s.releaseClientSlot()
+					if err := s.enqueueClientEffectCompletion(ctx, control, nil); err != nil {
+						return err
+					}
 					continue
 				}
 				if (strings.HasPrefix(control.event.EventType(), "live.handoff.") || s.shadowHandoffEpoch(control.epoch)) && s.cfg.FeatureGates != nil && s.cfg.FeatureGates.Enabled(feature.ShadowMode) {
 					finish()
-					if control.written != nil {
-						control.written <- nil
-					}
 					s.releaseClientSlot()
+					if err := s.enqueueClientEffectCompletion(ctx, control, nil); err != nil {
+						return err
+					}
 					continue
+				}
+				// A client may send its first audio as soon as this write is
+				// observable. Publish the provider-confirmed mode first so that
+				// clientReader cannot reject that causally later audio.
+				if control.inputTurnModeBoundary != realtime.InputTurnModeUnspecified {
+					s.boundaryMu.Lock()
+					s.boundary.InputTurnMode = control.inputTurnModeBoundary
+					s.boundaryMu.Unlock()
 				}
 				err := s.client.Write(writeCtx, control.event)
 				finish()
-				if control.written != nil {
-					control.written <- err
-				}
 				if err != nil {
+					s.releaseClientSlot()
 					if errors.Is(err, context.Canceled) && control.epoch != 0 && !s.fence.Accept(control.epoch) {
-						s.releaseClientSlot()
+						if completionErr := s.enqueueClientEffectCompletion(ctx, control, nil); completionErr != nil {
+							return completionErr
+						}
 						continue
 					}
-					s.releaseClientSlot()
+					if completionErr := s.enqueueClientEffectCompletion(ctx, control, err); completionErr != nil {
+						return completionErr
+					}
+					return nil
+				}
+				s.releaseClientSlot()
+				if err := s.enqueueClientEffectCompletion(ctx, control, nil); err != nil {
 					return err
 				}
+				continue
 			}
 			if control.close != nil {
 				s.graceful.Store(true)

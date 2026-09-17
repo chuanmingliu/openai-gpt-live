@@ -8,7 +8,10 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"unicode"
 	"unicode/utf8"
+
+	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 )
 
 const pcmFrameBytes = 960
@@ -41,6 +44,8 @@ func DecodeClient(raw []byte, limits Limits) (ClientEvent, error) {
 		target = &ResponseCancelEvent{}
 	case "live.tool.approval.resolve":
 		target = &LiveToolApprovalResolveEvent{}
+	case "live.tool_policy.update":
+		target = &LiveToolPolicyUpdateEvent{}
 	default:
 		return nil, fmt.Errorf("unsupported client event type %q", eventType)
 	}
@@ -51,6 +56,11 @@ func DecodeClient(raw []byte, limits Limits) (ClientEvent, error) {
 	event := reflect.ValueOf(target).Elem().Interface().(ClientEvent)
 	if err := validateClient(event, raw, limits); err != nil {
 		return nil, err
+	}
+	if typed, ok := event.(LiveToolPolicyUpdateEvent); ok {
+		fields, _ := rawObject(raw)
+		typed.Tools, _ = decodeCanonicalToolPolicy(fields, toolpolicy.DefaultCatalog())
+		event = typed
 	}
 	return event, nil
 }
@@ -71,6 +81,8 @@ func DecodeServer(raw []byte, limits Limits) (ServerEvent, error) {
 		target = &SessionUpdatedEvent{}
 	case "error":
 		target = &ErrorEvent{}
+	case "input_audio_buffer.committed":
+		target = &InputAudioBufferCommittedEvent{}
 	case "input_audio_buffer.speech_started":
 		target = &InputAudioBufferSpeechStartedEvent{}
 	case "input_audio_buffer.speech_stopped":
@@ -111,6 +123,10 @@ func DecodeServer(raw []byte, limits Limits) (ServerEvent, error) {
 		target = &LiveSessionResumedEvent{}
 	case "live.tool.approval.required":
 		target = &LiveToolApprovalRequiredEvent{}
+	case "live.tool_policy.updated":
+		target = &LiveToolPolicyUpdatedEvent{}
+	case "live.profile.selected":
+		target = &LiveProfileSelectedEvent{}
 	default:
 		return nil, fmt.Errorf("unsupported server event type %q", eventType)
 	}
@@ -121,6 +137,11 @@ func DecodeServer(raw []byte, limits Limits) (ServerEvent, error) {
 	event := reflect.ValueOf(target).Elem().Interface().(ServerEvent)
 	if err := validateServer(event, raw, limits); err != nil {
 		return nil, err
+	}
+	if typed, ok := event.(LiveToolPolicyUpdatedEvent); ok {
+		fields, _ := rawObject(raw)
+		typed.Tools, _ = decodeCanonicalToolPolicy(fields, toolpolicy.DefaultCatalog())
+		event = typed
 	}
 	return event, nil
 }
@@ -263,6 +284,15 @@ func validateClient(event ClientEvent, raw []byte, limits Limits) error {
 			return err
 		}
 		return requireBoundedString(fields, "idempotency_key", 256, true)
+	case LiveToolPolicyUpdateEvent:
+		if err := exactFields(fields, "type", "event_id", "tools"); err != nil {
+			return err
+		}
+		if err := requirePrintableASCIIString(fields, "event_id", 128); err != nil {
+			return err
+		}
+		_, err := decodeCanonicalToolPolicy(fields, toolpolicy.DefaultCatalog())
+		return err
 	default:
 		return fmt.Errorf("unsupported client event %T", event)
 	}
@@ -404,6 +434,18 @@ func validateServer(event ServerEvent, raw []byte, limits Limits) error {
 			return err
 		}
 		return requireString(errorFields, "message", true)
+	case InputAudioBufferCommittedEvent:
+		if err := requireString(fields, "item_id", true); err != nil {
+			return err
+		}
+		previous, ok := fields["previous_item_id"]
+		if !ok {
+			return errors.New("previous_item_id is required")
+		}
+		if bytes.Equal(bytes.TrimSpace(previous), []byte("null")) {
+			return nil
+		}
+		return requireString(fields, "previous_item_id", true)
 	case InputAudioBufferSpeechStartedEvent:
 		if err := requireString(fields, "item_id", true); err != nil {
 			return err
@@ -498,9 +540,57 @@ func validateServer(event ServerEvent, raw []byte, limits Limits) error {
 			return errors.New("approval risk class is invalid")
 		}
 		return nil
+	case LiveToolPolicyUpdatedEvent:
+		if err := exactFields(fields, "type", "event_id", "tools", "model"); err != nil {
+			return err
+		}
+		if err := requirePrintableASCIIString(fields, "event_id", 128); err != nil {
+			return err
+		}
+		if err := requireBoundedString(fields, "model", 256, true); err != nil {
+			return err
+		}
+		_, err := decodeCanonicalToolPolicy(fields, toolpolicy.DefaultCatalog())
+		return err
+	case LiveProfileSelectedEvent:
+		if err := exactFields(fields, "type", "event_id", "profile"); err != nil {
+			return err
+		}
+		if err := requirePrintableASCIIString(fields, "event_id", 128); err != nil {
+			return err
+		}
+		selected, err := requiredObject(fields, "profile")
+		if err != nil {
+			return err
+		}
+		if err := exactFields(selected, "id", "version", "snapshot_hash"); err != nil {
+			return err
+		}
+		if err := requireProfileIdentifier(selected, "id", 256); err != nil {
+			return err
+		}
+		if err := requirePositiveUint64(selected, "version"); err != nil || typed.Profile.Version == 0 {
+			return errors.New("profile version is invalid")
+		}
+		if err := requireString(selected, "snapshot_hash", true); err != nil || !isLowerHexHash(typed.Profile.SnapshotHash) {
+			return errors.New("profile snapshot hash is invalid")
+		}
+		return nil
 	default:
 		return fmt.Errorf("unsupported server event %T", event)
 	}
+}
+
+func isLowerHexHash(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, character := range value {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func rawObject(raw []byte) (map[string]json.RawMessage, error) {
@@ -553,6 +643,46 @@ func requireBoundedString(fields map[string]json.RawMessage, name string, limit 
 	return nil
 }
 
+func requirePrintableASCIIString(fields map[string]json.RawMessage, name string, limit int) error {
+	if err := requireBoundedString(fields, name, limit, true); err != nil {
+		return err
+	}
+	var value string
+	_ = json.Unmarshal(fields[name], &value)
+	for _, character := range value {
+		if character < 0x20 || character > 0x7e {
+			return fmt.Errorf("%s must contain only printable ASCII", name)
+		}
+	}
+	return nil
+}
+
+func requireProfileIdentifier(fields map[string]json.RawMessage, name string, limit int) error {
+	if err := requireBoundedString(fields, name, limit, true); err != nil {
+		return err
+	}
+	var value string
+	_ = json.Unmarshal(fields[name], &value)
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return fmt.Errorf("%s contains a control character", name)
+		}
+	}
+	return nil
+}
+
+func decodeCanonicalToolPolicy(fields map[string]json.RawMessage, catalog toolpolicy.Catalog) (toolpolicy.Policy, error) {
+	raw, ok := fields["tools"]
+	if !ok {
+		return toolpolicy.Policy{}, errors.New("tools is required")
+	}
+	policy, err := toolpolicy.Decode(raw)
+	if err != nil {
+		return toolpolicy.Policy{}, err
+	}
+	return toolpolicy.Canonicalize(policy, catalog)
+}
+
 func exactFields(fields map[string]json.RawMessage, names ...string) error {
 	if len(fields) != len(names) {
 		return errors.New("event fields are invalid")
@@ -576,6 +706,18 @@ func requireNonNegativeInt(fields map[string]json.RawMessage, name string) error
 	}
 	if value < 0 {
 		return fmt.Errorf("%s must not be negative", name)
+	}
+	return nil
+}
+
+func requirePositiveUint64(fields map[string]json.RawMessage, name string) error {
+	raw, ok := fields[name]
+	if !ok {
+		return fmt.Errorf("%s is required", name)
+	}
+	var value uint64
+	if err := json.Unmarshal(raw, &value); err != nil || value == 0 {
+		return fmt.Errorf("%s must be a positive uint64", name)
 	}
 	return nil
 }

@@ -3,12 +3,42 @@ package protocol
 import (
 	"encoding/json"
 	"time"
+
+	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 )
 
 type ServerEvent interface {
 	EventType() string
 	isServerEvent()
 }
+
+// SelectedProfile is the safe public identity of the immutable profile bound
+// to a live session. Prompt sources, rendered content, tools, and engine
+// implementation details are intentionally excluded from the wire contract.
+type SelectedProfile struct {
+	ID           string `json:"id"`
+	Version      uint64 `json:"version"`
+	SnapshotHash string `json:"snapshot_hash"`
+}
+
+type LiveProfileSelectedEvent struct {
+	Type    string          `json:"type"`
+	EventID string          `json:"event_id"`
+	Profile SelectedProfile `json:"profile"`
+}
+
+func (e LiveProfileSelectedEvent) EventType() string { return e.Type }
+func (LiveProfileSelectedEvent) isServerEvent()      {}
+
+type LiveToolPolicyUpdatedEvent struct {
+	Type    string            `json:"type"`
+	EventID string            `json:"event_id"`
+	Tools   toolpolicy.Policy `json:"tools"`
+	Model   string            `json:"model"`
+}
+
+func (e LiveToolPolicyUpdatedEvent) EventType() string { return e.Type }
+func (LiveToolPolicyUpdatedEvent) isServerEvent()      {}
 
 type SessionCreatedEvent struct {
 	Type      string             `json:"type"`
@@ -67,6 +97,16 @@ type ErrorEvent struct {
 
 func (e ErrorEvent) EventType() string { return e.Type }
 func (ErrorEvent) isServerEvent()      {}
+
+type InputAudioBufferCommittedEvent struct {
+	Type           string  `json:"type"`
+	EventID        string  `json:"event_id,omitempty"`
+	PreviousItemID *string `json:"previous_item_id"`
+	ItemID         string  `json:"item_id"`
+}
+
+func (e InputAudioBufferCommittedEvent) EventType() string { return e.Type }
+func (InputAudioBufferCommittedEvent) isServerEvent()      {}
 
 type InputAudioBufferSpeechStartedEvent struct {
 	Type         string `json:"type"`

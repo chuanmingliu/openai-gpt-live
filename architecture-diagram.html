@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GPT Live Go — System Architecture</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'JetBrains Mono', monospace;
+      background: #020617;
+      min-height: 100vh;
+      padding: 2rem;
+      color: white;
+    }
+    .container { max-width: 1240px; margin: 0 auto; }
+    .header { margin-bottom: 2rem; }
+    .header-row { display: flex; align-items: center; gap: 1rem; margin-bottom: 0.5rem; }
+    .pulse-dot {
+      width: 12px; height: 12px; background: #22d3ee; border-radius: 50%;
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+    h1 { font-size: 1.5rem; font-weight: 700; letter-spacing: -0.025em; }
+    .subtitle { color: #94a3b8; font-size: 0.875rem; margin-left: 1.75rem; }
+    .diagram-container {
+      background: rgba(15, 23, 42, 0.5);
+      border-radius: 1rem;
+      border: 1px solid #1e293b;
+      padding: 1.5rem;
+      overflow-x: auto;
+    }
+    svg { width: 100%; min-width: 900px; display: block; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; margin-top: 2rem; }
+    .card {
+      background: rgba(15, 23, 42, 0.5);
+      border-radius: 0.75rem;
+      border: 1px solid #1e293b;
+      padding: 1.25rem;
+    }
+    .card-header { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.75rem; }
+    .card-dot { width: 8px; height: 8px; border-radius: 50%; }
+    .card-dot.emerald { background: #34d399; }
+    .card-dot.violet { background: #a78bfa; }
+    .card-dot.rose { background: #fb7185; }
+    .card h3 { font-size: 0.875rem; font-weight: 600; }
+    .card ul { list-style: none; color: #94a3b8; font-size: 0.75rem; }
+    .card li { margin-bottom: 0.375rem; }
+    .footer { text-align: center; margin-top: 1.5rem; color: #475569; font-size: 0.75rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div class="header-row">
+        <div class="pulse-dot"></div>
+        <h1>GPT Live Go — System Architecture</h1>
+      </div>
+      <p class="subtitle">Realtime speech-to-speech + durable asynchronous reasoning · clients touch only live-gateway</p>
+    </div>
+
+    <div class="diagram-container">
+      <svg viewBox="0 0 1440 900">
+        <defs>
+          <marker id="a-cyan" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#22d3ee"/></marker>
+          <marker id="a-emerald" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#34d399"/></marker>
+          <marker id="a-violet" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#a78bfa"/></marker>
+          <marker id="a-amber" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#fbbf24"/></marker>
+          <marker id="a-rose" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#fb7185"/></marker>
+          <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+            <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e293b" stroke-width="0.5"/>
+          </pattern>
+        </defs>
+
+        <rect width="1440" height="900" fill="#020617"/>
+        <rect width="1440" height="900" fill="url(#grid)"/>
+
+        <rect x="230" y="36" width="920" height="720" rx="12" fill="rgba(251,191,36,0.04)" stroke="#fbbf24" stroke-width="1" stroke-dasharray="8,4"/>
+        <text x="242" y="56" fill="#fbbf24" font-size="10" font-weight="600">Kubernetes cluster · namespace gpt-live</text>
+
+        <!-- ================= ARROWS ================= -->
+        <line x1="190" y1="206" x2="248" y2="276" stroke="#22d3ee" stroke-width="1.5" marker-end="url(#a-cyan)"/>
+        <text x="200" y="228" fill="#22d3ee" font-size="8">WSS /v1/realtime</text>
+        <line x1="190" y1="336" x2="248" y2="302" stroke="#22d3ee" stroke-width="1.5" marker-end="url(#a-cyan)"/>
+        <text x="200" y="312" fill="#22d3ee" font-size="8">Bearer injected</text>
+        <line x1="190" y1="462" x2="248" y2="356" stroke="#fb7185" stroke-width="1.5" stroke-dasharray="5,5" marker-end="url(#a-rose)"/>
+        <text x="200" y="422" fill="#fb7185" font-size="8">OIDC discovery</text>
+        <line x1="370" y1="142" x2="370" y2="208" stroke="#fbbf24" stroke-width="1.5" marker-end="url(#a-amber)"/>
+        <text x="378" y="180" fill="#94a3b8" font-size="8">route</text>
+        <line x1="610" y1="142" x2="520" y2="208" stroke="#fb7185" stroke-width="1" stroke-dasharray="4,4"/>
+        <text x="520" y="182" fill="#fb7185" font-size="8">loopback</text>
+
+        <path d="M610,240 L610,168 L1170,168 L1170,198" fill="none" stroke="#34d399" stroke-width="1.5" marker-end="url(#a-emerald)"/>
+        <text x="840" y="161" fill="#34d399" font-size="8" text-anchor="middle">Realtime WS · model= · Bearer</text>
+
+        <path d="M1040,360 L1166,360 L1166,456" fill="none" stroke="#34d399" stroke-width="1.5" marker-end="url(#a-emerald)"/>
+        <text x="1100" y="352" fill="#34d399" font-size="8" text-anchor="middle">SSE · Bearer</text>
+
+        <line x1="430" y1="410" x2="560" y2="498" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#a-violet)"/>
+        <text x="480" y="456" fill="#a78bfa" font-size="8">durable writes · cursors</text>
+        <line x1="850" y1="410" x2="700" y2="498" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#a-violet)"/>
+        <text x="760" y="456" fill="#a78bfa" font-size="8">LeaseNext · Heartbeat</text>
+        <line x1="850" y1="545" x2="772" y2="545" stroke="#fbbf24" stroke-width="1.5" marker-end="url(#a-amber)"/>
+        <text x="804" y="538" fill="#fbbf24" font-size="8">DDL</text>
+
+        <line x1="620" y1="500" x2="620" y2="478" stroke="#a78bfa" stroke-width="1" stroke-dasharray="3,3"/>
+        <line x1="620" y1="478" x2="850" y2="478" stroke="#a78bfa" stroke-width="1" stroke-dasharray="3,3"/>
+        <line x1="850" y1="478" x2="850" y2="410" stroke="#a78bfa" stroke-width="1" stroke-dasharray="3,3" marker-end="url(#a-violet)"/>
+
+        <!-- ================= EXTERNAL LEFT ================= -->
+        <rect x="20" y="170" width="170" height="72" rx="6" fill="#0f172a"/>
+        <rect x="20" y="170" width="170" height="72" rx="6" fill="rgba(8,51,68,0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+        <text x="105" y="196" fill="white" font-size="11" font-weight="600" text-anchor="middle">Native client</text>
+        <text x="105" y="214" fill="#94a3b8" font-size="9" text-anchor="middle">WS + Bearer header</text>
+        <text x="105" y="230" fill="#94a3b8" font-size="8" text-anchor="middle">?model=&amp;reconnect</text>
+
+        <rect x="20" y="300" width="170" height="72" rx="6" fill="#0f172a"/>
+        <rect x="20" y="300" width="170" height="72" rx="6" fill="rgba(8,51,68,0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+        <text x="105" y="326" fill="white" font-size="11" font-weight="600" text-anchor="middle">Browser + BFF</text>
+        <text x="105" y="344" fill="#94a3b8" font-size="9" text-anchor="middle">operator WS proxy</text>
+        <text x="105" y="360" fill="#94a3b8" font-size="8" text-anchor="middle">injects OIDC bearer</text>
+
+        <rect x="20" y="430" width="170" height="64" rx="6" fill="#0f172a"/>
+        <rect x="20" y="430" width="170" height="64" rx="6" fill="rgba(136,19,55,0.4)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="105" y="456" fill="white" font-size="11" font-weight="600" text-anchor="middle">OIDC issuer</text>
+        <text x="105" y="474" fill="#94a3b8" font-size="9" text-anchor="middle">identity (prod)</text>
+
+        <!-- ================= CLUSTER TOP ================= -->
+        <rect x="280" y="84" width="180" height="58" rx="6" fill="#0f172a"/>
+        <rect x="280" y="84" width="180" height="58" rx="6" fill="rgba(120,53,15,0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="370" y="108" fill="white" font-size="11" font-weight="600" text-anchor="middle">Ingress (nginx)</text>
+        <text x="370" y="126" fill="#94a3b8" font-size="9" text-anchor="middle">TLS · trusted proxy</text>
+
+        <rect x="520" y="84" width="180" height="58" rx="6" fill="#0f172a"/>
+        <rect x="520" y="84" width="180" height="58" rx="6" fill="rgba(136,19,55,0.4)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="610" y="108" fill="white" font-size="11" font-weight="600" text-anchor="middle">Admin / health / metrics</text>
+        <text x="610" y="126" fill="#94a3b8" font-size="8" text-anchor="middle">gw :9090 · w :9091 · loopback</text>
+
+        <!-- ================= GATEWAY ================= -->
+        <rect x="250" y="210" width="360" height="200" rx="8" fill="#0f172a"/>
+        <rect x="250" y="210" width="360" height="200" rx="8" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="430" y="232" fill="white" font-size="13" font-weight="700" text-anchor="middle">live-gateway</text>
+
+        <rect x="266" y="248" width="162" height="66" rx="6" fill="#0f172a"/>
+        <rect x="266" y="248" width="162" height="66" rx="6" fill="rgba(136,19,55,0.4)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="347" y="272" fill="white" font-size="10" font-weight="600" text-anchor="middle">Auth / Admission</text>
+        <text x="347" y="289" fill="#94a3b8" font-size="8" text-anchor="middle">origin · quota · OIDC</text>
+
+        <rect x="432" y="248" width="162" height="66" rx="6" fill="#0f172a"/>
+        <rect x="432" y="248" width="162" height="66" rx="6" fill="rgba(30,41,59,0.5)" stroke="#94a3b8" stroke-width="1.5"/>
+        <text x="513" y="272" fill="white" font-size="10" font-weight="600" text-anchor="middle">Session Reactor</text>
+        <text x="513" y="289" fill="#94a3b8" font-size="8" text-anchor="middle">epoch fence · barge-in</text>
+
+        <rect x="266" y="326" width="162" height="66" rx="6" fill="#0f172a"/>
+        <rect x="266" y="326" width="162" height="66" rx="6" fill="rgba(30,41,59,0.5)" stroke="#94a3b8" stroke-width="1.5"/>
+        <text x="347" y="350" fill="white" font-size="10" font-weight="600" text-anchor="middle">S2S Connector</text>
+        <text x="347" y="367" fill="#94a3b8" font-size="8" text-anchor="middle">realtime/s2sws</text>
+
+        <rect x="432" y="326" width="162" height="66" rx="6" fill="#0f172a"/>
+        <rect x="432" y="326" width="162" height="66" rx="6" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="513" y="350" fill="white" font-size="10" font-weight="600" text-anchor="middle">Handoff Coord.</text>
+        <text x="513" y="367" fill="#94a3b8" font-size="8" text-anchor="middle">reserved tools</text>
+
+        <!-- ================= WORKER ================= -->
+        <rect x="680" y="210" width="360" height="200" rx="8" fill="#0f172a"/>
+        <rect x="680" y="210" width="360" height="200" rx="8" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="860" y="232" fill="white" font-size="13" font-weight="700" text-anchor="middle">live-worker</text>
+
+        <rect x="696" y="248" width="162" height="66" rx="6" fill="#0f172a"/>
+        <rect x="696" y="248" width="162" height="66" rx="6" fill="rgba(30,41,59,0.5)" stroke="#94a3b8" stroke-width="1.5"/>
+        <text x="777" y="272" fill="white" font-size="10" font-weight="600" text-anchor="middle">Lease / Retry</text>
+        <text x="777" y="289" fill="#94a3b8" font-size="8" text-anchor="middle">heartbeat · jitter</text>
+
+        <rect x="862" y="248" width="162" height="66" rx="6" fill="#0f172a"/>
+        <rect x="862" y="248" width="162" height="66" rx="6" fill="rgba(30,41,59,0.5)" stroke="#94a3b8" stroke-width="1.5"/>
+        <text x="943" y="272" fill="white" font-size="10" font-weight="600" text-anchor="middle">DeepSeek Adapter</text>
+        <text x="943" y="289" fill="#94a3b8" font-size="8" text-anchor="middle">reasoner/deepseek SSE</text>
+
+        <rect x="696" y="326" width="162" height="66" rx="6" fill="#0f172a"/>
+        <rect x="696" y="326" width="162" height="66" rx="6" fill="rgba(136,19,55,0.4)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="777" y="350" fill="white" font-size="10" font-weight="600" text-anchor="middle">Safety / Approvals</text>
+        <text x="777" y="367" fill="#94a3b8" font-size="8" text-anchor="middle">redact · approve</text>
+
+        <rect x="862" y="326" width="162" height="66" rx="6" fill="#0f172a"/>
+        <rect x="862" y="326" width="162" height="66" rx="6" fill="rgba(30,41,59,0.5)" stroke="#94a3b8" stroke-width="1.5"/>
+        <text x="943" y="350" fill="white" font-size="10" font-weight="600" text-anchor="middle">Tool Registry</text>
+        <text x="943" y="367" fill="#94a3b8" font-size="8" text-anchor="middle">empty by default</text>
+
+        <!-- ================= POSTGRES + MIGRATE ================= -->
+        <rect x="470" y="500" width="300" height="104" rx="6" fill="#0f172a"/>
+        <rect x="470" y="500" width="300" height="104" rx="6" fill="rgba(76,29,149,0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="620" y="526" fill="white" font-size="12" font-weight="700" text-anchor="middle">PostgreSQL 16</text>
+        <text x="620" y="546" fill="#94a3b8" font-size="9" text-anchor="middle">conversations · handoffs · leases</text>
+        <text x="620" y="562" fill="#94a3b8" font-size="9" text-anchor="middle">outbox · cursors · features</text>
+        <text x="620" y="578" fill="#94a3b8" font-size="9" text-anchor="middle">reconnect owners · retention</text>
+
+        <rect x="850" y="510" width="170" height="76" rx="6" fill="#0f172a"/>
+        <rect x="850" y="510" width="170" height="76" rx="6" fill="rgba(120,53,15,0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="935" y="534" fill="white" font-size="11" font-weight="600" text-anchor="middle">live-migrate (Job)</text>
+        <text x="935" y="552" fill="#94a3b8" font-size="8" text-anchor="middle">migrations 1-7</text>
+        <text x="935" y="568" fill="#94a3b8" font-size="8" text-anchor="middle">embedded · one-shot</text>
+
+        <text x="490" y="644" fill="#a78bfa" font-size="8">LISTEN/NOTIFY = wake-up only</text>
+        <text x="490" y="660" fill="#a78bfa" font-size="8">durable polling repairs misses</text>
+
+        <rect x="850" y="620" width="250" height="60" rx="6" fill="#0f172a"/>
+        <rect x="850" y="620" width="250" height="60" rx="6" fill="rgba(251,146,60,0.3)" stroke="#fb923c" stroke-width="1.5"/>
+        <text x="975" y="644" fill="white" font-size="10" font-weight="600" text-anchor="middle">egress proxy TCP/3128</text>
+        <text x="975" y="662" fill="#94a3b8" font-size="8" text-anchor="middle">external provider traffic</text>
+
+        <!-- ================= EXTERNAL RIGHT ================= -->
+        <rect x="1170" y="200" width="200" height="72" rx="6" fill="#0f172a"/>
+        <rect x="1170" y="200" width="200" height="72" rx="6" fill="rgba(30,41,59,0.5)" stroke="#94a3b8" stroke-width="1.5"/>
+        <text x="1270" y="226" fill="white" font-size="11" font-weight="600" text-anchor="middle">Speech-to-speech</text>
+        <text x="1270" y="244" fill="#94a3b8" font-size="9" text-anchor="middle">Realtime WebSocket</text>
+        <text x="1270" y="260" fill="#94a3b8" font-size="8" text-anchor="middle">wss:// · 24kHz PCM16LE</text>
+
+        <rect x="1170" y="420" width="200" height="72" rx="6" fill="#0f172a"/>
+        <rect x="1170" y="420" width="200" height="72" rx="6" fill="rgba(30,41,59,0.5)" stroke="#94a3b8" stroke-width="1.5"/>
+        <text x="1270" y="446" fill="white" font-size="11" font-weight="600" text-anchor="middle">DeepSeek-compatible</text>
+        <text x="1270" y="464" fill="#94a3b8" font-size="9" text-anchor="middle">SSE Chat Completions</text>
+        <text x="1270" y="480" fill="#94a3b8" font-size="8" text-anchor="middle">/chat/completions</text>
+
+        <!-- ================= LEGEND ================= -->
+        <text x="40" y="790" fill="white" font-size="10" font-weight="600">Legend</text>
+
+        <rect x="40" y="800" width="16" height="10" rx="2" fill="rgba(8,51,68,0.4)" stroke="#22d3ee" stroke-width="1"/>
+        <text x="64" y="808" fill="#94a3b8" font-size="8">Client / frontend</text>
+        <rect x="40" y="820" width="16" height="10" rx="2" fill="rgba(6,78,59,0.4)" stroke="#34d399" stroke-width="1"/>
+        <text x="64" y="828" fill="#94a3b8" font-size="8">Backend service</text>
+        <rect x="40" y="840" width="16" height="10" rx="2" fill="rgba(76,29,149,0.4)" stroke="#a78bfa" stroke-width="1"/>
+        <text x="64" y="848" fill="#94a3b8" font-size="8">Database / durable state</text>
+        <rect x="40" y="860" width="16" height="10" rx="2" fill="rgba(136,19,55,0.4)" stroke="#fb7185" stroke-width="1"/>
+        <text x="64" y="868" fill="#94a3b8" font-size="8">Security / auth boundary</text>
+
+        <rect x="360" y="800" width="16" height="10" rx="2" fill="rgba(30,41,59,0.5)" stroke="#94a3b8" stroke-width="1"/>
+        <text x="384" y="808" fill="#94a3b8" font-size="8">External provider</text>
+        <rect x="360" y="820" width="16" height="10" rx="2" fill="rgba(251,146,60,0.3)" stroke="#fb923c" stroke-width="1"/>
+        <text x="384" y="828" fill="#94a3b8" font-size="8">Message bus / egress</text>
+        <line x1="360" y1="845" x2="376" y2="845" stroke="#fb7185" stroke-width="1" stroke-dasharray="3,3"/>
+        <text x="384" y="848" fill="#94a3b8" font-size="8">Auth / loopback flow</text>
+        <rect x="360" y="854" width="16" height="10" rx="2" fill="transparent" stroke="#fbbf24" stroke-width="1" stroke-dasharray="3,3"/>
+        <text x="384" y="862" fill="#94a3b8" font-size="8">Kubernetes boundary</text>
+      </svg>
+    </div>
+
+    <div class="cards">
+      <div class="card">
+        <div class="card-header"><div class="card-dot emerald"></div><h3>Realtime speech path</h3></div>
+        <ul>
+          <li>• Client → gateway → S2S, 24 kHz PCM16LE</li>
+          <li>• Single serialized reactor boundary</li>
+          <li>• Epoch fence + incarnation drop stale output</li>
+          <li>• Bounded ingress/egress PCM queues</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="card-header"><div class="card-dot violet"></div><h3>Durable async handoffs</h3></div>
+        <ul>
+          <li>• Reserved tools → PostgreSQL lease → worker</li>
+          <li>• CAS fencing: owner+version+revision</li>
+          <li>• Heartbeat loop + bounded full-jitter retry</li>
+          <li>• Idempotent, revision-fenced terminal writes</li>
+        </ul>
+      </div>
+      <div class="card">
+        <div class="card-header"><div class="card-dot rose"></div><h3>Deployment &amp; security</h3></div>
+        <ul>
+          <li>• OIDC-only production auth (no static bearer)</li>
+          <li>• Config-hash drift guard, fail-closed</li>
+          <li>• Default-deny NetworkPolicy, non-root images</li>
+          <li>• Loopback-only admin, redacting logger</li>
+        </ul>
+      </div>
+    </div>
+
+    <p class="footer">
+      github.com/chuanmingliu/openai-gpt-live · Go 1.26 · PostgreSQL 16 · openai-realtime-subset v1.0.0
+    </p>
+  </div>
+</body>
+</html>

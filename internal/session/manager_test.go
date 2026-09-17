@@ -18,11 +18,356 @@ import (
 	"github.com/chuanmingliu/openai-gpt-live/internal/feature"
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
 	"github.com/chuanmingliu/openai-gpt-live/internal/identity"
+	"github.com/chuanmingliu/openai-gpt-live/internal/presentation"
+	"github.com/chuanmingliu/openai-gpt-live/internal/profile"
 	"github.com/chuanmingliu/openai-gpt-live/internal/protocol"
 	"github.com/chuanmingliu/openai-gpt-live/internal/realtime"
+	"github.com/chuanmingliu/openai-gpt-live/internal/realtime/s2sws"
 	"github.com/chuanmingliu/openai-gpt-live/internal/testkit"
+	"github.com/chuanmingliu/openai-gpt-live/internal/toolpolicy"
 	"github.com/stretchr/testify/require"
 )
+
+func TestManagerPublishesOwnedSafeProfileSelection(t *testing.T) {
+	connector := testkit.NewFakeConnector(2)
+	manager := NewManager(Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second}, connector,
+		managerIDs{session: "profile-session", conversation: "profile-conversation"})
+	client := newChannelClient(4)
+	selected := profile.Builtin()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.Run(ctx, OpenRequest{Subject: Subject{TenantID: "tenant", UserID: "user", ExpiresAt: time.Now().Add(time.Hour)}, Profile: selected}, client)
+	}()
+	_, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	select {
+	case event := <-client.writes:
+		require.IsType(t, protocol.SessionCreatedEvent{}, event)
+	case runErr := <-done:
+		t.Fatalf("manager failed before profile publication: %v", runErr)
+	}
+	selectedEvent := (<-client.writes).(protocol.LiveProfileSelectedEvent)
+	require.Equal(t, "builtin", selectedEvent.Profile.ID)
+	require.Equal(t, uint64(1), selectedEvent.Profile.Version)
+	require.Equal(t, selected.Snapshot.SnapshotHash, selectedEvent.Profile.SnapshotHash)
+	selected.Snapshot.Ref.ID = "mutated"
+	manager.activeMu.RLock()
+	retained := manager.logical["profile-session"].profile.Clone()
+	manager.activeMu.RUnlock()
+	require.Equal(t, profile.ID("builtin"), retained.Snapshot.Ref.ID)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestManagerWithoutExplicitProfileDoesNotPublishSelection(t *testing.T) {
+	connector := testkit.NewFakeConnector(2)
+	manager := NewManager(Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second}, connector,
+		managerIDs{session: "profile-disabled", conversation: "profile-disabled"})
+	client := newChannelClient(4)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.Run(ctx, OpenRequest{Subject: Subject{TenantID: "tenant", UserID: "user", ExpiresAt: time.Now().Add(time.Hour)}}, client)
+	}()
+	_, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	require.IsType(t, protocol.SessionCreatedEvent{}, <-client.writes)
+	_ = waitForActiveRuntime(t, manager, "profile-disabled", 1)
+	select {
+	case event := <-client.writes:
+		t.Fatalf("disabled profile mode published unexpected event %T", event)
+	default:
+	}
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestManagerReconnectAuthorityPublishesCustomProfileSelection(t *testing.T) {
+	manual := clock.NewManual(time.Now().UTC())
+	credentials, err := NewReconnectCredentials([]byte(strings.Repeat("z", 32)), manual)
+	require.NoError(t, err)
+	connector := testkit.NewFakeConnector(2)
+	owners := NewMemoryReconnectOwners(manual)
+	manager := NewManager(Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		ReconnectCredentials: credentials, ReconnectOwners: owners, ReconnectOwnerID: "profile-owner",
+		ReconnectCredentialTTL: time.Minute, Clock: manual}, connector,
+		managerIDs{session: "custom-profile-session", conversation: "custom-profile-conversation"})
+	selected := profile.Builtin()
+	selected.Snapshot.TenantID = "tenant"
+	selected.Snapshot.Ref = profile.VersionRef{ID: "insurance", Version: 3}
+	selected.Snapshot.SnapshotHash = ""
+	selected.Snapshot.SnapshotHash, err = selected.Snapshot.Hash()
+	require.NoError(t, err)
+	client := newChannelClient(4)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.Run(ctx, OpenRequest{Subject: Subject{TenantID: "tenant", UserID: "user", ExpiresAt: manual.Now().Add(time.Hour)},
+			RequestedModel: "provider-model", Profile: selected}, client)
+	}()
+	_, err = connector.NextSession(t.Context())
+	require.NoError(t, err)
+	select {
+	case event := <-client.writes:
+		require.IsType(t, protocol.SessionCreatedEvent{}, event)
+	case runErr := <-done:
+		t.Fatalf("manager failed before custom profile publication: %v", runErr)
+	}
+	require.IsType(t, protocol.LiveProfileSelectedEvent{}, <-client.writes)
+	_ = waitForActiveRuntime(t, manager, "custom-profile-session", 1)
+	require.Eventually(t, func() bool {
+		owner, ok := owners.Read("custom-profile-session")
+		return ok && owner.State == ReconnectOwnerActive
+	}, time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestManagerReconnectRequiresExactRetainedProfileSnapshot(t *testing.T) {
+	manager := NewManager(Config{}, testkit.NewFakeConnector(1), managerIDs{})
+	selected := profile.Builtin()
+	scope := handoff.Scope{TenantID: "tenant", UserID: "user", ConversationID: "conversation"}
+	logical := &logicalSession{scope: scope, highWater: 1, turnBoundary: true, state: logicalTombstoned, profile: selected.Clone()}
+	request := ReconnectRequest{Scope: scope, SessionID: "session", LastIncarnation: 1, Profile: selected.Clone()}
+	require.NoError(t, manager.checkReconnectLocked(request, logical))
+
+	different := selected.Clone()
+	different.Snapshot.AdapterRegistryVersion = "builtin-v2"
+	different.Snapshot.SnapshotHash = ""
+	hash, err := different.Snapshot.Hash()
+	require.NoError(t, err)
+	different.Snapshot.SnapshotHash = hash
+	request.Profile = different
+	require.ErrorIs(t, manager.checkReconnectLocked(request, logical), ErrInvalidReconnectCredential)
+}
+
+func TestManagerRejectsProfileBundleWithoutImmutableSnapshot(t *testing.T) {
+	_, _, err := normalizeBoundProfile(Subject{TenantID: "tenant"}, profile.Resolved{Bundle: profile.Builtin().Bundle})
+	require.ErrorIs(t, err, profile.ErrInvalidProfile)
+	_, _, err = normalizeBoundProfile(Subject{TenantID: "tenant"}, profile.Resolved{Definition: profile.Builtin().Definition})
+	require.ErrorIs(t, err, profile.ErrInvalidProfile)
+}
+
+func TestManagerRejectsProfileSourceThatDoesNotMatchImmutableSnapshot(t *testing.T) {
+	selected := profile.Builtin()
+	selected.Bundle.Templates["system.j2"] = "mutated prompt outside snapshot authority"
+	_, _, err := normalizeBoundProfile(Subject{TenantID: "tenant"}, selected)
+	require.ErrorIs(t, err, profile.ErrInvalidProfile)
+}
+
+func withInitialManualInputTurn(cfg Config) Config {
+	cfg.InitialSession.TurnDetection = json.RawMessage(`null`)
+	return cfg
+}
+
+func withInitialProviderVADInputTurn(cfg Config) Config {
+	cfg.InitialSession.TurnDetection = json.RawMessage(`{"type":"server_vad"}`)
+	return cfg
+}
+
+func activateInitialManualInputTurn(t *testing.T, manager *Manager, sessionID identity.SessionID, incarnation identity.Incarnation, voice *testkit.FakeVoiceSession) {
+	activateInitialInputTurn(t, manager, sessionID, incarnation, voice, `null`, realtime.InputTurnModeManual)
+}
+
+func activateInitialProviderVADInputTurn(t *testing.T, manager *Manager, sessionID identity.SessionID, incarnation identity.Incarnation, voice *testkit.FakeVoiceSession) {
+	activateInitialInputTurn(t, manager, sessionID, incarnation, voice, `{"type":"server_vad"}`, realtime.InputTurnModeProviderVAD)
+}
+
+func activateInitialInputTurn(
+	t *testing.T,
+	manager *Manager,
+	sessionID identity.SessionID,
+	incarnation identity.Incarnation,
+	voice *testkit.FakeVoiceSession,
+	turnDetection string,
+	mode realtime.InputTurnMode,
+) {
+	t.Helper()
+	command, err := voice.NextCommand(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, realtime.CommandSessionUpdate, command.Kind)
+	require.JSONEq(t, turnDetection, string(command.Session.TurnDetection))
+	require.NoError(t, voice.Emit(t.Context(), realtime.Event{
+		Kind:                         realtime.EventSessionUpdated,
+		ProviderEventID:              "initial-input-turn-mode-confirmed",
+		InputTurnMode:                mode,
+		InputTurnModeSpecified:       true,
+		SessionUpdateAcknowledgement: true,
+	}))
+	require.Eventually(t, func() bool {
+		manager.activeMu.RLock()
+		runtime := manager.active[runtimeKey{sessionID: sessionID, incarnation: incarnation}]
+		manager.activeMu.RUnlock()
+		if runtime == nil || runtime.state == nil {
+			return false
+		}
+		return runtime.state.currentInputTurnMode() == mode
+	}, time.Second, time.Millisecond)
+}
+
+func TestManagerInitialSessionAckCannotConsumePendingBrowserMode(t *testing.T) {
+	connector := testkit.NewFakeConnector(8)
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second,
+		EgressBlockTimeout:  time.Second,
+		InitialSession: realtime.SessionConfig{
+			Instructions: "manager bootstrap",
+		},
+	}, connector, managerIDs{session: "initial-ack-race", conversation: "initial-ack-race"})
+	client := newChannelClient(16)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.Run(ctx, OpenRequest{Subject: Subject{
+			TenantID: "tenant", UserID: "user", ExpiresAt: time.Now().Add(time.Hour),
+		}}, client)
+	}()
+
+	voice, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	initial, err := voice.NextCommand(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, realtime.CommandSessionUpdate, initial.Kind)
+	require.Zero(t, initial.Sequence)
+	require.Equal(t, "session.created", (<-client.writes).EventType())
+	runtime := waitForActiveRuntime(t, manager, "initial-ack-race", 1)
+
+	require.NoError(t, manager.Submit(t.Context(), "initial-ack-race", 1, ClientInput{
+		Event: inputTurnSessionUpdate(json.RawMessage(`null`)),
+	}))
+	browser, err := voice.NextCommand(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, realtime.CommandSessionUpdate, browser.Kind)
+	require.NotZero(t, browser.Sequence)
+
+	require.NoError(t, voice.Emit(t.Context(), realtime.Event{
+		Kind: realtime.EventSessionUpdated, ProviderEventID: "manager-initial-ack",
+		InputTurnMode: realtime.InputTurnModeManual, InputTurnModeSpecified: true,
+		SessionUpdateAcknowledgement: true,
+		SessionUpdateSequence:        0,
+	}))
+	require.NoError(t, voice.Emit(t.Context(), realtime.Event{
+		Kind: realtime.EventError, ProviderEventID: "initial-ack-barrier", Reason: "barrier",
+	}))
+	for {
+		event := <-client.writes
+		require.NotEqual(t, "session.updated", event.EventType(), "sequence-zero manager ack stole the browser pending update")
+		if event.EventType() == "error" {
+			break
+		}
+	}
+	require.Equal(t, realtime.InputTurnModeUnspecified, runtime.state.currentInputTurnMode())
+
+	require.NoError(t, voice.Emit(t.Context(), realtime.Event{
+		Kind: realtime.EventSessionUpdated, ProviderEventID: "browser-mode-ack",
+		InputTurnMode: realtime.InputTurnModeManual, InputTurnModeSpecified: true,
+		SessionUpdateAcknowledgement: true,
+		SessionUpdateSequence:        browser.Sequence,
+	}))
+	for {
+		event := <-client.writes
+		if event.EventType() == "session.updated" {
+			break
+		}
+	}
+	require.Equal(t, realtime.InputTurnModeManual, runtime.state.currentInputTurnMode(),
+		"the input boundary must publish before session.updated is externally observable")
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestManagerAcknowledgesPolicyWithoutSendingProviderCommand(t *testing.T) {
+	catalog := toolpolicy.DefaultCatalog()
+	catalog.WebSearch.ForceStrict = true
+	dispatcher := &durableDispatcherFake{
+		trusted: make(chan TrustedSessionContext, 1), transcripts: make(chan TranscriptRequestedEffect, 1),
+		handoffs: make(chan HandoffRequestedEffect, 1),
+	}
+	connector := testkit.NewFakeConnector(4)
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		ToolCatalog: catalog, AsyncModel: "deepseek-v4-flash", DurableDispatcher: dispatcher,
+	}, connector, managerIDs{session: "policy-session", conversation: "policy-conversation"})
+	client := newChannelClient(8)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- manager.Run(ctx, OpenRequest{Subject: Subject{
+			TenantID: "tenant", UserID: "user", ExpiresAt: time.Now().Add(time.Hour),
+		}}, client)
+	}()
+	voice, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	require.IsType(t, protocol.SessionCreatedEvent{}, <-client.writes)
+
+	requested := toolpolicy.DefaultPolicy()
+	requested.WebSearch.Region = "us-en"
+	requested.WebSearch.MaxResults = 2
+	requested.WebSearch.TimeoutMS = 4_000
+	client.reads <- protocol.LiveToolPolicyUpdateEvent{Type: "live.tool_policy.update", EventID: "policy-1", Tools: requested}
+	ack := (<-client.writes).(protocol.LiveToolPolicyUpdatedEvent)
+	require.Equal(t, "policy-1", ack.EventID)
+	require.Equal(t, "deepseek-v4-flash", ack.Model)
+	require.Equal(t, toolpolicy.SafeSearchStrict, ack.Tools.WebSearch.SafeSearch)
+	require.Equal(t, "us-en", ack.Tools.WebSearch.Region)
+
+	manager.activeMu.RLock()
+	var state *runState
+	for _, runtime := range manager.active {
+		state = runtime.state
+	}
+	manager.activeMu.RUnlock()
+	require.NotNil(t, state)
+	require.NoError(t, state.dispatchEffects(t.Context(), []Effect{{Handoff: &HandoffRequestedEffect{
+		ResponseID: "response", CallID: "call", ToolName: StartBackgroundTaskTool,
+		Arguments: json.RawMessage(`{"objective":"x"}`),
+	}}}, 0, 0))
+	require.Equal(t, ack.Tools, (<-dispatcher.handoffs).ToolPolicy)
+
+	providerCtx, stop := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer stop()
+	_, err = voice.NextCommand(providerCtx)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	cancel()
+	require.ErrorIs(t, <-result, context.Canceled)
+}
+
+func TestManagerDerivesDefaultPolicyFromCatalogForHandoffs(t *testing.T) {
+	dispatcher := &durableDispatcherFake{
+		trusted: make(chan TrustedSessionContext, 1), transcripts: make(chan TranscriptRequestedEffect, 1),
+		handoffs: make(chan HandoffRequestedEffect, 1),
+	}
+	catalog := toolpolicy.DefaultCatalog()
+	catalog.WebSearch.MaximumResults = 3
+	catalog.WebSearch.MaximumTimeoutMS = 5_000
+	cfg, err := normalizeManagerConfig(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+		ToolCatalog: catalog, AsyncModel: "deepseek-v4-flash", DurableDispatcher: dispatcher,
+	})
+	require.NoError(t, err)
+	state := newRunState(cfg, testIDs(), &recordingVoice{sent: make(chan realtime.Command, 1)}, newChannelClient(1), func() {})
+	handoffEffect := HandoffRequestedEffect{
+		ResponseID: "response", CallID: "call", ToolName: StartBackgroundTaskTool,
+		Arguments: json.RawMessage(`{"objective":"x"}`),
+	}
+	require.NoError(t, state.dispatchEffects(t.Context(), []Effect{{Handoff: &handoffEffect}}, 0, 0))
+	got := <-dispatcher.handoffs
+	require.Equal(t, toolpolicy.Policy{WebSearch: toolpolicy.WebSearchPolicy{
+		Enabled: true, SafeSearch: toolpolicy.SafeSearchModerate, Region: "wt-wt", MaxResults: 3, TimeoutMS: 5_000,
+	}}, got.ToolPolicy)
+}
+
+func TestManagerOwnsToolCatalogRegionStorage(t *testing.T) {
+	catalog := toolpolicy.DefaultCatalog()
+	manager := NewManager(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second, ToolCatalog: catalog,
+	}, testkit.NewFakeConnector(1), managerIDs{})
+	require.NoError(t, manager.validationErr)
+
+	catalog.WebSearch.Regions[0] = "caller-mutated"
+	require.NotEqual(t, "caller-mutated", manager.cfg.ToolCatalog.WebSearch.Regions[0])
+}
 
 type recoveryStoreFake struct {
 	snapshot RecoverySnapshot
@@ -455,24 +800,23 @@ type failingReconnectConnector struct {
 	calls atomic.Int32
 }
 
-type blockingApprovalStore struct {
-	started chan struct{}
-	release chan struct{}
-	once    sync.Once
+type blockingApprovalDispatcher struct {
+	started   chan struct{}
+	release   chan struct{}
+	completed chan struct{}
+	once      sync.Once
+	trusted   TrustedSessionContext
+	request   ApprovalResolutionRequestedEffect
 }
 
-func (s *blockingApprovalStore) ResolveApproval(ctx context.Context, _ handoff.Scope, _ handoff.ApprovalResolution) error {
-	s.once.Do(func() { close(s.started) })
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-s.release:
-		return nil
-	}
-}
-
-func (*blockingApprovalStore) LoadApproval(context.Context, handoff.Scope, string) (handoff.ToolApproval, error) {
-	return handoff.ToolApproval{}, handoff.ErrNotFound
+func (d *blockingApprovalDispatcher) DispatchApproval(trusted TrustedSessionContext, request ApprovalResolutionRequestedEffect) error {
+	d.trusted, d.request = trusted, request
+	d.once.Do(func() { close(d.started) })
+	go func() {
+		<-d.release
+		close(d.completed)
+	}()
+	return nil
 }
 
 type contextBlockingCloseClient struct {
@@ -1133,12 +1477,12 @@ func TestManagerReconnectEpochUsesQuiescedLiveFenceHighWaterAndStaysMonotonic(t 
 	require.Error(t, <-oldDone)
 }
 
-func TestManagerReconnectWaitsForAcceptedApprovalDurableResolution(t *testing.T) {
+func TestManagerTransfersAcceptedApprovalBeyondSessionDisconnect(t *testing.T) {
 	connector := testkit.NewFakeConnector(8)
 	scope := handoff.Scope{TenantID: "tenant-approval-boundary", UserID: "user", ConversationID: "conversation-approval-boundary"}
-	approvalStore := &blockingApprovalStore{started: make(chan struct{}), release: make(chan struct{})}
+	dispatcher := &blockingApprovalDispatcher{started: make(chan struct{}), release: make(chan struct{}), completed: make(chan struct{})}
 	manager := NewManager(Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
-		RecoveryStore: &recoveryStoreFake{snapshot: RecoverySnapshot{ConversationID: scope.ConversationID}}, ApprovalStore: approvalStore}, connector,
+		RecoveryStore: &recoveryStoreFake{snapshot: RecoverySnapshot{ConversationID: scope.ConversationID}}, ApprovalDispatcher: dispatcher}, connector,
 		managerIDs{session: "approval-boundary-session", conversation: scope.ConversationID})
 	runCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1153,21 +1497,40 @@ func TestManagerReconnectWaitsForAcceptedApprovalDurableResolution(t *testing.T)
 	waitForActiveRuntime(t, manager, "approval-boundary-session", 1)
 	client.reads <- protocol.LiveToolApprovalResolveEvent{Type: "live.tool.approval.resolve", InvocationID: "invocation", Decision: "approved", Reason: "confirmed", IdempotencyKey: "approval-key"}
 	select {
-	case <-approvalStore.started:
+	case <-dispatcher.started:
 	case <-time.After(time.Second):
-		t.Fatal("approval store did not begin durable resolution")
+		t.Fatal("approval dispatcher did not accept durable resolution")
 	}
-	err = manager.Reconnect(t.Context(), ReconnectRequest{Scope: scope, SessionID: "approval-boundary-session", LastIncarnation: 1}, newChannelClient(2))
-	require.ErrorIs(t, err, ErrReconnectNotAtBoundary)
-	close(approvalStore.release)
+	require.Equal(t, scope.TenantID, dispatcher.trusted.Subject.TenantID)
+	require.Equal(t, scope.UserID, dispatcher.trusted.Subject.UserID)
+	require.Equal(t, scope.ConversationID, dispatcher.trusted.IDs.ConversationID)
+	require.Equal(t, "invocation", dispatcher.request.InvocationID)
+	require.Equal(t, handoff.ApprovalApproved, dispatcher.request.Decision)
+	require.Equal(t, "approval-key", dispatcher.request.IdempotencyKey)
+	require.False(t, dispatcher.request.ResolvedAt.IsZero())
+	require.ErrorIs(t, manager.Submit(t.Context(), "approval-boundary-session", 2, ApprovalResolutionCompletedInput{
+		ExternalSequence: dispatcher.request.ExternalSequence, InvocationID: "invocation", Accepted: true,
+	}), ErrSessionNotActive)
+	manager.activeMu.RLock()
+	runtime := manager.active[runtimeKey{sessionID: "approval-boundary-session", incarnation: 1}]
+	manager.activeMu.RUnlock()
+	require.NotNil(t, runtime)
+	require.Equal(t, runtime.state.externalAccepted.Load(), runtime.state.externalApplied.Load(),
+		"app-owned queue admission must complete the session boundary before durable resolution")
+	require.NoError(t, manager.Submit(t.Context(), "approval-boundary-session", 1, ApprovalResolutionCompletedInput{
+		ExternalSequence: dispatcher.request.ExternalSequence, InvocationID: "invocation", Accepted: true,
+	}))
 	require.Eventually(t, func() bool {
-		manager.activeMu.RLock()
-		runtime := manager.active[runtimeKey{sessionID: "approval-boundary-session", incarnation: 1}]
-		manager.activeMu.RUnlock()
-		return runtime != nil && runtime.state.externalAccepted.Load() == runtime.state.externalApplied.Load()
+		return runtime.state.externalApplied.Load() == runtime.state.externalAccepted.Load()
 	}, time.Second, time.Millisecond)
 	cancel()
 	require.Error(t, <-runDone)
+	close(dispatcher.release)
+	select {
+	case <-dispatcher.completed:
+	case <-time.After(time.Second):
+		t.Fatal("app-owned approval work did not survive session disconnect")
+	}
 }
 
 func TestManagerRegistersReservedToolsBeforeFreshAndReconnectedProviderContext(t *testing.T) {
@@ -1247,9 +1610,7 @@ func TestManagerReconnectFutureCursorDoesNotDisturbLiveRuntime(t *testing.T) {
 		Scope: scope, SessionID: "future-session", LastIncarnation: 1, LastEventSeq: 5,
 	}, newChannelClient(1))
 	require.ErrorIs(t, err, ErrStaleReconnect)
-	require.NoError(t, manager.Submit(t.Context(), "future-session", 1, ClientInput{Event: protocol.SessionUpdateEvent{
-		Type: "session.update", Session: protocol.SessionUpdate{Type: "realtime"},
-	}}))
+	require.NoError(t, manager.Submit(t.Context(), "future-session", 1, ClientInput{Event: inputTurnSessionUpdate(json.RawMessage(`null`))}))
 	command, err := voice.NextCommand(t.Context())
 	require.NoError(t, err)
 	require.Equal(t, realtime.CommandSessionUpdate, command.Kind)
@@ -1587,7 +1948,7 @@ func TestManagerReconnectRejectsQueuedCommitUntilReactorAppliesIt(t *testing.T) 
 	commitGate := make(chan struct{})
 	connector := testkit.NewFakeConnector(8)
 	scope := handoff.Scope{TenantID: "tenant-commit", UserID: "user", ConversationID: "conversation-commit"}
-	manager := NewManager(Config{
+	manager := NewManager(withInitialManualInputTurn(Config{
 		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
 		RecoveryStore: &recoveryStoreFake{snapshot: RecoverySnapshot{ConversationID: scope.ConversationID}},
 		reactorApplyGate: func(input Input) <-chan struct{} {
@@ -1600,7 +1961,7 @@ func TestManagerReconnectRejectsQueuedCommitUntilReactorAppliesIt(t *testing.T) 
 			}
 			return nil
 		},
-	}, connector, managerIDs{session: "commit-session", conversation: scope.ConversationID})
+	}), connector, managerIDs{session: "commit-session", conversation: scope.ConversationID})
 	ctx, cancel := context.WithCancel(t.Context())
 	client := newChannelClient(8)
 	done := make(chan error, 1)
@@ -1612,6 +1973,7 @@ func TestManagerReconnectRejectsQueuedCommitUntilReactorAppliesIt(t *testing.T) 
 	voice, err := connector.NextSession(t.Context())
 	require.NoError(t, err)
 	require.Equal(t, "session.created", (<-client.writes).EventType())
+	activateInitialManualInputTurn(t, manager, "commit-session", 1, voice)
 	frame := base64.StdEncoding.EncodeToString(make([]byte, 960))
 	client.reads <- protocol.InputAudioBufferAppendEvent{Type: "input_audio_buffer.append", Audio: frame}
 	appendCommand, err := voice.NextCommand(t.Context())
@@ -1645,7 +2007,7 @@ func TestManagerReconnectRevalidatesBoundaryAfterRecoveryPreflight(t *testing.T)
 		snapshot: RecoverySnapshot{ConversationID: scope.ConversationID},
 		started:  make(chan struct{}), release: make(chan struct{}),
 	}
-	manager := NewManager(Config{
+	manager := NewManager(withInitialManualInputTurn(Config{
 		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second, RecoveryStore: store,
 		reactorApplyGate: func(input Input) <-chan struct{} {
 			if clientInput, ok := input.(ClientInput); ok {
@@ -1655,7 +2017,7 @@ func TestManagerReconnectRevalidatesBoundaryAfterRecoveryPreflight(t *testing.T)
 			}
 			return nil
 		},
-	}, connector, managerIDs{session: "cas-session", conversation: scope.ConversationID})
+	}), connector, managerIDs{session: "cas-session", conversation: scope.ConversationID})
 	ctx, cancel := context.WithCancel(t.Context())
 	client := newChannelClient(8)
 	runDone := make(chan error, 1)
@@ -1672,6 +2034,7 @@ func TestManagerReconnectRevalidatesBoundaryAfterRecoveryPreflight(t *testing.T)
 	case <-time.After(time.Second):
 		t.Fatal("initial session.created was not delivered")
 	}
+	activateInitialManualInputTurn(t, manager, "cas-session", 1, voice)
 	waitForActiveRuntime(t, manager, "cas-session", 1)
 
 	reconnectDone := make(chan error, 1)
@@ -1970,6 +2333,12 @@ type channelClient struct {
 	closeOnce sync.Once
 }
 
+type inputModeBoundaryClient struct {
+	*channelClient
+	current  func() realtime.InputTurnMode
+	observed chan realtime.InputTurnMode
+}
+
 type gateAudioClient struct {
 	*channelClient
 	audioStarted chan struct{}
@@ -1989,6 +2358,7 @@ func newLifecycleConnector() *lifecycleConnector {
 	return &lifecycleConnector{
 		voice: &lifecycleVoice{
 			failure: make(chan error, 1),
+			events:  make(chan realtime.Event, 1),
 			closed:  make(chan struct{}),
 			sending: make(chan struct{}),
 		},
@@ -2007,16 +2377,26 @@ func (c *lifecycleConnector) Connect(ctx context.Context, request realtime.OpenR
 
 type lifecycleVoice struct {
 	failure chan error
+	events  chan realtime.Event
 	closed  chan struct{}
 	sending chan struct{}
 
-	closeOnce sync.Once
-	sendOnce  sync.Once
-	closes    atomic.Int32
-	closeLive atomic.Bool
+	closeOnce      sync.Once
+	sendOnce       sync.Once
+	sendMu         sync.Mutex
+	immediateSends int
+	closes         atomic.Int32
+	closeLive      atomic.Bool
 }
 
 func (v *lifecycleVoice) Send(ctx context.Context, _ realtime.Command) error {
+	v.sendMu.Lock()
+	if v.immediateSends > 0 {
+		v.immediateSends--
+		v.sendMu.Unlock()
+		return nil
+	}
+	v.sendMu.Unlock()
 	v.sendOnce.Do(func() { close(v.sending) })
 	select {
 	case <-v.closed:
@@ -2028,11 +2408,19 @@ func (v *lifecycleVoice) Send(ctx context.Context, _ realtime.Command) error {
 
 func (v *lifecycleVoice) Receive(ctx context.Context) (realtime.Event, error) {
 	select {
+	case event := <-v.events:
+		return event, nil
 	case err := <-v.failure:
 		return realtime.Event{}, err
 	case <-ctx.Done():
 		return realtime.Event{}, ctx.Err()
 	}
+}
+
+func (v *lifecycleVoice) allowImmediateSends(count int) {
+	v.sendMu.Lock()
+	v.immediateSends = count
+	v.sendMu.Unlock()
 }
 
 func (v *lifecycleVoice) Close(ctx context.Context) error {
@@ -2164,6 +2552,54 @@ func (*recordingVoice) Receive(ctx context.Context) (realtime.Event, error) {
 }
 
 func (*recordingVoice) Close(context.Context) error { return nil }
+
+type gatedCancelVoice struct {
+	sent          chan realtime.Command
+	cancelStarted chan struct{}
+	cancelRelease chan struct{}
+}
+
+func (v *gatedCancelVoice) Send(ctx context.Context, command realtime.Command) error {
+	v.sent <- command
+	if command.Kind == realtime.CommandCancelResponse {
+		close(v.cancelStarted)
+		select {
+		case <-v.cancelRelease:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+func (*gatedCancelVoice) Receive(ctx context.Context) (realtime.Event, error) {
+	<-ctx.Done()
+	return realtime.Event{}, ctx.Err()
+}
+
+func (*gatedCancelVoice) Close(context.Context) error { return nil }
+
+type gatedProviderVoice struct {
+	started chan realtime.Command
+	release chan struct{}
+}
+
+func (v *gatedProviderVoice) Send(ctx context.Context, command realtime.Command) error {
+	v.started <- command
+	select {
+	case <-v.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (*gatedProviderVoice) Receive(ctx context.Context) (realtime.Event, error) {
+	<-ctx.Done()
+	return realtime.Event{}, ctx.Err()
+}
+
+func (*gatedProviderVoice) Close(context.Context) error { return nil }
 
 type closeErrorConnector struct {
 	voice     *closeErrorVoice
@@ -2353,6 +2789,17 @@ func (c *channelClient) Write(ctx context.Context, event protocol.ServerEvent) e
 	}
 }
 
+func (c *inputModeBoundaryClient) Write(ctx context.Context, event protocol.ServerEvent) error {
+	if event.EventType() == "session.updated" {
+		select {
+		case c.observed <- c.current():
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return c.channelClient.Write(ctx, event)
+}
+
 func (c *channelClient) Close(context.Context, int, string) error {
 	c.closeOnce.Do(func() { close(c.done) })
 	return nil
@@ -2360,10 +2807,10 @@ func (c *channelClient) Close(context.Context, int, string) error {
 
 func TestManagerFramesAppendAndFlushesEvenTailBeforeCommit(t *testing.T) {
 	connector := testkit.NewFakeConnector(16)
-	manager := NewManager(Config{
+	manager := NewManager(withInitialManualInputTurn(Config{
 		IngressBlockTimeout: time.Second,
 		EgressBlockTimeout:  time.Second,
-	}, connector, managerIDs{session: "session-1", conversation: "conversation-1"})
+	}), connector, managerIDs{session: "session-1", conversation: "conversation-1"})
 	client := newChannelClient(8)
 	ctx, cancel := context.WithCancel(context.Background())
 	runResult := make(chan error, 1)
@@ -2375,6 +2822,7 @@ func TestManagerFramesAppendAndFlushesEvenTailBeforeCommit(t *testing.T) {
 
 	voice, err := connector.NextSession(context.Background())
 	require.NoError(t, err)
+	activateInitialManualInputTurn(t, manager, "session-1", 1, voice)
 	pcm := make([]byte, 962)
 	for index := range pcm {
 		pcm[index] = byte(index)
@@ -2409,6 +2857,234 @@ func TestManagerFramesAppendAndFlushesEvenTailBeforeCommit(t *testing.T) {
 
 	cancel()
 	require.ErrorIs(t, <-runResult, context.Canceled)
+}
+
+func TestManagerRejectsSecondCommitUntilAckAndOrdersAckBeforeTranscript(t *testing.T) {
+	connector := testkit.NewFakeConnector(32)
+	manager := NewManager(withInitialManualInputTurn(Config{
+		IngressBlockTimeout: time.Second,
+		EgressBlockTimeout:  time.Second,
+	}), connector, managerIDs{session: "session-commit-ack", conversation: "conversation-commit-ack"})
+	client := newChannelClient(32)
+	ctx, cancel := context.WithCancel(context.Background())
+	runResult := make(chan error, 1)
+	go func() {
+		runResult <- manager.Run(ctx, OpenRequest{Subject: Subject{
+			TenantID: "tenant", UserID: "user", ExpiresAt: time.Now().Add(time.Hour),
+		}}, client)
+	}()
+	voice, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	activateInitialManualInputTurn(t, manager, "session-commit-ack", 1, voice)
+	commandCtx, stop := context.WithTimeout(t.Context(), time.Second)
+	defer stop()
+
+	appendAndExpect := func(fill byte) {
+		client.reads <- protocol.InputAudioBufferAppendEvent{
+			Type: "input_audio_buffer.append", Audio: base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{fill}, 960)),
+		}
+		command, commandErr := voice.NextCommand(commandCtx)
+		require.NoError(t, commandErr)
+		require.Equal(t, realtime.CommandAppendAudio, command.Kind)
+	}
+	commitAndExpect := func() realtime.Command {
+		client.reads <- protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}
+		command, commandErr := voice.NextCommand(commandCtx)
+		require.NoError(t, commandErr)
+		require.Equal(t, realtime.CommandCommitAudio, command.Kind)
+		return command
+	}
+	releaseAndExpect := func(itemID string, commitSequence uint64) {
+		command, commandErr := voice.NextCommand(commandCtx)
+		require.NoError(t, commandErr)
+		require.Equal(t, realtime.CommandAcknowledgeAudioCommit, command.Kind)
+		require.Equal(t, itemID, command.InputItemID)
+		require.Equal(t, commitSequence, command.InputAudioCommitSequence)
+	}
+	nextClientType := func(want string) protocol.ServerEvent {
+		for {
+			select {
+			case event := <-client.writes:
+				if event.EventType() == want {
+					return event
+				}
+			case runErr := <-runResult:
+				t.Fatalf("manager stopped before %s: %v", want, runErr)
+			case <-commandCtx.Done():
+				t.Fatalf("timed out waiting for %s", want)
+			}
+		}
+	}
+
+	appendAndExpect(0x11)
+	firstCommit := commitAndExpect()
+	appendAndExpect(0x22)
+	client.reads <- protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}
+	semantic := nextClientType("error").(protocol.ErrorEvent)
+	require.Equal(t, "input_audio_buffer_commit_in_flight", semantic.Error.Code)
+	require.Equal(t, "input audio commit acknowledgement is pending", semantic.Error.Message)
+	require.NotContains(t, semantic.Error.Message, "0x22")
+
+	require.NoError(t, voice.Emit(commandCtx, realtime.Event{
+		Kind: realtime.EventInputAudioCommitted, ProviderEventID: "ack-a", ItemID: "input-a",
+		InputAudioCommitSequence: firstCommit.Sequence,
+	}))
+	releaseAndExpect("input-a", firstCommit.Sequence)
+	require.NoError(t, voice.Emit(commandCtx, realtime.Event{
+		Kind: realtime.EventTranscriptionDelta, ProviderEventID: "delta-a", ItemID: "input-a", Text: "partial",
+	}))
+	committed := nextClientType("input_audio_buffer.committed").(protocol.InputAudioBufferCommittedEvent)
+	require.Equal(t, "input-a", committed.ItemID)
+	delta := nextClientType("conversation.item.input_audio_transcription.delta").(protocol.ConversationItemInputAudioTranscriptionDeltaEvent)
+	require.Equal(t, "input-a", delta.ItemID, "the sync ack boundary must open the exact item before its transcript")
+
+	secondCommit := commitAndExpect()
+	require.NoError(t, voice.Emit(commandCtx, realtime.Event{
+		Kind: realtime.EventInputAudioCommitted, ProviderEventID: "duplicate-ack-a", ItemID: "input-a",
+		InputAudioCommitSequence: secondCommit.Sequence,
+	}))
+	appendAndExpect(0x33)
+	client.reads <- protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}
+	duplicateSemantic := nextClientType("error").(protocol.ErrorEvent)
+	require.Equal(t, "input_audio_buffer_commit_in_flight", duplicateSemantic.Error.Code,
+		"a historical ack must not release the later commit")
+	require.NoError(t, voice.Emit(commandCtx, realtime.Event{
+		Kind: realtime.EventInputAudioCommitted, ProviderEventID: "ack-b", ItemID: "input-b",
+		InputAudioCommitSequence: secondCommit.Sequence,
+	}))
+	releaseAndExpect("input-b", secondCommit.Sequence)
+	nextClientType("input_audio_buffer.committed")
+	thirdCommit := commitAndExpect()
+	require.NoError(t, voice.Emit(commandCtx, realtime.Event{
+		Kind: realtime.EventInputAudioCommitted, ProviderEventID: "ack-c", ItemID: "input-c",
+		InputAudioCommitSequence: thirdCommit.Sequence,
+	}))
+	releaseAndExpect("input-c", thirdCommit.Sequence)
+	nextClientType("input_audio_buffer.committed")
+
+	cancel()
+	require.ErrorIs(t, <-runResult, context.Canceled)
+}
+
+func TestManagerSubmitReturnsCommitInFlightWithoutTerminatingSession(t *testing.T) {
+	connector := testkit.NewFakeConnector(16)
+	manager := NewManager(withInitialManualInputTurn(Config{
+		IngressBlockTimeout: time.Second,
+		EgressBlockTimeout:  time.Second,
+	}), connector, managerIDs{session: "session-submit-commit", conversation: "conversation-submit-commit"})
+	client := newChannelClient(16)
+	ctx, cancel := context.WithCancel(context.Background())
+	runResult := make(chan error, 1)
+	go func() {
+		runResult <- manager.Run(ctx, OpenRequest{Subject: Subject{
+			TenantID: "tenant", UserID: "user", ExpiresAt: time.Now().Add(time.Hour),
+		}}, client)
+	}()
+	voice, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	waitForActiveRuntime(t, manager, "session-submit-commit", 1)
+	activateInitialManualInputTurn(t, manager, "session-submit-commit", 1, voice)
+
+	commit := ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}}
+	require.NoError(t, manager.Submit(t.Context(), "session-submit-commit", 1, commit))
+	first, err := voice.NextCommand(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, realtime.CommandCommitAudio, first.Kind)
+
+	err = manager.Submit(t.Context(), "session-submit-commit", 1, commit)
+	require.ErrorIs(t, err, ErrAudioCommitInFlight)
+	require.Equal(t, int64(1), manager.ActiveSessions(), "a semantic rejection must not terminate the runtime")
+
+	require.NoError(t, voice.Emit(t.Context(), realtime.Event{
+		Kind: realtime.EventInputAudioCommitted, ProviderEventID: "ack-submit-a", ItemID: "submit-a",
+		InputAudioCommitSequence: first.Sequence,
+	}))
+	release, err := voice.NextCommand(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, realtime.CommandAcknowledgeAudioCommit, release.Kind)
+	require.Equal(t, "submit-a", release.InputItemID)
+	require.Equal(t, first.Sequence, release.InputAudioCommitSequence)
+	for {
+		event := <-client.writes
+		if event.EventType() == "input_audio_buffer.committed" {
+			break
+		}
+	}
+	require.NoError(t, manager.Submit(t.Context(), "session-submit-commit", 1, commit))
+	second, err := voice.NextCommand(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, realtime.CommandCommitAudio, second.Kind)
+
+	cancel()
+	require.ErrorIs(t, <-runResult, context.Canceled)
+}
+
+func TestClientCommitSemanticErrorDispatchOverflowRemainsFatal(t *testing.T) {
+	cfg, err := normalizeManagerConfig(withInitialManualInputTurn(Config{
+		ControlEvents: 2, WriterControlEvents: 1,
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+	}))
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(t.Context())
+	state := newRunState(cfg, testIDs(), &recordingVoice{sent: make(chan realtime.Command, 1)}, newChannelClient(1), cancel)
+	loopResult := make(chan error, 1)
+	go func() { loopResult <- state.reactorLoop(ctx) }()
+	require.NoError(t, state.enqueueReactorSync(t.Context(), reactorMessage{input: VoiceInput{Incarnation: state.ids.Incarnation, Event: realtime.Event{
+		Kind: realtime.EventSessionUpdated, InputTurnMode: realtime.InputTurnModeManual, InputTurnModeSpecified: true,
+		SessionUpdateAcknowledgement: true,
+	}}}))
+
+	first := reactorMessage{
+		input: ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}},
+		done:  make(chan error, 1),
+	}
+	require.NoError(t, state.enqueueReactor(first))
+	require.NoError(t, <-first.done)
+	<-state.clientSlots
+
+	second := reactorMessage{
+		input:             ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}},
+		clientAudioCommit: true,
+		done:              make(chan error, 1),
+	}
+	require.NoError(t, state.enqueueReactor(second))
+	require.ErrorIs(t, <-second.done, ErrControlOverflow)
+	select {
+	case loopErr := <-loopResult:
+		require.ErrorIs(t, loopErr, ErrControlOverflow)
+	case <-time.After(20 * time.Millisecond):
+		cancel()
+		require.ErrorIs(t, <-loopResult, ErrControlOverflow)
+	}
+}
+
+func TestManagerCommitAckTimeoutTearsDownRuntimeAndPreservesCause(t *testing.T) {
+	connector := testkit.NewFakeConnector(8)
+	manager := NewManager(withInitialManualInputTurn(Config{
+		IngressBlockTimeout: time.Second,
+		EgressBlockTimeout:  time.Second,
+	}), connector, managerIDs{session: "session-commit-timeout", conversation: "conversation-commit-timeout"})
+	client := newChannelClient(8)
+	runResult := make(chan error, 1)
+	go func() {
+		runResult <- manager.Run(t.Context(), OpenRequest{Subject: Subject{
+			TenantID: "tenant", UserID: "user", ExpiresAt: time.Now().Add(time.Hour),
+		}}, client)
+	}()
+	voice, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	waitForActiveRuntime(t, manager, "session-commit-timeout", 1)
+	activateInitialManualInputTurn(t, manager, "session-commit-timeout", 1, voice)
+	require.NoError(t, manager.Submit(t.Context(), "session-commit-timeout", 1,
+		ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}}))
+	command, err := voice.NextCommand(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, realtime.CommandCommitAudio, command.Kind)
+
+	voice.Fail(s2sws.ErrAudioCommitAckTimeout)
+	require.ErrorIs(t, <-runResult, s2sws.ErrAudioCommitAckTimeout)
+	require.Zero(t, manager.ActiveSessions())
+	require.ErrorIs(t, manager.Submit(t.Context(), "session-commit-timeout", 1, DurableInput{Sequence: 1}), ErrSessionNotActive)
 }
 
 func TestManagerRejectsExpiredSubjectBeforeConnect(t *testing.T) {
@@ -2468,7 +3144,10 @@ func TestDispatchFlushFencesActiveAndQueuedResponseControlsBeforeCancelOrTermina
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			client := &gatedResponseControlClient{started: make(chan struct{}), writes: make(chan string, 2), closed: make(chan struct{})}
-			voice := &recordingVoice{sent: make(chan realtime.Command, 2)}
+			// Keep provider Send blocked until the assertion observes it. This
+			// makes the required cancel-before-client-write composition order
+			// deterministic instead of relying on scheduler timing.
+			voice := &recordingVoice{sent: make(chan realtime.Command)}
 			ids := IDs{SessionID: "session", ConversationID: "conversation", Incarnation: 1}
 			state := newRunState(cfg, ids, voice, client, cancel)
 			epoch := state.fence.Advance()
@@ -2535,7 +3214,7 @@ func TestDispatchFlushFencesActiveAndQueuedResponseControlsBeforeCancelOrTermina
 	}
 }
 
-func TestDispatchPolicySuppressionWaitsForAllowedSpeechSendSuccess(t *testing.T) {
+func TestDispatchPolicySuppressionDoesNotWaitForAllowedSpeechSend(t *testing.T) {
 	cfg, err := normalizeManagerConfig(Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second})
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(t.Context())
@@ -2548,7 +3227,7 @@ func TestDispatchPolicySuppressionWaitsForAllowedSpeechSendSuccess(t *testing.T)
 	go func() { voiceDone <- state.voiceWriter(ctx) }()
 	command := realtime.Command{Kind: realtime.CommandCreateResponse, Sequence: 1}
 	err = state.dispatchEffects(ctx, []Effect{{VoiceCommand: &command}, {PolicySuppressed: true}}, 0, 0)
-	require.ErrorIs(t, err, providerErr)
+	require.NoError(t, err)
 	require.ErrorIs(t, <-voiceDone, providerErr)
 }
 
@@ -2579,6 +3258,25 @@ func TestDispatchShadowRechecksVisualAndSpeechBoundariesSeparately(t *testing.T)
 	}
 }
 
+func TestShadowSuppressedVoiceCompletionPreservesExactOutstandingCount(t *testing.T) {
+	gates := sessionShadowGates{feature.ShadowMode: true}
+	cfg, err := normalizeManagerConfig(Config{
+		ControlEvents: 1, WriterControlEvents: 1,
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second, FeatureGates: gates,
+	})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	state := newRunState(cfg, testIDs(), &recordingVoice{sent: make(chan realtime.Command, 1)}, newChannelClient(1), cancel)
+	done := make(chan error, 1)
+	go func() { done <- state.reactorLoop(ctx) }()
+	command := realtime.Command{Kind: realtime.CommandCreateResponse, Sequence: 1, Epoch: 2}
+	_, err = state.dispatchEffectsQueued(ctx, []Effect{{VoiceCommand: &command, HandoffPresentation: true}}, 0, 0, true)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return state.pendingVoice.Load() == 0 }, time.Second, time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
 func handoffAcceptanceEffectsForShadowTest(t *testing.T) (*Reactor, HandoffAcceptedInput, []Effect) {
 	t.Helper()
 	reactor, _ := testReactor(2)
@@ -2601,11 +3299,14 @@ func TestShadowFromStartSuppressesEveryHandoffAcceptanceReinjectionAndReconciles
 	cfg, err := normalizeManagerConfig(Config{IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second, FeatureGates: gates})
 	require.NoError(t, err)
 	state := newRunState(cfg, testIDs(), voice, client, func() {})
-	err = state.dispatchEffectsReconciled(t.Context(), effects, 0, 0, func(completed VoiceCommandCompletedInput) error {
-		_, applyErr := reactor.Apply(completed)
-		return applyErr
-	})
+	err = state.dispatchEffects(t.Context(), effects, 0, 0)
 	require.NoError(t, err)
+	for len(state.completions) != 0 {
+		message := <-state.completions
+		completed, ok := message.input.(VoiceCommandCompletedInput)
+		require.True(t, ok)
+		applyOK(t, reactor, completed)
+	}
 	require.Equal(t, ResponseTerminal, reactor.Snapshot().Response)
 	require.Empty(t, applyOK(t, reactor, accepted), "acceptance durable state must remain resolved")
 	select {
@@ -2636,7 +3337,7 @@ func TestQueuedHandoffAcceptanceSuppressionReconcilesBeforeProviderSend(t *testi
 	done := make(chan error, 1)
 	go func() { done <- state.voiceWriter(ctx) }()
 	for range 2 {
-		message := <-state.inbox
+		message := <-state.completions
 		completed, ok := message.input.(VoiceCommandCompletedInput)
 		require.True(t, ok)
 		require.True(t, completed.Suppressed)
@@ -2712,10 +3413,10 @@ func TestManagerReconnectRefreshCadenceIsBoundedByCredentialTTL(t *testing.T) {
 
 func TestManagerOddCommitKeepsTailForTheNextAppend(t *testing.T) {
 	connector := testkit.NewFakeConnector(8)
-	manager := NewManager(Config{
+	manager := NewManager(withInitialManualInputTurn(Config{
 		IngressBlockTimeout: time.Second,
 		EgressBlockTimeout:  time.Second,
-	}, connector, managerIDs{session: "session-odd", conversation: "conversation-odd"})
+	}), connector, managerIDs{session: "session-odd", conversation: "conversation-odd"})
 	client := newChannelClient(8)
 	ctx, cancel := context.WithCancel(context.Background())
 	runResult := make(chan error, 1)
@@ -2726,6 +3427,7 @@ func TestManagerOddCommitKeepsTailForTheNextAppend(t *testing.T) {
 	}()
 	voice, err := connector.NextSession(context.Background())
 	require.NoError(t, err)
+	activateInitialManualInputTurn(t, manager, "session-odd", 1, voice)
 
 	client.reads <- protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}
 	client.reads <- protocol.InputAudioBufferAppendEvent{
@@ -2857,10 +3559,10 @@ func TestManagerNormalizesProviderChunksAndOrdersAudioDoneAfterFrames(t *testing
 
 func TestManagerCancelsInFlightStaleAudioBeforeBargeWriteCanRecord(t *testing.T) {
 	connector := testkit.NewFakeConnector(16)
-	manager := NewManager(Config{
+	manager := NewManager(withInitialProviderVADInputTurn(Config{
 		IngressBlockTimeout: time.Second,
 		EgressBlockTimeout:  time.Second,
-	}, connector, managerIDs{session: "session-barge", conversation: "conversation-barge"})
+	}), connector, managerIDs{session: "session-barge", conversation: "conversation-barge"})
 	client := newGateAudioClient(16)
 	ctx, cancel := context.WithCancel(context.Background())
 	runResult := make(chan error, 1)
@@ -2871,6 +3573,7 @@ func TestManagerCancelsInFlightStaleAudioBeforeBargeWriteCanRecord(t *testing.T)
 	}()
 	voice, err := connector.NextSession(context.Background())
 	require.NoError(t, err)
+	activateInitialProviderVADInputTurn(t, manager, "session-barge", 1, voice)
 	commandCtx, stop := context.WithTimeout(context.Background(), time.Second)
 	defer stop()
 
@@ -2915,6 +3618,375 @@ func TestManagerCancelsInFlightStaleAudioBeforeBargeWriteCanRecord(t *testing.T)
 			t.Fatal("timed out waiting for barge-in notification")
 		}
 	}
+}
+
+// TestSpeechStartedAdvancesFenceWhileEarlierVisualWriteIsBlocked catches a
+// reactor loop that waits for exact client I/O before applying barge-in.
+func TestSpeechStartedAdvancesFenceWhileEarlierVisualWriteIsBlocked(t *testing.T) {
+	connector := testkit.NewFakeConnector(16)
+	manager := NewManager(withInitialProviderVADInputTurn(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+	}), connector, managerIDs{session: "session-async-visual", conversation: "conversation-async-visual"})
+	require.NoError(t, manager.validationErr)
+	client := newDeliveryClient()
+	client.visualRelease = make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.Run(ctx, OpenRequest{Subject: Subject{
+			TenantID: "tenant", UserID: "user", ExpiresAt: time.Now().Add(time.Hour),
+		}}, client)
+	}()
+	voice, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	activateInitialProviderVADInputTurn(t, manager, "session-async-visual", 1, voice)
+	require.Eventually(t, func() bool { return manager.ActiveSessions() == 1 }, time.Second, time.Millisecond)
+
+	manager.activeMu.RLock()
+	var runtime *sessionRuntime
+	for _, active := range manager.active {
+		runtime = active
+	}
+	manager.activeMu.RUnlock()
+	require.NotNil(t, runtime)
+	require.NoError(t, manager.Submit(t.Context(), runtime.key.sessionID, runtime.key.incarnation, ClientInput{
+		Event: protocol.ResponseCreateEvent{Type: "response.create"},
+	}))
+	command, err := voice.NextCommand(t.Context())
+	require.NoError(t, err)
+	require.NoError(t, voice.Emit(t.Context(), realtime.Event{
+		Kind: realtime.EventResponseCreated, Epoch: command.Epoch, ResponseID: "response-async-visual", Status: "in_progress",
+	}))
+	require.Eventually(t, func() bool { return runtime.state.fence.Current() == command.Epoch }, time.Second, time.Millisecond)
+
+	offered := make(chan error, 1)
+	go func() {
+		offered <- manager.OfferHandoffEvent(context.Background(), runtime.handoffScope(), handoff.Event{
+			Seq: 1, EventID: "visual-blocked", HandoffID: "handoff", TenantID: "tenant",
+			ConversationID: runtime.state.ids.ConversationID, Kind: "tool.approval_required", State: handoff.StateNeedsInput,
+			Payload: json.RawMessage(`{"invocation_id":"invoke","handoff_id":"handoff","action_summary":"approve","expires_at":"2099-01-01T00:00:00Z","risk_class":"low"}`),
+		})
+	}()
+	select {
+	case <-client.visualStarted:
+	case err := <-offered:
+		t.Fatalf("offer failed before visual write: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("visual write did not reach gate")
+	}
+	require.NoError(t, voice.Emit(t.Context(), realtime.Event{
+		Kind: realtime.EventSpeechStarted, ProviderEventID: "speech-async-visual", ItemID: "new-input",
+	}))
+	require.Eventually(t, func() bool { return runtime.state.fence.Current() > command.Epoch }, 100*time.Millisecond, time.Millisecond)
+
+	close(client.visualRelease)
+	select {
+	case <-offered:
+	case <-time.After(time.Second):
+		t.Fatal("offer did not finish after visual release")
+	}
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestSpeechStartedAdvancesFenceWhileEarlierProviderSendIsBlocked(t *testing.T) {
+	cfg, err := normalizeManagerConfig(withInitialProviderVADInputTurn(Config{ControlEvents: 2, WriterControlEvents: 2, IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second}))
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	voice := &gatedProviderVoice{started: make(chan realtime.Command, 2), release: make(chan struct{})}
+	state := newRunState(cfg, testIDs(), voice, newChannelClient(8), cancel)
+	reactorDone := make(chan error, 1)
+	writerDone := make(chan error, 1)
+	go func() { reactorDone <- state.reactorLoop(ctx) }()
+	go func() { writerDone <- state.voiceWriter(ctx) }()
+	require.NoError(t, state.enqueueReactorSync(t.Context(), reactorMessage{input: ConnectedInput{ProviderSession: json.RawMessage(`{}`)}}))
+	require.NoError(t, state.enqueueReactorSync(t.Context(), reactorMessage{input: VoiceInput{Incarnation: state.ids.Incarnation, Event: realtime.Event{
+		Kind: realtime.EventSessionUpdated, InputTurnMode: realtime.InputTurnModeProviderVAD, InputTurnModeSpecified: true,
+		SessionUpdateAcknowledgement: true,
+	}}}))
+	require.NoError(t, state.enqueueReactorSync(t.Context(), reactorMessage{input: ClientInput{Event: protocol.ResponseCreateEvent{Type: "response.create"}}}))
+	var create realtime.Command
+	select {
+	case create = <-voice.started:
+		require.Equal(t, realtime.CommandCreateResponse, create.Kind)
+	case <-time.After(time.Second):
+		t.Fatal("provider send did not reach gate")
+	}
+	require.NoError(t, state.enqueueReactorSync(t.Context(), reactorMessage{input: VoiceInput{Incarnation: state.ids.Incarnation, Event: realtime.Event{
+		Kind: realtime.EventSpeechStarted, ProviderEventID: "speech-provider-blocked", ItemID: "new-input",
+	}}}))
+	require.Greater(t, state.fence.Current(), create.Epoch)
+	close(voice.release)
+	cancel()
+	require.ErrorIs(t, <-reactorDone, context.Canceled)
+	require.ErrorIs(t, <-writerDone, context.Canceled)
+}
+
+func TestSpeechStartedAdvancesFenceWhilePresentationSafetyIsBlocked(t *testing.T) {
+	connector := testkit.NewFakeConnector(16)
+	policy := &blockingContextSafety{started: make(chan struct{}), cancelled: make(chan struct{})}
+	manager := NewManager(withInitialProviderVADInputTurn(Config{
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: 20 * time.Millisecond,
+		HandoffConsumerID: "public-client", HandoffSubscriptions: &signalingSubscriptions{},
+		PresentationPolicy: presentation.NewPolicy(presentation.Config{}), SafetyPolicy: policy,
+	}), connector, managerIDs{session: "session-async-safety", conversation: "conversation-async-safety"})
+	require.NoError(t, manager.validationErr)
+	client := newDeliveryClient()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- manager.Run(ctx, OpenRequest{Subject: Subject{
+			TenantID: "tenant", UserID: "user", ExpiresAt: time.Now().Add(time.Hour),
+		}}, client)
+	}()
+	voice, err := connector.NextSession(t.Context())
+	require.NoError(t, err)
+	activateInitialProviderVADInputTurn(t, manager, "session-async-safety", 1, voice)
+	require.Eventually(t, func() bool { return manager.ActiveSessions() == 1 }, time.Second, time.Millisecond)
+
+	manager.activeMu.RLock()
+	var runtime *sessionRuntime
+	for _, active := range manager.active {
+		runtime = active
+	}
+	manager.activeMu.RUnlock()
+	require.NotNil(t, runtime)
+	require.NoError(t, manager.Submit(t.Context(), runtime.key.sessionID, runtime.key.incarnation, ClientInput{
+		Event: protocol.ResponseCreateEvent{Type: "response.create"},
+	}))
+	command, err := voice.NextCommand(t.Context())
+	require.NoError(t, err)
+	require.NoError(t, voice.Emit(t.Context(), realtime.Event{
+		Kind: realtime.EventResponseCreated, Epoch: command.Epoch, ResponseID: "response-async-safety", Status: "in_progress",
+	}))
+	require.Eventually(t, func() bool { return runtime.state.fence.Current() == command.Epoch }, time.Second, time.Millisecond)
+
+	offered := make(chan error, 1)
+	go func() {
+		offered <- manager.OfferHandoffEvent(context.Background(), runtime.handoffScope(), handoff.Event{
+			Seq: 1, EventID: "safety-blocked", HandoffID: "handoff", TenantID: "tenant",
+			ConversationID: runtime.state.ids.ConversationID, Kind: "handoff.needs-input", State: handoff.StateNeedsInput,
+			Payload: json.RawMessage(`{"Prompt":"choose","Schema":{}}`),
+		})
+	}()
+	select {
+	case <-policy.started:
+	case <-time.After(time.Second):
+		t.Fatal("presentation safety did not block")
+	}
+	require.NoError(t, voice.Emit(t.Context(), realtime.Event{
+		Kind: realtime.EventSpeechStarted, ProviderEventID: "speech-async-safety", ItemID: "new-input",
+	}))
+	require.Eventually(t, func() bool { return runtime.state.fence.Current() > command.Epoch }, 100*time.Millisecond, time.Millisecond)
+
+	require.ErrorIs(t, <-offered, ErrControlOverflow)
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+	select {
+	case <-policy.cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("presentation safety did not stop with session")
+	}
+}
+
+func TestResponseCreateWaitsForBlockedBargeCancelCompletion(t *testing.T) {
+	cfg, err := normalizeManagerConfig(withInitialProviderVADInputTurn(Config{ControlEvents: 1, IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second}))
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	voice := &gatedCancelVoice{sent: make(chan realtime.Command, 8), cancelStarted: make(chan struct{}), cancelRelease: make(chan struct{})}
+	state := newRunState(cfg, testIDs(), voice, newChannelClient(8), cancel)
+	reactorDone := make(chan error, 1)
+	writerDone := make(chan error, 1)
+	go func() { reactorDone <- state.reactorLoop(ctx) }()
+	go func() { writerDone <- state.voiceWriter(ctx) }()
+	require.NoError(t, state.enqueueReactorSync(t.Context(), reactorMessage{input: ConnectedInput{ProviderSession: json.RawMessage(`{}`)}}))
+	require.NoError(t, state.enqueueReactorSync(t.Context(), reactorMessage{input: VoiceInput{Incarnation: state.ids.Incarnation, Event: realtime.Event{
+		Kind: realtime.EventSessionUpdated, InputTurnMode: realtime.InputTurnModeProviderVAD, InputTurnModeSpecified: true,
+		SessionUpdateAcknowledgement: true,
+	}}}))
+	require.NoError(t, state.enqueueReactorSync(t.Context(), reactorMessage{input: ClientInput{Event: protocol.ResponseCreateEvent{Type: "response.create"}}}))
+	first := <-voice.sent
+	require.Equal(t, realtime.CommandCreateResponse, first.Kind)
+	require.Eventually(t, func() bool { return state.pendingVoice.Load() == 0 }, time.Second, time.Millisecond)
+	require.NoError(t, state.enqueueReactorSync(t.Context(), reactorMessage{input: VoiceInput{Incarnation: state.ids.Incarnation, Event: realtime.Event{
+		Kind: realtime.EventResponseCreated, Epoch: first.Epoch, ResponseID: "response-before-barge", Status: "in_progress",
+	}}}))
+	require.NoError(t, state.enqueueReactorSync(t.Context(), reactorMessage{input: VoiceInput{Incarnation: state.ids.Incarnation, Event: realtime.Event{
+		Kind: realtime.EventSpeechStarted, ItemID: "new-input",
+	}}}))
+	select {
+	case <-voice.cancelStarted:
+	case <-time.After(time.Second):
+		t.Fatal("cancel send did not reach gate")
+	}
+	require.Equal(t, realtime.CommandCancelResponse, (<-voice.sent).Kind)
+	createDone := make(chan error, 1)
+	require.NoError(t, state.enqueueReactor(reactorMessage{input: ClientInput{Event: protocol.ResponseCreateEvent{Type: "response.create"}}, done: createDone}))
+	select {
+	case err := <-createDone:
+		t.Fatalf("response.create completed before cancel: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(voice.cancelRelease)
+	select {
+	case err := <-createDone:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("response.create did not resume after cancel completion")
+	}
+	second := <-voice.sent
+	require.Equal(t, realtime.CommandCreateResponse, second.Kind)
+	cancel()
+	require.ErrorIs(t, <-reactorDone, context.Canceled)
+	require.ErrorIs(t, <-writerDone, context.Canceled)
+}
+
+func TestClientWriterPublishesTypedCompletionOnReservedLane(t *testing.T) {
+	cfg, err := normalizeManagerConfig(Config{ControlEvents: 1, WriterControlEvents: 1, IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := newChannelClient(2)
+	state := newRunState(cfg, testIDs(), &recordingVoice{sent: make(chan realtime.Command, 1)}, client, cancel)
+	<-state.inboxSlots
+	done := make(chan error, 1)
+	go func() { done <- state.clientWriter(ctx) }()
+	_, err = state.dispatchEffectsQueued(ctx, []Effect{{ClientEvent: protocol.SessionCreatedEvent{Type: "session.created"}}}, 0, 0, true)
+	require.NoError(t, err)
+	select {
+	case <-client.writes:
+	case <-time.After(time.Second):
+		t.Fatal("client effect was not written")
+	}
+	select {
+	case completion := <-state.completions:
+		typed, ok := completion.input.(ClientEffectCompletedInput)
+		require.True(t, ok)
+		require.NotZero(t, typed.Sequence)
+		require.NoError(t, typed.Err)
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("client writer did not publish a typed reserved completion")
+	}
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestClientWriterPublishesInputTurnModeBeforeSessionUpdated(t *testing.T) {
+	cfg, err := normalizeManagerConfig(Config{
+		ControlEvents: 1, WriterControlEvents: 1,
+		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
+	})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := &inputModeBoundaryClient{
+		channelClient: newChannelClient(2),
+		observed:      make(chan realtime.InputTurnMode, 1),
+	}
+	state := newRunState(cfg, testIDs(), &recordingVoice{sent: make(chan realtime.Command, 1)}, client, cancel)
+	client.current = state.currentInputTurnMode
+	done := make(chan error, 1)
+	go func() { done <- state.clientWriter(ctx) }()
+
+	_, err = state.dispatchEffectsQueued(ctx, []Effect{{
+		ClientEvent: protocol.SessionUpdatedEvent{
+			Type: "session.updated", Session: json.RawMessage(`{"type":"realtime"}`),
+		},
+		InputTurnModeBoundary: realtime.InputTurnModeManual,
+	}}, 0, 0, false)
+	require.NoError(t, err)
+	select {
+	case observed := <-client.observed:
+		require.Equal(t, realtime.InputTurnModeManual, observed,
+			"the confirmed input mode must publish before session.updated becomes client-observable")
+	case <-time.After(time.Second):
+		t.Fatal("session.updated was not written")
+	}
+	require.Equal(t, realtime.InputTurnModeManual, state.currentInputTurnMode())
+
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestDurableWriterPublishesTypedCompletionOnReservedLane(t *testing.T) {
+	cfg, err := normalizeManagerConfig(Config{ControlEvents: 1, WriterControlEvents: 1, IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second})
+	require.NoError(t, err)
+	dispatcher := &durableDispatcherFake{
+		trusted: make(chan TrustedSessionContext, 1), transcripts: make(chan TranscriptRequestedEffect, 1), handoffs: make(chan HandoffRequestedEffect, 1),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	state := newRunState(cfg, testIDs(), &recordingVoice{sent: make(chan realtime.Command, 1)}, newChannelClient(1), cancel)
+	state.dispatcher = dispatcher
+	<-state.inboxSlots
+	done := make(chan error, 1)
+	go func() { done <- state.durableWriter(ctx) }()
+	transcript := TranscriptRequestedEffect{Turn: identity.TurnKey{ID: "turn", Revision: 1}, Sequence: 3, Role: "assistant", FinalText: "done"}
+	_, err = state.dispatchEffectsQueued(ctx, []Effect{{Transcript: &transcript}}, 0, 0, true)
+	require.NoError(t, err)
+	select {
+	case <-dispatcher.transcripts:
+	case <-time.After(time.Second):
+		t.Fatal("durable effect was not dispatched")
+	}
+	select {
+	case completion := <-state.completions:
+		typed, ok := completion.input.(DurableEffectCompletedInput)
+		require.True(t, ok)
+		require.NotZero(t, typed.Sequence)
+		require.Equal(t, "transcript", typed.Kind)
+		require.NoError(t, typed.Err)
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("durable writer did not publish a typed reserved completion")
+	}
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestClientWriterPublishesTypedFailureCompletion(t *testing.T) {
+	cfg, err := normalizeManagerConfig(Config{ControlEvents: 1, WriterControlEvents: 1, IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second})
+	require.NoError(t, err)
+	writeErr := errors.New("client write failed")
+	client := &failureClient{reads: make(chan protocol.ClientEvent), readErr: make(chan error), writeErr: make(chan error, 1)}
+	client.writeErr <- writeErr
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	state := newRunState(cfg, testIDs(), &recordingVoice{sent: make(chan realtime.Command, 1)}, client, cancel)
+	done := make(chan error, 1)
+	go func() { done <- state.clientWriter(ctx) }()
+	_, err = state.dispatchEffectsQueued(ctx, []Effect{{ClientEvent: protocol.SessionCreatedEvent{Type: "session.created"}}}, 0, 0, true)
+	require.NoError(t, err)
+	completion := <-state.completions
+	typed, ok := completion.input.(ClientEffectCompletedInput)
+	require.True(t, ok)
+	require.ErrorIs(t, typed.Err, writeErr)
+	require.NoError(t, <-done, "writer failure is reconciled through the typed reactor input")
+}
+
+func TestDurableWriterPublishesTypedFailureCompletion(t *testing.T) {
+	cfg, err := normalizeManagerConfig(Config{ControlEvents: 1, WriterControlEvents: 1, IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second})
+	require.NoError(t, err)
+	dispatchErr := errors.New("durable dispatch failed")
+	dispatcher := &durableDispatcherFake{
+		trusted: make(chan TrustedSessionContext, 1), transcripts: make(chan TranscriptRequestedEffect, 1),
+		handoffs: make(chan HandoffRequestedEffect, 1), err: dispatchErr,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	state := newRunState(cfg, testIDs(), &recordingVoice{sent: make(chan realtime.Command, 1)}, newChannelClient(1), cancel)
+	state.dispatcher = dispatcher
+	done := make(chan error, 1)
+	go func() { done <- state.durableWriter(ctx) }()
+	transcript := TranscriptRequestedEffect{Turn: identity.TurnKey{ID: "turn", Revision: 1}, Sequence: 3, Role: "assistant", FinalText: "done"}
+	_, err = state.dispatchEffectsQueued(ctx, []Effect{{Transcript: &transcript}}, 0, 0, true)
+	require.NoError(t, err)
+	completion := <-state.completions
+	typed, ok := completion.input.(DurableEffectCompletedInput)
+	require.True(t, ok)
+	require.ErrorIs(t, typed.Err, dispatchErr)
+	require.NoError(t, <-done, "dispatcher failure is reconciled through the typed reactor input")
 }
 
 func TestManagerTransportFailureClosesOnceUnregistersAndPreservesCause(t *testing.T) {
@@ -2997,10 +4069,10 @@ func TestManagerKeepsPCMFramersIsolatedAcrossConcurrentSessions(t *testing.T) {
 	}
 	start := func(sessionID string, sentinel byte) running {
 		connector := testkit.NewFakeConnector(8)
-		manager := NewManager(Config{
+		manager := NewManager(withInitialManualInputTurn(Config{
 			IngressBlockTimeout: time.Second,
 			EgressBlockTimeout:  time.Second,
-		}, connector, managerIDs{session: identity.SessionID(sessionID), conversation: identity.ConversationID("conversation-" + sessionID)})
+		}), connector, managerIDs{session: identity.SessionID(sessionID), conversation: identity.ConversationID("conversation-" + sessionID)})
 		client := newChannelClient(4)
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan error, 1)
@@ -3011,6 +4083,7 @@ func TestManagerKeepsPCMFramersIsolatedAcrossConcurrentSessions(t *testing.T) {
 		}()
 		voice, err := connector.NextSession(context.Background())
 		require.NoError(t, err)
+		activateInitialManualInputTurn(t, manager, identity.SessionID(sessionID), 1, voice)
 		client.reads <- protocol.InputAudioBufferAppendEvent{
 			Type: "input_audio_buffer.append", Audio: base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{sentinel}, 960)),
 		}
@@ -3036,11 +4109,12 @@ func TestManagerKeepsPCMFramersIsolatedAcrossConcurrentSessions(t *testing.T) {
 
 func TestManagerIngressAcceptsCapacityAndFailsOnFirstExcessFrame(t *testing.T) {
 	connector := newLifecycleConnector()
-	manager := NewManager(Config{
+	connector.voice.allowImmediateSends(1)
+	manager := NewManager(withInitialManualInputTurn(Config{
 		IngressFrames:       1,
 		IngressBlockTimeout: 20 * time.Millisecond,
 		EgressBlockTimeout:  time.Second,
-	}, connector, managerIDs{session: "session-ingress-full", conversation: "conversation-ingress-full"})
+	}), connector, managerIDs{session: "session-ingress-full", conversation: "conversation-ingress-full"})
 	client := newChannelClient(8)
 	runCtx, runCancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer runCancel()
@@ -3051,6 +4125,16 @@ func TestManagerIngressAcceptsCapacityAndFailsOnFirstExcessFrame(t *testing.T) {
 		}}, client)
 	}()
 	<-connector.connected
+	connector.voice.events <- realtime.Event{
+		Kind: realtime.EventSessionUpdated, InputTurnMode: realtime.InputTurnModeManual, InputTurnModeSpecified: true,
+		SessionUpdateAcknowledgement: true,
+	}
+	require.Eventually(t, func() bool {
+		manager.activeMu.RLock()
+		runtime := manager.active[runtimeKey{sessionID: "session-ingress-full", incarnation: 1}]
+		manager.activeMu.RUnlock()
+		return runtime != nil && runtime.state.currentInputTurnMode() == realtime.InputTurnModeManual
+	}, time.Second, time.Millisecond)
 	frame := base64.StdEncoding.EncodeToString(make([]byte, 960))
 	client.reads <- protocol.InputAudioBufferAppendEvent{Type: "input_audio_buffer.append", Audio: frame}
 	select {
@@ -3120,111 +4204,32 @@ func TestManagerVoiceControlAcceptsCapacityAndFailsOnFirstExcessControl(t *testi
 		}}, client)
 	}()
 	<-connector.connected
-	update := protocol.SessionUpdateEvent{Type: "session.update", Session: protocol.SessionUpdate{Type: "realtime"}}
-	client.reads <- update
+	createItem := func(itemID string) protocol.ConversationItemCreateEvent {
+		return protocol.ConversationItemCreateEvent{
+			Type: "conversation.item.create",
+			Item: protocol.ConversationItem{
+				ID: itemID, Type: "message", Role: "assistant",
+				Content: json.RawMessage(`[{"type":"text","text":"queued"}]`),
+			},
+		}
+	}
+	client.reads <- createItem("queued-a")
 	select {
 	case <-connector.voice.sending:
 	case <-time.After(time.Second):
 		t.Fatal("voice writer did not consume the first control")
 	}
-	client.reads <- update
+	client.reads <- createItem("queued-b")
 	require.ErrorIs(t, <-runResult, ErrControlOverflow)
-}
-
-func TestManagerWaitsForProviderSessionUpdateAndAcceptsCommittedAudio(t *testing.T) {
-	connector := testkit.NewFakeConnector(16)
-	manager := NewManager(Config{
-		IngressBlockTimeout: time.Second,
-		EgressBlockTimeout:  time.Second,
-	}, connector, managerIDs{session: "session-provider-acks", conversation: "conversation-provider-acks"})
-	client := newChannelClient(16)
-	ctx, cancel := context.WithCancel(t.Context())
-	runResult := make(chan error, 1)
-	go func() {
-		runResult <- manager.Run(ctx, OpenRequest{Subject: Subject{
-			TenantID: "tenant", UserID: "user", ExpiresAt: time.Now().Add(time.Hour),
-		}}, client)
-	}()
-
-	voice, err := connector.NextSession(t.Context())
-	require.NoError(t, err)
-	require.Equal(t, "session.created", (<-client.writes).EventType())
-	runtime := waitForActiveRuntime(t, manager, "session-provider-acks", 1)
-	require.NoError(t, manager.Submit(t.Context(), "session-provider-acks", 1, ClientInput{Event: protocol.SessionUpdateEvent{
-		Type: "session.update", Session: protocol.SessionUpdate{Type: "realtime"},
-	}}))
-	command, err := voice.NextCommand(t.Context())
-	require.NoError(t, err)
-	require.Equal(t, realtime.CommandSessionUpdate, command.Kind)
-	require.NotZero(t, command.Sequence)
-	require.Eventually(t, func() bool { return runtime.state.pendingVoice.Load() == 0 }, time.Second, time.Millisecond,
-		"the transport send completion was not applied")
-	select {
-	case event := <-client.writes:
-		t.Fatalf("transport send completion published %s before provider acceptance", event.EventType())
-	default:
-	}
-
-	assertNoSessionUpdatedThrough := func(providerEvent realtime.Event) {
-		t.Helper()
-		require.NoError(t, voice.Emit(t.Context(), providerEvent))
-		require.NoError(t, voice.Emit(t.Context(), realtime.Event{
-			Kind: realtime.EventError, ProviderEventID: providerEvent.ProviderEventID + "-barrier", Reason: "barrier",
-		}))
-		for {
-			select {
-			case event := <-client.writes:
-				require.NotEqual(t, "session.updated", event.EventType())
-				if event.EventType() == "error" {
-					return
-				}
-			case err := <-runResult:
-				t.Fatalf("manager stopped before barrier: %v", err)
-			case <-time.After(time.Second):
-				t.Fatal("provider barrier was not observed")
-			}
-		}
-	}
-	assertNoSessionUpdatedThrough(realtime.Event{
-		Kind: realtime.EventSessionUpdated, ProviderEventID: "unsolicited-provider-update",
-	})
-	assertNoSessionUpdatedThrough(realtime.Event{
-		Kind: realtime.EventSessionUpdated, ProviderEventID: "mismatched-provider-update",
-		SessionUpdateAcknowledgement: true, SessionUpdateSequence: command.Sequence + 1,
-	})
-
-	require.NoError(t, voice.Emit(t.Context(), realtime.Event{
-		Kind: realtime.EventSessionUpdated, ProviderEventID: "matching-provider-update",
-		SessionUpdateAcknowledgement: true, SessionUpdateSequence: command.Sequence,
-	}))
-	select {
-	case event := <-client.writes:
-		require.Equal(t, "session.updated", event.EventType())
-	case err := <-runResult:
-		t.Fatalf("manager stopped before publishing provider acknowledgement: %v", err)
-	case <-time.After(time.Second):
-		t.Fatal("matching provider acknowledgement was not published")
-	}
-
-	assertNoSessionUpdatedThrough(realtime.Event{
-		Kind: realtime.EventInputAudioCommitted, ProviderEventID: "provider-commit", ItemID: "input-item",
-	})
-	select {
-	case err := <-runResult:
-		t.Fatalf("committed audio ended the live session: %v", err)
-	default:
-	}
-	cancel()
-	require.ErrorIs(t, <-runResult, context.Canceled)
 }
 
 func TestManagerClientControlAcceptsCapacityAndFailsOnFirstExcessControl(t *testing.T) {
 	connector := testkit.NewFakeConnector(8)
-	manager := NewManager(Config{
+	manager := NewManager(withInitialProviderVADInputTurn(Config{
 		WriterControlEvents: 1,
 		IngressBlockTimeout: time.Second,
 		EgressBlockTimeout:  time.Second,
-	}, connector, managerIDs{session: "session-client-control", conversation: "conversation-client-control"})
+	}), connector, managerIDs{session: "session-client-control", conversation: "conversation-client-control"})
 	client := newBlockingWriteClient()
 	runCtx, runCancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer runCancel()
@@ -3236,6 +4241,7 @@ func TestManagerClientControlAcceptsCapacityAndFailsOnFirstExcessControl(t *test
 	}()
 	voice, err := connector.NextSession(context.Background())
 	require.NoError(t, err)
+	activateInitialProviderVADInputTurn(t, manager, "session-client-control", 1, voice)
 	commandCtx, stop := context.WithTimeout(context.Background(), time.Second)
 	defer stop()
 	require.NoError(t, voice.Emit(commandCtx, realtime.Event{
@@ -3243,6 +4249,8 @@ func TestManagerClientControlAcceptsCapacityAndFailsOnFirstExcessControl(t *test
 	}))
 	select {
 	case <-client.started:
+	case err := <-runResult:
+		t.Fatalf("manager stopped before first post-ready event: %v", err)
 	case <-time.After(time.Second):
 		t.Fatal("client writer did not consume first post-ready event")
 	}
@@ -3458,10 +4466,10 @@ func TestManagerStopsProviderBatchAtMidBatchInvalidation(t *testing.T) {
 
 func TestManagerDiscardsInvalidatedProviderTailBeforeNextResponse(t *testing.T) {
 	connector := testkit.NewFakeConnector(32)
-	manager := NewManager(Config{
+	manager := NewManager(withInitialProviderVADInputTurn(Config{
 		IngressBlockTimeout: time.Second,
 		EgressBlockTimeout:  time.Second,
-	}, connector, managerIDs{session: "session-tail-barge", conversation: "conversation-tail-barge"})
+	}), connector, managerIDs{session: "session-tail-barge", conversation: "conversation-tail-barge"})
 	client := newChannelClient(32)
 	ctx, cancel := context.WithCancel(context.Background())
 	runResult := make(chan error, 1)
@@ -3472,6 +4480,7 @@ func TestManagerDiscardsInvalidatedProviderTailBeforeNextResponse(t *testing.T) 
 	}()
 	voice, err := connector.NextSession(context.Background())
 	require.NoError(t, err)
+	activateInitialProviderVADInputTurn(t, manager, "session-tail-barge", 1, voice)
 	commandCtx, stop := context.WithTimeout(context.Background(), time.Second)
 	defer stop()
 	client.reads <- protocol.ResponseCreateEvent{Type: "response.create"}
@@ -3491,6 +4500,9 @@ func TestManagerDiscardsInvalidatedProviderTailBeforeNextResponse(t *testing.T) 
 	cancelCommand, err := voice.NextCommand(commandCtx)
 	require.NoError(t, err)
 	require.Equal(t, realtime.CommandCancelResponse, cancelCommand.Kind)
+	require.NoError(t, voice.Emit(commandCtx, realtime.Event{
+		Kind: realtime.EventSpeechStopped, ProviderEventID: "barge-stopped", ItemID: "input-item",
+	}))
 
 	require.NoError(t, voice.Emit(commandCtx, realtime.Event{
 		Kind: realtime.EventResponseCreated, NeedsEpochBinding: true,
@@ -3664,18 +4676,19 @@ type durableDispatcherFake struct {
 	trusted     chan TrustedSessionContext
 	transcripts chan TranscriptRequestedEffect
 	handoffs    chan HandoffRequestedEffect
+	err         error
 }
 
 func (f *durableDispatcherFake) DispatchTranscript(_ context.Context, trusted TrustedSessionContext, effect TranscriptRequestedEffect) error {
 	f.trusted <- trusted
 	f.transcripts <- effect
-	return nil
+	return f.err
 }
 
 func (f *durableDispatcherFake) DispatchHandoff(_ context.Context, trusted TrustedSessionContext, effect HandoffRequestedEffect) error {
 	f.trusted <- trusted
 	f.handoffs <- effect
-	return nil
+	return f.err
 }
 
 func TestManagerDispatchesTypedDurableEffectsWithTrustedRuntimeIdentity(t *testing.T) {
@@ -3806,7 +4819,7 @@ func TestManagerMetricsHooksObserveOverflowAndDroppedAudio(t *testing.T) {
 	require.Equal(t, 960, <-dropped)
 }
 
-func TestManagerReactorAggregateBoundRejectsFirstExcessWhileApplyIsActive(t *testing.T) {
+func TestManagerReactorReleasesAggregateCreditBeforeCancelIOCompletes(t *testing.T) {
 	cfg := Config{
 		IngressFrames: 1, EgressFrames: 1, ControlEvents: 1, WriterControlEvents: 4,
 		IngressBlockTimeout: time.Second, EgressBlockTimeout: time.Second,
@@ -3841,18 +4854,16 @@ func TestManagerReactorAggregateBoundRejectsFirstExcessWhileApplyIsActive(t *tes
 	case <-time.After(time.Second):
 		t.Fatal("reactor Apply did not reach flush gate")
 	}
-	require.ErrorIs(t, state.enqueueReactor(reactorMessage{input: DurableInput{Sequence: 1}}), ErrControlOverflow)
-	close(releaseApply)
+	require.NoError(t, <-applyDone)
+	require.NoError(t, state.enqueueReactorSync(context.Background(), reactorMessage{input: DurableInput{Sequence: 1, Kind: "benign-before-ack"}}))
 	cancelControl := <-state.voiceCtl
 	require.Equal(t, realtime.CommandCancelResponse, cancelControl.command.Kind)
-	require.NotNil(t, cancelControl.sent)
+	require.Nil(t, cancelControl.sent)
 	state.releaseVoiceSlot()
-	cancelControl.sent <- nil
-	state.pendingVoice.Add(-1)
-	require.NoError(t, <-applyDone)
-	require.NoError(t, state.enqueueReactorSync(context.Background(), reactorMessage{
-		input: DurableInput{Sequence: 1, Kind: "benign-after-ack"},
-	}), "an observed completion ack must make its aggregate credit immediately reusable")
+	require.NoError(t, state.enqueueReactorSync(context.Background(), reactorMessage{input: VoiceCommandCompletedInput{
+		Sequence: cancelControl.command.Sequence, Kind: cancelControl.command.Kind,
+	}}))
+	close(releaseApply)
 	cancel()
 	require.ErrorIs(t, <-done, context.Canceled)
 }

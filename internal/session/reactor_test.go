@@ -74,7 +74,21 @@ func TestReactorPresentsApprovalResolutionWithoutSessionDegradation(t *testing.T
 
 func testReactor(initial identity.ResponseEpoch) (*Reactor, *EpochFence) {
 	fence := NewEpochFence(initial)
+	reactor := NewReactor(testIDs(), fence)
+	reactor.inputTurnMode = realtime.InputTurnModeManual
+	return reactor, fence
+}
+
+func unconfiguredTestReactor(initial identity.ResponseEpoch) (*Reactor, *EpochFence) {
+	fence := NewEpochFence(initial)
 	return NewReactor(testIDs(), fence), fence
+}
+
+func providerVADTestReactor(initial identity.ResponseEpoch) (*Reactor, *EpochFence) {
+	fence := NewEpochFence(initial)
+	reactor := NewReactor(testIDs(), fence)
+	reactor.inputTurnMode = realtime.InputTurnModeProviderVAD
+	return reactor, fence
 }
 
 func applyOK(t *testing.T, reactor *Reactor, input Input) []Effect {
@@ -86,6 +100,29 @@ func applyOK(t *testing.T, reactor *Reactor, input Input) []Effect {
 
 func currentVoice(reactor *Reactor, event realtime.Event) VoiceInput {
 	return VoiceInput{Incarnation: reactor.Snapshot().IDs.Incarnation, Event: event}
+}
+
+func acknowledgeAudio(t *testing.T, reactor *Reactor, itemID string, previousItemID *string) []Effect {
+	t.Helper()
+	pending := reactor.providerInput.awaitingAcknowledgment()
+	require.GreaterOrEqual(t, pending, 0)
+	sequence := reactor.providerInput.generations[pending].commandSequence
+	return applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventInputAudioCommitted, ProviderEventID: "committed-" + itemID,
+		ItemID: itemID, PreviousItemID: previousItemID,
+		InputAudioCommitSequence: sequence,
+	}))
+}
+
+func openManualInputTranscription(t *testing.T, reactor *Reactor, itemID string) {
+	t.Helper()
+	applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+	acknowledgeAudio(t, reactor, itemID, nil)
+}
+
+func exactProviderInputItemID(index int) string {
+	prefix := fmt.Sprintf("item-%04d-", index)
+	return prefix + strings.Repeat("i", DurableIdentifierBytes-len(prefix))
 }
 
 func exactSizeSessionUpdate(t *testing.T, size int) protocol.SessionUpdateEvent {
@@ -179,9 +216,12 @@ type reactorMutationView struct {
 	PendingToolCount          int
 	PendingToolBytes          int
 	ActiveTurn                *activeInputTurn
+	ActiveSpeechItemID        string
 	InputTurnRevision         uint32
 	PendingCancelSequence     uint64
 	SynthesizedEventSequence  uint64
+	TranscriptSequence        uint64
+	ProviderInput             providerInputAuthorityLedger
 }
 
 func errorString(err error) string {
@@ -206,6 +246,12 @@ func mutationView(reactor *Reactor) reactorMutationView {
 		copy := *reactor.activeTurn
 		activeTurn = &copy
 	}
+	providerInput := reactor.providerInput
+	providerInput.history = make(map[string]string, len(reactor.providerInput.history))
+	for itemID, canonical := range reactor.providerInput.history {
+		providerInput.history[itemID] = canonical
+	}
+	providerInput.generations = append([]providerInputGeneration(nil), reactor.providerInput.generations...)
 	return reactorMutationView{
 		Snapshot:                  reactor.Snapshot(),
 		NextSequence:              reactor.nextSeq,
@@ -218,9 +264,12 @@ func mutationView(reactor *Reactor) reactorMutationView {
 		PendingToolCount:          len(reactor.pendingTools),
 		PendingToolBytes:          reactor.pendingToolBytes,
 		ActiveTurn:                activeTurn,
+		ActiveSpeechItemID:        reactor.activeSpeechItemID,
 		InputTurnRevision:         reactor.inputTurnRevision,
 		PendingCancelSequence:     reactor.pendingCancelSequence,
 		SynthesizedEventSequence:  reactor.synthEventSequence,
+		TranscriptSequence:        reactor.transcriptSequence,
+		ProviderInput:             providerInput,
 	}
 }
 
@@ -464,9 +513,68 @@ func TestImplicitCreatedAdvancesBindsThenPublishes(t *testing.T) {
 	assert.IsType(t, protocol.ResponseOutputAudioTranscriptDeltaEvent{}, effects[0].ClientEvent)
 }
 
+func TestImplicitCreatedWhileSpeakingBindsCancelsAndNeverPublishes(t *testing.T) {
+	reactor, fence := providerVADTestReactor(20)
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventSpeechStarted, ItemID: "user-speaking",
+	}))
+	newerStarted := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventSpeechStarted, ItemID: "newer-user-speaking",
+	}))
+	require.Len(t, newerStarted, 1)
+	assert.Equal(t, "newer-user-speaking", newerStarted[0].ClientEvent.(protocol.InputAudioBufferSpeechStartedEvent).ItemID)
+	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventSpeechStopped, ItemID: "user-speaking",
+	})))
+	require.True(t, reactor.Snapshot().UserSpeaking, "a delayed stop must not open the implicit-response fence")
+	beforeSequence := reactor.nextSeq
+
+	effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind:              realtime.EventResponseCreated,
+		ProviderEventID:   "implicit-created",
+		ResponseID:        "implicit-over-user",
+		Status:            "in_progress",
+		NeedsEpochBinding: true,
+	}))
+
+	assert.Equal(t, []string{
+		fmt.Sprintf("command:%d", realtime.CommandBindResponseEpoch),
+		"flush",
+		fmt.Sprintf("command:%d", realtime.CommandCancelResponse),
+	}, effectOrder(effects))
+	require.Len(t, effects, 3)
+	bind := effects[0].VoiceCommand
+	require.NotNil(t, bind)
+	assert.Equal(t, "implicit-over-user", bind.ResponseID)
+	assert.Equal(t, identity.ResponseEpoch(22), bind.Epoch)
+	assert.Equal(t, identity.ResponseEpoch(23), effects[1].FlushBefore)
+	cancel := effects[2].VoiceCommand
+	require.NotNil(t, cancel)
+	assert.Equal(t, "implicit-over-user", cancel.ResponseID)
+	assert.Equal(t, identity.ResponseEpoch(23), cancel.Epoch)
+	assert.Equal(t, beforeSequence+2, reactor.nextSeq)
+	assert.Equal(t, identity.ResponseEpoch(23), fence.Current())
+	assert.Equal(t, ResponseTerminal, reactor.Snapshot().Response)
+
+	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptDelta, Epoch: bind.Epoch, ResponseID: "implicit-over-user",
+		ItemID: "assistant-over-user", Text: "must not stream",
+	})))
+	assert.Empty(t, applyOK(t, reactor, VoiceCommandCompletedInput{
+		Sequence: cancel.Sequence, Kind: realtime.CommandCancelResponse,
+	}))
+	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventResponseDone, Epoch: cancel.Epoch, ResponseID: "implicit-over-user", Status: "cancelled",
+	})))
+	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventError, Epoch: cancel.Epoch, ProviderEventID: "implicit-cancel-error", Reason: "cancel rejected",
+	})))
+	assert.Equal(t, ResponseTerminal, reactor.Snapshot().Response)
+}
+
 func TestSpeechEdgesAndExplicitCancelFenceInOrder(t *testing.T) {
 	t.Run("idle speech edge flushes once", func(t *testing.T) {
-		reactor, fence := testReactor(1)
+		reactor, fence := providerVADTestReactor(1)
 		effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
 			Kind:   realtime.EventSpeechStarted,
 			ItemID: "utterance-1",
@@ -476,15 +584,26 @@ func TestSpeechEdgesAndExplicitCancelFenceInOrder(t *testing.T) {
 		assert.Equal(t, identity.ResponseEpoch(2), effects[0].FlushBefore)
 
 		before := reactor.Snapshot()
-		assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventSpeechStarted, ItemID: "duplicate"})))
+		assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventSpeechStarted, ItemID: "utterance-1"})))
 		assert.Equal(t, before, reactor.Snapshot())
 		assert.Equal(t, identity.ResponseEpoch(2), fence.Current())
 
-		effects = applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventSpeechStopped, ItemID: "utterance-1"}))
+		effects = applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventSpeechStarted, ItemID: "utterance-2"}))
 		require.Len(t, effects, 1)
-		assert.Equal(t, "input_audio_buffer.speech_stopped", effects[0].ClientEvent.EventType())
-		assert.Equal(t, identity.ResponseEpoch(2), fence.Current(), "speech stop must not advance")
+		started := effects[0].ClientEvent.(protocol.InputAudioBufferSpeechStartedEvent)
+		assert.Equal(t, "utterance-2", started.ItemID)
+		assert.Equal(t, identity.ResponseEpoch(2), fence.Current(), "a superseding speech start must not re-fence")
+		beforeDelayedStop := mutationView(reactor)
 		assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventSpeechStopped, ItemID: "utterance-1"})))
+		assert.Equal(t, beforeDelayedStop, mutationView(reactor), "a delayed stop for the superseded item must not clear the live speech fence")
+		assert.True(t, reactor.Snapshot().UserSpeaking)
+
+		effects = applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventSpeechStopped, ItemID: "utterance-2"}))
+		require.Len(t, effects, 1)
+		stopped := effects[0].ClientEvent.(protocol.InputAudioBufferSpeechStoppedEvent)
+		assert.Equal(t, "utterance-2", stopped.ItemID)
+		assert.Equal(t, identity.ResponseEpoch(2), fence.Current(), "speech stop must not advance")
+		assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventSpeechStopped, ItemID: "utterance-2"})))
 	})
 
 	for _, test := range []struct {
@@ -505,7 +624,7 @@ func TestSpeechEdgesAndExplicitCancelFenceInOrder(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			reactor, fence := testReactor(5)
+			reactor, fence := providerVADTestReactor(5)
 			startStreaming(t, reactor, "active")
 			assert.Equal(t, identity.ResponseEpoch(6), fence.Current())
 			effects := applyOK(t, reactor, test.cancel(reactor))
@@ -535,7 +654,7 @@ func TestSpeechEdgesAndExplicitCancelFenceInOrder(t *testing.T) {
 }
 
 func TestDifferentSpeechItemWhileSpeakingSupersedesCommittedEligibility(t *testing.T) {
-	reactor, _ := testReactor(1)
+	reactor, _ := providerVADTestReactor(1)
 	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
 		Kind: realtime.EventSpeechStarted, ItemID: "turn-a",
 	}))
@@ -546,9 +665,11 @@ func TestDifferentSpeechItemWhileSpeakingSupersedesCommittedEligibility(t *testi
 	})
 	epoch := startStreaming(t, reactor, "response-1")
 
-	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+	supersedingStart := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
 		Kind: realtime.EventSpeechStarted, ItemID: "turn-b",
-	})))
+	}))
+	require.Len(t, supersedingStart, 1)
+	assert.Equal(t, "turn-b", supersedingStart[0].ClientEvent.(protocol.InputAudioBufferSpeechStartedEvent).ItemID)
 	require.NotNil(t, reactor.activeTurn)
 	assert.Equal(t, identity.TurnKey{ID: "turn-b", Revision: 2}, reactor.activeTurn.key)
 	assert.False(t, reactor.activeTurn.committed)
@@ -558,6 +679,591 @@ func TestDifferentSpeechItemWhileSpeakingSupersedesCommittedEligibility(t *testi
 	)))
 	require.Len(t, effects, 1)
 	assert.Nil(t, effects[0].Async)
+}
+
+func TestNewSpeechItemRejectsLateOlderInputTranscriptsWithoutMutation(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		kind realtime.EventKind
+		text string
+	}{
+		{name: "delta", kind: realtime.EventTranscriptionDelta, text: "stale partial"},
+		{name: "completion", kind: realtime.EventTranscriptionCompleted, text: "stale final"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			reactor, fence := providerVADTestReactor(1)
+			applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+				Kind: realtime.EventSpeechStarted, ItemID: "turn-a",
+			}))
+			applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+				Kind: realtime.EventSpeechStarted, ItemID: "turn-b",
+			}))
+			require.NotNil(t, reactor.activeTurn)
+			beforeTurn := *reactor.activeTurn
+			beforeNextSequence := reactor.nextSeq
+			beforeTranscriptSequence := reactor.transcriptSequence
+			beforeSnapshot := reactor.Snapshot()
+			beforeEpoch := fence.Current()
+
+			effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+				Kind: test.kind, ItemID: "turn-a", Text: test.text,
+			}))
+
+			assert.Empty(t, effects, "stale input must not publish or request persistence")
+			require.NotNil(t, reactor.activeTurn)
+			assert.Equal(t, beforeTurn, *reactor.activeTurn, "stale input must not replace the active turn")
+			assert.Equal(t, beforeNextSequence, reactor.nextSeq, "stale input must not allocate an effect sequence")
+			assert.Equal(t, beforeTranscriptSequence, reactor.transcriptSequence, "stale input must not allocate a durable transcript sequence")
+			assert.Equal(t, beforeSnapshot, reactor.Snapshot())
+			assert.Equal(t, beforeEpoch, fence.Current())
+		})
+	}
+}
+
+func TestClientCreatedUserTurnRejectsLateOlderProviderTranscriptsWithoutMutation(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		kind realtime.EventKind
+		text string
+	}{
+		{name: "delta", kind: realtime.EventTranscriptionDelta, text: "late partial"},
+		{name: "completion", kind: realtime.EventTranscriptionCompleted, text: "late final"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			reactor, fence := providerVADTestReactor(1)
+			applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+				Kind: realtime.EventSpeechStarted, ItemID: "provider-turn-a",
+			}))
+			applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+				Kind: realtime.EventSpeechStopped, ItemID: "provider-turn-a",
+			}))
+			applyOK(t, reactor, ClientInput{Event: protocol.ConversationItemCreateEvent{
+				Type: "conversation.item.create",
+				Item: protocol.ConversationItem{
+					ID: "client-turn-b", Type: "message", Role: "user",
+					Content: json.RawMessage(`[{"type":"input_text","text":"newer user turn"}]`),
+				},
+			}})
+			require.NotNil(t, reactor.activeTurn)
+			beforeTurn := *reactor.activeTurn
+			beforeNextSequence := reactor.nextSeq
+			beforeTranscriptSequence := reactor.transcriptSequence
+			beforeSnapshot := reactor.Snapshot()
+			beforeEpoch := fence.Current()
+
+			effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+				Kind: test.kind, ItemID: "provider-turn-a", Text: test.text,
+			}))
+
+			assert.Empty(t, effects)
+			require.NotNil(t, reactor.activeTurn)
+			assert.Equal(t, beforeTurn, *reactor.activeTurn)
+			assert.Equal(t, beforeNextSequence, reactor.nextSeq)
+			assert.Equal(t, beforeTranscriptSequence, reactor.transcriptSequence)
+			assert.Equal(t, beforeSnapshot, reactor.Snapshot())
+			assert.Equal(t, beforeEpoch, fence.Current())
+		})
+	}
+}
+
+func TestClientTurnSupersedesPendingManualCommitWithoutLateAckStealingAuthority(t *testing.T) {
+	reactor, fence := testReactor(1)
+	commit := applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{
+		Type: "input_audio_buffer.commit",
+	}})
+	require.Len(t, commit, 1)
+	commitSequence := commit[0].VoiceCommand.Sequence
+	applyOK(t, reactor, ClientInput{Event: protocol.ConversationItemCreateEvent{
+		Type: "conversation.item.create",
+		Item: protocol.ConversationItem{
+			ID: "client-turn-b", Type: "message", Role: "user",
+			Content: json.RawMessage(`[{"type":"input_text","text":"newer user turn"}]`),
+		},
+	}})
+	require.NotNil(t, reactor.activeTurn)
+	assert.Equal(t, identity.TurnKey{ID: "client-turn-b", Revision: 1}, reactor.activeTurn.key)
+
+	lateAck := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventInputAudioCommitted, ProviderEventID: "late-provider-turn-a",
+		ItemID: "provider-turn-a", InputAudioCommitSequence: commitSequence,
+	}))
+	require.Len(t, lateAck, 2, "the causal ack still releases the sole manual commit slot")
+	assert.Equal(t, realtime.CommandAcknowledgeAudioCommit, lateAck[0].VoiceCommand.Kind)
+	require.NotNil(t, reactor.activeTurn)
+	assert.Equal(t, identity.TurnKey{ID: "client-turn-b", Revision: 1}, reactor.activeTurn.key,
+		"a superseded commit ack must not replace newer explicit client authority")
+	beforeLateTranscript := mutationView(reactor)
+	for _, kind := range []realtime.EventKind{realtime.EventTranscriptionDelta, realtime.EventTranscriptionCompleted} {
+		assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+			Kind: kind, ItemID: "provider-turn-a", Text: "late transcript",
+		})))
+	}
+	assert.Equal(t, beforeLateTranscript, mutationView(reactor))
+
+	applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+	acknowledgeAudio(t, reactor, "provider-turn-c", nil)
+
+	effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionDelta, ItemID: "provider-turn-c", Text: "new partial",
+	}))
+	require.Len(t, effects, 1)
+	assert.Equal(t, "conversation.item.input_audio_transcription.delta", effects[0].ClientEvent.EventType())
+	require.NotNil(t, reactor.activeTurn)
+	assert.Equal(t, identity.TurnKey{ID: "provider-turn-c", Revision: 2}, reactor.activeTurn.key)
+
+	effects = applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "provider-turn-c", Text: "new final",
+	}))
+	require.Len(t, effects, 1)
+	require.NotNil(t, effects[0].Transcript)
+	assert.Equal(t, identity.TurnKey{ID: "provider-turn-c", Revision: 2}, effects[0].Transcript.Turn)
+	assert.Equal(t, "new final", effects[0].Transcript.FinalText)
+
+	for _, itemID := range []string{"provider-turn-a", "client-turn-b"} {
+		before := mutationView(reactor)
+		beforeEpoch := fence.Current()
+		for _, event := range []realtime.Event{
+			{Kind: realtime.EventTranscriptionDelta, ItemID: itemID, Text: "late partial"},
+			{Kind: realtime.EventTranscriptionCompleted, ItemID: itemID, Text: "late final"},
+		} {
+			assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, event)))
+		}
+		assert.Equal(t, before, mutationView(reactor))
+		assert.Equal(t, beforeEpoch, fence.Current())
+	}
+}
+
+func TestManualTranscriptCannotOpenBeforeCommittedAck(t *testing.T) {
+	reactor, _ := testReactor(1)
+	applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+	before := mutationView(reactor)
+	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-a", Text: "early turn a",
+	})))
+	assert.Equal(t, before, mutationView(reactor))
+	acknowledgeAudio(t, reactor, "turn-a", nil)
+
+	effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-a", Text: "turn a",
+	}))
+	require.Len(t, effects, 1)
+	require.NotNil(t, effects[0].Transcript)
+	assert.Equal(t, identity.TurnKey{ID: "turn-a", Revision: 1}, effects[0].Transcript.Turn)
+}
+
+func TestClientUserItemCannotReuseHistoricalProviderItemWithoutSpeechEdge(t *testing.T) {
+	reactor, _ := providerVADTestReactor(1)
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventSpeechStarted, ItemID: "turn-a",
+	}))
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventSpeechStopped, ItemID: "turn-a",
+	}))
+	applyOK(t, reactor, ClientInput{Event: protocol.ConversationItemCreateEvent{
+		Type: "conversation.item.create",
+		Item: protocol.ConversationItem{
+			ID: "turn-b", Type: "message", Role: "user",
+			Content: json.RawMessage(`[{"type":"input_text","text":"turn b"}]`),
+		},
+	}})
+	before := mutationView(reactor)
+
+	effects, err := reactor.Apply(ClientInput{Event: protocol.ConversationItemCreateEvent{
+		Type: "conversation.item.create",
+		Item: protocol.ConversationItem{
+			ID: "turn-a", Type: "message", Role: "user",
+			Content: json.RawMessage(`[{"type":"input_text","text":"reused turn a"}]`),
+		},
+	}})
+	require.ErrorContains(t, err, "historical provider input item")
+	assert.Empty(t, effects)
+	assert.Equal(t, before, mutationView(reactor))
+
+	for _, event := range []realtime.Event{
+		{Kind: realtime.EventTranscriptionDelta, ItemID: "turn-a", Text: "late partial"},
+		{Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-a", Text: "late final"},
+	} {
+		assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, event)))
+	}
+	assert.Equal(t, before, mutationView(reactor))
+}
+
+func TestAudioCommitRequiresCommittedAckBeforeNextCommit(t *testing.T) {
+	reactor, _ := testReactor(1)
+
+	first := applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+	require.Len(t, first, 1)
+	require.NotNil(t, first[0].VoiceCommand)
+	assert.Equal(t, realtime.CommandCommitAudio, first[0].VoiceCommand.Kind)
+
+	before := mutationView(reactor)
+	second, err := reactor.Apply(ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+	require.ErrorIs(t, err, ErrAudioCommitInFlight)
+	assert.Empty(t, second)
+	assert.Equal(t, before, mutationView(reactor), "rejected commit must not allocate a sequence or mutate correlation state")
+
+	previous := "assistant-or-tool-item"
+	ack := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventInputAudioCommitted, ProviderEventID: "ack-a",
+		ItemID: "input-a", PreviousItemID: &previous,
+		InputAudioCommitSequence: first[0].VoiceCommand.Sequence,
+	}))
+	require.Len(t, ack, 2)
+	require.NotNil(t, ack[0].VoiceCommand)
+	assert.Equal(t, realtime.CommandAcknowledgeAudioCommit, ack[0].VoiceCommand.Kind)
+	assert.Equal(t, "input-a", ack[0].VoiceCommand.InputItemID)
+	committed, ok := ack[1].ClientEvent.(protocol.InputAudioBufferCommittedEvent)
+	require.True(t, ok)
+	assert.Equal(t, "input-a", committed.ItemID)
+	require.NotNil(t, committed.PreviousItemID)
+	assert.Equal(t, previous, *committed.PreviousItemID)
+
+	next := applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+	require.Len(t, next, 1, "the exact committed ack releases the sole commit slot")
+	assert.Equal(t, realtime.CommandCommitAudio, next[0].VoiceCommand.Kind)
+}
+
+func TestManualCommittedWithoutRegisteredSequenceCannotStealPendingCommit(t *testing.T) {
+	reactor, _ := testReactor(1)
+	applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+	before := mutationView(reactor)
+
+	effects, err := reactor.Apply(currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventInputAudioCommitted, ProviderEventID: "pre-registration",
+		ItemID: "stale-auto-item",
+	}))
+	require.ErrorIs(t, err, ErrUnexpectedAudioCommitAck)
+	assert.Empty(t, effects)
+	assert.Equal(t, before, mutationView(reactor))
+	require.True(t, reactor.Snapshot().InputAudioCommitPending)
+
+	effects, err = reactor.Apply(ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+	require.ErrorIs(t, err, ErrAudioCommitInFlight)
+	assert.Empty(t, effects)
+	assert.Equal(t, before, mutationView(reactor))
+
+	ack := acknowledgeAudio(t, reactor, "actual-manual-item", nil)
+	require.Len(t, ack, 2)
+	assert.Equal(t, realtime.CommandAcknowledgeAudioCommit, ack[0].VoiceCommand.Kind)
+}
+
+func TestPriorManualSequenceCannotStealNextCommit(t *testing.T) {
+	reactor, _ := testReactor(1)
+	first := applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+	firstSequence := first[0].VoiceCommand.Sequence
+
+	ackA := realtime.Event{
+		Kind: realtime.EventInputAudioCommitted, ProviderEventID: "slot-one-a", ItemID: "slot-one-a",
+		InputAudioCommitSequence: firstSequence,
+	}
+	bufferedB := realtime.Event{
+		Kind: realtime.EventInputAudioCommitted, ProviderEventID: "slot-one-b", ItemID: "slot-one-b",
+		InputAudioCommitSequence: firstSequence,
+	}
+	release := applyOK(t, reactor, currentVoice(reactor, ackA))
+	require.Len(t, release, 2)
+	assert.Equal(t, firstSequence, release[0].VoiceCommand.InputAudioCommitSequence)
+
+	second := applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+	secondSequence := second[0].VoiceCommand.Sequence
+	require.NotEqual(t, firstSequence, secondSequence)
+
+	before := mutationView(reactor)
+	stale, err := reactor.Apply(currentVoice(reactor, bufferedB))
+	require.ErrorIs(t, err, ErrUnexpectedAudioCommitAck)
+	assert.Empty(t, stale)
+	assert.Equal(t, before, mutationView(reactor))
+	require.True(t, reactor.Snapshot().InputAudioCommitPending)
+
+	actual := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventInputAudioCommitted, ProviderEventID: "slot-two", ItemID: "slot-two",
+		InputAudioCommitSequence: secondSequence,
+	}))
+	require.Len(t, actual, 2)
+	assert.Equal(t, secondSequence, actual[0].VoiceCommand.InputAudioCommitSequence)
+}
+
+func TestUnknownTranscriptAndDuplicateAckCannotReleaseLaterCommit(t *testing.T) {
+	reactor, _ := testReactor(1)
+	applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+	beforeUnknown := mutationView(reactor)
+	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "unacknowledged-x", Text: "must not claim",
+	})))
+	assert.Equal(t, beforeUnknown, mutationView(reactor))
+
+	acknowledgeAudio(t, reactor, "turn-a", nil)
+	applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+	beforeDuplicate := mutationView(reactor)
+	assert.Empty(t, acknowledgeAudio(t, reactor, "turn-a", nil), "historical duplicate is consumed without binding the new slot")
+	assert.Equal(t, beforeDuplicate, mutationView(reactor))
+
+	effects, err := reactor.Apply(ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+	require.ErrorIs(t, err, ErrAudioCommitInFlight)
+	assert.Empty(t, effects)
+	acknowledgeAudio(t, reactor, "turn-b", nil)
+	require.Len(t, applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}}), 1)
+}
+
+func TestProviderVADTranscriptsRequireCommittedForEachGeneration(t *testing.T) {
+	reactor, _ := providerVADTestReactor(1)
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventSpeechStarted, ItemID: "turn-a",
+	}))
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventSpeechStopped, ItemID: "turn-a",
+	}))
+	beforeCommit := mutationView(reactor)
+	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-a", Text: "turn a",
+	})))
+	assert.Equal(t, beforeCommit, mutationView(reactor))
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventInputAudioCommitted, ItemID: "turn-a"}))
+	first := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-a", Text: "turn a",
+	}))
+	require.Len(t, first, 1)
+	require.NotNil(t, first[0].Transcript)
+
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventSpeechStarted, ItemID: "turn-b"}))
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventSpeechStopped, ItemID: "turn-b"}))
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventInputAudioCommitted, ItemID: "turn-b"}))
+
+	effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-b", Text: "turn b",
+	}))
+	require.Len(t, effects, 1)
+	require.NotNil(t, effects[0].Transcript)
+	assert.Equal(t, identity.TurnKey{ID: "turn-b", Revision: 2}, effects[0].Transcript.Turn)
+}
+
+func TestUnknownTranscriptsNeverEstablishAuthorityInConfiguredModes(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		new  func(identity.ResponseEpoch) (*Reactor, *EpochFence)
+	}{
+		{name: "manual", new: testReactor},
+		{name: "provider VAD", new: providerVADTestReactor},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			reactor, fence := test.new(1)
+			before := mutationView(reactor)
+			beforeEpoch := fence.Current()
+			for _, event := range []realtime.Event{
+				{Kind: realtime.EventTranscriptionDelta, ItemID: "unknown", Text: "partial"},
+				{Kind: realtime.EventTranscriptionCompleted, ItemID: "unknown", Text: "final"},
+			} {
+				assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, event)))
+			}
+			assert.Equal(t, before, mutationView(reactor))
+			assert.Equal(t, beforeEpoch, fence.Current())
+		})
+	}
+}
+
+func TestAudioCommitGenerationLedgerFailsClosedAtCapacity(t *testing.T) {
+	reactor, _ := testReactor(1)
+	for index := range providerInputGenerationLimit {
+		applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+		itemID := fmt.Sprintf("open-%02d", index)
+		acknowledgeAudio(t, reactor, itemID, nil)
+		applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+			Kind: realtime.EventTranscriptionDelta, ItemID: itemID, Text: "open",
+		}))
+	}
+	before := mutationView(reactor)
+
+	effects, err := reactor.Apply(ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+	require.ErrorContains(t, err, "provider input generation limit")
+	assert.Empty(t, effects)
+	assert.Equal(t, before, mutationView(reactor))
+}
+
+func TestProviderInputHistoryUsesExactNoEvictionBounds(t *testing.T) {
+	reactor, _ := providerVADTestReactor(1)
+	for index := range providerInputItemHistoryLimit {
+		itemID := exactProviderInputItemID(index)
+		applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventSpeechStarted, ItemID: itemID}))
+		applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventSpeechStopped, ItemID: itemID}))
+		applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventInputAudioCommitted, ItemID: itemID}))
+		effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+			Kind: realtime.EventTranscriptionCompleted, ItemID: itemID, Text: "bounded",
+		}))
+		require.Len(t, effects, 1)
+	}
+	require.Len(t, reactor.providerInput.history, providerInputItemHistoryLimit)
+	assert.Equal(t, providerInputItemHistoryBytes, reactor.providerInput.historyBytes)
+
+	first := exactProviderInputItemID(0)
+	beforeReuse := mutationView(reactor)
+	effects, err := reactor.Apply(currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventSpeechStarted, ItemID: first,
+	}))
+	require.ErrorIs(t, err, ErrHistoricalProviderInputItem)
+	assert.Empty(t, effects)
+	assert.Equal(t, beforeReuse, mutationView(reactor))
+
+	beforeClientReuse := mutationView(reactor)
+	effects, err = reactor.Apply(ClientInput{Event: protocol.ConversationItemCreateEvent{
+		Type: "conversation.item.create",
+		Item: protocol.ConversationItem{ID: first, Type: "message", Role: "user", Content: json.RawMessage(`[{"type":"input_text","text":"reuse"}]`)},
+	}})
+	require.ErrorIs(t, err, ErrHistoricalProviderInputItem)
+	assert.Empty(t, effects)
+	assert.Equal(t, beforeClientReuse, mutationView(reactor))
+
+	beforeOverflow := mutationView(reactor)
+	effects, err = reactor.Apply(currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventSpeechStarted, ItemID: exactProviderInputItemID(providerInputItemHistoryLimit),
+	}))
+	require.ErrorIs(t, err, ErrProviderInputItemLimit)
+	assert.Empty(t, effects)
+	assert.Equal(t, beforeOverflow, mutationView(reactor), "overflow must not evict history")
+}
+
+func TestProviderInputIdentifiersRejectInvalidValuesWithoutMutation(t *testing.T) {
+	invalidUTF8 := string([]byte{0xff})
+	tests := []struct {
+		name string
+		id   string
+	}{
+		{name: "257 bytes", id: strings.Repeat("i", DurableIdentifierBytes+1)},
+		{name: "one mebibyte", id: strings.Repeat("i", 1<<20)},
+		{name: "whitespace only", id: " \t"},
+		{name: "interior ASCII space", id: "item bad"},
+		{name: "unicode space", id: "item\u00a0bad"},
+		{name: "control", id: "item\x00bad"},
+		{name: "invalid UTF-8", id: invalidUTF8},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			inputs := []func(*Reactor) Input{
+				func(*Reactor) Input {
+					return ClientInput{Event: protocol.ConversationItemCreateEvent{
+						Type: "conversation.item.create",
+						Item: protocol.ConversationItem{ID: test.id, Type: "message", Role: "user", Content: json.RawMessage(`[{"type":"input_text","text":"x"}]`)},
+					}}
+				},
+				func(r *Reactor) Input {
+					r.inputTurnMode = realtime.InputTurnModeProviderVAD
+					return currentVoice(r, realtime.Event{Kind: realtime.EventSpeechStarted, ItemID: test.id})
+				},
+				func(r *Reactor) Input {
+					r.inputTurnMode = realtime.InputTurnModeProviderVAD
+					applyOK(t, r, currentVoice(r, realtime.Event{Kind: realtime.EventSpeechStarted, ItemID: "valid-speech-item"}))
+					return currentVoice(r, realtime.Event{Kind: realtime.EventSpeechStopped, ItemID: test.id})
+				},
+				func(r *Reactor) Input {
+					applyOK(t, r, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+					return currentVoice(r, realtime.Event{Kind: realtime.EventInputAudioCommitted, ItemID: test.id})
+				},
+				func(r *Reactor) Input {
+					return currentVoice(r, realtime.Event{Kind: realtime.EventTranscriptionDelta, ItemID: test.id, Text: "x"})
+				},
+				func(r *Reactor) Input {
+					return currentVoice(r, realtime.Event{Kind: realtime.EventTranscriptionCompleted, ItemID: test.id, Text: "x"})
+				},
+			}
+			for index, build := range inputs {
+				reactor, _ := testReactor(1)
+				input := build(reactor)
+				before := mutationView(reactor)
+				effects, err := reactor.Apply(input)
+				require.Error(t, err, "input variant %d", index)
+				assert.Empty(t, effects)
+				assert.Equal(t, before, mutationView(reactor), "input variant %d", index)
+			}
+		})
+	}
+
+	t.Run("invalid nullable predecessor", func(t *testing.T) {
+		reactor, _ := testReactor(1)
+		applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+		invalid := "assistant item"
+		before := mutationView(reactor)
+		effects, err := reactor.Apply(currentVoice(reactor, realtime.Event{
+			Kind: realtime.EventInputAudioCommitted, ItemID: "valid-item", PreviousItemID: &invalid,
+		}))
+		require.Error(t, err)
+		assert.Empty(t, effects)
+		assert.Equal(t, before, mutationView(reactor))
+	})
+
+	t.Run("exact 256 bytes", func(t *testing.T) {
+		reactor, _ := testReactor(1)
+		applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+		itemID := strings.Repeat("i", DurableIdentifierBytes)
+		require.Len(t, acknowledgeAudio(t, reactor, itemID, nil), 2)
+		assert.Equal(t, DurableIdentifierBytes, reactor.providerInput.historyBytes)
+	})
+}
+
+func TestClientSupersessionRetainsOnlyUnknownAckTombstone(t *testing.T) {
+	reactor, _ := testReactor(1)
+	commit := applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+	commitSequence := commit[0].VoiceCommand.Sequence
+	applyOK(t, reactor, ClientInput{Event: protocol.ConversationItemCreateEvent{
+		Type: "conversation.item.create",
+		Item: protocol.ConversationItem{
+			ID: "client-b", Type: "message", Role: "user",
+			Content: json.RawMessage(`[{"type":"input_text","text":"newer"}]`),
+		},
+	}})
+	beforeLate := mutationView(reactor)
+	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "input-a", Text: "late pre-ack transcript",
+	})))
+	assert.Equal(t, beforeLate, mutationView(reactor))
+
+	release := acknowledgeAudio(t, reactor, "input-a", nil)
+	require.Len(t, release, 2)
+	assert.Equal(t, commitSequence, release[0].VoiceCommand.InputAudioCommitSequence)
+	require.NotNil(t, reactor.activeTurn)
+	assert.Equal(t, "client-b", reactor.activeTurn.key.ID, "late ack releases the slot but cannot replace the client turn")
+	applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+	previous := "tool-result-predecessor"
+	acknowledgeAudio(t, reactor, "input-c", &previous)
+	effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "input-c", Text: "turn c",
+	}))
+	require.Len(t, effects, 1)
+	require.NotNil(t, effects[0].Transcript)
+	assert.Equal(t, "input-c", effects[0].Transcript.Turn.ID)
+
+	beforeStale := mutationView(reactor)
+	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "input-a", Text: "late a",
+	})))
+	assert.Equal(t, beforeStale, mutationView(reactor))
+}
+
+func TestAcknowledgedOpenGenerationsKeepImmutableTurnsWhenInterleaved(t *testing.T) {
+	reactor, _ := testReactor(1)
+	applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+	acknowledgeAudio(t, reactor, "turn-b", nil)
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventTranscriptionDelta, ItemID: "turn-b", Text: "b"}))
+	turnB := reactor.providerInput.generations[0].turn
+
+	applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+	acknowledgeAudio(t, reactor, "turn-c", nil)
+	applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventTranscriptionDelta, ItemID: "turn-c", Text: "c"}))
+	turnC := reactor.providerInput.generations[1].turn
+
+	completedB := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-b", Text: "turn b",
+	}))
+	require.NotNil(t, completedB[0].Transcript)
+	assert.Equal(t, turnB, completedB[0].Transcript.Turn)
+	require.NotNil(t, reactor.activeTurn)
+	assert.Equal(t, turnC, reactor.activeTurn.key, "older completion must not replace the newer active turn")
+
+	completedC := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
+		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-c", Text: "turn c",
+	}))
+	require.NotNil(t, completedC[0].Transcript)
+	assert.Equal(t, turnC, completedC[0].Transcript.Turn)
+	require.Len(t, applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}}), 1,
+		"matching completions release aggregate generation capacity")
 }
 
 func TestPendingCancelNeverSynthesizesEmptyResponseDone(t *testing.T) {
@@ -812,8 +1518,27 @@ func TestConnectedInputSynthesizesSessionCreatedAndOnlyReconnectAdvances(t *test
 	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventSessionCreated, ProviderEventID: "upstream-created"})))
 }
 
-func TestSessionUpdatedIsPublishedOnlyForMatchingProviderAcknowledgement(t *testing.T) {
-	reactor, fence := testReactor(1)
+func TestConnectedInputEmitsSafeProfileSelectionAfterSessionCreated(t *testing.T) {
+	reactor, _ := testReactor(1)
+	selected := protocol.SelectedProfile{ID: "insurance", Version: 3, SnapshotHash: strings.Repeat("a", 64)}
+	effects := applyOK(t, reactor, ConnectedInput{ProviderSession: json.RawMessage(`{"id":"provider"}`), Profile: &selected})
+	require.Len(t, effects, 2)
+	assert.IsType(t, protocol.SessionCreatedEvent{}, effects[0].ClientEvent)
+	profileEvent, ok := effects[1].ClientEvent.(protocol.LiveProfileSelectedEvent)
+	require.True(t, ok)
+	assert.Equal(t, selected, profileEvent.Profile)
+	assert.NotEmpty(t, profileEvent.EventID)
+	restaged, _ := testReactor(1)
+	restagedEffects := applyOK(t, restaged, ConnectedInput{ProviderSession: json.RawMessage(`{"id":"provider-retry"}`), Profile: &selected})
+	restagedEvent := restagedEffects[1].ClientEvent.(protocol.LiveProfileSelectedEvent)
+	assert.Equal(t, profileEvent.EventID, restagedEvent.EventID, "the same incarnation and attempt order must replay a stable identity")
+
+	selected.ID = "mutated"
+	assert.Equal(t, "insurance", profileEvent.Profile.ID)
+}
+
+func TestSessionUpdatedRequiresActualProviderAcknowledgement(t *testing.T) {
+	reactor, fence := unconfiguredTestReactor(1)
 	toolParams := json.RawMessage(`{"type":"object","properties":{"q":{"type":"string"}}}`)
 	tools := json.RawMessage(`[{"type":"function","name":"lookup","description":"find it","parameters":` + string(toolParams) + `}]`)
 	turnDetection := json.RawMessage(`{"type":"server_vad","threshold":0.5}`)
@@ -863,39 +1588,17 @@ func TestSessionUpdatedIsPublishedOnlyForMatchingProviderAcknowledgement(t *test
 	assert.JSONEq(t, `{"type":"server_vad","threshold":0.5}`, string(command.Session.TurnDetection))
 	assert.JSONEq(t, `{"type":"object","properties":{"q":{"type":"string"}}}`, string(command.Session.Tools[0].Parameters))
 
-	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventSessionUpdated, ProviderEventID: "unsolicited"})))
 	assert.Empty(t, applyOK(t, reactor, VoiceCommandCompletedInput{Sequence: command.Sequence + 1, Kind: realtime.CommandSessionUpdate}))
 	assert.Empty(t, applyOK(t, reactor, VoiceCommandCompletedInput{Sequence: command.Sequence, Kind: realtime.CommandCommitAudio}))
 	assert.Empty(t, applyOK(t, reactor, VoiceCommandCompletedInput{Sequence: command.Sequence, Kind: realtime.CommandSessionUpdate}))
-	require.Contains(t, reactor.pendingSessionUpdates, command.Sequence, "transport send completion must not acknowledge provider acceptance")
-	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
-		Kind: realtime.EventSessionUpdated, ProviderEventID: "mismatched-provider-ack",
-		SessionUpdateAcknowledgement: true, SessionUpdateSequence: command.Sequence + 1,
-	})))
 
-	effects = applyOK(t, reactor, currentVoice(reactor, realtime.Event{
-		Kind: realtime.EventSessionUpdated, ProviderEventID: "provider-ack",
-		SessionUpdateAcknowledgement: true, SessionUpdateSequence: command.Sequence,
-	}))
+	effects = applyOK(t, reactor, currentVoice(reactor, providerSessionUpdated(`{"type":"server_vad","threshold":0.5}`, command.Sequence)))
 	require.Len(t, effects, 1)
 	updated := effects[0].ClientEvent.(protocol.SessionUpdatedEvent)
-	assert.Equal(t, "provider-ack", updated.EventID)
+	assert.NotEmpty(t, updated.EventID)
 	assert.JSONEq(t, `{"type":"realtime","instructions":"be concise","audio":{"input":{"format":{"type":"audio/pcm","rate":24000},"turn_detection":{"type":"server_vad","threshold":0.5}},"output":{"format":{"type":"audio/pcm","rate":24000},"voice":"alloy"}},"tools":[{"type":"function","name":"lookup","description":"find it","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}],"tool_choice":"auto"}`, string(updated.Session))
-	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
-		Kind: realtime.EventSessionUpdated, ProviderEventID: "duplicate-provider-ack",
-		SessionUpdateAcknowledgement: true, SessionUpdateSequence: command.Sequence,
-	})))
+	assert.Empty(t, applyOK(t, reactor, VoiceCommandCompletedInput{Sequence: command.Sequence, Kind: realtime.CommandSessionUpdate}))
 	assert.Equal(t, identity.ResponseEpoch(1), fence.Current(), "session updates and completions never advance")
-}
-
-func TestInputAudioCommittedIsAcceptedWithoutEndingTheSession(t *testing.T) {
-	reactor, _ := testReactor(1)
-	before := mutationView(reactor)
-	effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
-		Kind: realtime.EventInputAudioCommitted, ProviderEventID: "commit-ack", ItemID: "input-item",
-	}))
-	assert.Empty(t, effects)
-	assert.Equal(t, before, mutationView(reactor))
 }
 
 func TestInvalidSessionUpdateDoesNotAllocateSequenceOrPendingAck(t *testing.T) {
@@ -1082,6 +1785,7 @@ func TestSessionUpdatePreservesOrdinaryToolsAndInjectsReservedSchemas(t *testing
 func TestSessionUpdateDoesNotInjectReservedToolsWhenHandoffCapabilityIsDisabled(t *testing.T) {
 	freeze := NewEpochFence(5)
 	reactor := newReactorWithHandoffTools(testIDs(), freeze, false)
+	reactor.inputTurnMode = realtime.InputTurnModeManual
 	effects := applyOK(t, reactor, ClientInput{Event: protocol.SessionUpdateEvent{
 		Type: "session.update",
 		Session: protocol.SessionUpdate{
@@ -1153,7 +1857,7 @@ func TestClientCannotShadowOrForceReservedTools(t *testing.T) {
 }
 
 func TestPendingSessionUpdateCountLimitPrecedesNormalizationAndRecovers(t *testing.T) {
-	const countLimit = 16
+	const countLimit = 1
 	const wantLimitError = "pending session update limit exceeded"
 	assert.Equal(t, countLimit, PendingSessionUpdateLimit)
 	reactor, _ := testReactor(5)
@@ -1162,17 +1866,10 @@ func TestPendingSessionUpdateCountLimitPrecedesNormalizationAndRecovers(t *testi
 		Session: protocol.SessionUpdate{Type: "realtime"},
 	}
 
-	var firstSequence uint64
-	for index := 0; index < countLimit; index++ {
-		effects := applyOK(t, reactor, ClientInput{Event: event})
-		require.Len(t, effects, 1)
-		command := effects[0].VoiceCommand
-		require.NotNil(t, command)
-		assert.Equal(t, uint64(index+1), command.Sequence)
-		if index == 0 {
-			firstSequence = command.Sequence
-		}
-	}
+	effects := applyOK(t, reactor, ClientInput{Event: event})
+	require.Len(t, effects, 1)
+	firstSequence := effects[0].VoiceCommand.Sequence
+	assert.Equal(t, uint64(1), firstSequence)
 	require.Len(t, reactor.pendingSessionUpdates, countLimit)
 	retainedCapacity := 0
 	for _, pending := range reactor.pendingSessionUpdates {
@@ -1212,7 +1909,7 @@ func TestPendingSessionUpdateCountLimitPrecedesNormalizationAndRecovers(t *testi
 
 	effects = applyOK(t, reactor, ClientInput{Event: event})
 	require.Len(t, effects, 1)
-	assert.Equal(t, uint64(countLimit+1), effects[0].VoiceCommand.Sequence)
+	assert.Equal(t, uint64(2), effects[0].VoiceCommand.Sequence)
 	require.Len(t, reactor.pendingSessionUpdates, countLimit)
 
 	beforeDuplicate := mutationView(reactor)
@@ -1228,19 +1925,11 @@ func TestPendingSessionUpdateByteBoundaryNoMutationAndRecovery(t *testing.T) {
 	const wantLimitError = "pending session update limit exceeded"
 	assert.Equal(t, byteLimit, PendingSessionUpdateBytes)
 	reactor, _ := testReactor(5)
-	halfBoundary := exactSizeSessionUpdate(t, byteLimit/2)
-
-	var firstSequence uint64
-	for index := 0; index < 2; index++ {
-		effects := applyOK(t, reactor, ClientInput{Event: halfBoundary})
-		require.Len(t, effects, 1)
-		command := effects[0].VoiceCommand
-		require.NotNil(t, command)
-		assert.Equal(t, uint64(index+1), command.Sequence)
-		if index == 0 {
-			firstSequence = command.Sequence
-		}
-	}
+	exactBoundary := exactSizeSessionUpdate(t, byteLimit)
+	effects := applyOK(t, reactor, ClientInput{Event: exactBoundary})
+	require.Len(t, effects, 1)
+	firstSequence := effects[0].VoiceCommand.Sequence
+	assert.Equal(t, uint64(1), firstSequence)
 	assert.Equal(t, byteLimit, reactor.pendingSessionUpdateBytes)
 
 	beforeOverflow := mutationView(reactor)
@@ -1263,18 +1952,18 @@ func TestPendingSessionUpdateByteBoundaryNoMutationAndRecovery(t *testing.T) {
 	}))
 	require.Len(t, effects, 1)
 	updated := effects[0].ClientEvent.(protocol.SessionUpdatedEvent)
-	assert.Len(t, updated.Session, byteLimit/2)
+	assert.Len(t, updated.Session, byteLimit)
 
 	effects = applyOK(t, reactor, ClientInput{Event: protocol.SessionUpdateEvent{
 		Type:    "session.update",
 		Session: protocol.SessionUpdate{Type: "realtime"},
 	}})
 	require.Len(t, effects, 1)
-	assert.Equal(t, uint64(3), effects[0].VoiceCommand.Sequence)
+	assert.Equal(t, uint64(2), effects[0].VoiceCommand.Sequence)
 }
 
 func TestReconnectClearsPendingSessionUpdateSnapshots(t *testing.T) {
-	const countLimit = 16
+	const countLimit = 1
 	const byteLimit = 1 << 20
 	const wantLimitError = "pending session update limit exceeded"
 	reactor, _ := testReactor(5)
@@ -1284,31 +1973,24 @@ func TestReconnectClearsPendingSessionUpdateSnapshots(t *testing.T) {
 		Type:    "session.update",
 		Session: protocol.SessionUpdate{Type: "realtime"},
 	}
-	for index := 0; index < countLimit; index++ {
-		effects := applyOK(t, reactor, ClientInput{Event: minimal})
-		require.Len(t, effects, 1)
-		assert.Equal(t, uint64(index+1), effects[0].VoiceCommand.Sequence)
-	}
+	effects := applyOK(t, reactor, ClientInput{Event: minimal})
+	require.Len(t, effects, 1)
+	assert.Equal(t, uint64(1), effects[0].VoiceCommand.Sequence)
 	require.Len(t, reactor.pendingSessionUpdates, countLimit)
 
 	reconnectEffects := applyOK(t, reactor, ConnectedInput{ProviderSession: json.RawMessage(`{"id":"second"}`)})
 	require.Len(t, reconnectEffects, 2)
 	assert.Empty(t, reactor.pendingSessionUpdates)
 
-	for sequence := uint64(1); sequence <= countLimit; sequence++ {
-		beforeLateAck := mutationView(reactor)
-		assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, realtime.Event{
-			Kind: realtime.EventSessionUpdated, ProviderEventID: "late-provider-ack",
-			SessionUpdateAcknowledgement: true, SessionUpdateSequence: sequence,
-		})))
-		assert.Equal(t, beforeLateAck, mutationView(reactor))
-	}
+	beforeLateCompletion := mutationView(reactor)
+	assert.Empty(t, applyOK(t, reactor, VoiceCommandCompletedInput{Sequence: 1, Kind: realtime.CommandSessionUpdate}))
+	assert.Equal(t, beforeLateCompletion, mutationView(reactor))
 
 	exactBoundary := exactSizeSessionUpdate(t, byteLimit)
-	effects := applyOK(t, reactor, ClientInput{Event: exactBoundary})
+	effects = applyOK(t, reactor, ClientInput{Event: exactBoundary})
 	require.Len(t, effects, 1)
 	boundarySequence := effects[0].VoiceCommand.Sequence
-	assert.Equal(t, uint64(countLimit+1), boundarySequence)
+	assert.Equal(t, uint64(2), boundarySequence)
 	assert.Empty(t, applyOK(t, reactor, VoiceCommandCompletedInput{
 		Sequence: boundarySequence,
 		Kind:     realtime.CommandSessionUpdate,
@@ -1318,9 +2000,7 @@ func TestReconnectClearsPendingSessionUpdateSnapshots(t *testing.T) {
 		SessionUpdateAcknowledgement: true, SessionUpdateSequence: boundarySequence,
 	}))
 
-	for index := 0; index < countLimit; index++ {
-		applyOK(t, reactor, ClientInput{Event: minimal})
-	}
+	applyOK(t, reactor, ClientInput{Event: minimal})
 	beforeOverflow := mutationView(reactor)
 	effects, err := reactor.Apply(ClientInput{Event: minimal})
 	require.EqualError(t, err, wantLimitError)
@@ -1332,6 +2012,7 @@ func TestReconnectClearsPendingSessionUpdateSnapshots(t *testing.T) {
 func TestControlAndTranscriptMappingsUseTypedDTOsAndNonemptyEventIDs(t *testing.T) {
 	reactor, _ := testReactor(1)
 	epoch := startStreaming(t, reactor, "response-1")
+	openManualInputTranscription(t, reactor, "user-item")
 
 	tests := []struct {
 		name      string
@@ -1418,6 +2099,12 @@ func TestMalformedMappedVoiceEventsFailWithoutMutation(t *testing.T) {
 			return fixture{reactor: reactor, event: event}
 		}
 	}
+	providerIdle := func(event realtime.Event) func(*testing.T) fixture {
+		return func(*testing.T) fixture {
+			reactor, _ := providerVADTestReactor(1)
+			return fixture{reactor: reactor, event: event}
+		}
+	}
 	pending := func(event realtime.Event) func(*testing.T) fixture {
 		return func(t *testing.T) fixture {
 			reactor, _ := testReactor(1)
@@ -1441,11 +2128,11 @@ func TestMalformedMappedVoiceEventsFailWithoutMutation(t *testing.T) {
 		name  string
 		setup func(*testing.T) fixture
 	}{
-		{name: "speech started item ID", setup: idle(realtime.Event{Kind: realtime.EventSpeechStarted})},
+		{name: "speech started item ID", setup: providerIdle(realtime.Event{Kind: realtime.EventSpeechStarted})},
 		{
 			name: "speech stopped item ID",
 			setup: func(t *testing.T) fixture {
-				reactor, _ := testReactor(1)
+				reactor, _ := providerVADTestReactor(1)
 				applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventSpeechStarted, ItemID: "turn-1"}))
 				return fixture{reactor: reactor, event: realtime.Event{Kind: realtime.EventSpeechStopped}}
 			},
@@ -1508,6 +2195,7 @@ func TestDurableSequenceHighWaterRejectsGapsWithoutMutation(t *testing.T) {
 
 func TestFinalTranscriptsEmitTypedPersistenceOnlyAtCompletion(t *testing.T) {
 	reactor, _ := testReactor(1)
+	openManualInputTranscription(t, reactor, "user-turn")
 	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
 		Kind: realtime.EventTranscriptionDelta, ItemID: "user-turn", Text: "par",
 	}))
@@ -1537,20 +2225,21 @@ func TestFinalTranscriptsEmitTypedPersistenceOnlyAtCompletion(t *testing.T) {
 
 func TestIdenticalFinalTranscriptReplayDoesNotAllocateRevisionOrDurableWork(t *testing.T) {
 	reactor, _ := testReactor(1)
+	openManualInputTranscription(t, reactor, "user-replay")
 	event := realtime.Event{Kind: realtime.EventTranscriptionCompleted, ItemID: "user-replay", Text: "same final"}
 	first := applyOK(t, reactor, currentVoice(reactor, event))
 	require.NotNil(t, first[0].Transcript)
 	turn := first[0].Transcript.Turn
 
 	second := applyOK(t, reactor, currentVoice(reactor, event))
-	require.Len(t, second, 1)
-	assert.Nil(t, second[0].Transcript)
+	assert.Empty(t, second)
 	assert.Equal(t, turn, reactor.activeTurn.key)
 }
 
 func TestTypedTurnCommitAttachesStartToExactTranscript(t *testing.T) {
 	reactor, _ := testReactor(1)
 	epoch := startStreaming(t, reactor, "response-start")
+	openManualInputTranscription(t, reactor, "turn-exact")
 	effects := applyOK(t, reactor, currentVoice(reactor, realtime.Event{
 		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-exact", Text: "trusted transcript",
 	}))
@@ -1887,6 +2576,7 @@ func TestDurableWorkByteBoundariesCoverImmediateReservedToolsTranscriptsAndIDs(t
 
 	for _, size := range []int{DurableTranscriptBytes, DurableTranscriptBytes + 1} {
 		reactor, _ := testReactor(1)
+		openManualInputTranscription(t, reactor, "turn-transcript-bound")
 		effects, err := reactor.Apply(currentVoice(reactor, realtime.Event{
 			Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-transcript-bound", Text: strings.Repeat("t", size),
 		}))
@@ -2036,9 +2726,10 @@ func backgroundToolEvent(epoch identity.ResponseEpoch, responseID, callID string
 func TestPendingBackgroundToolCountBoundary(t *testing.T) {
 	reactor, _ := testReactor(1)
 	epoch := startStreaming(t, reactor, "response-1")
-	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
-		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-1", Text: "research this",
-	}))
+	applyOK(t, reactor, DurableInput{
+		Sequence: 1, Kind: DurableKindTurnProvisional,
+		Payload: committedTurnPayload(identity.TurnKey{ID: "turn-1", Revision: 1}),
+	})
 
 	for index := 0; index < PendingBackgroundToolLimit; index++ {
 		effects := applyOK(t, reactor, currentVoice(reactor, backgroundToolEvent(
@@ -2107,9 +2798,8 @@ func TestPendingBackgroundToolByteBoundaryAndCopyIsolation(t *testing.T) {
 func TestPendingBackgroundToolsFlushInOrderOnCommit(t *testing.T) {
 	reactor, _ := testReactor(1)
 	epoch := startStreaming(t, reactor, "response-1")
-	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
-		Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-1", Text: "request",
-	}))
+	turn := identity.TurnKey{ID: "turn-1", Revision: 1}
+	applyOK(t, reactor, DurableInput{Sequence: 1, Kind: DurableKindTurnProvisional, Payload: committedTurnPayload(turn)})
 	for _, callID := range []string{"call-a", "call-b"} {
 		applyOK(t, reactor, currentVoice(reactor, backgroundToolEvent(
 			epoch, "response-1", callID, json.RawMessage(`{"value":"`+callID+`"}`),
@@ -2117,9 +2807,9 @@ func TestPendingBackgroundToolsFlushInOrderOnCommit(t *testing.T) {
 	}
 
 	effects := applyOK(t, reactor, DurableInput{
-		Sequence: 1,
+		Sequence: 2,
 		Kind:     DurableKindTurnCommitted,
-		Payload:  committedTurnPayload(identity.TurnKey{ID: "turn-1", Revision: 1}),
+		Payload:  committedTurnPayload(turn),
 	})
 	require.Len(t, effects, 2)
 	for index, callID := range []string{"call-a", "call-b"} {
@@ -2143,13 +2833,15 @@ func TestPendingBackgroundToolsFlushInOrderOnCommit(t *testing.T) {
 
 func TestPriorCommittedTurnDoesNotAuthorizeNewInputTurnTool(t *testing.T) {
 	tests := []struct {
-		name       string
-		activeTurn identity.TurnKey
-		boundary   func(*testing.T, *Reactor)
+		name        string
+		activeTurn  identity.TurnKey
+		providerVAD bool
+		boundary    func(*testing.T, *Reactor)
 	}{
 		{
-			name:       "speech boundary",
-			activeTurn: identity.TurnKey{ID: "speech-new", Revision: 6},
+			name:        "speech boundary",
+			activeTurn:  identity.TurnKey{ID: "speech-new", Revision: 6},
+			providerVAD: true,
 			boundary: func(t *testing.T, reactor *Reactor) {
 				applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventSpeechStarted, ItemID: "speech-new"}))
 				applyOK(t, reactor, currentVoice(reactor, realtime.Event{Kind: realtime.EventSpeechStopped, ItemID: "speech-new"}))
@@ -2174,6 +2866,7 @@ func TestPriorCommittedTurnDoesNotAuthorizeNewInputTurnTool(t *testing.T) {
 			name:       "transcription boundary",
 			activeTurn: identity.TurnKey{ID: "transcript-new", Revision: 6},
 			boundary: func(t *testing.T, reactor *Reactor) {
+				openManualInputTranscription(t, reactor, "transcript-new")
 				applyOK(t, reactor, currentVoice(reactor, realtime.Event{
 					Kind: realtime.EventTranscriptionCompleted, ItemID: "transcript-new", Text: "new request",
 				}))
@@ -2184,6 +2877,9 @@ func TestPriorCommittedTurnDoesNotAuthorizeNewInputTurnTool(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			reactor, _ := testReactor(1)
+			if test.providerVAD {
+				reactor, _ = providerVADTestReactor(1)
+			}
 			oldTurn := identity.TurnKey{ID: "turn-old", Revision: 5}
 			applyOK(t, reactor, DurableInput{Sequence: 1, Kind: DurableKindTurnCommitted, Payload: committedTurnPayload(oldTurn)})
 			test.boundary(t, reactor)
@@ -2212,14 +2908,18 @@ func TestPriorCommittedTurnDoesNotAuthorizeNewInputTurnTool(t *testing.T) {
 	}
 }
 
-func TestRepeatedTranscriptionCompletionAdvancesCapturedRevision(t *testing.T) {
+func TestRepeatedTranscriptionCompletionDoesNotAdvanceCapturedRevision(t *testing.T) {
 	reactor, _ := testReactor(1)
 	epoch := startStreaming(t, reactor, "response-1")
-	for _, transcript := range []string{"first revision", "second revision"} {
-		applyOK(t, reactor, currentVoice(reactor, realtime.Event{
-			Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-same", Text: transcript,
-		}))
-	}
+	openManualInputTranscription(t, reactor, "turn-same")
+	event := realtime.Event{Kind: realtime.EventTranscriptionCompleted, ItemID: "turn-same", Text: "accepted final"}
+	first := applyOK(t, reactor, currentVoice(reactor, event))
+	require.Len(t, first, 1)
+	require.NotNil(t, first[0].Transcript)
+	turn := first[0].Transcript.Turn
+	beforeReplay := mutationView(reactor)
+	assert.Empty(t, applyOK(t, reactor, currentVoice(reactor, event)))
+	assert.Equal(t, beforeReplay, mutationView(reactor))
 	applyOK(t, reactor, currentVoice(reactor, backgroundToolEvent(
 		epoch, "response-1", "call-revision", json.RawMessage(`{"objective":"latest"}`),
 	)))
@@ -2227,34 +2927,29 @@ func TestRepeatedTranscriptionCompletionAdvancesCapturedRevision(t *testing.T) {
 	effects := applyOK(t, reactor, DurableInput{
 		Sequence: 1,
 		Kind:     DurableKindTurnCommitted,
-		Payload:  committedTurnPayload(identity.TurnKey{ID: "turn-same", Revision: 1}),
-	})
-	assert.Empty(t, effects, "an older commit cannot decide the current captured revision")
-	require.Len(t, reactor.pendingTools, 1)
-	assert.Equal(t, identity.TurnKey{ID: "turn-same", Revision: 2}, *reactor.pendingTools[0].turn)
-
-	effects = applyOK(t, reactor, DurableInput{
-		Sequence: 2,
-		Kind:     DurableKindTurnCommitted,
-		Payload:  committedTurnPayload(identity.TurnKey{ID: "turn-same", Revision: 2}),
+		Payload:  committedTurnPayload(turn),
 	})
 	require.Len(t, effects, 1)
 	require.NotNil(t, effects[0].Async)
 	assert.Equal(t, AsyncKindStartBackgroundTask, effects[0].Async.Kind)
 	var payload asyncToolPayload
 	require.NoError(t, json.Unmarshal(effects[0].Async.Payload, &payload))
-	assert.Equal(t, identity.TurnKey{ID: "turn-same", Revision: 2}, payload.Turn)
+	assert.Equal(t, identity.TurnKey{ID: "turn-same", Revision: 1}, payload.Turn)
 	assert.Empty(t, payload.Reason)
 }
 
 func TestSupersededTurnKeyCannotResurrectAfterABAItemSequence(t *testing.T) {
 	reactor, _ := testReactor(1)
 	epoch := startStreaming(t, reactor, "response-1")
-	for _, itemID := range []string{"turn-a", "turn-b", "turn-a"} {
-		applyOK(t, reactor, currentVoice(reactor, realtime.Event{
-			Kind: realtime.EventTranscriptionCompleted, ItemID: itemID, Text: "transcript",
-		}))
-		if itemID == "turn-a" && reactor.activeTurn.key.Revision == 1 {
+	for index, turn := range []identity.TurnKey{
+		{ID: "turn-a", Revision: 1},
+		{ID: "turn-b", Revision: 2},
+		{ID: "turn-a", Revision: 3},
+	} {
+		applyOK(t, reactor, DurableInput{
+			Sequence: uint64(index + 1), Kind: DurableKindTurnProvisional, Payload: committedTurnPayload(turn),
+		})
+		if turn.Revision == 1 {
 			applyOK(t, reactor, currentVoice(reactor, backgroundToolEvent(
 				epoch, "response-1", "call-before-supersession", json.RawMessage(`{"objective":"first"}`),
 			)))
@@ -2264,7 +2959,7 @@ func TestSupersededTurnKeyCannotResurrectAfterABAItemSequence(t *testing.T) {
 	assert.Equal(t, identity.TurnKey{ID: "turn-a", Revision: 3}, reactor.activeTurn.key)
 
 	effects := applyOK(t, reactor, DurableInput{
-		Sequence: 1,
+		Sequence: 4,
 		Kind:     DurableKindTurnCommitted,
 		Payload:  committedTurnPayload(identity.TurnKey{ID: "turn-a", Revision: 1}),
 	})
@@ -2283,7 +2978,7 @@ func TestSupersededTurnKeyCannotResurrectAfterABAItemSequence(t *testing.T) {
 	assert.Nil(t, effects[0].Async, "an old A:1 commit must not authorize the new A:2 turn")
 
 	effects = applyOK(t, reactor, DurableInput{
-		Sequence: 2,
+		Sequence: 5,
 		Kind:     DurableKindTurnCommitted,
 		Payload:  committedTurnPayload(identity.TurnKey{ID: "turn-a", Revision: 3}),
 	})
@@ -2294,17 +2989,16 @@ func TestSupersededTurnKeyCannotResurrectAfterABAItemSequence(t *testing.T) {
 
 func TestStaleDurableProvisionalCannotResurrectSupersededTurn(t *testing.T) {
 	reactor, _ := testReactor(1)
-	for _, itemID := range []string{"turn-a", "turn-b"} {
-		applyOK(t, reactor, currentVoice(reactor, realtime.Event{
-			Kind: realtime.EventTranscriptionCompleted, ItemID: itemID, Text: "transcript",
-		}))
-	}
+	applyOK(t, reactor, DurableInput{Sequence: 1, Kind: DurableKindTurnProvisional,
+		Payload: committedTurnPayload(identity.TurnKey{ID: "turn-a", Revision: 1})})
+	applyOK(t, reactor, DurableInput{Sequence: 2, Kind: DurableKindTurnProvisional,
+		Payload: committedTurnPayload(identity.TurnKey{ID: "turn-b", Revision: 2})})
 	require.NotNil(t, reactor.activeTurn)
 	assert.Equal(t, identity.TurnKey{ID: "turn-b", Revision: 2}, reactor.activeTurn.key)
 
 	before := mutationView(reactor)
 	effects, err := reactor.Apply(DurableInput{
-		Sequence: 1,
+		Sequence: 3,
 		Kind:     DurableKindTurnProvisional,
 		Payload:  committedTurnPayload(identity.TurnKey{ID: "turn-a", Revision: 1}),
 	})
@@ -2347,9 +3041,7 @@ func TestStaleCommitPreservesPendingToolForCurrentHighWaterTurn(t *testing.T) {
 	turnA := identity.TurnKey{ID: "turn-a", Revision: 1}
 	turnB := identity.TurnKey{ID: "turn-b", Revision: 2}
 	applyOK(t, reactor, DurableInput{Sequence: 1, Kind: DurableKindTurnCommitted, Payload: committedTurnPayload(turnA)})
-	applyOK(t, reactor, currentVoice(reactor, realtime.Event{
-		Kind: realtime.EventTranscriptionCompleted, ItemID: turnB.ID, Text: "new turn",
-	}))
+	applyOK(t, reactor, DurableInput{Sequence: 2, Kind: DurableKindTurnProvisional, Payload: committedTurnPayload(turnB)})
 	epoch := startStreaming(t, reactor, "response-1")
 	applyOK(t, reactor, currentVoice(reactor, backgroundToolEvent(
 		epoch, "response-1", "call-current", json.RawMessage(`{"objective":"current"}`),
@@ -2357,7 +3049,7 @@ func TestStaleCommitPreservesPendingToolForCurrentHighWaterTurn(t *testing.T) {
 	require.Len(t, reactor.pendingTools, 1)
 
 	assert.Empty(t, applyOK(t, reactor, DurableInput{
-		Sequence: 2,
+		Sequence: 3,
 		Kind:     DurableKindTurnCommitted,
 		Payload:  committedTurnPayload(turnA),
 	}))
@@ -2365,7 +3057,7 @@ func TestStaleCommitPreservesPendingToolForCurrentHighWaterTurn(t *testing.T) {
 	assert.Equal(t, turnB, *reactor.pendingTools[0].turn)
 
 	effects := applyOK(t, reactor, DurableInput{
-		Sequence: 3,
+		Sequence: 4,
 		Kind:     DurableKindTurnCommitted,
 		Payload:  committedTurnPayload(turnB),
 	})
@@ -2398,24 +3090,30 @@ func TestPendingToolRetainsCapturedTurnAndArgumentsAcrossNewItem(t *testing.T) {
 
 func TestTurnRevisionOverflowRejectsInputBoundariesWithoutMutation(t *testing.T) {
 	tests := []struct {
-		name  string
-		input func(*Reactor) Input
+		name        string
+		providerVAD bool
+		input       func(*testing.T, *Reactor) Input
 	}{
 		{
-			name: "speech",
-			input: func(reactor *Reactor) Input {
+			name:        "speech",
+			providerVAD: true,
+			input: func(_ *testing.T, reactor *Reactor) Input {
 				return currentVoice(reactor, realtime.Event{Kind: realtime.EventSpeechStarted, ItemID: "next"})
 			},
 		},
 		{
-			name: "transcription",
-			input: func(reactor *Reactor) Input {
-				return currentVoice(reactor, realtime.Event{Kind: realtime.EventTranscriptionCompleted, ItemID: "next"})
+			name: "manual committed acknowledgement",
+			input: func(t *testing.T, reactor *Reactor) Input {
+				commit := applyOK(t, reactor, ClientInput{Event: protocol.InputAudioBufferCommitEvent{Type: "input_audio_buffer.commit"}})
+				return currentVoice(reactor, realtime.Event{
+					Kind: realtime.EventInputAudioCommitted, ItemID: "next",
+					InputAudioCommitSequence: commit[0].VoiceCommand.Sequence,
+				})
 			},
 		},
 		{
 			name: "user conversation item",
-			input: func(*Reactor) Input {
+			input: func(*testing.T, *Reactor) Input {
 				return ClientInput{Event: protocol.ConversationItemCreateEvent{
 					Type: "conversation.item.create",
 					Item: protocol.ConversationItem{
@@ -2432,13 +3130,17 @@ func TestTurnRevisionOverflowRejectsInputBoundariesWithoutMutation(t *testing.T)
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			reactor, _ := testReactor(1)
+			if test.providerVAD {
+				reactor, _ = providerVADTestReactor(1)
+			}
 			applyOK(t, reactor, DurableInput{
 				Sequence: 1,
 				Kind:     DurableKindTurnProvisional,
 				Payload:  committedTurnPayload(identity.TurnKey{ID: "last", Revision: ^uint32(0)}),
 			})
+			input := test.input(t, reactor)
 			before := mutationView(reactor)
-			effects, err := reactor.Apply(test.input(reactor))
+			effects, err := reactor.Apply(input)
 			require.EqualError(t, err, "session turn revision exhausted")
 			assert.Empty(t, effects)
 			assert.Equal(t, before, mutationView(reactor))

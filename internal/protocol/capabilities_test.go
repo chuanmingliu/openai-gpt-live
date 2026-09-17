@@ -22,12 +22,14 @@ func TestCapabilitiesPublishesPinnedFirstReleaseContract(t *testing.T) {
 		"response.create",
 		"response.cancel",
 		"live.tool.approval.resolve",
+		"live.tool_policy.update",
 	}, got.ClientEvents)
 	assert.Equal(t, []string{
 		"session.created",
 		"session.reconnect.updated",
 		"session.updated",
 		"error",
+		"input_audio_buffer.committed",
 		"input_audio_buffer.speech_started",
 		"input_audio_buffer.speech_stopped",
 		"conversation.item.input_audio_transcription.delta",
@@ -47,9 +49,11 @@ func TestCapabilitiesPublishesPinnedFirstReleaseContract(t *testing.T) {
 		"live.handoff.completed",
 		"live.handoff.failed",
 		"live.handoff.cancelled",
+		"live.profile.selected",
 		"live.session.degraded",
 		"live.session.resumed",
 		"live.tool.approval.required",
+		"live.tool_policy.updated",
 	}, got.Extensions)
 	assert.Equal(t, PCMContract{
 		Encoding:        "pcm_s16le",
@@ -74,4 +78,11 @@ func TestCapabilitiesReturnsIndependentEventSlices(t *testing.T) {
 	require.Equal(t, "session.update", second.ClientEvents[0])
 	require.Equal(t, "session.created", second.ServerEvents[0])
 	require.Equal(t, "live.handoff.created", second.Extensions[0])
+}
+
+func TestCapabilitiesAdvertisesVerticalProfilesOnlyWhenEnabled(t *testing.T) {
+	disabled := CapabilitiesForFeatures(Limits{}, CapabilityFeatures{})
+	assert.NotContains(t, disabled.Extensions, "live.profile.selected")
+	enabled := CapabilitiesForFeatures(Limits{}, CapabilityFeatures{VerticalProfiles: true})
+	assert.Contains(t, enabled.Extensions, "live.profile.selected")
 }

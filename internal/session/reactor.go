@@ -11,6 +11,7 @@ import (
 	"io"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/chuanmingliu/openai-gpt-live/internal/handoff"
@@ -24,7 +25,7 @@ import (
 const (
 	PendingBackgroundToolLimit = 16
 	PendingBackgroundToolBytes = 1 << 20
-	PendingSessionUpdateLimit  = 16
+	PendingSessionUpdateLimit  = 1
 	PendingSessionUpdateBytes  = 1 << 20
 	PendingHandoffResultLimit  = 16
 	PendingHandoffResultBytes  = 64 << 10
@@ -39,22 +40,58 @@ const (
 	DurableKindTurnCommitted             = "turn.committed"
 	AsyncKindStartBackgroundTask         = StartBackgroundTaskTool
 	AsyncKindStartBackgroundTaskRejected = "start_background_task.rejected"
+	asyncKindPresentationSafety          = "presentation.safety"
 	recentPresentationCorrelationLimit   = 8
+	providerInputItemHistoryLimit        = 1024
+	providerInputItemHistoryBytes        = providerInputItemHistoryLimit * DurableIdentifierBytes
+	providerInputGenerationLimit         = 64
 )
 
+type ClientEffectCompletedInput struct {
+	Sequence uint64
+	Err      error
+}
+
+func (ClientEffectCompletedInput) isSessionInput() {}
+
+type DurableEffectCompletedInput struct {
+	Sequence uint64
+	Kind     string
+	Err      error
+}
+
+func (DurableEffectCompletedInput) isSessionInput() {}
+
+type ApprovalResolutionCompletedInput struct {
+	ExternalSequence uint64
+	InvocationID     string
+	Accepted         bool
+}
+
+func (ApprovalResolutionCompletedInput) isSessionInput() {}
+
 var (
-	ErrInvalidTransition         = errors.New("invalid session transition")
-	ErrUnsupportedInput          = errors.New("unsupported session input")
-	ErrMediaInput                = errors.New("audio append belongs to the media loop")
-	ErrDurableSequenceGap        = errors.New("durable sequence gap")
-	ErrPendingToolLimit          = errors.New("pending background tool limit exceeded")
-	ErrInvalidVoiceEvent         = errors.New("invalid voice event")
-	ErrUnsupportedField          = errors.New("unsupported nonzero client field")
-	ErrInvalidSessionTool        = errors.New("invalid session tool")
-	ErrPendingSessionUpdateLimit = errors.New("pending session update limit exceeded")
-	ErrInvalidSessionIDs         = errors.New("invalid session IDs")
-	ErrTurnRevisionExhausted     = errors.New("session turn revision exhausted")
-	ErrTurnRevisionRegression    = errors.New("session turn revision must increase")
+	ErrInvalidTransition            = errors.New("invalid session transition")
+	ErrUnsupportedInput             = errors.New("unsupported session input")
+	ErrMediaInput                   = errors.New("audio append belongs to the media loop")
+	ErrDurableSequenceGap           = errors.New("durable sequence gap")
+	ErrPendingToolLimit             = errors.New("pending background tool limit exceeded")
+	ErrInvalidVoiceEvent            = errors.New("invalid voice event")
+	ErrUnsupportedField             = errors.New("unsupported nonzero client field")
+	ErrInvalidSessionTool           = errors.New("invalid session tool")
+	ErrPendingSessionUpdateLimit    = errors.New("pending session update limit exceeded")
+	ErrInvalidSessionIDs            = errors.New("invalid session IDs")
+	ErrTurnRevisionExhausted        = errors.New("session turn revision exhausted")
+	ErrTurnRevisionRegression       = errors.New("session turn revision must increase")
+	ErrProviderInputItemLimit       = errors.New("provider input item history limit exceeded")
+	ErrProviderInputGenerationLimit = errors.New("provider input generation limit exceeded")
+	ErrHistoricalProviderInputItem  = errors.New("historical provider input item cannot be reused by client")
+	ErrAudioCommitInFlight          = errors.New("input audio commit acknowledgement is pending")
+	ErrUnexpectedAudioCommitAck     = errors.New("unexpected input audio commit acknowledgement")
+	ErrInputTurnModeUnconfirmed     = realtime.ErrInputTurnModeUnconfirmed
+	ErrManualAudioCommitDisabled    = realtime.ErrManualAudioCommitDisabled
+	ErrInputTurnModeImmutable       = realtime.ErrInputTurnModeImmutable
+	ErrPendingInputTurnMode         = realtime.ErrPendingInputTurnMode
 )
 
 type terminalMarker struct {
@@ -65,6 +102,8 @@ type terminalMarker struct {
 type pendingSessionUpdate struct {
 	session       json.RawMessage
 	retainedBytes int
+	inputTurnMode realtime.InputTurnMode
+	modeSetting   bool
 }
 
 type pendingTool struct {
@@ -106,6 +145,25 @@ type stagedPresentation struct {
 	structured json.RawMessage
 }
 
+type pendingPresentationSafety struct {
+	event    handoff.Event
+	decision presentation.Decision
+	summary  string
+}
+
+type presentationSafetyRequest struct {
+	Visual safety.WorkerResultCandidate  `json:"visual"`
+	Speech *safety.WorkerResultCandidate `json:"speech,omitempty"`
+}
+
+type HandoffSafetyCompletedInput struct {
+	Sequence uint64
+	Visual   safety.Decision
+	Speech   safety.Decision
+}
+
+func (HandoffSafetyCompletedInput) isSessionInput() {}
+
 type presentationCorrelation struct {
 	epoch    identity.ResponseEpoch
 	eventID  string
@@ -115,6 +173,22 @@ type presentationCorrelation struct {
 type finalizedTranscript struct {
 	turn identity.TurnKey
 	text string
+}
+
+type providerInputGeneration struct {
+	commandSequence        uint64
+	itemID                 string
+	turn                   identity.TurnKey
+	awaitingCommit         bool
+	awaitingAcknowledgment bool
+	suppressed             bool
+	transcriptOpen         bool
+}
+
+type providerInputAuthorityLedger struct {
+	history      map[string]string
+	historyBytes int
+	generations  []providerInputGeneration
 }
 
 type Reactor struct {
@@ -127,13 +201,19 @@ type Reactor struct {
 
 	activeResponseID          string
 	activeResponseEpoch       identity.ResponseEpoch
+	suppressedImplicitID      string
 	terminal                  *terminalMarker
 	pendingSessionUpdates     map[uint64]pendingSessionUpdate
 	pendingSessionUpdateBytes int
+	pendingInputTurnMode      uint64
+	inputTurnMode             realtime.InputTurnMode
+	initialInputTurnMode      realtime.InputTurnMode
 	connected                 bool
 	pendingTools              []pendingTool
 	pendingToolBytes          int
 	activeTurn                *activeInputTurn
+	activeSpeechItemID        string
+	providerInput             providerInputAuthorityLedger
 	inputTurnRevision         uint32
 	pendingCancelSequence     uint64
 	pendingCreateSequence     uint64
@@ -156,6 +236,8 @@ type Reactor struct {
 	presentationSequence      int64
 	stagedPresentation        *stagedPresentation
 	recentPresentations       []presentationCorrelation
+	deferPresentationSafety   bool
+	pendingPresentationSafety map[uint64]pendingPresentationSafety
 }
 
 func NewReactor(ids IDs, fence *EpochFence) *Reactor {
@@ -175,21 +257,33 @@ func newReactorWithPresentationAndHandoffTools(ids IDs, fence *EpochFence, polic
 		fence = NewEpochFence(0)
 	}
 	reactor := &Reactor{
-		ids:                     ids,
-		state:                   State{Response: ResponseIdle},
-		fence:                   fence,
-		nextSeq:                 1,
-		pendingSessionUpdates:   make(map[uint64]pendingSessionUpdate),
-		handoffCalls:            make(map[string]*handoffCall),
-		terminalResponses:       make(map[string]struct{}),
-		finalizedAssistantTexts: make(map[string]finalizedTranscript),
-		resolvedHandoffs:        make(map[handoffToken]struct{}),
-		presentationPolicy:      policy,
-		safetyPolicy:            safetyPolicy,
-		handoffToolsEnabled:     enabled,
+		ids:                       ids,
+		state:                     State{Response: ResponseIdle},
+		fence:                     fence,
+		nextSeq:                   1,
+		pendingSessionUpdates:     make(map[uint64]pendingSessionUpdate),
+		handoffCalls:              make(map[string]*handoffCall),
+		terminalResponses:         make(map[string]struct{}),
+		finalizedAssistantTexts:   make(map[string]finalizedTranscript),
+		resolvedHandoffs:          make(map[handoffToken]struct{}),
+		presentationPolicy:        policy,
+		safetyPolicy:              safetyPolicy,
+		handoffToolsEnabled:       enabled,
+		pendingPresentationSafety: make(map[uint64]pendingPresentationSafety),
 	}
 	reactor.initErr = validateSessionIDs(ids)
 	return reactor
+}
+
+func (r *Reactor) expectInitialInputTurnMode(turnDetection json.RawMessage) error {
+	mode, specified, err := realtime.ParseInputTurnMode(turnDetection)
+	if err != nil {
+		return err
+	}
+	if specified {
+		r.initialInputTurnMode = mode
+	}
+	return nil
 }
 
 func validateSessionIDs(ids IDs) error {
@@ -244,6 +338,27 @@ func (r *Reactor) ApplyContext(ctx context.Context, input Input) ([]Effect, erro
 		return effects, err
 	case VoiceCommandCompletedInput:
 		return r.applyVoiceCommandCompleted(typed)
+	case ClientEffectCompletedInput:
+		if typed.Err != nil {
+			return nil, fmt.Errorf("client effect %d failed: %w", typed.Sequence, typed.Err)
+		}
+		return nil, nil
+	case DurableEffectCompletedInput:
+		if typed.Err != nil {
+			return nil, fmt.Errorf("durable %s effect %d failed: %w", typed.Kind, typed.Sequence, typed.Err)
+		}
+		return nil, nil
+	case ApprovalResolutionCompletedInput:
+		if typed.Accepted {
+			return nil, nil
+		}
+		return []Effect{{ClientEvent: protocol.ErrorEvent{
+			Type:    "error",
+			EventID: r.providerOrSynthEventID(""),
+			Error: protocol.ProtocolError{
+				Type: "invalid_request_error", Code: "approval_rejected", Message: "approval resolution was not accepted",
+			},
+		}}}, nil
 	case DurableInput:
 		return r.applyDurable(typed)
 	case TurnCommittedInput:
@@ -254,6 +369,8 @@ func (r *Reactor) ApplyContext(ctx context.Context, input Input) ([]Effect, erro
 		return r.applyHandoffAccepted(typed)
 	case HandoffEventInput:
 		return r.applyHandoffEvent(ctx, typed)
+	case HandoffSafetyCompletedInput:
+		return r.applyHandoffSafetyCompleted(ctx, typed)
 	case FailedInput:
 		return r.applyFailed(typed)
 	default:
@@ -301,7 +418,7 @@ func (r *Reactor) applyHandoffEvent(ctx context.Context, input HandoffEventInput
 		return []Effect{{ClientEvent: handoffDegradedEvent(event, "unsupported_handoff_event"), RequireClientWrite: true}}, nil
 	}
 	event.Payload = append(json.RawMessage(nil), public.Details...)
-	visual, known := handoffVisualEvent(event, public.Details)
+	_, known := handoffVisualEvent(event, public.Details)
 	if !known {
 		return []Effect{{ClientEvent: handoffDegradedEvent(event, "unsupported_handoff_event"), RequireClientWrite: true}}, nil
 	}
@@ -328,27 +445,56 @@ func (r *Reactor) applyHandoffEvent(ctx context.Context, input HandoffEventInput
 	}
 	visualCandidate := baseCandidate.Clone()
 	visualCandidate.Channel = safety.ChannelVisual
+	var speechCandidate *safety.WorkerResultCandidate
+	speechEligible := presentationDecision.SpeakNow || presentationDecision.DeferSpeech
+	if speechEligible {
+		candidate := baseCandidate.Clone()
+		candidate.Channel = safety.ChannelSpeech
+		speechCandidate = &candidate
+	}
+	if r.deferPresentationSafety {
+		sequence := r.allocateSequence()
+		r.pendingPresentationSafety[sequence] = pendingPresentationSafety{
+			event: handoff.CloneEvent(event), decision: presentationDecision, summary: summary,
+		}
+		payload, err := json.Marshal(presentationSafetyRequest{Visual: visualCandidate, Speech: speechCandidate})
+		if err != nil {
+			delete(r.pendingPresentationSafety, sequence)
+			return nil, err
+		}
+		return []Effect{{Async: &AsyncEffect{Kind: asyncKindPresentationSafety, Sequence: sequence, Payload: payload}}}, nil
+	}
 	visualSafety := safety.EvaluateOrSuppress(ctx, r.safetyPolicy, visualCandidate)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	var speechSafety safety.Decision
+	if speechCandidate != nil {
+		speechSafety = safety.EvaluateOrSuppress(ctx, r.safetyPolicy, *speechCandidate)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return r.finishHandoffEvent(ctx, event, presentationDecision, summary, visualSafety, speechSafety)
+}
+
+func (r *Reactor) applyHandoffSafetyCompleted(ctx context.Context, input HandoffSafetyCompletedInput) ([]Effect, error) {
+	pending, ok := r.pendingPresentationSafety[input.Sequence]
+	if !ok {
+		return nil, nil
+	}
+	delete(r.pendingPresentationSafety, input.Sequence)
+	return r.finishHandoffEvent(ctx, pending.event, pending.decision, pending.summary, input.Visual, input.Speech)
+}
+
+func (r *Reactor) finishHandoffEvent(ctx context.Context, event handoff.Event, presentationDecision presentation.Decision, summary string, visualSafety, speechSafety safety.Decision) ([]Effect, error) {
 	visualSummary, visualDetails, visualAllowed, visualTerminate := applyPresentationSafety(visualSafety, summary, event.Payload)
 	_ = visualSummary
 	visualUrgent := visualSafety.Action == safety.ActionCancelResponse
 	if visualTerminate {
 		return r.terminateForSafety(), nil
 	}
-
-	var speechSafety safety.Decision
 	speechEligible := presentationDecision.SpeakNow || presentationDecision.DeferSpeech
-	if speechEligible {
-		speechCandidate := baseCandidate.Clone()
-		speechCandidate.Channel = safety.ChannelSpeech
-		speechSafety = safety.EvaluateOrSuppress(ctx, r.safetyPolicy, speechCandidate)
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-	}
 	speechSummary, speechDetails, speechAllowed, speechTerminate := applyPresentationSafety(speechSafety, summary, event.Payload)
 	urgent := visualUrgent || speechSafety.Action == safety.ActionCancelResponse
 	if speechTerminate {
@@ -363,7 +509,7 @@ func (r *Reactor) applyHandoffEvent(ctx context.Context, input HandoffEventInput
 		visualEvent.Kind = "handoff.needs-input"
 		visualEvent.State = handoff.StateNeedsInput
 	}
-	visual, known = handoffVisualEvent(visualEvent, visualDetails)
+	visual, known := handoffVisualEvent(visualEvent, visualDetails)
 	if !known {
 		return []Effect{{ClientEvent: handoffDegradedEvent(event, "unsupported_handoff_event"), RequireClientWrite: true}}, nil
 	}
@@ -1124,12 +1270,14 @@ func (r *Reactor) Snapshot() Snapshot {
 		return Snapshot{}
 	}
 	return Snapshot{
-		IDs:            r.ids,
-		Response:       r.state.Response,
-		ResponseEpoch:  r.fence.Current(),
-		UserSpeaking:   r.state.UserSpeaking,
-		CommittedTurn:  cloneTurn(r.state.CommittedTurn),
-		LastDurableSeq: r.state.LastDurableSeq,
+		IDs:                     r.ids,
+		Response:                r.state.Response,
+		ResponseEpoch:           r.fence.Current(),
+		UserSpeaking:            r.state.UserSpeaking,
+		InputAudioCommitPending: r.providerInput.awaitingAcknowledgment() >= 0,
+		InputTurnMode:           r.inputTurnMode,
+		CommittedTurn:           cloneTurn(r.state.CommittedTurn),
+		LastDurableSeq:          r.state.LastDurableSeq,
 	}
 }
 
@@ -1200,6 +1348,12 @@ func (r *Reactor) applyConnected(input ConnectedInput) ([]Effect, error) {
 		Reconnect: cloneReconnectMetadata(input.Reconnect),
 	}
 	effects = append(effects, Effect{ClientEvent: created})
+	if input.Profile != nil {
+		selected := *input.Profile
+		effects = append(effects, Effect{ClientEvent: protocol.LiveProfileSelectedEvent{
+			Type: "live.profile.selected", EventID: r.providerOrSynthEventID(""), Profile: selected,
+		}})
+	}
 	if terminalizedPending {
 		acceptance, err := r.emitNextReadyHandoffAcceptance()
 		if err != nil {
@@ -1226,6 +1380,25 @@ func (r *Reactor) applySessionUpdate(event protocol.SessionUpdateEvent) ([]Effec
 	if err != nil {
 		return nil, err
 	}
+	requestedMode, modeSpecified, err := realtime.ParseInputTurnMode(commandSession.TurnDetection)
+	if err != nil {
+		return nil, err
+	}
+	modeSetting := false
+	if r.inputTurnMode == realtime.InputTurnModeUnspecified {
+		if !modeSpecified {
+			return nil, ErrInputTurnModeUnconfirmed
+		}
+		if r.initialInputTurnMode != realtime.InputTurnModeUnspecified || r.pendingInputTurnMode != 0 || len(r.pendingSessionUpdates) != 0 {
+			return nil, ErrPendingInputTurnMode
+		}
+		modeSetting = true
+	} else if modeSpecified && requestedMode != r.inputTurnMode {
+		return nil, ErrInputTurnModeImmutable
+	}
+	if r.pendingInputTurnMode != 0 {
+		return nil, ErrPendingInputTurnMode
+	}
 	// json.Marshal creates the transient encoding needed to determine admission
 	// size. It is not retained by the reactor when the byte budget rejects it.
 	snapshot, err := json.Marshal(event.Session)
@@ -1247,6 +1420,11 @@ func (r *Reactor) applySessionUpdate(event protocol.SessionUpdateEvent) ([]Effec
 	r.pendingSessionUpdates[sequence] = pendingSessionUpdate{
 		session:       ownedSnapshot,
 		retainedBytes: retainedBytes,
+		inputTurnMode: requestedMode,
+		modeSetting:   modeSetting,
+	}
+	if modeSetting {
+		r.pendingInputTurnMode = sequence
 	}
 	r.pendingSessionUpdateBytes += retainedBytes
 	command := realtime.Command{
@@ -1258,10 +1436,23 @@ func (r *Reactor) applySessionUpdate(event protocol.SessionUpdateEvent) ([]Effec
 }
 
 func (r *Reactor) applyAudioCommit() ([]Effect, error) {
-	command := realtime.Command{
-		Kind:     realtime.CommandCommitAudio,
-		Sequence: r.allocateSequence(),
+	if r.inputTurnMode == realtime.InputTurnModeUnspecified {
+		return nil, ErrInputTurnModeUnconfirmed
 	}
+	if r.inputTurnMode != realtime.InputTurnModeManual {
+		return nil, ErrManualAudioCommitDisabled
+	}
+	if r.providerInput.awaitingAcknowledgment() >= 0 {
+		return nil, ErrAudioCommitInFlight
+	}
+	if len(r.providerInput.generations) >= providerInputGenerationLimit {
+		return nil, ErrProviderInputGenerationLimit
+	}
+	sequence := r.allocateSequence()
+	command := realtime.Command{Kind: realtime.CommandCommitAudio, Sequence: sequence}
+	r.providerInput.generations = append(r.providerInput.generations, providerInputGeneration{
+		commandSequence: sequence, awaitingAcknowledgment: true,
+	})
 	return []Effect{{VoiceCommand: &command}}, nil
 }
 
@@ -1278,7 +1469,7 @@ func (r *Reactor) applyConversationItemCreate(event protocol.ConversationItemCre
 		return nil, fmt.Errorf("encode conversation item: %w", err)
 	}
 	if isUserMessage {
-		if err := r.beginInputTurn(event.Item.ID); err != nil {
+		if err := r.establishClientProviderInputItem(event.Item.ID); err != nil {
 			return nil, err
 		}
 	}
@@ -1303,6 +1494,7 @@ func (r *Reactor) applyResponseCreate(event protocol.ResponseCreateEvent) ([]Eff
 	r.state.Response = ResponsePending
 	r.activeResponseID = ""
 	r.activeResponseEpoch = epoch
+	r.suppressedImplicitID = ""
 	r.terminal = nil
 	r.pendingCancelSequence = 0
 	command := realtime.Command{
@@ -1368,10 +1560,16 @@ func (r *Reactor) applyVoice(input VoiceInput) ([]Effect, error) {
 	case realtime.EventSessionUpdated:
 		return r.applyProviderSessionUpdated(input.Event)
 	case realtime.EventInputAudioCommitted:
-		return nil, nil
+		return r.applyInputAudioCommitted(input.Event)
 	case realtime.EventSpeechStarted:
+		if r.inputTurnMode != realtime.InputTurnModeProviderVAD {
+			return nil, fmt.Errorf("%w: provider speech started outside provider VAD mode", ErrInvalidTransition)
+		}
 		return r.applySpeechStarted(input.Event)
 	case realtime.EventSpeechStopped:
+		if r.inputTurnMode != realtime.InputTurnModeProviderVAD {
+			return nil, fmt.Errorf("%w: provider speech stopped outside provider VAD mode", ErrInvalidTransition)
+		}
 		return r.applySpeechStopped(input.Event)
 	case realtime.EventResponseCreated:
 		if input.Event.NeedsEpochBinding {
@@ -1428,41 +1626,108 @@ func (r *Reactor) applyVoice(input VoiceInput) ([]Effect, error) {
 }
 
 func (r *Reactor) applyProviderSessionUpdated(event realtime.Event) ([]Effect, error) {
-	if !event.SessionUpdateAcknowledgement || event.SessionUpdateSequence == 0 {
+	mode, specified := event.InputTurnMode, event.InputTurnModeSpecified
+	if !specified && len(event.Payload) != 0 {
+		var err error
+		mode, specified, err = realtime.ParseSessionUpdatedInputTurnMode(event.Payload)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if !event.SessionUpdateAcknowledgement {
+		if r.inputTurnMode != realtime.InputTurnModeUnspecified && specified && mode != r.inputTurnMode {
+			return nil, ErrInputTurnModeImmutable
+		}
 		return nil, nil
 	}
-	pending, ok := r.pendingSessionUpdates[event.SessionUpdateSequence]
-	if !ok {
+
+	if event.SessionUpdateSequence == 0 {
+		if r.inputTurnMode == realtime.InputTurnModeUnspecified {
+			if r.initialInputTurnMode == realtime.InputTurnModeUnspecified {
+				return nil, nil
+			}
+			if !specified {
+				return nil, errors.New("provider session.updated omitted input turn mode")
+			}
+			if mode != r.initialInputTurnMode {
+				return nil, ErrInputTurnModeImmutable
+			}
+			r.inputTurnMode = r.initialInputTurnMode
+			r.initialInputTurnMode = realtime.InputTurnModeUnspecified
+			return nil, nil
+		}
+		if !specified {
+			return nil, nil
+		}
+		if mode != r.inputTurnMode {
+			return nil, ErrInputTurnModeImmutable
+		}
 		return nil, nil
 	}
-	delete(r.pendingSessionUpdates, event.SessionUpdateSequence)
+
+	sequence := event.SessionUpdateSequence
+	pending, exists := r.pendingSessionUpdates[sequence]
+	if !exists {
+		if r.inputTurnMode != realtime.InputTurnModeUnspecified && specified && mode != r.inputTurnMode {
+			return nil, ErrInputTurnModeImmutable
+		}
+		return nil, nil
+	}
+	if pending.modeSetting {
+		if !specified {
+			return nil, errors.New("provider session.updated omitted input turn mode")
+		}
+		if pending.inputTurnMode != mode {
+			return nil, ErrInputTurnModeImmutable
+		}
+		r.inputTurnMode = mode
+	} else if specified && mode != r.inputTurnMode {
+		return nil, ErrInputTurnModeImmutable
+	}
+
+	delete(r.pendingSessionUpdates, sequence)
 	r.pendingSessionUpdateBytes -= pending.retainedBytes
+	if r.pendingInputTurnMode == sequence {
+		r.pendingInputTurnMode = 0
+	}
 	updated := protocol.SessionUpdatedEvent{
 		Type:    "session.updated",
 		EventID: r.providerOrSynthEventID(event.ProviderEventID),
 		Session: cloneRaw(pending.session),
 	}
-	return []Effect{{ClientEvent: updated}}, nil
+	return []Effect{{ClientEvent: updated, InputTurnModeBoundary: r.inputTurnMode}}, nil
 }
 
 func (r *Reactor) applySpeechStarted(event realtime.Event) ([]Effect, error) {
-	r.stagedPresentation = nil
-	if r.state.UserSpeaking {
-		if r.activeTurn != nil && r.activeTurn.key.ID == event.ItemID {
-			return nil, nil
-		}
-		if err := r.beginInputTurn(event.ItemID); err != nil {
-			return nil, err
-		}
-		return nil, nil
-	}
-
-	if err := r.beginInputTurn(event.ItemID); err != nil {
+	if err := validateProviderInputItemID("speech item ID", event.ItemID); err != nil {
 		return nil, err
 	}
+	if r.state.UserSpeaking {
+		if r.activeSpeechItemID == event.ItemID {
+			return nil, nil
+		}
+		if err := r.establishSpeechProviderInputItem(event.ItemID); err != nil {
+			return nil, err
+		}
+		r.stagedPresentation = nil
+		r.activeSpeechItemID = strings.Clone(event.ItemID)
+		started := protocol.InputAudioBufferSpeechStartedEvent{
+			Type:    "input_audio_buffer.speech_started",
+			EventID: r.providerOrSynthEventID(event.ProviderEventID),
+			ItemID:  event.ItemID,
+		}
+		return []Effect{{ClientEvent: started}}, nil
+	}
+
+	if err := r.establishSpeechProviderInputItem(event.ItemID); err != nil {
+		return nil, err
+	}
+	r.stagedPresentation = nil
 	r.clearPresentationResponse()
 	epoch := r.fence.Advance()
 	r.state.UserSpeaking = true
+	r.activeSpeechItemID = strings.Clone(event.ItemID)
 	effects := []Effect{{FlushBefore: epoch}}
 	if r.state.Response == ResponsePending || r.state.Response == ResponseStreaming {
 		r.activeResponseEpoch = epoch
@@ -1495,10 +1760,14 @@ func (r *Reactor) applySpeechStarted(event realtime.Event) ([]Effect, error) {
 }
 
 func (r *Reactor) applySpeechStopped(event realtime.Event) ([]Effect, error) {
-	if !r.state.UserSpeaking {
+	if err := validateProviderInputItemID("speech item ID", event.ItemID); err != nil {
+		return nil, err
+	}
+	if !r.state.UserSpeaking || r.activeSpeechItemID != event.ItemID {
 		return nil, nil
 	}
 	r.state.UserSpeaking = false
+	r.activeSpeechItemID = ""
 	stopped := protocol.InputAudioBufferSpeechStoppedEvent{
 		Type:    "input_audio_buffer.speech_stopped",
 		EventID: r.providerOrSynthEventID(event.ProviderEventID),
@@ -1544,6 +1813,7 @@ func (r *Reactor) applyImplicitResponseCreated(event realtime.Event) ([]Effect, 
 	r.state.Response = ResponseStreaming
 	r.activeResponseID = event.ResponseID
 	r.activeResponseEpoch = epoch
+	r.suppressedImplicitID = ""
 	r.terminal = nil
 	r.pendingCancelSequence = 0
 	bind := realtime.Command{
@@ -1551,6 +1821,24 @@ func (r *Reactor) applyImplicitResponseCreated(event realtime.Event) ([]Effect, 
 		Sequence:   r.allocateSequence(),
 		Epoch:      epoch,
 		ResponseID: event.ResponseID,
+	}
+	if r.state.UserSpeaking {
+		cancelEpoch := r.fence.Advance()
+		cancel := realtime.Command{
+			Kind:       realtime.CommandCancelResponse,
+			Sequence:   r.allocateSequence(),
+			Epoch:      cancelEpoch,
+			ResponseID: event.ResponseID,
+		}
+		r.state.Response = ResponseTerminal
+		r.activeResponseEpoch = cancelEpoch
+		r.suppressedImplicitID = event.ResponseID
+		r.pendingCancelSequence = cancel.Sequence
+		return []Effect{
+			{VoiceCommand: &bind},
+			{FlushBefore: cancelEpoch},
+			{VoiceCommand: &cancel},
+		}, nil
 	}
 	created := protocol.ResponseCreatedEvent{
 		Type:    "response.created",
@@ -1581,13 +1869,23 @@ func (r *Reactor) applyTranscriptDelta(event realtime.Event) ([]Effect, error) {
 }
 
 func (r *Reactor) applyInputTranscriptionDelta(event realtime.Event) ([]Effect, error) {
-	if err := r.observeTranscription(event.ItemID, false); err != nil {
+	if err := validateProviderInputItemID("transcript item ID", event.ItemID); err != nil {
 		return nil, err
+	}
+	itemID := event.ItemID
+	if generation := r.providerInput.generationForTranscript(itemID); generation >= 0 {
+		providerGeneration := &r.providerInput.generations[generation]
+		if providerGeneration.suppressed || providerGeneration.awaitingCommit || providerGeneration.awaitingAcknowledgment || !providerGeneration.transcriptOpen {
+			return nil, nil
+		}
+		itemID = providerGeneration.itemID
+	} else {
+		return nil, nil
 	}
 	mapped := protocol.ConversationItemInputAudioTranscriptionDeltaEvent{
 		Type:    "conversation.item.input_audio_transcription.delta",
 		EventID: r.providerOrSynthEventID(event.ProviderEventID),
-		ItemID:  event.ItemID,
+		ItemID:  itemID,
 		Delta:   event.Text,
 	}
 	return []Effect{{ClientEvent: mapped}}, nil
@@ -1597,35 +1895,283 @@ func (r *Reactor) applyInputTranscriptionCompleted(event realtime.Event) ([]Effe
 	if err := validateDurableText("user transcript", event.Text); err != nil {
 		return nil, err
 	}
-	if err := validateDurableID("transcript item ID", event.ItemID); err != nil {
+	if err := validateProviderInputItemID("transcript item ID", event.ItemID); err != nil {
 		return nil, err
 	}
-	if r.activeTurn != nil && r.activeTurn.key.ID == event.ItemID && r.activeTurn.transcriptComplete && r.activeTurn.transcript == event.Text {
-		mapped := protocol.ConversationItemInputAudioTranscriptionCompletedEvent{
-			Type: "conversation.item.input_audio_transcription.completed", EventID: r.providerOrSynthEventID(event.ProviderEventID),
-			ItemID: event.ItemID, Transcript: event.Text,
-		}
-		return []Effect{{ClientEvent: mapped}}, nil
+
+	generation := r.providerInput.generationForTranscript(event.ItemID)
+	if generation < 0 {
+		return nil, nil
 	}
-	if err := r.observeTranscription(event.ItemID, true); err != nil {
-		return nil, err
+
+	providerGeneration := r.providerInput.generations[generation]
+	if providerGeneration.suppressed || providerGeneration.awaitingCommit || providerGeneration.awaitingAcknowledgment || !providerGeneration.transcriptOpen {
+		return nil, nil
+	}
+	if providerGeneration.turn == (identity.TurnKey{}) {
+		return nil, ErrUnexpectedAudioCommitAck
 	}
 	mapped := protocol.ConversationItemInputAudioTranscriptionCompletedEvent{
-		Type:       "conversation.item.input_audio_transcription.completed",
-		EventID:    r.providerOrSynthEventID(event.ProviderEventID),
-		ItemID:     event.ItemID,
-		Transcript: event.Text,
+		Type: "conversation.item.input_audio_transcription.completed", EventID: r.providerOrSynthEventID(event.ProviderEventID),
+		ItemID: providerGeneration.itemID, Transcript: event.Text,
 	}
-	if r.activeTurn == nil {
+	if r.activeTurn != nil && r.activeTurn.key == providerGeneration.turn && r.activeTurn.transcriptComplete && r.activeTurn.transcript == event.Text {
+		r.providerInput.removeGeneration(generation)
 		return []Effect{{ClientEvent: mapped}}, nil
 	}
-	r.activeTurn.transcript = event.Text
-	r.transcriptSequence++
-	r.activeTurn.durableSequence = r.transcriptSequence
-	transcript := TranscriptRequestedEffect{
-		Turn: r.activeTurn.key, Sequence: r.transcriptSequence, Role: "user", FinalText: event.Text,
+	if r.activeTurn != nil && r.activeTurn.key == providerGeneration.turn {
+		r.activeTurn.committed = false
+		r.activeTurn.transcriptComplete = true
+		r.activeTurn.transcript = event.Text
 	}
+	r.transcriptSequence++
+	if r.activeTurn != nil && r.activeTurn.key == providerGeneration.turn {
+		r.activeTurn.durableSequence = r.transcriptSequence
+	}
+	transcript := TranscriptRequestedEffect{
+		Turn: providerGeneration.turn, Sequence: r.transcriptSequence, Role: "user", FinalText: event.Text,
+	}
+	r.providerInput.removeGeneration(generation)
 	return []Effect{{ClientEvent: mapped, Transcript: &transcript}}, nil
+}
+
+func (r *Reactor) applyInputAudioCommitted(event realtime.Event) ([]Effect, error) {
+	if err := validateProviderInputItemID("committed audio item ID", event.ItemID); err != nil {
+		return nil, err
+	}
+	if event.PreviousItemID != nil {
+		if err := validateProviderInputItemID("committed audio previous item ID", *event.PreviousItemID); err != nil {
+			return nil, err
+		}
+	}
+	if !r.providerInput.canRemember(event.ItemID) {
+		return nil, ErrProviderInputItemLimit
+	}
+
+	matching := r.providerInput.generationForItem(event.ItemID)
+	switch r.inputTurnMode {
+	case realtime.InputTurnModeManual:
+		pending := r.providerInput.awaitingAcknowledgment()
+		if r.providerInput.historical(event.ItemID) {
+			return nil, nil
+		}
+		if pending < 0 || event.InputAudioCommitSequence == 0 ||
+			event.InputAudioCommitSequence != r.providerInput.generations[pending].commandSequence {
+			return nil, ErrUnexpectedAudioCommitAck
+		}
+		generation := r.providerInput.generations[pending]
+		if generation.itemID != "" && generation.itemID != event.ItemID {
+			return nil, ErrUnexpectedAudioCommitAck
+		}
+		return r.acknowledgeProviderInputGeneration(event, pending, true)
+	case realtime.InputTurnModeProviderVAD:
+		if event.InputAudioCommitSequence != 0 {
+			return nil, ErrUnexpectedAudioCommitAck
+		}
+		if matching >= 0 && r.providerInput.generations[matching].awaitingCommit {
+			return r.acknowledgeProviderInputGeneration(event, matching, false)
+		}
+		if r.providerInput.historical(event.ItemID) {
+			return nil, nil
+		}
+	case realtime.InputTurnModeUnspecified:
+		return nil, ErrInputTurnModeUnconfirmed
+	default:
+		return nil, ErrInvalidTransition
+	}
+	if len(r.providerInput.generations) >= providerInputGenerationLimit {
+		return nil, ErrProviderInputGenerationLimit
+	}
+	canonical := r.providerInput.canonicalItemID(event.ItemID)
+	if err := r.beginInputTurn(canonical); err != nil {
+		return nil, err
+	}
+	canonical = r.providerInput.remember(canonical)
+	turn := r.activeTurn.key
+	r.providerInput.generations = append(r.providerInput.generations, providerInputGeneration{
+		itemID: canonical, turn: turn, transcriptOpen: true,
+	})
+	return r.inputAudioCommittedEffects(event, canonical, false, 0), nil
+}
+
+func (r *Reactor) acknowledgeProviderInputGeneration(event realtime.Event, generation int, manual bool) ([]Effect, error) {
+	providerGeneration := &r.providerInput.generations[generation]
+	commandSequence := providerGeneration.commandSequence
+	if providerGeneration.itemID == "" {
+		canonical := r.providerInput.canonicalItemID(event.ItemID)
+		if !providerGeneration.suppressed {
+			if err := r.beginInputTurn(canonical); err != nil {
+				return nil, err
+			}
+			providerGeneration.turn = r.activeTurn.key
+		}
+		providerGeneration.itemID = r.providerInput.remember(canonical)
+	}
+	providerGeneration.awaitingCommit = false
+	providerGeneration.awaitingAcknowledgment = false
+	providerGeneration.transcriptOpen = !providerGeneration.suppressed
+	itemID := providerGeneration.itemID
+	if providerGeneration.suppressed {
+		r.providerInput.removeGeneration(generation)
+		return r.inputAudioCommittedEffects(event, itemID, manual, commandSequence), nil
+	}
+	return r.inputAudioCommittedEffects(event, itemID, manual, commandSequence), nil
+}
+
+func (r *Reactor) inputAudioCommittedEffects(
+	event realtime.Event,
+	itemID string,
+	releaseManualCommit bool,
+	inputAudioCommitSequence uint64,
+) []Effect {
+	effects := make([]Effect, 0, 2)
+	if releaseManualCommit {
+		command := realtime.Command{
+			Kind: realtime.CommandAcknowledgeAudioCommit, Sequence: r.allocateSequence(), InputItemID: itemID,
+			InputAudioCommitSequence: inputAudioCommitSequence,
+		}
+		effects = append(effects, Effect{VoiceCommand: &command})
+	}
+	committed := protocol.InputAudioBufferCommittedEvent{
+		Type: "input_audio_buffer.committed", EventID: r.providerOrSynthEventID(event.ProviderEventID),
+		ItemID: itemID, PreviousItemID: cloneStringPointer(event.PreviousItemID),
+	}
+	return append(effects, Effect{ClientEvent: committed})
+}
+
+func cloneStringPointer(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	cloned := strings.Clone(*value)
+	return &cloned
+}
+
+func (r *Reactor) establishClientProviderInputItem(itemID string) error {
+	if err := validateProviderInputItemID("client input item ID", itemID); err != nil {
+		return err
+	}
+	if r.providerInput.historical(itemID) {
+		return ErrHistoricalProviderInputItem
+	}
+	if !r.providerInput.canRemember(itemID) {
+		return ErrProviderInputItemLimit
+	}
+	canonical := r.providerInput.canonicalItemID(itemID)
+	if err := r.beginInputTurn(canonical); err != nil {
+		return err
+	}
+	canonical = r.providerInput.remember(canonical)
+	r.providerInput.suppressForExplicitAuthority()
+	return nil
+}
+
+func (r *Reactor) establishSpeechProviderInputItem(itemID string) error {
+	if r.providerInput.historical(itemID) {
+		return ErrHistoricalProviderInputItem
+	}
+	if !r.providerInput.canRemember(itemID) {
+		return ErrProviderInputItemLimit
+	}
+	if len(r.providerInput.generations) >= providerInputGenerationLimit {
+		return ErrProviderInputGenerationLimit
+	}
+	canonical := r.providerInput.canonicalItemID(itemID)
+	if err := r.beginInputTurn(canonical); err != nil {
+		return err
+	}
+	canonical = r.providerInput.remember(canonical)
+	r.providerInput.suppressForExplicitAuthority()
+	r.providerInput.generations = append(r.providerInput.generations, providerInputGeneration{
+		itemID: canonical, turn: r.activeTurn.key, awaitingCommit: true, transcriptOpen: true,
+	})
+	return nil
+}
+
+func (l *providerInputAuthorityLedger) historical(itemID string) bool {
+	_, exists := l.history[itemID]
+	return exists
+}
+
+func (l *providerInputAuthorityLedger) canRemember(itemID string) bool {
+	if l.historical(itemID) {
+		return true
+	}
+	if len(l.history) >= providerInputItemHistoryLimit || l.historyBytes > providerInputItemHistoryBytes {
+		return false
+	}
+	return len(itemID) <= providerInputItemHistoryBytes-l.historyBytes
+}
+
+func (l *providerInputAuthorityLedger) canonicalItemID(itemID string) string {
+	if canonical, exists := l.history[itemID]; exists {
+		return canonical
+	}
+	return strings.Clone(itemID)
+}
+
+func (l *providerInputAuthorityLedger) remember(itemID string) string {
+	if canonical, exists := l.history[itemID]; exists {
+		return canonical
+	}
+	if l.history == nil {
+		l.history = make(map[string]string)
+	}
+	l.history[itemID] = itemID
+	l.historyBytes += len(itemID)
+	return itemID
+}
+
+func (l *providerInputAuthorityLedger) awaitingAcknowledgment() int {
+	for index := range l.generations {
+		if l.generations[index].awaitingAcknowledgment {
+			return index
+		}
+	}
+	return -1
+}
+
+func (l *providerInputAuthorityLedger) generationForItem(itemID string) int {
+	for index := len(l.generations) - 1; index >= 0; index-- {
+		if l.generations[index].itemID == itemID {
+			return index
+		}
+	}
+	return -1
+}
+
+func (l *providerInputAuthorityLedger) generationForTranscript(itemID string) int {
+	for index := len(l.generations) - 1; index >= 0; index-- {
+		generation := l.generations[index]
+		if generation.itemID == itemID {
+			return index
+		}
+	}
+	return -1
+}
+
+func (l *providerInputAuthorityLedger) suppressForExplicitAuthority() {
+	kept := l.generations[:0]
+	for index := range l.generations {
+		generation := l.generations[index]
+		if !generation.awaitingAcknowledgment {
+			continue
+		}
+		generation.suppressed = true
+		generation.transcriptOpen = false
+		kept = append(kept, generation)
+	}
+	for index := len(kept); index < len(l.generations); index++ {
+		l.generations[index] = providerInputGeneration{}
+	}
+	l.generations = kept
+}
+
+func (l *providerInputAuthorityLedger) removeGeneration(index int) {
+	copy(l.generations[index:], l.generations[index+1:])
+	last := len(l.generations) - 1
+	l.generations[last] = providerInputGeneration{}
+	l.generations = l.generations[:last]
 }
 
 func (r *Reactor) applyAudioDone(event realtime.Event) ([]Effect, error) {
@@ -1833,6 +2379,10 @@ func (r *Reactor) applyResponseDone(event realtime.Event) ([]Effect, error) {
 	if !r.currentResponseEvent(event) {
 		return nil, nil
 	}
+	if r.suppressedImplicitID != "" &&
+		(event.ResponseID == r.suppressedImplicitID || (event.ResponseID == "" && event.Epoch == r.activeResponseEpoch)) {
+		return nil, nil
+	}
 	if r.terminal != nil && r.terminal.responseID == event.ResponseID && r.terminal.epoch == event.Epoch {
 		return nil, nil
 	}
@@ -1900,6 +2450,9 @@ func (r *Reactor) rememberTerminalResponse(responseID string) {
 
 func (r *Reactor) applyVoiceCommandCompleted(input VoiceCommandCompletedInput) ([]Effect, error) {
 	if input.Kind == realtime.CommandSessionUpdate {
+		// Send completion proves only that the frame reached the provider
+		// transport. The uniquely outstanding update remains pending until the
+		// provider's actual session.updated event arrives.
 		return nil, nil
 	}
 	if input.Kind == realtime.CommandCreateResponse {
@@ -1948,6 +2501,7 @@ func (r *Reactor) applyVoiceCommandCompleted(input VoiceCommandCompletedInput) (
 func (r *Reactor) clearPendingSessionUpdates() {
 	clear(r.pendingSessionUpdates)
 	r.pendingSessionUpdateBytes = 0
+	r.pendingInputTurnMode = 0
 }
 
 func (r *Reactor) synthesizeResponseDone(status string) ([]Effect, error) {
@@ -1981,6 +2535,10 @@ func (r *Reactor) applyProviderError(event realtime.Event) ([]Effect, error) {
 		return nil, nil
 	}
 	if event.ResponseID != "" && !r.currentResponseEvent(event) {
+		return nil, nil
+	}
+	if r.suppressedImplicitID != "" &&
+		(event.ResponseID == r.suppressedImplicitID || (event.ResponseID == "" && event.Epoch == r.activeResponseEpoch)) {
 		return nil, nil
 	}
 	mapped := protocol.ErrorEvent{
@@ -2078,7 +2636,7 @@ func (r *Reactor) providerOrSynthEventID(providerID string) string {
 		return providerID
 	}
 	r.synthEventSequence++
-	return fmt.Sprintf("session-%s-%06d", r.ids.SessionID, r.synthEventSequence)
+	return fmt.Sprintf("session-%s-%06d-%06d", r.ids.SessionID, r.ids.Incarnation, r.synthEventSequence)
 }
 
 func defaultString(value, fallback string) string {
@@ -2091,6 +2649,18 @@ func defaultString(value, fallback string) string {
 func validateDurableID(name, value string) error {
 	if strings.TrimSpace(value) == "" || !utf8.ValidString(value) || len(value) > DurableIdentifierBytes {
 		return fmt.Errorf("%s exceeds durable-work bounds", name)
+	}
+	return nil
+}
+
+func validateProviderInputItemID(name, value string) error {
+	if err := validateDurableID(name, value); err != nil {
+		return err
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) || unicode.IsSpace(character) {
+			return fmt.Errorf("%s contains forbidden whitespace or control characters", name)
+		}
 	}
 	return nil
 }
@@ -2119,6 +2689,8 @@ func validateVoiceEvent(event realtime.Event) error {
 	switch event.Kind {
 	case realtime.EventSessionCreated, realtime.EventSessionUpdated:
 		return nil
+	case realtime.EventInputAudioCommitted:
+		return requireItem()
 	case realtime.EventSpeechStarted, realtime.EventSpeechStopped,
 		realtime.EventTranscriptionDelta, realtime.EventTranscriptionCompleted:
 		return requireItem()
@@ -2411,31 +2983,6 @@ func (r *Reactor) beginInputTurn(id string) error {
 		return nil
 	}
 	r.activeTurn = &activeInputTurn{key: identity.TurnKey{ID: id, Revision: revision}}
-	return nil
-}
-
-func (r *Reactor) observeTranscription(id string, complete bool) error {
-	needsRevision := r.activeTurn == nil ||
-		r.activeTurn.key.ID != id ||
-		r.activeTurn.committed ||
-		r.activeTurn.transcriptComplete
-	if needsRevision {
-		revision, err := r.nextInputTurnRevision()
-		if err != nil {
-			return err
-		}
-		if id == "" {
-			r.activeTurn = nil
-			return nil
-		}
-		r.activeTurn = &activeInputTurn{
-			key:                identity.TurnKey{ID: id, Revision: revision},
-			transcriptComplete: complete,
-		}
-		return nil
-	}
-	r.activeTurn.committed = false
-	r.activeTurn.transcriptComplete = complete
 	return nil
 }
 

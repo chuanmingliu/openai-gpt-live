@@ -39,6 +39,7 @@ var (
 	ErrImplicitResponseLimit = errors.New("implicit unbound response limit exceeded")
 	ErrPendingResponseLimit  = errors.New("pending explicit response limit exceeded")
 	ErrPendingSessionUpdate  = errors.New("pending session update limit exceeded")
+	ErrAudioCommitAckTimeout = errors.New("input audio commit acknowledgement timed out")
 	ErrSessionClosed         = errors.New("realtime WebSocket session closed")
 )
 

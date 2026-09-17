@@ -18,18 +18,23 @@ const (
 	CommandCreateResponse
 	CommandCancelResponse
 	CommandBindResponseEpoch
+	CommandAcknowledgeAudioCommit
 )
 
 type Command struct {
-	Kind       CommandKind
-	Sequence   uint64
-	AfterSeq   uint64
-	Epoch      identity.ResponseEpoch
-	Session    SessionConfig
-	Audio      []byte
-	Item       json.RawMessage
-	Response   ResponseConfig
-	ResponseID string
+	Kind     CommandKind
+	Sequence uint64
+	AfterSeq uint64
+	Epoch    identity.ResponseEpoch
+	// InputItemID is the exact committed item carried by the internal
+	// AcknowledgeAudioCommit release. It is never serialized onto the wire.
+	InputItemID              string
+	InputAudioCommitSequence uint64
+	Session                  SessionConfig
+	Audio                    []byte
+	Item                     json.RawMessage
+	Response                 ResponseConfig
+	ResponseID               string
 }
 
 type OpenRequest struct {
@@ -89,12 +94,14 @@ const (
 )
 
 type Event struct {
-	Kind            EventKind
-	Epoch           identity.ResponseEpoch
-	ProviderEventID string
-	ResponseID      string
-	ItemID          string
-	PreviousItemID  *string
+	Kind                   EventKind
+	Epoch                  identity.ResponseEpoch
+	ProviderEventID        string
+	ResponseID             string
+	ItemID                 string
+	PreviousItemID         *string
+	InputTurnMode          InputTurnMode
+	InputTurnModeSpecified bool
 	// SessionUpdateAcknowledgement is true only when the adapter observed this
 	// provider event while one local session.update was outstanding.
 	SessionUpdateAcknowledgement bool
@@ -106,15 +113,18 @@ type Event struct {
 	// provider acknowledgement or rejection produced this event. Zero is reserved
 	// for manager-owned initial configuration or unsolicited provider updates.
 	SessionUpdateSequence uint64
-	CallID                string
-	Name                  string
-	Audio                 []byte
-	Text                  string
-	Arguments             json.RawMessage
-	Status                string
-	Reason                string
-	Payload               json.RawMessage
-	NeedsEpochBinding     bool
+	// InputAudioCommitSequence is non-zero only in manual mode and identifies
+	// the sole client commit generation that the provider acknowledgement closes.
+	InputAudioCommitSequence uint64
+	CallID                   string
+	Name                     string
+	Audio                    []byte
+	Text                     string
+	Arguments                json.RawMessage
+	Status                   string
+	Reason                   string
+	Payload                  json.RawMessage
+	NeedsEpochBinding        bool
 }
 
 type Session interface {
