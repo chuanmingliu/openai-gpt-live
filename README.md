@@ -1,148 +1,68 @@
-# GPT Live Go framework
+# Mac Aria service maintenance
 
-## What it is
+This branch tracks ownership and the source-recovery boundary for the **native Go
+Aria application on the Mac**. It must not be used to replace the installed
+service until the source gap below is resolved.
 
-GPT Live Go is a Go **backend only** framework: an OpenAI Realtime-compatible
-WebSocket gateway plus an optional durable asynchronous worker. The production
-`live-gateway` and `live-worker` services include no frontend, browser server, or
-static assets. A separate development demo lives under `demo/live-client`.
-The gateway owns the realtime
-protocol boundary; the worker is used only when a durable backend is selected.
+**Scope:** `codex/service-mac-aria` in `openai-gpt-live`.
 
-## Requirements
+## Source gap
 
-Credential-free startup requires only Go 1.26. PostgreSQL and provider
-credentials are required only for the optional durable-worker and provider
-paths described below.
+This branch was created from verified GitHub revision `8f59fd074a50`, the
+credential-free backend branch. That tree contains `cmd/live-gateway`,
+`cmd/live-worker` and `demo/live-client`; **it does not contain `cmd/live-aria`**.
+Consequently there is no valid `go build ./cmd/live-aria` command on this branch.
 
-## Quick start without credentials
+The installed Mac binary identifies itself as
+`github.com/chuanmingliu/openai-gpt-live/cmd/live-aria`, revision
+`051b03f4a8ef9f1fcae860c276f73249fe183e8d`, with `vcs.modified=true`.
+Neither this branch nor that commit alone reproduces the deployed application.
+Recover and review its exact source changes before implementing a service update.
 
-Run these in separate terminals:
+The similarly named TypeScript Aria originator on the ThinkPad is a different
+codebase. Do not deploy its package over this native Go application.
 
-```sh
-go run ./cmd/live-gateway
-go run ./cmd/live-worker --backend none
-```
+## Installed service contract
 
-The gateway starts on `127.0.0.1:8080` with its local OpenAI
-Realtime-compatible configuration. The worker's explicit `--backend none` mode
-starts diagnostics only: it does not read configuration, look up credentials,
-connect to PostgreSQL, or process durable jobs.
+| Item | Observed configuration, 2026-10-31 |
+| --- | --- |
+| Supervisor | LaunchAgent `com.openai-gpt-live.aria`, with KeepAlive and RunAtLoad |
+| Binary | `~/Library/Application Support/Aria/bin/live-aria` |
+| State/config root | `~/Library/Application Support/Aria`; references a private telephony env file under its rollback directory |
+| Logs | `~/Library/Logs/Aria/live-aria.stdout.log` and `live-aria.stderr.log` |
+| Listeners | Loopback 3000, 8765 and 8768; wildcard 8767 |
+| Verified health routes | `:3000/healthz`, `:3000/readyz` and `:8765/health` returned 200 |
 
-## Verify the processes
+All four listeners belong to one process. A healthy HTTP listener does not
+establish that the configured PBX route or providers can complete a real call.
 
-```sh
-curl --fail http://127.0.0.1:8080/v1/realtime/capabilities
-curl --fail http://127.0.0.1:9091/health/live
-curl --silent --output /dev/null --write-out '%{http_code}\n' \
-  http://127.0.0.1:9091/health/ready
-```
-
-Capabilities returns JSON, liveness returns `ok`, and idle-worker readiness
-intentionally returns `503`: the process is alive but cannot accept durable
-jobs without a selected backend.
-
-## Add local speech
-
-For realtime sessions, run the official
-[Hugging Face `speech-to-speech`](https://github.com/huggingface/speech-to-speech)
-server on its loopback OpenAI Realtime endpoint,
-`ws://127.0.0.1:8765/v1/realtime`. The Go gateway still starts when that server
-is absent, but a realtime session requires it and will fail cleanly if it cannot
-be reached. This repository neither embeds nor launches the speech service.
-
-## Test with the browser UI
-
-Run these in separate terminals:
+Read-only checks on the Mac:
 
 ```sh
-go run ./cmd/live-gateway
-go run ./cmd/live-worker --backend none
-go run ./demo/live-client
+launchctl print "gui/$(id -u)/com.openai-gpt-live.aria"
+go version -m "$HOME/Library/Application Support/Aria/bin/live-aria"
+curl --noproxy '*' --fail http://127.0.0.1:3000/healthz
 ```
 
-Open `http://127.0.0.1:3000`, press Start, grant microphone permission, and use
-Mute or Stop to control the session. The page and its capabilities load without
-speech, while realtime conversation requires a compatible local speech endpoint
-at `ws://127.0.0.1:8765/v1/realtime`.
+Keep the installed binary, LaunchAgent and private referenced configuration
+intact. An authorized restart uses the existing launchd service; starting the
+backend/demo commands from this branch is not an Aria restart and may collide
+with its ports. Before an eventual upgrade, establish idle state, preserve a
+rollback copy and verify all listener contracts against the recovered build.
 
-### Optional configured gateway authentication
+## Candidate source locations
 
-For a configured gateway that requires bearer authentication, pass the value by
-environment variable:
+The inventory found later local checkouts of the same repository:
 
-```sh
-LIVE_DEMO_BEARER=... go run ./demo/live-client -bearer-env LIVE_DEMO_BEARER
-```
+- `~/Documents/openai-gpt-live`: branch `codex/public-operator-proxy`, observed
+  revision `26f5ca36f9df4565ac16874a47546e2cc8155f7c`; includes `cmd/live-aria`.
+- `~/Documents/openai-gpt-live-custom`: detached at
+  `e8dea1d78206265ec37e019c8b648b9fbe8a2a2a`.
 
-Avoid putting credential values in shell history. This demo is loopback
-development tooling, not a production proxy.
+These are candidates for source reconciliation, not verified reproductions of
+the installed dirty binary. Do not import their uncommitted changes or replace
+this branch's history as part of a README update.
 
-## Use explicit configuration
-
-Use explicit configuration once the gateway needs a chosen speech provider or a
-worker needs durable jobs. The legacy worker form remains compatible and selects
-the durable backend when a configuration file is supplied.
-
-```sh
-go run ./cmd/live-gateway -config configs/gateway.example.yaml
-go run ./cmd/live-worker -config configs/worker.example.yaml
-go run ./cmd/live-worker --backend durable -config configs/worker.example.yaml
-```
-
-The configured gateway accepts the advertised public model, then dials the
-configured speech endpoint for a session. Configured credentials remain strict:
-if a configuration names a credential environment variable, it must be supplied.
-The durable worker requires PostgreSQL, migrations, and its configured reasoner
-credentials; `--backend none` is deliberately not a substitute for that runtime.
-
-## Security boundary
-
-The credential-free defaults are loopback-only and unauthenticated. Never expose
-them directly. Production remains controlled by OIDC, TLS, PostgreSQL, and a
-secret manager through reviewed configuration and deployment procedures.
-
-## Protocol and operations
-
-Read the focused references for the supported protocol and production operation:
-[protocol](docs/protocol.md), [security](docs/security.md),
-[operations](docs/operations.md), [testing](docs/testing.md), and
-[deployment](deploy/README.md).
-
-## Design references
-
-This design adopts two external patterns without importing either project:
-[Hugging Face `speech-to-speech`](https://github.com/huggingface/speech-to-speech)
-provides the local OpenAI Realtime transport pattern, and
-[Qwen Audio Agent](https://github.com/QwenAudio/qwen-audio-agent) provides the
-explicit no-backend worker lifecycle pattern. The Go service keeps its own
-protocol, audio, session, and deployment implementations.
-
-## Optional durable and provider paths
-
-The examples in [configs/gateway.example.yaml](configs/gateway.example.yaml) and
-[configs/worker.example.yaml](configs/worker.example.yaml) are for explicitly
-configured processes. Configure a gateway speech endpoint and its credential
-reference only when the endpoint needs one. Configure `DATABASE_URL` and
-`DEEPSEEK_API_KEY` only for the durable worker, and provide those values through
-a secret manager or secure process environment; never commit them or place them
-in a tracked command.
-
-For a production-like local topology, PostgreSQL, additional HMAC material,
-authentication, provider credentials, and Compose inputs are documented in
-[deploy/README.md](deploy/README.md). `LIVE_STATIC_BEARER_TOKEN` is an optional
-explicit local-auth setting; production forbids static auth and uses OIDC.
-
-## Runtime contracts
-
-- `live-gateway` without `-config` binds `127.0.0.1:8080`, serves capabilities,
-  and defers the local speech-provider dial until a realtime session opens.
-- `live-worker --backend none` binds diagnostics on `127.0.0.1:9091`; liveness
-  is `200`, readiness is content-free `503`, and the process owns no durable
-  dependencies or admin operations.
-- `live-worker -config <path>` and `live-worker --backend durable -config <path>`
-  use the strict durable runtime. `--backend none` rejects `-config`, and
-  `--backend durable` requires it.
-
-No provider, database, cluster, registry, secret file, or external identity is
-contacted implicitly by the credential-free startup path.
+Once the matching source has been recovered and reviewed, add the actual Aria
+build/check commands and its release provenance here. Until then, this branch
+records service ownership and lifecycle without claiming a reproducible build.
